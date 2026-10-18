@@ -71,5 +71,10 @@
  "note": "A tool that scrubs multi-part stores keeps what a reader sees.",
  "files": {"s.tsvz": "#_defaults_#\td1\td2\na\t1\n", "s.tsvz.1": "b\t2\na\n"},
  "steps": [{"op": ["scrub"]}],
- "after": {"rows": [["b", "2", "d2"]], "fidelity": "full"}}
+ "after": {"rows": [["b", "2", "d2"]], "fidelity": "full"}},
+{"id": "19.10.2-a-writer-never-writes-the-snapshot-marker", "spec": ["19.10.2", "19.10.3"], "level": "MUST",
+ "note": "A writer appending records refuses #_snapshot_#, in any case, with or without a value, and writes nothing: as the first line of a new part it would make readers skip the parts before it.",
+ "files": {"s.tsvz": "a\t1\n"},
+ "steps": [{"op": ["set", "#_snapshot_#"], "exit": 1}, {"op": ["set", "#_SNAPSHOT_#", ""], "exit": 1}],
+ "after": {"bytes": ["unchanged"]}}
 ]}
