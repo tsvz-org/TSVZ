@@ -1108,7 +1108,12 @@ when:
    c. no part up to and including it declares a version higher than the producer
       implements (§19.4).
 
-A writer appending records (§18) never writes `#_snapshot_#`.
+A writer appending records (§18) to a strict store **MUST NOT** write
+`#_snapshot_#`, with a value or without one: as the first line of a part it would
+make readers skip every part before it (§19.10.3). It refuses such a record, writes
+nothing, and reports the refusal as a failure (exit status 1, §20.6; status 1,
+§21.10.3). The rule does not apply to loose files (§5.2), which carry no marker
+semantics.
 
 19.10.3 **Readers.** A reader **MAY** begin its replay at the last snapshot part in
 replay order, from the built-in default state, without reading the parts before
@@ -1177,7 +1182,7 @@ effect and exit status (§20.6).
 |---|---|---|
 | `read` | `STORE` | Print every live key's resolved row (§7, §14) in first-appearance order (§3.4). |
 | `get` | `STORE KEY [KEY ...]` | Print each requested key's resolved row, in argument order. For a missing key, print what §14.5 specifies a read returns: the key followed by the active defaults while `#_return_defaults_when_missing_#` is `true`; nothing while it is `false`. Each KEY names a key as §20.2.7 says. |
-| `set` | `STORE KEY [VALUE ...]` or `STORE -` | Append one record whose first field is `KEY` and whose value fields are the `VALUE`s. A `KEY` with no `VALUE` writes a tombstone (§9.2). An empty-string `VALUE` writes a present-empty cell. A `KEY` matching the reserved pattern (§12.2) writes a marker line with that key. `-` reads records from standard input (§20.3). |
+| `set` | `STORE KEY [VALUE ...]` or `STORE -` | Append one record whose first field is `KEY` and whose value fields are the `VALUE`s. A `KEY` with no `VALUE` writes a tombstone (§9.2). An empty-string `VALUE` writes a present-empty cell. A `KEY` matching the reserved pattern (§12.2) writes a marker line with that key; `#_snapshot_#` in a strict store is refused instead (§19.10.2). `-` reads records from standard input (§20.3). |
 | `append` | as `set` | Alias of `set`, with identical behaviour. |
 | `delete` | `STORE KEY [KEY ...]` or `STORE -` | Append one tombstone per `KEY`, for the key it names (§20.2.7). It MUST NOT fail because a key is absent. `-` reads keys from standard input (§20.3). |
 | `clear` | `STORE` | Make the store empty. For a single-part store: rewrite the part in place keeping the header comment and the active markers (§19.8); a part that declares a version the tool does not implement is refused (§19.8). For a multi-part store: append a tombstone for every live key to the active part (§18.8). A refused `clear` writes nothing and exits with status 1. |
@@ -1406,7 +1411,8 @@ whatever the store's variant.
 
 21.4.3 Each field of a request is decoded per §13 before use. A key whose written
 form matches the reserved pattern (§12.2) is a marker key, as in §20.2; a key
-written with `<#>` is a data key.
+written with `<#>` is a data key. A write of `#_snapshot_#` to a strict store is
+refused with status 1 (§19.10.2, §21.10.3).
 
 ### 21.5 Requests
 
