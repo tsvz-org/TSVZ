@@ -73,8 +73,9 @@
  "steps": [{"op": ["scrub"]}],
  "after": {"rows": [["b", "2", "d2"]], "fidelity": "full"}},
 {"id": "19.10.2-a-writer-never-writes-the-snapshot-marker", "spec": ["19.10.2", "19.10.3"], "level": "MUST",
- "note": "A writer appending records refuses #_snapshot_#, in any case, with or without a value, and writes nothing: as the first line of a new part it would make readers skip the parts before it.",
+ "note": "A writer appending records refuses #_snapshot_#, in any case, without a value (or an empty one) and with one, and writes nothing: as the first line of a new part it would make readers skip the parts before it.",
  "files": {"s.tsvz": "a\t1\n"},
- "steps": [{"op": ["set", "#_snapshot_#"], "exit": 1}, {"op": ["set", "#_SNAPSHOT_#", ""], "exit": 1}],
+ "steps": [{"op": ["set", "#_snapshot_#"], "exit": 1}, {"op": ["set", "#_SNAPSHOT_#", ""], "exit": 1},
+  {"op": ["set", "#_snapshot_#", "x"], "exit": 1}],
  "after": {"bytes": ["unchanged"]}}
 ]}
