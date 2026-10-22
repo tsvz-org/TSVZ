@@ -6602,3 +6602,134 @@ def test_tsvzedlite_popitem_does_not_list_the_keys_before_python_3_8(tmp_path, m
 	while len(t):
 		t.popitem()
 	assert True not in listed  # list(self.indexes) at every pop made emptying a store quadratic
+
+
+# --- third review round: the legacy writer's locks, stamps and queue ----------
+def _stopped(p, **kwargs):
+	"""A TSVZed whose background writer is stopped, so a test drives every write itself."""
+	kwargs.setdefault('header', 'key\tval')
+	kwargs.setdefault('append_check_delay', 0.001)
+	kwargs.setdefault('rewrite_on_load', False)
+	t = TSVZ.TSVZed(p, **kwargs)
+	_stop(t)
+	return t
+
+
+def _dirty(t):
+	"""Give ``t`` a row in the file and a newer one queued: a rewrite has something to change."""
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	t['a'] = ['a', '2']
+	t.commitAppendToFile()
+	assert t.dirty
+
+
+def _open_fds():
+	return len(os.listdir('/proc/self/fd'))
+
+
+class _InterruptingFile(object):
+	"""A file whose writes raise KeyboardInterrupt (Ctrl-C in the middle of a rewrite)."""
+
+	def __init__(self, f):
+		self._f = f
+
+	def write(self, data):
+		raise KeyboardInterrupt
+
+	def __getattr__(self, name):
+		return getattr(self._f, name)
+
+
+@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
+def test_tsvzed_legacy_rewrite_lets_go_of_the_lock_and_the_file_when_interrupted(tmp_path, method):
+	p = str(tmp_path / 'ki.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	original = t.get_file_obj
+	opened = []
+
+	def hooked(modes='ab', locked=False):
+		f = original(modes, locked)
+		if modes in ('wb', 'r+b'):
+			opened.append(f)
+			return _InterruptingFile(f)
+		return f
+
+	t.get_file_obj = hooked
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			getattr(t, method)()
+		held = t.writeLock.locked()
+	finally:
+		t.get_file_obj = original
+		if t.writeLock.locked():
+			t.writeLock.release()  # so that the rest of the run does not hang where it fails
+	assert not held, 'writeLock is still held: close(), atexit and __del__ would hang'
+	assert opened and opened[0].closed
+	t.mapToFile()  # and the next rewrite works
+	assert _bytes(p) == b'key\tval\na\t2\n'
+
+
+@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='counts open descriptors in /proc')
+@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
+def test_tsvzed_legacy_rewrite_whose_file_lock_fails_never_writes_unlocked(tmp_path, method, monkeypatch, capsys):
+	import errno
+	p = str(tmp_path / 'nolock.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	before = _bytes(p)
+	fds = _open_fds()
+
+	def failing(f):
+		raise OSError(errno.ENOLCK, 'No locks available')  # NFS without a lock daemon
+
+	monkeypatch.setattr(TSVZ, '_lockFile', failing)
+	getattr(t, method)()
+	monkeypatch.undo()
+	out = capsys.readouterr().out
+	assert not t.writeLock.locked()
+	assert _open_fds() == fds, 'the file was left open'
+	assert out.count('No locks available') == 1 and 'NoneType' not in out and 'failback' not in out, out
+	if method == 'mapToFile':
+		assert _bytes(p) == before  # it never wrote to a file it could not lock
+	assert not t._externalChange()  # emptying it on open ('wb') is this object's own change: no reload of it
+	assert t.dirty and dict(t) == {'a': ['a', '2']}
+	getattr(t, method)()
+	assert _bytes(p) == b'key\tval\na\t2\n'
+
+
+@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
+def test_tsvzed_legacy_rewrite_that_cannot_open_the_file_reports_why_once(tmp_path, method, monkeypatch, capsys):
+	p = str(tmp_path / 'noopen.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	before = _bytes(p)
+	real = TSVZ.openFileAsCompressed
+
+	def failing(fileName, mode='rb', *args, **kwargs):
+		if mode in ('wb', 'r+b'):
+			raise PermissionError(13, 'Permission denied')
+		return real(fileName, mode, *args, **kwargs)
+
+	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', failing)
+	getattr(t, method)()
+	monkeypatch.undo()
+	out = capsys.readouterr().out
+	assert not t.writeLock.locked()
+	assert out.count('Permission denied') == 1 and 'NoneType' not in out and 'failback' not in out, out
+	assert _bytes(p) == before and t.dirty
+
+
+def test_tsvzed_legacy_append_that_cannot_open_the_file_keeps_the_rows_queued(tmp_path, monkeypatch, capsys):
+	p = str(tmp_path / 'q.tsv')
+	t = _stopped(p)
+	t['b'] = ['b', '1']
+	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', lambda *a, **k: (_ for _ in ()).throw(PermissionError(13, 'Permission denied')))
+	t.commitAppendToFile()
+	monkeypatch.undo()
+	out = capsys.readouterr().out
+	assert 'Permission denied' in out and 'NoneType' not in out, out
+	assert not t.writeLock.locked() and list(t.appendQueue) == [['b', '1']]
+	t.commitAppendToFile()
+	assert _bytes(p) == b'key\tval\nb\t1\n'

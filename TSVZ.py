@@ -4430,6 +4430,9 @@ class TSVZed(OrderedDict):
 				header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
 				headerBytes = _encodeRow(_sanitize(self.header,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header')
 				file = self.get_file_obj('wb')  # opening it empties it: encode first
+				if file is None:
+					self.deSynced = True  # get_file_obj reported why
+					return self
 				file.write(headerBytes + b'\n')
 				self.release_file_obj(file)
 				if self.verbose:
@@ -4437,6 +4440,9 @@ class TSVZed(OrderedDict):
 					self.__teePrintOrNot(f"File {self._fileName} size: {os.path.getsize(self._fileName)}")
 			else:
 				file = self.get_file_obj('wb')
+				if file is None:
+					self.deSynced = True  # get_file_obj reported why
+					return self
 				self.release_file_obj(file)
 				if self.verbose:
 					self.__teePrintOrNot(f"File {self._fileName} cleared empty")
@@ -4689,27 +4695,39 @@ memoryOnly:{self.memoryOnly}
 		for row in rows:
 			yield _encodeRow(row,self.delimiter,self.encoding,self.errors,self.header)
 
+	def _endRewrite(self, file):
+		"""Let go of what a rewrite holds from its snapshot on: the file (noting its modification time) and writeLock."""
+		if file is not None:
+			self.release_file_obj(file)  # lets go of writeLock too
+		else:
+			self.writeLock.release()
+
 	def hardMapToFile(self):
 		if self._spec:
 			_warnOnce(self, 'hardMapToFile()', self._fileName,
 					  'hardMapToFile() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
 					  self.teeLogger)
 			return self
-		file = None
 		try:
 			if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
 				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
 			snapshot = self._snapshotForRewrite()  # checked, and the lock held: opening the file for writing empties it
-			file = self.get_file_obj('wb',locked=True)
-			buf = io.BufferedWriter(file, buffer_size=64*1024*1024)  # 64MB buffer
-			if snapshot[0] is not None:
-				buf.write(_encodeRow(snapshot[0],self.delimiter,self.encoding,self.errors,what='header') + b'\n')
-			# The defaults line comes right after the header, so it survives a
-			# full rewrite -- it is not a regular mapping key.
-			for line in self._rewriteLines(snapshot):
-				buf.write(line + b'\n')
-			buf.flush()
-			self.release_file_obj(file)
+			file = None
+			try:
+				file = self.get_file_obj('wb',locked=True)
+				if file is None:
+					self.deSynced = True  # get_file_obj reported why; tried again later
+					return self
+				buf = io.BufferedWriter(file, buffer_size=64*1024*1024)  # 64MB buffer
+				if snapshot[0] is not None:
+					buf.write(_encodeRow(snapshot[0],self.delimiter,self.encoding,self.errors,what='header') + b'\n')
+				# The defaults line comes right after the header, so it survives a
+				# full rewrite -- it is not a regular mapping key.
+				for line in self._rewriteLines(snapshot):
+					buf.write(line + b'\n')
+				buf.flush()
+			finally:
+				self._endRewrite(file)  # whatever stopped it, KeyboardInterrupt included
 			if self.verbose:
 				self.__teePrintOrNot(f"{len(self)} records written to {self._fileName}")
 				self.__teePrintOrNot(f"File {self._fileName} size: {os.path.getsize(self._fileName)}")
@@ -4719,7 +4737,6 @@ memoryOnly:{self.memoryOnly}
 		except TSVZEncodeError as e:
 			self._refuse('hardMapToFile()', e)
 		except Exception as e:
-			self.release_file_obj(file)
 			self.__teePrintOrNot(f"Failed to write at hardMapToFile() to {self._fileName}: {e}",'error')
 			import traceback
 			self.__teePrintOrNot(traceback.format_exc(),'error')
@@ -4740,7 +4757,6 @@ memoryOnly:{self.memoryOnly}
 			self.monitor_external_changes = mec
 
 	def _mapToFile(self):
-		file = None
 		try:
 			if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
 				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
@@ -4748,49 +4764,55 @@ memoryOnly:{self.memoryOnly}
 				# if the file is compressed, we need to use the hardMapToFile method
 				return self.hardMapToFile()
 			snapshot = self._snapshotForRewrite()  # checked, and the lock held
-			file = self.get_file_obj('r+b',locked=True)
-			overWrite = False
-			if snapshot[0] is not None:
-				line = file.readline().decode(self.encoding,errors='replace')
-				aftPos = file.tell()
-				if not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
-					header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
-					file.seek(0)
-					file.write(_encodeRow(snapshot[0],self.delimiter,self.encoding,self.errors,what='header')+b'\n')
-					# if the header is not the same length as the line, we need to overwrite the file
-					if aftPos != file.tell():
+			file = None
+			try:
+				file = self.get_file_obj('r+b',locked=True)
+				if file is None:
+					self.deSynced = True  # get_file_obj reported why; the file is untouched, tried again later
+					return self
+				overWrite = False
+				if snapshot[0] is not None:
+					line = file.readline().decode(self.encoding,errors='replace')
+					aftPos = file.tell()
+					if not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
+						header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
+						file.seek(0)
+						file.write(_encodeRow(snapshot[0],self.delimiter,self.encoding,self.errors,what='header')+b'\n')
+						# if the header is not the same length as the line, we need to overwrite the file
+						if aftPos != file.tell():
+							overWrite = True
+						if self.verbose:
+							self.__teePrintOrNot(f"Header {header} written to {self._fileName}")
+				# Rows to (re)write, in order: the defaults line first (right after the
+				# header, if set) then every data row.
+				for encoded in self._rewriteLines(snapshot):
+					if overWrite:
+						if self.verbose:
+							self.__teePrintOrNot(f"Overwriting {encoded!r} to {self._fileName}")
+						file.write(encoded+b'\n')
+						continue
+					pos = file.tell()
+					line = file.readline()
+					aftPos = file.tell()
+					if not line or pos == aftPos:
+						if self.verbose:
+							self.__teePrintOrNot(f"End of file reached. Appending {encoded!r} to {self._fileName}")
+						# L6: 3.39 omitted this newline and glued the row to the next one.
+						file.write(encoded+b'\n')
 						overWrite = True
-					if self.verbose:
-						self.__teePrintOrNot(f"Header {header} written to {self._fileName}")
-			# Rows to (re)write, in order: the defaults line first (right after the
-			# header, if set) then every data row.
-			for encoded in self._rewriteLines(snapshot):
-				if overWrite:
-					if self.verbose:
-						self.__teePrintOrNot(f"Overwriting {encoded!r} to {self._fileName}")
-					file.write(encoded+b'\n')
-					continue
-				pos = file.tell()
-				line = file.readline()
-				aftPos = file.tell()
-				if not line or pos == aftPos:
-					if self.verbose:
-						self.__teePrintOrNot(f"End of file reached. Appending {encoded!r} to {self._fileName}")
-					# L6: 3.39 omitted this newline and glued the row to the next one.
-					file.write(encoded+b'\n')
-					overWrite = True
-					continue
-				strToWrite = encoded.ljust(len(line)-1)+b'\n'
-				if line != strToWrite:
-					if self.verbose:
-						self.__teePrintOrNot(f"Modifing {encoded!r} to {self._fileName}")
-					file.seek(pos)
-					# fill the string with space to write to the correct length
-					file.write(strToWrite)
-					if aftPos != file.tell():
-						overWrite = True
-			file.truncate()
-			self.release_file_obj(file)
+						continue
+					strToWrite = encoded.ljust(len(line)-1)+b'\n'
+					if line != strToWrite:
+						if self.verbose:
+							self.__teePrintOrNot(f"Modifing {encoded!r} to {self._fileName}")
+						file.seek(pos)
+						# fill the string with space to write to the correct length
+						file.write(strToWrite)
+						if aftPos != file.tell():
+							overWrite = True
+				file.truncate()
+			finally:
+				self._endRewrite(file)  # whatever stopped it, KeyboardInterrupt included
 			if self.verbose:
 				self.__teePrintOrNot(f"{len(self)} records written to {self._fileName}")
 				self.__teePrintOrNot(f"File {self._fileName} size: {os.path.getsize(self._fileName)}")
@@ -4801,7 +4823,6 @@ memoryOnly:{self.memoryOnly}
 			self._refuse('mapToFile()', e)
 			return self
 		except Exception as e:
-			self.release_file_obj(file)
 			self.__teePrintOrNot(f"Failed to write at mapToFile() to {self._fileName}: {e}",'error')
 			import traceback
 			self.__teePrintOrNot(traceback.format_exc(),'error')
@@ -4862,6 +4883,8 @@ memoryOnly:{self.memoryOnly}
 					self.__teePrintOrNot(f"Before size of {self._fileName}: {os.path.getsize(self._fileName)}")
 				compressed = _isCompressedFile(self._fileName)
 				file = self.get_file_obj('ab' if compressed else 'a+b')
+				if file is None:
+					return self  # get_file_obj reported why; the rows stay queued for the next try
 				chunks = []
 				while self.appendQueue:
 					row = self.appendQueue.popleft()
@@ -4914,7 +4937,11 @@ memoryOnly:{self.memoryOnly}
 			self.__teePrintOrNot(traceback.format_exc(),'error')
 	
 	def get_file_obj(self,modes = 'ab',locked = False):
-		# ``locked``: the caller took writeLock already (a rewrite looks at its rows under it before it opens the file).
+		"""Take ``writeLock`` (unless ``locked``: the caller holds it already), open the file and lock it.
+
+		On failure the error is reported, a file this opened is closed and None is returned. writeLock is then let
+		go only when this call took it: a caller that holds it keeps it, and lets go of it itself.
+		"""
 		if not locked:
 			self.writeLock.acquire()
 		file = None
@@ -4932,13 +4959,20 @@ memoryOnly:{self.memoryOnly}
 				msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, lock_length)
 			if self.verbose:
 				self.__teePrintOrNot(f"File {self._fileName} locked with mode {modes}")
+			return file
 		except Exception as e:
-			try:
-				self.writeLock.release()  # Release the thread lock in case of an error
-			except Exception as e:
-				self.__teePrintOrNot(f"Failed to release writeLock for {self._fileName}: {e}",'error')
 			self.__teePrintOrNot(f"Failed to open file {self._fileName}: {e}",'error')
-		return file
+			if file is not None:
+				try:
+					file.close()  # an unlocked file is never handed out
+				except Exception:
+					pass
+				if 'w' in modes:
+					# Opening it emptied it: that change is this object's own, not another process's.
+					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
+			if not locked:
+				self.writeLock.release()
+			return None
 
 	def release_file_obj(self,file):
 		# if write lock is already released, return
