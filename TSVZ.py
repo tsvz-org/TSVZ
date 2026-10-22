@@ -4779,43 +4779,34 @@ memoryOnly:{self.memoryOnly}
 		return False
 
 	def _snapshotForRewrite(self):
-		"""Lock the file, then copy what a rewrite writes and check that all of it can be written; return the copy.
+		"""Lock the file, then encode what a rewrite writes, checking that all of it can be written; return the bytes.
 
 		The caller holds ``writeLock`` when this returns, and must open the file with
-		``get_file_obj(..., locked=True)``. The copy is taken under the lock, so the
-		background writer cannot append a row after it was taken and before the file is
-		cut (that row would be lost); a row set later is appended after the rewrite. It
-		is ``(header, defaults, rows)``: sanitised lists of cells (``None`` for no header
-		or defaults line), shallow copies, so a row another thread changes in place cannot
-		make the write differ from what was checked. A ``TSVZEncodeError`` releases the
-		lock and leaves the file untouched.
+		``get_file_obj(..., locked=True)``. The rows are encoded under the lock, so the
+		background writer cannot append a row after they were taken and before the file is
+		cut (that row would be lost); a row set later is appended after the rewrite. It is
+		``(header, lines)``: the header line (None for no header) and the defaults line and
+		every row after it, as bytes without their newline. Each row is encoded once, and
+		what is written is what was checked, whatever another thread does to a row later.
+		A ``TSVZEncodeError`` releases the lock and leaves the file untouched.
 		"""
 		self.writeLock.acquire()
 		try:
-			delimiter = self.delimiter
-			header = _sanitize(list(self.header),delimiter=delimiter) if self.header else None
-			defaults = _sanitize(list(self.defaults),delimiter=delimiter) if self.defaults and len(self.defaults) > 1 else None
+			delimiter, encoding, errors = self.delimiter, self.encoding, self.errors
+			header = _encodeRow(_sanitize(list(self.header),delimiter=delimiter),delimiter,encoding,errors,what='header') if self.header else None
+			lines = []
+			if self.defaults and len(self.defaults) > 1:
+				# The defaults line comes right after the header, so it survives a
+				# full rewrite -- it is not a regular mapping key.
+				lines.append(_encodeRow(_sanitize(list(self.defaults),delimiter=delimiter),delimiter,encoding,errors,what='defaults'))
 			# '#'-prefixed keys are in-memory only (comments / internal); never written.
-			rows = [_sanitize(value,delimiter=delimiter) for value in list(self.values()) if value and not str(value[0]).startswith('#')]
-			if _mayRaise(self.errors):
-				if header is not None:
-					_encodeRow(header,delimiter,self.encoding,self.errors,what='header')
-				if defaults is not None:
-					_encodeRow(defaults,delimiter,self.encoding,self.errors,what='defaults')
-				for row in rows:
-					_encodeRow(row,delimiter,self.encoding,self.errors,self.header)
+			for value in list(self.values()):
+				if value and not str(value[0]).startswith('#'):
+					lines.append(_encodeRow(_sanitize(value,delimiter=delimiter),delimiter,encoding,errors,self.header))
 		except BaseException:
 			self.writeLock.release()
 			raise
-		return header, defaults, rows
-
-	def _rewriteLines(self, snapshot):
-		"""The lines of a rewrite after the header, as bytes without their newline: the defaults line, then every row."""
-		header, defaults, rows = snapshot
-		if defaults is not None:
-			yield _encodeRow(defaults,self.delimiter,self.encoding,self.errors,what='defaults')
-		for row in rows:
-			yield _encodeRow(row,self.delimiter,self.encoding,self.errors,self.header)
+		return header, lines
 
 	def _endRewrite(self, file):
 		"""Let go of what a rewrite holds from its snapshot on: the file (noting its modification time) and writeLock."""
@@ -4848,11 +4839,10 @@ memoryOnly:{self.memoryOnly}
 					self.deSynced = True  # get_file_obj reported why; tried again later
 					return self
 				buf = io.BufferedWriter(file, buffer_size=64*1024*1024)  # 64MB buffer
-				if snapshot[0] is not None:
-					buf.write(_encodeRow(snapshot[0],self.delimiter,self.encoding,self.errors,what='header') + b'\n')
-				# The defaults line comes right after the header, so it survives a
-				# full rewrite -- it is not a regular mapping key.
-				for line in self._rewriteLines(snapshot):
+				header, lines = snapshot
+				if header is not None:
+					buf.write(header + b'\n')
+				for line in lines:
 					buf.write(line + b'\n')
 				buf.flush()
 			finally:
@@ -4900,13 +4890,14 @@ memoryOnly:{self.memoryOnly}
 				if self._externalChangeStops(defer):
 					return self  # reloaded first
 				overWrite = False
-				if snapshot[0] is not None:
+				headerBytes, lines = snapshot
+				if headerBytes is not None:
 					line = file.readline().decode(self.encoding,errors='replace')
 					aftPos = file.tell()
 					if not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
 						header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
 						file.seek(0)
-						file.write(_encodeRow(snapshot[0],self.delimiter,self.encoding,self.errors,what='header')+b'\n')
+						file.write(headerBytes+b'\n')
 						# if the header is not the same length as the line, we need to overwrite the file
 						if aftPos != file.tell():
 							overWrite = True
@@ -4914,7 +4905,7 @@ memoryOnly:{self.memoryOnly}
 							self.__teePrintOrNot(f"Header {header} written to {self._fileName}")
 				# Rows to (re)write, in order: the defaults line first (right after the
 				# header, if set) then every data row.
-				for encoded in self._rewriteLines(snapshot):
+				for encoded in lines:
 					if overWrite:
 						if self.verbose:
 							self.__teePrintOrNot(f"Overwriting {encoded!r} to {self._fileName}")

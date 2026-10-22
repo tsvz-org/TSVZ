@@ -6172,13 +6172,12 @@ def test_legacy_writers_encode_each_row_once(tmp_path, monkeypatch):
 	del calls[:]
 	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=5, rewrite_on_load=False)
 	del calls[:]
-	# A rewrite checks every row under the lock and then streams the same snapshot to the file: two
-	# passes, and no copy of the encoded store held in memory in between.
+	# A rewrite encodes every row once, under the lock, and writes the bytes it checked.
 	t.hardMapToFile()
-	assert len([c for c in calls if c[0] in 'abc']) == 6, calls
+	assert len([c for c in calls if c[0] in 'abc']) == 3, calls
 	del calls[:]
 	t.mapToFile()
-	assert len([c for c in calls if c[0] in 'abc']) == 6, calls
+	assert len([c for c in calls if c[0] in 'abc']) == 3, calls
 	_stop(t)
 
 
@@ -7101,3 +7100,4 @@ def test_tsvzed_legacy_clear_and_sets_in_another_thread_agree_stress(tmp_path):
 	other.join()
 	t.close()
 	assert dict(TSVZ.readTabularFile(p, header='key\tval')) == dict(t)
+
