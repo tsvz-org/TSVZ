@@ -7011,16 +7011,16 @@ def test_tsvzed_legacy_change_right_after_a_rewrite_is_not_taken_for_seen(tmp_pa
 	p = str(tmp_path / 'mask.tsv')
 	t = _stopped(p)
 	_dirty(t)
-	real = t.release_file_obj
+	real = t._releaseRewrite
 
-	def release(f, **kwargs):
-		real(f, **kwargs)
-		with open(p, 'ab') as g:  # another process appends right after the rewrite let go of the lock
+	def release(*args, **kwargs):
+		real(*args, **kwargs)
+		with open(p, 'ab') as g:  # another process appends right after the rewrite let go of the file lock
 			g.write(b'ext\tB\n')
 
-	t.release_file_obj = release
+	t._releaseRewrite = release
 	t.mapToFile()
-	t.release_file_obj = real
+	t._releaseRewrite = real
 	assert t._externalChange()
 	t['a'] = ['a', '3']
 	t.rewrite(force=True)  # reloads the change first
@@ -7133,21 +7133,21 @@ def test_tsvzed_legacy_own_write_in_progress_is_not_an_external_change(tmp_path)
 	p = str(tmp_path / 'own.tsv')
 	t = _stopped(p)
 	_dirty(t)
-	real = t.release_file_obj
+	real = t._releaseRewrite
 
-	def release(f, **kwargs):
+	def release(f, *args, **kwargs):
 		f.flush()  # the file has changed; its time is noted next, under the lock
 		check = threading.Thread(target=t.checkExternalChanges)  # the background writer's look meanwhile
 		check.start()
 		check.join(0.2)
-		real(f, **kwargs)
+		real(f, *args, **kwargs)
 		check.join(5)
-		seen.append(t.deSynced)  # before clear_file sets it False on success, as the background writer sees it
+		seen.append(t.deSynced)  # as the background writer sees it once the rewrite lets go of writeLock
 
 	seen = []
-	t.release_file_obj = release
+	t._releaseRewrite = release
 	t.clear_file()
-	t.release_file_obj = real
+	t._releaseRewrite = real
 	assert seen == [False], 'its own clear_file was taken for another process changing the file'
 
 
@@ -7893,3 +7893,168 @@ def test_tsvzed_legacy_failed_rewrite_and_its_fallback_count_as_one_try(tmp_path
 	assert waits == [TSVZ._FAILURE_RETRY_FIRST * f for f in (1, 2, 4)], waits
 	t.rewrite()
 	assert 'rewrite' not in t._failures and _bytes(p) == b'key\tval\na\t2\n'
+
+
+# --- fifth review round: a rewrite lets go of the file once, whatever stops it where ----------
+def _interrupt_at(n, call, where=None):
+	"""Call ``call()``, raising KeyboardInterrupt at the ``n``-th line TSVZ.py runs in it; True when it got there.
+
+	``where``: count only the lines of that TSVZ.py function and of what it calls (the first time it runs). Two kinds
+	of line are skipped, where the tracer runs but CPython handles no signal: a ``try:`` line, before the try is set
+	up (3.6 makes the opcode before SETUP_FINALLY uninterruptible; from 3.11 on it is a NOP), and a ``with`` line,
+	which the tracer reports again as the block ends, before ``__exit__`` (no signal is handled between the last
+	statement of the block and the call of a C ``__exit__``, a lock's).
+	"""
+	import gc
+	import linecache
+	source = TSVZ.__file__
+	state = {'count': 0, 'hit': False, 'armed': 0 if where else 1}
+
+	def local(frame, event, arg):
+		if event == 'return' and where is not None and frame.f_code.co_name == where:
+			state['armed'] = -1  # it ran once: nothing after it counts
+		elif event == 'line' and state['armed'] > 0:
+			line = linecache.getline(source, frame.f_lineno).strip()
+			if line == 'try:' or line.startswith('with '):
+				return local
+			state['count'] += 1
+			if state['count'] == n:
+				state['hit'] = True
+				raise KeyboardInterrupt
+		return local
+
+	def tracer(frame, event, arg):
+		if frame.f_code.co_filename != source:
+			return None
+		if where is not None and frame.f_code.co_name == where and state['armed'] == 0:
+			state['armed'] = 1
+		return local if state['armed'] > 0 or where is not None else None
+
+	sys.settrace(tracer)
+	try:
+		call()
+	except KeyboardInterrupt:
+		if not state['hit']:
+			raise
+	finally:
+		sys.settrace(None)
+	gc.collect()  # the traceback that held the frames is gone: what is still open was left open
+	return state['hit']
+
+
+def _lets_go(t, fds):
+	"""Assert ``t`` holds neither writeLock nor the file, and that the next rewrite() does not wait for them."""
+	import threading
+	assert not t.writeLock.locked(), 'writeLock is still held: close(), atexit and __del__ would hang'
+	assert _open_fds() == fds, 'the file was left open (and locked: the next rewrite waits for it)'
+	done = []
+	th = threading.Thread(target=lambda: done.append(t.rewrite(force=True)), daemon=True)
+	th.start()
+	th.join(10)
+	assert done, 'the next rewrite() waits for a lock left held'
+
+
+@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='counts open descriptors in /proc')
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile', 'clear_file', 'clear', 'defer'])
+def test_tsvzed_legacy_rewrite_interrupted_at_any_line_lets_go_and_loses_nothing(tmp_path, suffix, method):
+	# A KeyboardInterrupt in the release of a deferred rewrite (release_file_obj catches only Exception), on
+	# entering the release of a written one or between the lock and the try left writeLock or the file held: the
+	# next rewrite and close() hung. One before the look for another process's change noted its time as seen,
+	# and the next rewrite erased the change. Here one lands at every line from the lock to the unlock in turn.
+	p = str(tmp_path / ('any.' + suffix))
+	t = _stopped(p)
+	_dirty(t)
+	fds = _open_fds()
+	n = 0
+	while True:
+		n += 1
+		external = 'ext%d' % n
+		if method == 'defer':  # another process appends after rewrite() looked: the rewrite is deferred
+			_append_external(p, _compressedAs(suffix, external.encode() + b'\tB\n'))
+			call = lambda: t._mapToFile(defer=True)
+		else:
+			call = getattr(t, method)
+		before = dict(t)
+		hit = _interrupt_at(n, call)
+		_lets_go(t, fds)
+		assert not t._keepFileTime
+		if method == 'clear':
+			assert dict(t) in (before, {}), n
+		elif method == 'defer':
+			assert t.get(external) == ['ext' + external[3:], 'B'], (n, 'the change was erased')
+			assert dict(t) == dict(before, **{external: [external, 'B']}), n
+		else:
+			assert dict(t) == before, n
+		if method == 'clear_file':  # once it is done the file is empty and memory is kept; before, it is made again
+			assert _back(p) in ({}, dict(t)), n
+		elif method == 'clear':  # stopped after memory was emptied and before the file was: docs/legacy-writer-failures.md 5
+			assert _back(p) in (before, dict(t)), n
+		else:
+			assert _back(p) == dict(t), n
+		assert not t._externalChange() and not t.deSynced, n
+		if not hit:
+			break
+		if method == 'defer':
+			del t[external]  # as many rows at each try: the next one runs as many lines
+		t['a'] = ['a', str(n)]  # dirty again, for the next try
+		t.commitAppendToFile()
+	assert n > 20, n  # it did get through all of it
+
+
+@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='counts open descriptors in /proc')
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2'])
+@pytest.mark.parametrize('first', ['none', 'fsync', 'write', 'defer'])
+def test_tsvzed_legacy_rewrite_interrupted_again_in_its_release_lets_go_and_loses_nothing(tmp_path, monkeypatch, suffix, first):
+	# In _releaseRewrite's finally writeLock was let go of after _unlockFile and after a close that caught only
+	# Exception: a second Ctrl-C there (the first one stopped the write, or an fsync failed) left it held for good.
+	# Here a KeyboardInterrupt lands at every line of the release in turn, after the first failure.
+	import errno
+	p = str(tmp_path / ('again.' + suffix))
+	t = _stopped(p)
+	_dirty(t)
+	fds = _open_fds()
+	real = t._snapshotForRewrite
+	m = 0
+	while True:
+		m += 1
+		external = 'ext%d' % m
+		before = dict(t)
+		if first == 'defer':
+			_append_external(p, _compressedAs(suffix, external.encode() + b'\tB\n'))
+		elif first == 'fsync':
+			def failing(fd):
+				raise OSError(errno.EIO, 'Input/output error')
+			monkeypatch.setattr(TSVZ.os, 'fsync', failing)
+		elif first == 'write':
+			def snapshot():
+				header, lines = real()
+
+				def interrupted():
+					yield lines[0]
+					raise KeyboardInterrupt
+				return header, interrupted()
+			t._snapshotForRewrite = snapshot
+
+		def call():
+			try:
+				t._hardMapToFile(defer=True)
+			except KeyboardInterrupt:
+				pass  # the first one, or the second
+		hit = _interrupt_at(m, call, where='_releaseRewrite')
+		monkeypatch.undo()
+		t._snapshotForRewrite = real
+		_lets_go(t, fds)
+		if first == 'defer':
+			assert dict(t) == dict(before, **{external: [external, 'B']}), (m, 'the change was erased')
+			del t[external]
+			t.commitAppendToFile()
+		else:
+			assert dict(t) == before, m
+		assert _back(p) == dict(t), m
+		assert not t._externalChange() and not t.deSynced, m
+		if not hit:
+			break
+		t['a'] = ['a', str(m)]  # dirty again, for the next try
+		t.commitAppendToFile()
+	assert m > 10, m
