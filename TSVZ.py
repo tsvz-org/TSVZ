@@ -4883,7 +4883,7 @@ memoryOnly:{self.memoryOnly}
 	def _endRewrite(self, file):
 		"""Let go of what a rewrite holds from its snapshot on: the file (noting its modification time) and writeLock."""
 		if file is not None:
-			self.release_file_obj(file)  # lets go of writeLock too
+			self.release_file_obj(file, ownChange=True)  # lets go of writeLock too
 		else:
 			self._keepFileTime = False
 			self.writeLock.release()
@@ -4910,6 +4910,7 @@ memoryOnly:{self.memoryOnly}
 				if file is None:
 					self.deSynced = True  # get_file_obj reported why; tried again later
 					return self
+				self.dirty = True  # until it is all written, the file does not hold memory: a rewrite that fails is made again
 				buf = io.BufferedWriter(file, buffer_size=64*1024*1024)  # 64MB buffer
 				header, lines = snapshot
 				if header is not None:
@@ -4961,6 +4962,7 @@ memoryOnly:{self.memoryOnly}
 					return self
 				if self._externalChangeStops(defer):
 					return self  # reloaded first
+				self.dirty = True  # until it is all written, the file does not hold memory: a rewrite that fails is made again
 				overWrite = False
 				headerBytes, lines = snapshot
 				if headerBytes is not None:
@@ -5188,7 +5190,13 @@ memoryOnly:{self.memoryOnly}
 				self.writeLock.release()
 			return None
 
-	def release_file_obj(self,file):
+	def release_file_obj(self,file,ownChange=False):
+		"""Unlock and close ``file``, note the file's modification time as this object's own, and let go of writeLock.
+
+		``ownChange``: the file of a rewrite, whose change is this object's own even when flushing or closing
+		it fails (a full disk): its time is noted then too. Else the next check takes the damage for another
+		process's change and reloads it over memory, instead of writing the file again from memory.
+		"""
 		# if write lock is already released, return
 		if not self.writeLock.locked():
 			return
@@ -5218,6 +5226,25 @@ memoryOnly:{self.memoryOnly}
 			if self.verbose:
 				self.__teePrintOrNot(f"File {file.name} unlocked / released")
 		except Exception as e:
+			if ownChange and not self._keepFileTime and not noted:
+				try:
+					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # still under writeLock
+				except Exception:
+					pass
+			# Unlocked and closed all the same (closing gives up what cannot be flushed): a file left open keeps its
+			# lock, and the next rewrite, hardMapToFile() right after a failed mapToFile() among them, waits for it for good.
+			try:
+				if not file.closed:
+					if os.name == 'posix':
+						_unlockFile(file)
+					elif os.name == 'nt':
+						msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 2147483647)
+			except Exception:
+				pass
+			try:
+				_closeFile(file)
+			except Exception:
+				pass
 			try:
 				self.writeLock.release()  # Ensure the thread lock is always released
 			except Exception as e:

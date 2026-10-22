@@ -6727,6 +6727,62 @@ def test_tsvzed_legacy_rewrite_that_cannot_open_the_file_reports_why_once(tmp_pa
 	assert _bytes(p) == before and t.dirty
 
 
+
+class _FullDiskFile(object):
+	"""A file on a full disk: a write stores its first line and fails, and so does every flush."""
+
+	def __init__(self, f):
+		self._f = f
+
+	def write(self, data):
+		import errno
+		data = bytes(data)
+		self._f.write(data[:data.find(b'\n') + 1])
+		self._f.flush()
+		raise OSError(errno.ENOSPC, 'No space left on device')
+
+	def flush(self):
+		import errno
+		raise OSError(errno.ENOSPC, 'No space left on device')
+
+	def __getattr__(self, name):
+		return getattr(self._f, name)
+
+
+@pytest.mark.parametrize('method', ['rewrite', 'hardMapToFile'])
+def test_tsvzed_legacy_rewrite_that_fails_half_way_is_made_again_from_memory(tmp_path, monkeypatch, capsys, method):
+	p = str(tmp_path / 'full.tsv')
+	t = _stopped(p)
+	for i in range(50):
+		t['k%d' % i] = ['k%d' % i, str(i)]
+	t.commitAppendToFile()
+	t['k1'] = ['k1', 'upd']  # an update: dirty
+	t.commitAppendToFile()
+	rows = dict(t)
+	realOpen = TSVZ.openFileAsCompressed
+
+	def opening(fileName, mode='rb', *args, **kwargs):
+		f = realOpen(fileName, mode, *args, **kwargs)
+		return _FullDiskFile(f) if mode in ('r+b', 'wb') else f
+
+	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', opening)
+	if hasattr(TSVZ, '_openUntruncated'):
+		realUntruncated = TSVZ._openUntruncated
+		monkeypatch.setattr(TSVZ, '_openUntruncated', lambda fileName: _FullDiskFile(realUntruncated(fileName)))
+	if method == 'rewrite':
+		t.rewrite(force=True)  # the background writer's: mapToFile, then hardMapToFile when that fails
+	else:
+		t.hardMapToFile()
+	monkeypatch.undo()
+	capsys.readouterr()
+	assert not t.writeLock.locked()
+	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) != rows and t.deSynced and t.dirty  # the disk filled up
+	assert not t._externalChange(), "the rewrite's own damage was taken for another process's change"
+	t.rewrite()  # the next tick, once there is space again
+	assert dict(t) == rows
+	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == rows and not t.deSynced and not t.dirty
+
+
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 @pytest.mark.parametrize('how', ['lock fails', 'interrupted'])
 @pytest.mark.parametrize('method', ['hardMapToFile', 'clear_file', 'clear'])
@@ -6875,8 +6931,8 @@ def test_tsvzed_legacy_change_right_after_a_rewrite_is_not_taken_for_seen(tmp_pa
 	_dirty(t)
 	real = t.release_file_obj
 
-	def release(f):
-		real(f)
+	def release(f, **kwargs):
+		real(f, **kwargs)
 		with open(p, 'ab') as g:  # another process appends right after the rewrite let go of the lock
 			g.write(b'ext\tB\n')
 
@@ -6997,12 +7053,12 @@ def test_tsvzed_legacy_own_write_in_progress_is_not_an_external_change(tmp_path)
 	_dirty(t)
 	real = t.release_file_obj
 
-	def release(f):
+	def release(f, **kwargs):
 		f.flush()  # the file has changed; its time is noted next, under the lock
 		check = threading.Thread(target=t.checkExternalChanges)  # the background writer's look meanwhile
 		check.start()
 		check.join(0.2)
-		real(f)
+		real(f, **kwargs)
 		check.join(5)
 		seen.append(t.deSynced)  # before clear_file sets it False on success, as the background writer sees it
 
