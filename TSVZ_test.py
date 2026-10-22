@@ -5892,17 +5892,26 @@ class _FlipList(list):
 
 
 @pytest.mark.parametrize('method', ['hardMapToFile', 'mapToFile'])
-def test_tsvzed_legacy_rewrite_encodes_everything_before_it_touches_the_file(tmp_path, method):
+def test_tsvzed_legacy_rewrite_checks_everything_before_it_touches_the_file(tmp_path, capsys, method):
+	# A row that cannot be written refuses the rewrite before the file is touched; one that another thread changes
+	# in place after the check (it encodes each row again as it writes: a rewrite does not hold the whole store
+	# encoded) is left out of the write and reported, and the others are written: the file is never half written.
 	p = str(tmp_path / 'r.tsv')
 	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=5, rewrite_on_load=False)
 	t['a'] = ['a', '1']
 	t['b'] = ['b', '2']
 	t.commitAppendToFile()
 	before = _bytes(p)
+	OrderedDict.__setitem__(t, 'a', ['a', BAD_NAME])
+	with pytest.raises(ValueError):
+		getattr(t, method)()
+	assert _bytes(p) == before  # not emptied
 	_FlipList.reads = 0
 	OrderedDict.__setitem__(t, 'a', _FlipList(['a', '1']))
+	capsys.readouterr()
 	getattr(t, method)()
-	assert _bytes(p) == before  # not emptied
+	assert 'Refused at a rewrite' in capsys.readouterr().out
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False) == {'b': ['b', '2']} and t.dirty
 	_stop(t)
 
 
@@ -8066,7 +8075,7 @@ def test_tsvzed_legacy_rewrite_interrupted_again_in_its_release_lets_go_and_lose
 				header, lines = real()
 
 				def interrupted():
-					yield lines[0]
+					yield next(iter(lines))
 					raise KeyboardInterrupt
 				return header, interrupted()
 			t._snapshotForRewrite = snapshot
@@ -8715,3 +8724,52 @@ def test_tsvzed_legacy_compressed_rewrite_cut_short_by_a_really_full_disk_then_a
 	assert result['deSynced'] and 0 < result['cut'] and result['damage'] == [result['cut'], True], result
 	assert result['wholeStops'], result  # read from its start, the file stops at the cut
 	assert result == dict(result, rewrite=True, memory=True, file=True), result
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+@pytest.mark.parametrize('method', ['hardMapToFile', 'mapToFile'])
+def test_tsvzed_legacy_rewrite_memory_does_not_grow_with_the_store(tmp_path, suffix, method):
+	# A rewrite encoded the whole store before writing it (to refuse a row that cannot be written before anything
+	# is): its peak grew with the store, 159 MiB for 1,000,000 rows (47.6 MiB), where main 1688d25 took 64 MiB. It
+	# now checks every row, dropping each, then encodes them again a chunk at a time as it writes: what grows with
+	# the store is the list of its rows (8 bytes a row), not their bytes.
+	import tracemalloc
+	peaks = []
+	sizes = []
+	for n in (25000, 100000):
+		p = str(tmp_path / ('big%d.%s' % (n, suffix)))
+		t = _stopped(p)
+		for i in range(n):  # straight into memory: a rewrite has it all to write
+			TSVZ.OrderedDict.__setitem__(t, 'key%08d' % i, ['key%08d' % i, 'value-%08d some other text %d' % (i, i)])
+		t.dirty = True
+		sizes.append(sum(len(row[0]) + len(row[1]) + 2 for row in t.values()))
+		tracemalloc.start()
+		try:
+			getattr(t, method)()
+			peaks.append(tracemalloc.get_traced_memory()[1])
+		finally:
+			tracemalloc.stop()
+		assert _back(p) == dict(t)
+	assert peaks[1] - peaks[0] < (sizes[1] - sizes[0]) / 4, (peaks, sizes)
+
+
+def test_tsvzed_legacy_row_changed_in_place_between_the_check_and_the_write_is_left_out(tmp_path, capsys):
+	# The check and the write encode each row apart: a row changed in place in between (not a set, which replaces
+	# the row and queues it) so that it cannot be written is left out of the write, reported, and the others written.
+	p = str(tmp_path / 'inplace.tsv')
+	t = _stopped(p)
+	rows = _many(t, 5)
+	real = t.get_file_obj  # opened between the check and the write
+
+	def opening(*args, **kwargs):
+		t['k2'][1] = 'bad\udcff'  # another thread changes the row in place
+		return real(*args, **kwargs)
+
+	t.get_file_obj = opening
+	t.hardMapToFile()
+	del t.get_file_obj
+	out = capsys.readouterr().out
+	assert 'Refused at a rewrite' in out and '1 row(s)' in out, out
+	expected = dict(rows)
+	del expected['k2']
+	assert _back(p) == expected and t.dirty and not t.deSynced
