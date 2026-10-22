@@ -7158,6 +7158,33 @@ def test_tsvzed_legacy_deferred_rewrite_leaves_the_change_unseen(tmp_path):
 	assert t.deSynced and t._externalChange() and b'ext\tB' in _bytes(p)
 
 
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_rewrite_deferred_for_a_change_after_its_reload_is_made_then(tmp_path, suffix):
+	p = str(tmp_path / ('late.' + suffix))
+	t = _stopped(p)
+	_dirty(t)  # the file holds a twice: a rewrite has something to do
+	real = t._mapToFile
+	state = {'changes': 1}
+
+	def mapping(*args, **kwargs):
+		if state['changes']:
+			state['changes'] -= 1
+			_append_external(p, b'ext\tB\n' if suffix == 'tsv' else __import__('gzip').compress(b'ext\tB\n'))
+		return real(*args, **kwargs)
+
+	t._mapToFile = mapping  # another process appends after rewrite() looked for changes, before the rewrite
+	assert t.rewrite(force=True)  # what close() makes with rewrite_on_exit: there is no next tick
+	assert dict(t) == {'a': ['a', '2'], 'ext': ['ext', 'B']}
+	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == dict(t)
+	if suffix == 'tsv':
+		assert _bytes(p) == b'key\tval\na\t2\next\tB\n'  # rewritten, not only appended to
+	assert not t.deSynced and not t.dirty and not t._externalChange()
+	state['changes'] = 10  # it keeps changing: given up after a few tries, left to the next tick
+	t['a'] = ['a', '3']
+	t.commitAppendToFile()
+	assert not t.rewrite(force=True) and t.deSynced
+
+
 def test_tsvzed_legacy_clear_drops_the_rows_set_before_it(tmp_path):
 	p = str(tmp_path / 'clr.tsv')
 	t = _stopped(p)
