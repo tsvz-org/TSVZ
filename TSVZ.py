@@ -4544,8 +4544,6 @@ memoryOnly:{self.memoryOnly}
 					  self.teeLogger)
 			self._specSync(reloadInternalFromFile)
 			return False
-		if not force and self._refusedAt and time.time() - self._refusedAt < max(self.rewrite_interval, _REFUSED_RETRY_SECONDS):
-			return False  # the last rewrite was refused (text that cannot be written): try again later, not at every tick
 		if not self.deSynced and not force:
 			if not self.dirty:
 				return False
@@ -4555,15 +4553,18 @@ memoryOnly:{self.memoryOnly}
 
 			if reloadInternalFromFile is None:
 				reloadInternalFromFile = self.monitor_external_changes
-			if reloadInternalFromFile and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
+			if reloadInternalFromFile and self._externalChange():
 				# this will be needed if more than 1 process is accessing the file
 				self.commitAppendToFile()
 				self.reload()
+				self.deSynced = False  # memory is the file again; a refused write below must not keep this set
 			if self.memoryOnly:
 				if self.verbose:
 					self.__teePrintOrNot("Memory only mode. Map to file skipped.")
 				return False
 			if self.dirty:
+				if not force and self._refusalPending():
+					return False  # the last rewrite was refused (text that cannot be written): try again later, not at every tick
 				if self.verbose:
 					self.__teePrintOrNot(f"Rewriting {self._fileName}")
 				self.mapToFile()
@@ -4581,41 +4582,75 @@ memoryOnly:{self.memoryOnly}
 			self.deSynced = True
 			return False
 		
-	_refusedAt = 0.0  # when a rewrite or an append was last refused for text that cannot be written; 0 when none is
+	def _externalChange(self):
+		"""True when the file changed since this object last wrote or read it.
+
+		Looked at under ``writeLock``, which this object's writer holds from the moment it
+		opens the file until it has noted the new modification time: its own append is
+		never mistaken for another process's change (a reload then would drop the rows set
+		since the append was queued).
+		"""
+		with self.writeLock:
+			return self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName)
+
+	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
 
-	def _refuse(self, where, error, detail):
-		"""Remember that ``where`` was refused with ``error`` and report it once per run of refusals (no traceback: it is not a bug)."""
-		self._refusedAt = time.time()
+	def _refuse(self, where, error):
+		"""Remember that a rewrite was refused with ``error`` and report it once per run of refusals (no traceback: it is not a bug)."""
+		self._refusedAt = _specClock()
 		if not self._refusalReported:
 			self._refusalReported = True
-			self.__teePrintOrNot(f"Refused at {where} to {self._fileName}: {error}; {detail}",'error')
+			self.__teePrintOrNot(f"Refused at {where} to {self._fileName}: {error}; the file is left as it is and rows that can be written are still appended; "
+								 f"a later rewrite stores the rest once the row is fixed or removed (tried at most every {max(self.rewrite_interval, _REFUSED_RETRY_SECONDS):g} s)",'error')
+
+	def _refusalPending(self):
+		"""True while the last rewrite was refused less than ``max(rewrite_interval, 1 s)`` ago."""
+		return self._refusedAt is not None and _specClock() - self._refusedAt < max(self.rewrite_interval, _REFUSED_RETRY_SECONDS)
 
 	def _accepted(self):
-		"""A write went through: a later refusal is reported again."""
-		self._refusedAt = 0.0
+		"""A rewrite went through: a later refusal is reported again."""
+		self._refusedAt = None
 		self._refusalReported = False
 
-	def _encodeRewrite(self):
-		"""Encode everything a rewrite writes before the file is opened; return ``(header, rows)`` as bytes.
+	def _snapshotForRewrite(self):
+		"""Lock the file, then copy what a rewrite writes and check that all of it can be written; return the copy.
 
-		``header`` is the header line (``None`` without one), ``rows`` the
-		defaults line then every stored row, none newline-terminated. A
-		``TSVZEncodeError`` here leaves the file as it is, and a row another
-		thread changes later cannot make the write fail half-way.
+		The caller holds ``writeLock`` when this returns, and must open the file with
+		``get_file_obj(..., locked=True)``. The copy is taken under the lock, so the
+		background writer cannot append a row after it was taken and before the file is
+		cut (that row would be lost); a row set later is appended after the rewrite. It
+		is ``(header, defaults, rows)``: sanitised lists of cells (``None`` for no header
+		or defaults line), shallow copies, so a row another thread changes in place cannot
+		make the write differ from what was checked. A ``TSVZEncodeError`` releases the
+		lock and leaves the file untouched.
 		"""
-		delimiter = self.delimiter
-		header = None
-		if self.header:
-			header = _encodeRow(_sanitize(self.header,delimiter=delimiter),delimiter,self.encoding,self.errors,what='header')
-		rows = []
-		if self.defaults and len(self.defaults) > 1:
-			rows.append(_encodeRow(_sanitize(self.defaults,delimiter=delimiter),delimiter,self.encoding,self.errors,what='defaults'))
-		# '#'-prefixed keys are in-memory only (comments / internal); never written.
-		for value in list(self.values()):
-			if value and not str(value[0]).startswith('#'):
-				rows.append(_encodeRow(_sanitize(value,delimiter=delimiter),delimiter,self.encoding,self.errors,self.header))
-		return header, rows
+		self.writeLock.acquire()
+		try:
+			delimiter = self.delimiter
+			header = _sanitize(list(self.header),delimiter=delimiter) if self.header else None
+			defaults = _sanitize(list(self.defaults),delimiter=delimiter) if self.defaults and len(self.defaults) > 1 else None
+			# '#'-prefixed keys are in-memory only (comments / internal); never written.
+			rows = [_sanitize(value,delimiter=delimiter) for value in list(self.values()) if value and not str(value[0]).startswith('#')]
+			if _mayRaise(self.errors):
+				if header is not None:
+					_encodeRow(header,delimiter,self.encoding,self.errors,what='header')
+				if defaults is not None:
+					_encodeRow(defaults,delimiter,self.encoding,self.errors,what='defaults')
+				for row in rows:
+					_encodeRow(row,delimiter,self.encoding,self.errors,self.header)
+		except BaseException:
+			self.writeLock.release()
+			raise
+		return header, defaults, rows
+
+	def _rewriteLines(self, snapshot):
+		"""The lines of a rewrite after the header, as bytes without their newline: the defaults line, then every row."""
+		header, defaults, rows = snapshot
+		if defaults is not None:
+			yield _encodeRow(defaults,self.delimiter,self.encoding,self.errors,what='defaults')
+		for row in rows:
+			yield _encodeRow(row,self.delimiter,self.encoding,self.errors,self.header)
 
 	def hardMapToFile(self):
 		if self._spec:
@@ -4627,14 +4662,14 @@ memoryOnly:{self.memoryOnly}
 		try:
 			if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
 				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
-			header, rows = self._encodeRewrite()  # all of it, before the file is emptied
-			file = self.get_file_obj('wb')
+			snapshot = self._snapshotForRewrite()  # checked, and the lock held: opening the file for writing empties it
+			file = self.get_file_obj('wb',locked=True)
 			buf = io.BufferedWriter(file, buffer_size=64*1024*1024)  # 64MB buffer
-			if header is not None:
-				buf.write(header + b'\n')
+			if snapshot[0] is not None:
+				buf.write(_encodeRow(snapshot[0],self.delimiter,self.encoding,self.errors,what='header') + b'\n')
 			# The defaults line comes right after the header, so it survives a
 			# full rewrite -- it is not a regular mapping key.
-			for line in rows:
+			for line in self._rewriteLines(snapshot):
 				buf.write(line + b'\n')
 			buf.flush()
 			self.release_file_obj(file)
@@ -4645,7 +4680,7 @@ memoryOnly:{self.memoryOnly}
 			self.deSynced = False
 			self._accepted()
 		except TSVZEncodeError as e:
-			self._refuse('hardMapToFile()', e, 'the file is left as it is; will retry')
+			self._refuse('hardMapToFile()', e)
 		except Exception as e:
 			self.release_file_obj(file)
 			self.__teePrintOrNot(f"Failed to write at hardMapToFile() to {self._fileName}: {e}",'error')
@@ -4675,16 +4710,16 @@ memoryOnly:{self.memoryOnly}
 			if _isCompressedFile(self._fileName):
 				# if the file is compressed, we need to use the hardMapToFile method
 				return self.hardMapToFile()
-			headerBytes, rowsToWrite = self._encodeRewrite()  # all of it, before the file is touched
-			file = self.get_file_obj('r+b')
+			snapshot = self._snapshotForRewrite()  # checked, and the lock held
+			file = self.get_file_obj('r+b',locked=True)
 			overWrite = False
-			if self.header:
+			if snapshot[0] is not None:
 				line = file.readline().decode(self.encoding,errors='replace')
 				aftPos = file.tell()
 				if not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
 					header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
 					file.seek(0)
-					file.write(headerBytes+b'\n')
+					file.write(_encodeRow(snapshot[0],self.delimiter,self.encoding,self.errors,what='header')+b'\n')
 					# if the header is not the same length as the line, we need to overwrite the file
 					if aftPos != file.tell():
 						overWrite = True
@@ -4692,7 +4727,7 @@ memoryOnly:{self.memoryOnly}
 						self.__teePrintOrNot(f"Header {header} written to {self._fileName}")
 			# Rows to (re)write, in order: the defaults line first (right after the
 			# header, if set) then every data row.
-			for encoded in rowsToWrite:
+			for encoded in self._rewriteLines(snapshot):
 				if overWrite:
 					if self.verbose:
 						self.__teePrintOrNot(f"Overwriting {encoded!r} to {self._fileName}")
@@ -4726,7 +4761,7 @@ memoryOnly:{self.memoryOnly}
 			self.deSynced = False
 			self._accepted()
 		except TSVZEncodeError as e:
-			self._refuse('mapToFile()', e, 'the file is left as it is; will retry')
+			self._refuse('mapToFile()', e)
 			return self
 		except Exception as e:
 			self.release_file_obj(file)
@@ -4841,8 +4876,10 @@ memoryOnly:{self.memoryOnly}
 			import traceback
 			self.__teePrintOrNot(traceback.format_exc(),'error')
 	
-	def get_file_obj(self,modes = 'ab'):
-		self.writeLock.acquire()
+	def get_file_obj(self,modes = 'ab',locked = False):
+		# ``locked``: the caller took writeLock already (a rewrite looks at its rows under it before it opens the file).
+		if not locked:
+			self.writeLock.acquire()
 		file = None
 		try:
 			if not self.encoding:
@@ -4899,11 +4936,11 @@ memoryOnly:{self.memoryOnly}
 			self.__teePrintOrNot(traceback.format_exc(),'error')
 		# release the write lock if not already released
 		if self.writeLock.locked():
+			self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # before the lock is let go: see _externalChange()
 			try:
 				self.writeLock.release()  # Ensure the thread lock is always released
 			except Exception as e:
 				self.__teePrintOrNot(f"Failed to release writeLock for {file.name}: {e}",'error')
-			self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 
 class TSVZedLite(MutableMapping):
 	"""

@@ -6171,11 +6171,13 @@ def test_legacy_writers_encode_each_row_once(tmp_path, monkeypatch):
 	del calls[:]
 	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=5, rewrite_on_load=False)
 	del calls[:]
+	# A rewrite checks every row under the lock and then streams the same snapshot to the file: two
+	# passes, and no copy of the encoded store held in memory in between.
 	t.hardMapToFile()
-	assert len([c for c in calls if c[0] in 'abc']) == 3, calls
+	assert len([c for c in calls if c[0] in 'abc']) == 6, calls
 	del calls[:]
 	t.mapToFile()
-	assert len([c for c in calls if c[0] in 'abc']) == 3, calls
+	assert len([c for c in calls if c[0] in 'abc']) == 6, calls
 	_stop(t)
 
 
@@ -6226,3 +6228,98 @@ def test_cli_setdefault_through_a_handler_looks_up_as_a_reader_reads(tmp_path, s
 	status, out, err = _run('setdefault', p, 'k', BAD_NAME)
 	assert status == 1 and 'cannot write' in err, err
 	assert _run('has', p, 'k')[0] != 0
+
+
+# --- second review round: the rewrite takes its snapshot under the lock ----------
+@pytest.mark.parametrize('method', ['hardMapToFile', 'mapToFile'])
+def test_tsvzed_legacy_rewrite_does_not_cut_a_row_the_writer_appends_after_its_snapshot(tmp_path, method):
+	p = str(tmp_path / 'race.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.001, rewrite_on_load=False)
+	t['a'] = ['a', '1']
+	assert _wait_for(lambda: b'a\t1' in _bytes(p))
+	original = t.get_file_obj
+	state = {'done': False}
+
+	def hooked(modes='ab', *args, **kwargs):
+		if modes in ('wb', 'r+b') and not state['done']:
+			state['done'] = True
+			t['late'] = ['late', '2']  # another thread sets a key just before the file is cut
+			_wait_for(lambda: not t.appendQueue, 0.3)  # the writer must not get in before the rewrite is done
+		return original(modes, *args, **kwargs)
+
+	t.get_file_obj = hooked
+	getattr(t, method)()
+	t.get_file_obj = original
+	assert state['done']
+	assert _wait_for(lambda: b'late\t2' in _bytes(p)), _bytes(p)
+	_stop(t)
+	u = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.01, rewrite_on_load=False)
+	assert dict(u) == {'a': ['a', '1'], 'late': ['late', '2']}
+	_stop(u)
+
+
+def test_tsvzed_legacy_concurrent_sets_survive_repeated_rewrites(tmp_path):
+	# A rewrite in one thread and sets in another: no row set meanwhile is lost, whether the rewrite
+	# reloads (an append of its own is not an external change), cuts the file, or fixes it in place.
+	import threading
+	p = str(tmp_path / 'many.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.0005, rewrite_on_load=False)
+	stop = threading.Event()
+
+	def setter():
+		i = 0
+		while not stop.is_set() and i < 1500:
+			t['k%d' % i] = ['k%d' % i, str(i)]
+			i += 1
+			if i % 10 == 0:
+				time.sleep(0.001)
+		state['count'] = i
+
+	state = {}
+	thread = threading.Thread(target=setter)
+	thread.start()
+	rewrites = [lambda: t.rewrite(force=True), t.hardMapToFile, t.mapToFile]
+	n = 0
+	while thread.is_alive():
+		rewrites[n % 3]()
+		n += 1
+	thread.join()
+	t.close()
+	u = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.01, rewrite_on_load=False)
+	assert len(u) == state['count'], (len(u), state['count'])
+	_stop(u)
+
+
+@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
+def test_tsvzed_legacy_refused_rewrite_does_not_delay_reloading_an_external_change(tmp_path, method):
+	p = str(tmp_path / 'g.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_interval=30, append_check_delay=0.01, rewrite_on_load=False)
+	t['a'] = ['a', '1']
+	assert _wait_for(lambda: b'a\t1' in _bytes(p))
+	t['a'][1] = BAD_NAME  # a row changed in place
+	t.dirty = True
+	getattr(t, method)()  # refused
+	assert t._refusedAt is not None
+	with open(p, 'ab') as f:  # another process appends
+		f.write(b'ext\t9\n')
+	assert _wait_for(lambda: 'ext' in t, 2.5), 'the external row was not reloaded while the refusal was pending'
+	_stop(t)
+
+
+def test_tsvzed_legacy_refusal_is_timed_on_the_monotonic_clock(tmp_path, monkeypatch):
+	p = str(tmp_path / 'm.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_interval=0.05, append_check_delay=5, rewrite_on_load=False)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	t['a'][1] = BAD_NAME
+	t.dirty = True
+	t.mapToFile()  # refused
+	calls = []
+	original = t.mapToFile
+	t.mapToFile = lambda: calls.append(1) or original()
+	real = time.time
+	monkeypatch.setattr(TSVZ.time, 'time', lambda: real() + 3600)  # the wall clock jumps forward an hour
+	time.sleep(0.1)
+	t.rewrite()
+	assert calls == []  # still inside the retry window: it is not the wall clock that counts
+	_stop(t)
