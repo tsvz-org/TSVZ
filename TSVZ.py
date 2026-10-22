@@ -5390,7 +5390,7 @@ memoryOnly:{self.memoryOnly}
 		"""Take ``writeLock`` (unless ``locked``: the caller holds it already), open the file and lock it.
 
 		'wb' opens the file as it is (created when missing) and empties it only once it is locked; a compressed
-		one is then written through its codec (_emptyLocked). With ``empty=False`` it is handed out locked and not
+		one is then written through its codec. With ``empty=False`` it is handed out locked and not
 		yet emptied, as it is: _writeRewrite looks for another process's change first, and empties it itself.
 
 		On failure the error is reported, a file this opened is closed and None is returned. writeLock is then let
@@ -5413,8 +5413,9 @@ memoryOnly:{self.memoryOnly}
 				file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding,teeLogger=self.teeLogger)
 			_lockFile(file)  # the whole file, on POSIX and Windows
 			if 'w' in modes and empty:
-				emptied = True
-				file = self._emptyLocked(file)
+				file.truncate(0)
+				emptied = True  # only once it is: a truncate that fails changed nothing of another process's
+				file = _compressedWriter(self._fileName, file) or file
 			# An append that finds another process's change not yet seen must not mark it seen (release_file_obj
 			# notes the time after it): the next check still reloads it. A rewrite replaces the file, so it does.
 			# Looked at once the file is locked: another writer may append until then.

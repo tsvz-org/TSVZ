@@ -8262,3 +8262,34 @@ def test_tsvzed_legacy_rewrite_needs_no_64_mib_buffer(tmp_path, suffix, method):
 		tracemalloc.stop()
 	assert peak < 4 << 20, peak
 	assert _back(p) == ({} if method != 'hardMapToFile' else dict(t))
+
+
+# --- sixth review round: one release, a merge safe to interrupt, bounded rewrites ----------
+class _FailingTruncate(object):
+	"""A file whose truncate() fails (an I/O error, a file system that cannot)."""
+
+	def __init__(self, f):
+		self._f = f
+
+	def truncate(self, *args):
+		import errno
+		raise OSError(errno.EIO, 'Input/output error')
+
+	def __getattr__(self, name):
+		return getattr(self._f, name)
+
+
+def test_tsvzed_legacy_get_file_obj_whose_truncate_fails_does_not_take_the_file_for_its_own(tmp_path, monkeypatch):
+	# 639fa34 noted the file as emptied before the truncate: when it failed, get_file_obj's error path noted the
+	# file's time as this object's own, and another process's change made before was taken for seen.
+	p = str(tmp_path / 'trunc.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	t.commitAppendToFile()
+	_append_external(p)
+	real = TSVZ._openUntruncated
+	monkeypatch.setattr(TSVZ, '_openUntruncated', lambda fileName: _FailingTruncate(real(fileName)))
+	assert t.get_file_obj('wb') is None
+	monkeypatch.undo()
+	assert not t.writeLock.locked()
+	assert b'ext\tB' in _bytes(p) and t._externalChange(), "another process's change was taken for seen"
