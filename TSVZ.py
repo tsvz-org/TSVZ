@@ -5059,8 +5059,7 @@ memoryOnly:{self.memoryOnly}
 					if not whole:
 						self._writeInPlace(file, header, lines)
 					else:
-						file.truncate(0)
-						file = _compressedWriter(self._fileName, file) or file
+						file = self._emptyLocked(file)
 						buf = io.BufferedWriter(file, buffer_size=64*1024*1024)  # 64MB buffer
 						if header is not None:
 							buf.write(header + b'\n')
@@ -5374,8 +5373,8 @@ memoryOnly:{self.memoryOnly}
 		"""Take ``writeLock`` (unless ``locked``: the caller holds it already), open the file and lock it.
 
 		'wb' opens the file as it is (created when missing) and empties it only once it is locked; a compressed
-		one is then written through its codec. With ``empty=False`` it is handed out locked and not yet emptied,
-		as it is: a rewrite looks for another process's change first, and empties it itself.
+		one is then written through its codec (_emptyLocked). With ``empty=False`` it is handed out locked and not
+		yet emptied, as it is: _writeRewrite looks for another process's change first, and empties it itself.
 
 		On failure the error is reported, a file this opened is closed and None is returned. writeLock is then let
 		go only when this call took it: a caller that holds it keeps it, and lets go of it itself. A KeyboardInterrupt
@@ -5397,9 +5396,8 @@ memoryOnly:{self.memoryOnly}
 				file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding,teeLogger=self.teeLogger)
 			_lockFile(file)  # the whole file, on POSIX and Windows
 			if 'w' in modes and empty:
-				file.truncate(0)
 				emptied = True
-				file = _compressedWriter(self._fileName, file) or file
+				file = self._emptyLocked(file)
 			# An append that finds another process's change not yet seen must not mark it seen (release_file_obj
 			# notes the time after it): the next check still reloads it. A rewrite replaces the file, so it does.
 			# Looked at once the file is locked: another writer may append until then.
@@ -5423,6 +5421,11 @@ memoryOnly:{self.memoryOnly}
 			if not isinstance(e, Exception):
 				raise
 			return None
+
+	def _emptyLocked(self, file):
+		"""Empty the open, locked ``file`` and return what to write it through: its codec's writer, or the file."""
+		file.truncate(0)
+		return _compressedWriter(self._fileName, file) or file
 
 	def release_file_obj(self,file):
 		"""Unlock and close ``file``, note the file's modification time as this object's own, and let go of writeLock."""
