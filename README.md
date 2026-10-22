@@ -190,6 +190,12 @@ recovered, skipped or stops the read, as the store's `#_on_corruption_#` says,
 part keeps the original as `<part>.damaged-<time>`), an unreadable part, and a
 delimiter or encoding argument that conflicts with the extension.
 
+Writing is stricter than reading: a key, value, header or marker that cannot be
+encoded as UTF-8, such as the lone surrogate `os.fsdecode` gives for a
+non-UTF-8 file name, raises a `ValueError` (`TSVZEncodeError`) that names it
+and writes nothing, instead of storing `?`. Pass `errors='replace'` to the
+writing functions or to `TSVZed`, `TSVZedLite` and `TSVZClient` to get the old `?`.
+
 ## Breaking changes from 3.39
 
 ### `.tsv`, `.csv`, `.nsv`, `.psv`: bug fixes only

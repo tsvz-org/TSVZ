@@ -2891,7 +2891,7 @@ def test_tsvzed_spec_survives_a_failed_external_reload(tmp_path, capsys):
 
 def test_tsvzed_spec_lone_surrogate_does_not_kill_the_worker(tmp_path):
 	p = str(tmp_path / 's.tsvz')
-	t = TSVZ.TSVZed(p, append_check_delay=0.01)
+	t = TSVZ.TSVZed(p, append_check_delay=0.01, errors='replace')
 	t['bad'] = ['bad', b'\xff'.decode('utf-8', 'surrogateescape')]
 	assert _wait_for(lambda: b'bad\t?\n' in open(p, 'rb').read())
 	t['c'] = ['c', '1']
@@ -5590,3 +5590,265 @@ def test_spec_verify_and_parts_see_the_parts_a_snapshot_part_lets_a_read_skip(tm
 	assert status == 4, (out, err)
 	status, out, err = _run('parts', p)
 	assert status == 0 and len(out.splitlines()) == 2, out
+
+
+# ==========================================================================
+# Writing text that cannot be encoded as UTF-8 fails loudly (errors='strict')
+# ==========================================================================
+BAD_NAME = 'bad\udcff.txt'  # what os.fsdecode(b'bad\xff.txt') gives
+BAD_SUFFIXES = ('.tsv', '.tsvz')
+
+
+def _hash(suffix):
+	return b'#' if suffix == '.tsvz' else b''  # a strict store's header is a comment
+
+
+def _bytes(path):
+	with open(path, 'rb') as f:
+		return f.read()
+
+
+def _expect_unencodable(excinfo, *shown):
+	"""The error is a ValueError that names the text and the character, and points at both ways out."""
+	message = str(excinfo.value)
+	assert isinstance(excinfo.value, ValueError)
+	for part in ('cannot write', 'as UTF-8', '\\udcff', '0xff', "errors='replace'") + shown:
+		assert part in message, (part, message)
+	assert 'bad\\udcff.txt' in message or 'bad\udcff' not in message  # never the raw surrogate
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+@pytest.mark.parametrize('call', ['appendTabularFile', 'appendLinesTabularFile', 'appendTSV'])
+def test_append_refuses_an_unencodable_key_and_leaves_the_file(tmp_path, suffix, call):
+	p = str(tmp_path / ('s' + suffix))
+	_touch(p, b'id\tv\nk\t1\n')
+	row = [BAD_NAME, 'x']
+	with pytest.raises(ValueError) as e:
+		getattr(TSVZ, call)(p, [row] if call == 'appendLinesTabularFile' else row, header='id\tv', strict=False)
+	_expect_unencodable(e, 'the key', "'bad\\udcff.txt'")
+	assert _bytes(p) == b'id\tv\nk\t1\n'
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_append_names_the_column_of_an_unencodable_value(tmp_path, suffix):
+	p = str(tmp_path / ('s' + suffix))
+	_touch(p, b'id\tname\nk\t1\n')
+	with pytest.raises(ValueError) as e:
+		TSVZ.appendLinesTabularFile(p, [['good', 'fine'], ['k2', BAD_NAME]], header='id\tname', strict=False)
+	_expect_unencodable(e, "column 2 'name'", "key 'k2'")
+	assert _bytes(p) == b'id\tname\nk\t1\n'
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_append_to_a_new_file_creates_nothing_when_the_row_is_refused(tmp_path, suffix):
+	p = str(tmp_path / ('n' + suffix))
+	with pytest.raises(ValueError):
+		TSVZ.appendLinesTabularFile(p, [[BAD_NAME, 'x']], header='id\tv', createIfNotExist=True, strict=False)
+	assert not os.path.exists(p)
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_creating_a_file_refuses_an_unencodable_header_and_creates_nothing(tmp_path, suffix):
+	p = str(tmp_path / ('h' + suffix))
+	with pytest.raises(ValueError) as e:
+		TSVZ.appendLinesTabularFile(p, [['k', 'x']], header=['id', BAD_NAME], createIfNotExist=True, strict=False)
+	_expect_unencodable(e, 'the header')
+	assert not os.path.exists(p)
+	with pytest.raises(ValueError):
+		TSVZ.readTabularFile(p, header=['id', BAD_NAME], createIfNotExist=True, strict=False)
+	assert not os.path.exists(p)
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_clear_refuses_an_unencodable_header_and_keeps_the_rows(tmp_path, suffix):
+	p = str(tmp_path / ('c' + suffix))
+	_touch(p, b'id\tv\nk\t1\n')
+	with pytest.raises(ValueError) as e:
+		TSVZ.clearTabularFile(p, header=['id', 'v' + BAD_NAME])
+	_expect_unencodable(e, 'the header')
+	assert _bytes(p) == b'id\tv\nk\t1\n'
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_scrub_refuses_an_unencodable_header_and_keeps_the_rows(tmp_path, suffix):
+	p = str(tmp_path / ('r' + suffix))
+	_touch(p, b'id\tv\nk\t1\n')
+	with pytest.raises(ValueError):
+		TSVZ.scrubTabularFile(p, header=['id', 'v' + BAD_NAME], verifyHeader=False)
+	assert _bytes(p) == b'id\tv\nk\t1\n'
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_errors_replace_writes_a_question_mark_as_before(tmp_path, suffix):
+	p = str(tmp_path / ('q' + suffix))
+	TSVZ.appendLinesTabularFile(p, [[BAD_NAME, 'x']], header='id\tv', createIfNotExist=True, strict=False,
+								errors='replace')
+	assert _bytes(p) == _hash(suffix) + b'id\tv\nbad?.txt\tx\n'
+	TSVZ.appendTabularFile(p, ['b2\udcff', 'y'], errors='replace')
+	assert _bytes(p) == _hash(suffix) + b'id\tv\nbad?.txt\tx\nb2?\ty\n'
+	q = str(tmp_path / ('q2' + suffix))  # clearing keeps a strict store's own header line, so clear a new file
+	TSVZ.clearTabularFile(q, header=['id', 'v\udcff'], errors='replace')
+	assert _bytes(q) == _hash(suffix) + b'id\tv?\n'
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_ordinary_non_ascii_text_still_round_trips(tmp_path, suffix):
+	p = str(tmp_path / ('u' + suffix))
+	rows = [['café', '中文'], ['\U0001f600', 'naïve']]
+	TSVZ.appendLinesTabularFile(p, rows, header=['id', 'vé'], createIfNotExist=True, strict=False)
+	assert _bytes(p) == (_hash(suffix).decode() + 'id\tvé\ncafé\t中文\n\U0001f600\tnaïve\n').encode('utf-8')
+	back = TSVZ.readTabularFile(p, header=['id', 'vé'], strict=False)
+	assert [back[k] for k in back] == rows
+	t = TSVZ.TSVZed(p, header=['id', 'vé'])
+	t['ü'] = ['ü', '☃']
+	t.close()
+	lite = TSVZ.TSVZedLite(p, header=['id', 'vé'])
+	lite['ö'] = ['ö', '\U0001f4a9']
+	assert lite['ö'] == ['ö', '\U0001f4a9']
+	lite.close()
+	back = TSVZ.readTabularFile(p, header=['id', 'vé'], strict=False)
+	assert back['ü'] == ['ü', '☃'] and back['ö'] == ['ö', '\U0001f4a9']
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_reading_raw_invalid_bytes_still_replaces_and_warns(tmp_path, capsys, suffix):
+	p = str(tmp_path / ('i' + suffix))
+	_touch(p, _hash(suffix) + b'id\tv\nraw\xfe.txt\tx\n')
+	data = TSVZ.readTabularFile(p, header='id\tv', strict=False)
+	assert list(data) == ['raw�.txt']
+	what = 'invalid UTF-8' if suffix == '.tsvz' else 'invalid utf8'
+	assert _tsvz_warnings(capsys) == ['TSVZ warning: %s: %s replaced with U+FFFD (line 2)' % (p, what)]
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_tsvzed_set_refuses_an_unencodable_key_at_once(tmp_path, suffix):
+	p = str(tmp_path / ('z' + suffix))
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.01)
+	t['ok'] = ['ok', '1']
+	with pytest.raises(ValueError) as e:
+		t[BAD_NAME] = [BAD_NAME, 'x']
+	_expect_unencodable(e, 'the key')
+	with pytest.raises(ValueError) as e:
+		t['k2'] = ['k2', BAD_NAME]
+	_expect_unencodable(e, "column 2 'v'")
+	assert list(t) == ['ok'] and t.correctColumnNum == 2
+	t['after'] = ['after', '2']  # the store is still usable
+	t.close()
+	assert t.appendThread.is_alive() is False
+	assert _bytes(p) == _hash(suffix) + b'id\tv\nok\t1\nafter\t2\n'
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_tsvzed_refuses_an_unencodable_header_before_it_starts(tmp_path, suffix):
+	p = str(tmp_path / ('zh' + suffix))
+	before = threading.active_count()
+	with pytest.raises(ValueError) as e:
+		TSVZ.TSVZed(p, header=['id', BAD_NAME])
+	_expect_unencodable(e, 'the header')
+	assert not os.path.exists(p)
+	assert threading.active_count() == before
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_tsvzed_errors_replace_writes_a_question_mark(tmp_path, suffix):
+	p = str(tmp_path / ('zr' + suffix))
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.01, errors='replace')
+	t[BAD_NAME] = [BAD_NAME, 'x']
+	t.close()
+	assert _bytes(p) == _hash(suffix) + b'id\tv\nbad?.txt\tx\n'
+
+
+def test_tsvzed_spec_marker_with_an_unencodable_value_is_refused(tmp_path):
+	p = str(tmp_path / 'm.tsvz')
+	t = TSVZ.TSVZed(p, append_check_delay=0.01)
+	with pytest.raises(ValueError):
+		t['#_defaults_#'] = ['#_defaults_#', BAD_NAME]
+	assert t.defaults == ['#_defaults_#']
+	t.close()
+	assert _bytes(p) == b''
+
+
+def test_tsvzed_legacy_rewrite_with_a_mutated_row_writes_nothing(tmp_path, capsys):
+	p = str(tmp_path / 'w.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.01, rewrite_on_load=False)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	before = _bytes(p)
+	t['a'][1] = BAD_NAME  # in place: no __setitem__ sees it
+	t.dirty = True
+	t.hardMapToFile()
+	t.mapToFile()
+	assert _bytes(p) == before
+	assert t.deSynced
+	assert "cannot write 'bad\\udcff.txt' as UTF-8" in capsys.readouterr().out
+	t.shutdownEvent.set()
+	t.appendThread.join()
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_tsvzedlite_set_refuses_an_unencodable_key_and_changes_nothing(tmp_path, suffix):
+	p = str(tmp_path / ('l' + suffix))
+	lite = TSVZ.TSVZedLite(p, header='id\tv')
+	lite['ok'] = ['ok', '1']
+	before = _bytes(p)
+	with pytest.raises(ValueError) as e:
+		lite[BAD_NAME] = [BAD_NAME, 'x']
+	_expect_unencodable(e, 'the key')
+	with pytest.raises(ValueError) as e:
+		lite['k2'] = ['k2', BAD_NAME]
+	_expect_unencodable(e, "column 2 'v'")
+	assert _bytes(p) == before and list(lite) == ['ok']
+	lite.close()
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_tsvzedlite_refuses_an_unencodable_header_and_creates_nothing(tmp_path, suffix):
+	p = str(tmp_path / ('lh' + suffix))
+	with pytest.raises(ValueError) as e:
+		TSVZ.TSVZedLite(p, header=['id', BAD_NAME])
+	_expect_unencodable(e, 'the header')
+	assert not os.path.exists(p)
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_tsvzedlite_errors_replace_writes_a_question_mark(tmp_path, suffix):
+	p = str(tmp_path / ('lr' + suffix))
+	lite = TSVZ.TSVZedLite(p, header='id\tv', errors='replace')
+	lite[BAD_NAME] = [BAD_NAME, 'x']
+	lite.close()
+	assert _bytes(p) == _hash(suffix) + b'id\tv\nbad?.txt\tx\n'
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_cli_set_with_an_unencodable_argument_says_so_and_exits_non_zero(tmp_path, suffix):
+	p = str(tmp_path / ('cli' + suffix))
+	_touch(p, b'a\t1\n')
+	for args in (('set', p, BAD_NAME, 'x'), ('set', p, 'k', BAD_NAME), ('append', p, 'k', BAD_NAME)):
+		status, out, err = _run(*args)
+		assert status == 1 and out == '', (args, status, out, err)
+		assert 'cannot write' in err and '\\udcff' in err and 'Traceback' not in err, err
+		assert _bytes(p) == b'a\t1\n'
+	assert _run('set', p, 'café', '中')[0] == 0
+	assert _run('get', p, 'café')[1] == 'café\t中\n'
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_cli_lookup_of_an_undecodable_argument_still_names_u_fffd(tmp_path, suffix):
+	p = str(tmp_path / ('look' + suffix))
+	_touch(p, b'\xff\t1\n')
+	assert _run('get', p, '\udcff')[1] == '�\t1\n'  # the reader reads the byte as U+FFFD
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_tsvzclient_refuses_an_unencodable_write_and_sends_nothing(tmp_path, suffix):
+	p = str(tmp_path / ('cl' + suffix))
+	c = TSVZ.TSVZClient(p)
+	c['ok'] = ['ok', '1']
+	before = _bytes(p)
+	with pytest.raises(ValueError) as e:
+		c[BAD_NAME] = [BAD_NAME, 'x']
+	_expect_unencodable(e)
+	assert _bytes(p) == before
+	c2 = TSVZ.TSVZClient(p, errors='replace')
+	c2[BAD_NAME] = [BAD_NAME, 'x']
+	assert b'bad?.txt\tx\n' in _bytes(p)

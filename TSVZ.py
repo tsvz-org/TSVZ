@@ -541,6 +541,81 @@ def _isSpecPath(path):
 	return _parsePartName(path).ext in STRICT_EXTENSIONS
 
 
+class TSVZEncodeError(ValueError):
+	"""Text to write cannot be encoded: a lone surrogate (what ``os.fsdecode`` gives for a non-UTF-8 file name), or a character the encoding lacks.
+
+	Writers raise it, before writing anything, unless they were given
+	``errors='replace'`` (or another codec error handler) to take the old
+	behaviour of writing ``?`` for the character.
+	"""
+
+
+def _encodingName(encoding):
+	try:
+		return codecs.lookup(encoding or 'utf8').name.upper()
+	except LookupError:
+		return str(encoding)
+
+
+def _unencodable(text, error, encoding, where=None):
+	"""The ``TSVZEncodeError`` for ``error``, the ``UnicodeEncodeError`` raised encoding ``text``."""
+	name = _encodingName(encoding)
+	char = error.object[error.start]
+	code = ord(char)
+	shown = ascii(char)[1:-1]
+	if 0xDC80 <= code <= 0xDCFF:
+		what = '{} (an undecodable byte 0x{:02x}, as os.fsdecode gives)'.format(shown, code - 0xDC00)
+	elif 0xD800 <= code <= 0xDFFF:
+		what = '{} (a lone surrogate)'.format(shown)
+	else:
+		what = '{} (U+{:04X}), which {} cannot encode'.format(shown, code, name)
+	subject = ascii(text)
+	if len(subject) > 100:
+		subject = subject[:97] + '...'
+	return TSVZEncodeError("cannot write {} as {}{}: it holds {}; escape it first or pass errors='replace'".format(
+		subject, name, ' ({})'.format(where) if where else '', what))
+
+
+def _encodeText(text, encoding='utf8', errors='strict', where=None):
+	"""``text.encode(encoding, errors)``; under ``errors='strict'`` a failure is a ``TSVZEncodeError`` naming ``where``."""
+	encoding = encoding or 'utf8'
+	if errors != 'strict':
+		return text.encode(encoding, errors)
+	try:
+		return text.encode(encoding)
+	except UnicodeEncodeError as e:
+		raise _unencodable(text, e, encoding, where) from None
+
+
+def _encodeRow(cells, delimiter, encoding='utf8', errors='strict', header=None, what='row'):
+	"""The bytes of ``cells`` joined by ``delimiter``; a strict failure names the cell (``what``: 'row', 'header' or 'defaults')."""
+	encoding = encoding or 'utf8'
+	line = delimiter.join(cells)
+	if errors != 'strict':
+		return line.encode(encoding, errors)
+	try:
+		return line.encode(encoding)
+	except UnicodeEncodeError as e:
+		char = e.object[e.start]
+		for i, cell in enumerate(cells):
+			if char in cell:
+				if what != 'row':
+					where = 'the ' + what if what == 'header' else 'the defaults line'
+				elif i == 0:
+					where = 'the key'
+				else:
+					name = header[i] if header and i < len(header) and header[i] else ''
+					where = 'column {}{} of key {}'.format(i + 1, " '{}'".format(name) if name else '', ascii(cells[0]))
+				raise _unencodable(cell, e, encoding, where) from None
+		raise _unencodable(line, e, encoding) from None
+
+
+def _checkRow(cells, delimiter, encoding='utf8', errors='strict', header=None, what='row'):
+	"""Raise ``TSVZEncodeError`` now when ``cells`` could not be written (nothing else: used before state changes)."""
+	if errors == 'strict':
+		_encodeRow(cells, delimiter, encoding, errors, header, what)
+
+
 def _warn(message, teeLogger=None):
 	"""Report a tolerance warning through ``teeLogger``, else stderr (never stdout)."""
 	if teeLogger:
@@ -1167,7 +1242,7 @@ def _lineContainHeader(header,line,verbose = False,teeLogger = None,strict = Fal
 		return False
 	return True
 
-def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,header = [],encoding = 'utf8',strict = True,delimiter = ...):
+def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,header = [],encoding = 'utf8',strict = True,delimiter = ...,errors = 'strict'):
 	"""
 	Verify the existence of the tabular file.
 
@@ -1178,6 +1253,7 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 	- header (list, optional): The header line to verify against. Defaults to [].
 	- encoding (str, optional): The encoding of the file. Defaults to 'utf8'.
 	- strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to True.
+	- errors (str, optional): What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8 file name (os.fsdecode). 'strict' (the default) raises a ValueError (TSVZEncodeError) naming it, before anything is written; 'replace' writes '?' instead.
 
 	Returns:
 	bool: True if the file exists, False otherwise.
@@ -1196,13 +1272,14 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 		__teePrintOrNot(f'Warning: Filename {fileName} does not end with .psv','warning',teeLogger=teeLogger)
 	if not os.path.isfile(fileName):
 		if createIfNotExist:
+			# Encode first: a header that cannot be written must not leave an empty file behind.
+			headerBytes = _encodeRow(_sanitize(_formatHeader(header,
+											 teeLogger=teeLogger,
+											 delimiter=delimiter,
+											 ),delimiter=delimiter),delimiter,encoding,errors,what='header')
 			try:
 				with openFileAsCompressed(fileName, mode ='wb',encoding=encoding,teeLogger=teeLogger) as file:
-					header = delimiter.join(_sanitize(_formatHeader(header,
-													 teeLogger=teeLogger,
-													 delimiter=delimiter,
-													 ),delimiter=delimiter))
-					file.write(header.encode(encoding=encoding,errors='replace')+b'\n')
+					file.write(headerBytes+b'\n')
 				__teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
 				return True
 			except Exception:
@@ -1219,7 +1296,7 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 
 def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,
 			verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = '\t',defaults = ...,
-			correctColumnNum = -1):
+			correctColumnNum = -1,errors = 'strict'):
 	"""
 	Compatibility method, calls readTabularFile. 
 	Read a Tabular (CSV / TSV / NSV) file and return the data as a dictionary.
@@ -1249,11 +1326,11 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
 	return readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,
 						   lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
 						   encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults,
-						   correctColumnNum = correctColumnNum)
+						   correctColumnNum = correctColumnNum,errors = errors)
 
 def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,
 					verbose = False,taskDic = None,encoding = 'utf8',strict = True,delimiter = ...,defaults = ...,
-					correctColumnNum = -1,storeOffset = False):
+					correctColumnNum = -1,storeOffset = False,errors = 'strict'):
 	"""
 	Read a Tabular (CSV / TSV / NSV) file and return the data as a dictionary.
 
@@ -1272,6 +1349,7 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 	- defaults (list, optional): The default values to use for missing columns. Defaults to [].
 	- correctColumnNum (int, optional): The expected number of columns in the file. If -1, it will be determined from the first valid line. Defaults to -1.
 	- storeOffset (bool, optional): Instead of storing the data in taskDic, store the offset of each line. Defaults to False.
+	- errors (str, optional): Reading replaces invalid UTF-8 with U+FFFD whatever this is; it applies only to the header written when createIfNotExist creates the file: 'strict' (the default) raises a ValueError for text the encoding cannot hold, 'replace' writes '?'.
 	
 	Returns:
 	- OrderedDict: The dictionary containing the data from the Tabular file.
@@ -1284,14 +1362,15 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 		return _specReadTabularFile(fileName, teeLogger=teeLogger, header=header, createIfNotExist=createIfNotExist,
 									lastLineOnly=lastLineOnly, verifyHeader=verifyHeader, verbose=verbose,
 									taskDic=taskDic, encoding=encoding, strict=strict, delimiter=delimiter,
-									defaults=defaults, correctColumnNum=correctColumnNum, storeOffset=storeOffset)
+									defaults=defaults, correctColumnNum=correctColumnNum, storeOffset=storeOffset,
+									errors=errors)
 	if taskDic is None:
 		taskDic = {}
 	if defaults is ...:
 		defaults = []
 	delimiter = get_delimiter(delimiter,file_name=fileName)
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger, delimiter = delimiter)
-	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter):
+	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter,errors = errors):
 		return taskDic
 	reporter = _Reporter(fileName, teeLogger)
 	try:
@@ -1361,7 +1440,7 @@ def _legacyReadLoop(file, fileName, taskDic, correctColumnNum, lineNo, strict, d
 			committed = position
 	return correctColumnNum, committed, lineNo
 
-def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = '\t'):
+def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = '\t', errors = 'strict'):
 	"""
 	Compatibility method, calls appendTabularFile.
 	Append a line of data to a Tabular file.
@@ -1376,13 +1455,15 @@ def appendTSV(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExis
 	- encoding (str, optional): The encoding of the file.
 	- strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
 	- delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
+	- errors (str, optional): What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8 file name (os.fsdecode). 'strict' (the default) raises a ValueError (TSVZEncodeError) naming it, before anything is written; 'replace' writes '?' instead.
 	Raises:
 	- Exception: If the file does not exist and createIfNotExist is False.
 	- Exception: If the existing header does not match the provided header.
+	- ValueError (TSVZEncodeError): If a value, key or header cannot be encoded and errors is 'strict'. Nothing is written.
 	"""
-	return appendTabularFile(fileName,lineToAppend,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding, strict = strict, delimiter = delimiter)
+	return appendTabularFile(fileName,lineToAppend,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding, strict = strict, delimiter = delimiter, errors = errors)
 
-def appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = ...):
+def appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = ..., errors = 'strict'):
 	"""
 	Append a line of data to a Tabular file.
 	Parameters:
@@ -1396,13 +1477,15 @@ def appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createI
 	- encoding (str, optional): The encoding of the file.
 	- strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
 	- delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
+	- errors (str, optional): What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8 file name (os.fsdecode). 'strict' (the default) raises a ValueError (TSVZEncodeError) naming it, before anything is written; 'replace' writes '?' instead.
 	Raises:
 	- Exception: If the file does not exist and createIfNotExist is False.
 	- Exception: If the existing header does not match the provided header.
+	- ValueError (TSVZEncodeError): If a value, key or header cannot be encoded and errors is 'strict'. Nothing is written.
 	"""
-	return appendLinesTabularFile(fileName,[lineToAppend],teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding, strict = strict, delimiter = delimiter)
+	return appendLinesTabularFile(fileName,[lineToAppend],teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding, strict = strict, delimiter = delimiter, errors = errors)
 
-def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = ...):
+def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = ..., errors = 'strict'):
 	"""
 	Append lines of data to a Tabular file.
 	Parameters:
@@ -1416,20 +1499,27 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 	- encoding (str, optional): The encoding of the file.
 	- strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
 	- delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
+	- errors (str, optional): What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8 file name (os.fsdecode). 'strict' (the default) raises a ValueError (TSVZEncodeError) naming it, before anything is written; 'replace' writes '?' instead.
 	Raises:
 	- Exception: If the file does not exist and createIfNotExist is False.
 	- Exception: If the existing header does not match the provided header.
+	- ValueError (TSVZEncodeError): If a value, key or header cannot be encoded and errors is 'strict'. Nothing is written.
 	"""
 	if _isSpecPath(fileName):
 		return _specAppendLinesTabularFile(fileName, linesToAppend, teeLogger=teeLogger, header=header,
 										   createIfNotExist=createIfNotExist, verifyHeader=verifyHeader,
-										   verbose=verbose, encoding=encoding, strict=strict, delimiter=delimiter)
+										   verbose=verbose, encoding=encoding, strict=strict, delimiter=delimiter,
+										   errors=errors)
 	delimiter = get_delimiter(delimiter,file_name=fileName)
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
-	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter):
+	# Look at every row before the file is created or touched: a refused row writes nothing.
+	rows = _legacyRows(linesToAppend, delimiter)
+	for row in rows:
+		_checkRow(row, delimiter, encoding, errors, header)
+	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter,errors = errors):
 		return
 	payload, count = _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding,
-										  strict, delimiter)
+										  strict, delimiter, errors, rows)
 	if not count:
 		if verbose:
 			__teePrintOrNot(f"No lines to append to {fileName}",teeLogger=teeLogger)
@@ -1447,13 +1537,8 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 		__teePrintOrNot(f"Appended {count} lines to {fileName}",teeLogger=teeLogger)
 
 
-def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding, strict, delimiter):
-	"""Format rows as 3.39's ``appendLinesTabularFile`` writes them; return ``(payload, count)``.
-
-	``header`` is a formatted header list and ``delimiter`` a resolved
-	delimiter. Rows are sanitised and padded or cut to the column count: the
-	header's when the file's first line matches it, else the longest row's.
-	"""
+def _legacyRows(linesToAppend, delimiter):
+	"""``linesToAppend`` as sanitised lists of cells, the key first for a dict, as 3.39 formats them."""
 	formatedLines = []
 	for line in linesToAppend:
 		if isinstance(linesToAppend,dict):
@@ -1477,6 +1562,19 @@ def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeade
 			if (not line or line[0] != key):
 				line = [key]+line
 		formatedLines.append(_sanitize(line,delimiter=delimiter))
+	return formatedLines
+
+
+def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding, strict, delimiter,
+						 errors='strict', rows=None):
+	"""Format rows as 3.39's ``appendLinesTabularFile`` writes them; return ``(payload, count)``.
+
+	``header`` is a formatted header list and ``delimiter`` a resolved
+	delimiter. Rows are sanitised and padded or cut to the column count: the
+	header's when the file's first line matches it, else the longest row's.
+	``rows`` are the rows already made by ``_legacyRows``.
+	"""
+	formatedLines = _legacyRows(linesToAppend, delimiter) if rows is None else rows
 	if not formatedLines:
 		return b'', 0
 	correctColumnNum = max([len(line) for line in formatedLines])
@@ -1493,10 +1591,10 @@ def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeade
 			formatedLines[i] += ['']*(correctColumnNum-len(formatedLines[i]))
 		elif len(formatedLines[i]) > correctColumnNum:
 			formatedLines[i] = formatedLines[i][:correctColumnNum]
-	payload = b'\n'.join([delimiter.join(line).encode(encoding=encoding,errors='replace') for line in formatedLines]) + b'\n'
+	payload = b'\n'.join([_encodeRow(line,delimiter,encoding,errors,header) for line in formatedLines]) + b'\n'
 	return payload, len(formatedLines)
 
-def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False,delimiter = '\t'):
+def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False,delimiter = '\t',errors = 'strict'):
 	"""
 	Compatibility method, calls clearTabularFile.
 	Clear the contents of a Tabular file. Will create if not exist.
@@ -1508,10 +1606,11 @@ def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose 
 	- verbose (bool, optional): If True, additional information will be printed during the execution.
 	- encoding (str, optional): The encoding of the file.
 	- strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
+	- errors (str, optional): What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8 file name (os.fsdecode). 'strict' (the default) raises a ValueError (TSVZEncodeError) naming it, before anything is written; 'replace' writes '?' instead.
 	"""
-	return clearTabularFile(fileName,teeLogger = teeLogger,header = header,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter)
+	return clearTabularFile(fileName,teeLogger = teeLogger,header = header,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter,errors = errors)
 
-def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False,delimiter = ...):
+def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False,delimiter = ...,errors = 'strict'):
 	"""
 	Clear the contents of a Tabular file. Will create if not exist.
 	Parameters:
@@ -1522,14 +1621,15 @@ def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,
 	- verbose (bool, optional): If True, additional information will be printed during the execution.
 	- encoding (str, optional): The encoding of the file.
 	- strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
+	- errors (str, optional): What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8 file name (os.fsdecode). 'strict' (the default) raises a ValueError (TSVZEncodeError) naming it, before anything is written; 'replace' writes '?' instead.
 	"""
 	if _isSpecPath(fileName):
 		_specClearTabularFile(fileName, teeLogger=teeLogger, header=header, verifyHeader=verifyHeader,
-							  verbose=verbose, encoding=encoding, strict=strict, delimiter=delimiter)
+							  verbose=verbose, encoding=encoding, strict=strict, delimiter=delimiter, errors=errors)
 		return
 	delimiter = get_delimiter(delimiter,file_name=fileName)
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
-	if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = header,encoding = encoding,strict = False,delimiter=delimiter):
+	if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = header,encoding = encoding,strict = False,delimiter=delimiter,errors = errors):
 		raise FileNotFoundError("Something catastrophic happened! File still not found after creation")
 	else:
 		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
@@ -1538,10 +1638,11 @@ def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,
 				if not _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
 					__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
 				header = _formatHeader(line,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
+		# Encode before the file is opened for writing, which empties it.
+		headerBytes = _encodeRow(_sanitize(header,delimiter=delimiter),delimiter,encoding,errors,what='header') if header else None
 		with openFileAsCompressed(fileName, mode ='wb',encoding=encoding,teeLogger=teeLogger) as file:
-			if header:
-				header = delimiter.join(_sanitize(header,delimiter=delimiter))
-				file.write(header.encode(encoding=encoding,errors='replace')+b'\n')
+			if headerBytes is not None:
+				file.write(headerBytes+b'\n')
 	if verbose:
 		__teePrintOrNot(f"Cleared {fileName}",teeLogger=teeLogger)
 
@@ -1562,7 +1663,7 @@ def get_time_ns():
 		# try to get the time in nanoseconds
 		return int(time.time()*1e9)
 
-def scrubTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = False,delimiter = '\t',defaults = ...):
+def scrubTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,verbose = False,taskDic = None,encoding = 'utf8',strict = False,delimiter = '\t',defaults = ...,errors = 'strict'):
 	"""
 	Compatibility method, calls scrubTabularFile.
 	Scrub a Tabular (CSV / TSV / NSV) file by reading it and writing the contents back into the file.
@@ -1581,6 +1682,7 @@ def scrubTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, las
 	- strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to False.
 	- delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
 	- defaults (list, optional): The default values to use for missing columns. Defaults to [].
+	- errors (str, optional): What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8 file name (os.fsdecode). 'strict' (the default) raises a ValueError (TSVZEncodeError) naming it, before anything is written; 'replace' writes '?' instead.
 
 	Returns:
 	- OrderedDict: The dictionary containing the data from the Tabular file.
@@ -1589,10 +1691,10 @@ def scrubTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, las
 	- Exception: If the file is not found or there is a data format error.
 
 	"""
-	return scrubTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults)
+	return scrubTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults,errors = errors)
 
 def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = False, lastLineOnly = False,verifyHeader = True,
-					 verbose = False,taskDic = None,encoding = 'utf8',strict = False,delimiter = ...,defaults = ...,correctColumnNum = -1):
+					 verbose = False,taskDic = None,encoding = 'utf8',strict = False,delimiter = ...,defaults = ...,correctColumnNum = -1,errors = 'strict'):
 	"""
 	Scrub a Tabular (CSV / TSV / NSV) file by reading it and writing the contents back into the file.
 	If using compressed files. This will recompress the file in whole and possibily increase the compression ratio reducing the file size.
@@ -1612,6 +1714,7 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 	- delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
 	- defaults (list, optional): The default values to use for missing columns. Defaults to [].
 	- correctColumnNum (int, optional): The expected number of columns in the file. If -1, it will be determined from the first valid line. Defaults to -1.
+	- errors (str, optional): What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8 file name (os.fsdecode). 'strict' (the default) raises a ValueError (TSVZEncodeError) naming it, before anything is written; 'replace' writes '?' instead.
 
 	Returns:
 	- OrderedDict: The dictionary containing the data from the Tabular file.
@@ -1624,13 +1727,17 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 		return _specScrubTabularFile(fileName, teeLogger=teeLogger, header=header, createIfNotExist=createIfNotExist,
 									 lastLineOnly=lastLineOnly, verifyHeader=verifyHeader, verbose=verbose,
 									 taskDic=taskDic, encoding=encoding, strict=strict, delimiter=delimiter,
-									 defaults=defaults, correctColumnNum=correctColumnNum)
+									 defaults=defaults, correctColumnNum=correctColumnNum, errors=errors)
 	file =  readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,
 							lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
-							encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults,correctColumnNum = correctColumnNum)
+							encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults,correctColumnNum = correctColumnNum,errors = errors)
 	if file:
-		clearTabularFile(fileName,teeLogger = teeLogger,header = header,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter)
-		appendLinesTabularFile(fileName,file,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter)
+		# Check every row before the file is cleared: a refused row must not cost the file its data.
+		dlm = get_delimiter(delimiter,file_name=fileName)
+		for row in _legacyRows(file, dlm):
+			_checkRow(row, dlm, encoding, errors, _formatHeader(header,delimiter=dlm))
+		clearTabularFile(fileName,teeLogger = teeLogger,header = header,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter,errors = errors)
+		appendLinesTabularFile(fileName,file,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter,errors = errors)
 	return file
 
 # ===========================================================================
@@ -2854,7 +2961,7 @@ def _specHeaderComment(header, delimiter):
 	return line if line.startswith('#') else '#' + line
 
 
-def _specEnsureStore(fileName, createIfNotExist, header, defaults, strict, teeLogger, delimiter):
+def _specEnsureStore(fileName, createIfNotExist, header, defaults, strict, teeLogger, delimiter, errors='strict'):
 	"""Make sure the store exists (3.39 ``_verifyFileExistence`` semantics).
 
 	A new file starts with the header comment and, when ``defaults`` carry a
@@ -2871,10 +2978,12 @@ def _specEnsureStore(fileName, createIfNotExist, header, defaults, strict, teeLo
 		return False
 	lines = []
 	if header and any(header):
+		_checkRow(header, delimiter, 'utf-8', errors, what='header')
 		lines.append(_specHeaderComment(header, delimiter))
 	if defaults and any(defaults[1:]):
+		_checkRow(defaults, delimiter, 'utf-8', errors, what='defaults')
 		lines.append(_specFormatRecord(defaults, delimiter, marker=True))
-	content = ''.join(line + '\n' for line in lines).encode('utf-8')
+	content = _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors)
 	codec = _parsePartName(fileName).codec
 	try:
 		_requireCodec(codec)  # not even an empty file in a codec this Python lacks
@@ -2899,7 +3008,7 @@ def _specEnsureStore(fileName, createIfNotExist, header, defaults, strict, teeLo
 
 def _specReadTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False, lastLineOnly=False,
 						 verifyHeader=True, verbose=False, taskDic=None, encoding='utf8', strict=True,
-						 delimiter=..., defaults=..., correctColumnNum=-1, storeOffset=False):
+						 delimiter=..., defaults=..., correctColumnNum=-1, storeOffset=False, errors='strict'):
 	"""``readTabularFile`` for spec paths (same signature and return values as 3.39)."""
 	if taskDic is None:
 		taskDic = {}
@@ -2908,7 +3017,7 @@ def _specReadTabularFile(fileName, teeLogger=None, header='', createIfNotExist=F
 		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
 		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
 		initial = _normalizeDefaults(defaults, delimiter)
-		if not _specEnsureStore(fileName, createIfNotExist, header, initial, strict, teeLogger, delimiter):
+		if not _specEnsureStore(fileName, createIfNotExist, header, initial, strict, teeLogger, delimiter, errors):
 			if lastLineOnly:
 				return -1 if storeOffset else []
 			return taskDic
@@ -3251,7 +3360,7 @@ def _specCheckHeader(fileName, header, delimiter, strict, verbose, teeLogger):
 
 
 def _specAppendLinesTabularFile(fileName, linesToAppend, teeLogger=None, header='', createIfNotExist=False,
-								verifyHeader=True, verbose=False, encoding='utf8', strict=True, delimiter=...):
+								verifyHeader=True, verbose=False, encoding='utf8', strict=True, delimiter=..., errors='strict'):
 	"""``appendLinesTabularFile`` for spec paths: rows are written exactly as given (design §5.2)."""
 	reporter = _Reporter(fileName, teeLogger)
 	try:
@@ -3272,23 +3381,24 @@ def _specAppendLinesTabularFile(fileName, linesToAppend, teeLogger=None, header=
 				line = [key] + line
 			if not line:
 				continue
+			_checkRow(line, delimiter, 'utf-8', errors, header)  # before the store is created or touched
 			records.append(_specFormatRecord(line, delimiter, marker=bool(_MARKER_RE.match(line[0]))))
 		_specAppendRecords(fileName, records, reporter, teeLogger=teeLogger, header=header,
 						   createIfNotExist=createIfNotExist, verifyHeader=verifyHeader, verbose=verbose,
-						   strict=strict, delimiter=delimiter)
+						   strict=strict, delimiter=delimiter, errors=errors)
 	finally:
 		reporter.flush()
 
 
 def _specAppendRecords(fileName, records, reporter, teeLogger=None, header=(), createIfNotExist=False,
-					   verifyHeader=True, verbose=False, strict=True, delimiter='\t'):
+					   verifyHeader=True, verbose=False, strict=True, delimiter='\t', errors='strict'):
 	"""Append formatted records (each without its '\\n') to the store in one write (spec §18.2).
 
 	The store is created first when ``createIfNotExist`` allows it (see
 	``_specEnsureStore``); ``header`` is a formatted header list. Returns False
 	when the store is missing and may not be created.
 	"""
-	if not _specEnsureStore(fileName, createIfNotExist, header, [DEFAULTS_INDICATOR_KEY], strict, teeLogger, delimiter):
+	if not _specEnsureStore(fileName, createIfNotExist, header, [DEFAULTS_INDICATOR_KEY], strict, teeLogger, delimiter, errors):
 		return False
 	if not records:
 		if verbose:
@@ -3297,14 +3407,14 @@ def _specAppendRecords(fileName, records, reporter, teeLogger=None, header=(), c
 	if any(header) and verifyHeader:
 		_specCheckHeader(fileName, header, delimiter, strict, verbose, teeLogger)
 	_, active = _storeParts(fileName, reporter)
-	_specAppendPayload(active, ''.join(record + '\n' for record in records).encode('utf-8'), reporter)
+	_specAppendPayload(active, _encodeText(''.join(record + '\n' for record in records), 'utf-8', errors), reporter)
 	if verbose:
 		__teePrintOrNot(f"Appended {len(records)} lines to {fileName}",teeLogger=teeLogger)
 	return True
 
 
 def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=False, verbose=False,
-						  encoding='utf8', strict=False, delimiter=...):
+						  encoding='utf8', strict=False, delimiter=..., errors='strict'):
 	"""``clearTabularFile`` for spec paths (design §5.5, §5.8). Returns True when the store was cleared.
 
 	A single file is read without a lock and rewritten in place only if no
@@ -3320,11 +3430,12 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 	try:
 		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
 		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
+		_checkRow(header, delimiter, 'utf-8', errors, what='header')  # before anything is cleared
 		name = _parsePartName(fileName)
 		if name.ordinal is not None or name.rotated:
 			reporter.note('fragment', None, 'clear skipped: {} names one part of a multi-part store; clear the store path instead; nothing was written'.format(fileName))
 			return False
-		if not _specEnsureStore(fileName, True, header, [DEFAULTS_INDICATOR_KEY], False, teeLogger, delimiter):
+		if not _specEnsureStore(fileName, True, header, [DEFAULTS_INDICATOR_KEY], False, teeLogger, delimiter, errors):
 			raise FileNotFoundError("Something catastrophic happened! File still not found after creation")
 		headerChecked = False
 		for _ in range(_SPEC_REWRITE_ATTEMPTS):
@@ -3342,7 +3453,7 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			if len(load.parts) > 1:
 				tombstones = _specFormatRecords(_specTombstones(load.data, delimiter, load.state.strip), delimiter)
 				if tombstones:
-					_specAppendPayload(load.active, tombstones.encode('utf-8'), attempt, memberSize=load.state.memberSize)
+					_specAppendPayload(load.active, _encodeText(tombstones, 'utf-8', errors), attempt, memberSize=load.state.memberSize)
 				attempt.note('multipart', None, 'cleared a multi-part store by appending tombstones; older parts are not compacted')
 				cleared = True
 				break
@@ -3361,7 +3472,7 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			if headerLine:
 				lines.append(headerLine)
 			lines += _specPreamble(load.state, delimiter, version=False)
-			if _specRewriteInPlace(load.parts[0], ''.join(line + '\n' for line in lines).encode('utf-8'), expect=stamp,
+			if _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors), expect=stamp,
 								   memberSize=load.state.memberSize) is not None:
 				cleared = True
 				break
@@ -3415,19 +3526,21 @@ def _specRoundTrips(cells, state):
 
 def _specScrubTabularFile(fileName, teeLogger=None, header='', createIfNotExist=False, lastLineOnly=False,
 						  verifyHeader=True, verbose=False, taskDic=None, encoding='utf8', strict=False,
-						  delimiter=..., defaults=..., correctColumnNum=-1):
+						  delimiter=..., defaults=..., correctColumnNum=-1, errors='strict'):
 	"""``scrubTabularFile`` for spec paths: archival in-place compaction (design §5.7)."""
 	if lastLineOnly:
 		return _specReadTabularFile(fileName, teeLogger=teeLogger, header=header, createIfNotExist=createIfNotExist,
 									lastLineOnly=True, verifyHeader=verifyHeader, verbose=verbose, encoding=encoding,
-									strict=strict, delimiter=delimiter, defaults=defaults, correctColumnNum=correctColumnNum)
+									strict=strict, delimiter=delimiter, defaults=defaults, correctColumnNum=correctColumnNum,
+									errors=errors)
 	return _specScrub(fileName, teeLogger=teeLogger, header=header, createIfNotExist=createIfNotExist,
 					  verifyHeader=verifyHeader, verbose=verbose, taskDic=taskDic, encoding=encoding,
-					  strict=strict, delimiter=delimiter, defaults=defaults, correctColumnNum=correctColumnNum)[0]
+					  strict=strict, delimiter=delimiter, defaults=defaults, correctColumnNum=correctColumnNum,
+					  errors=errors)[0]
 
 
 def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, verifyHeader=True, verbose=False,
-			   taskDic=None, encoding='utf8', strict=False, delimiter=..., defaults=..., correctColumnNum=-1):
+			   taskDic=None, encoding='utf8', strict=False, delimiter=..., defaults=..., correctColumnNum=-1, errors='strict'):
 	"""Compact a single-part store in place; return ``(taskDic, done)``.
 
 	The store is read without a lock and rewritten in place only if no other
@@ -3446,7 +3559,8 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
 		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
 		initial = _normalizeDefaults(defaults, delimiter)
-		if not _specEnsureStore(fileName, createIfNotExist, header, initial, strict, teeLogger, delimiter):
+		_checkRow(header, delimiter, 'utf-8', errors, what='header')  # before anything is rewritten
+		if not _specEnsureStore(fileName, createIfNotExist, header, initial, strict, teeLogger, delimiter, errors):
 			return taskDic, False
 		name = _parsePartName(fileName)
 		given = list(taskDic.items()) if taskDic else []
@@ -3497,7 +3611,7 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 			lines += [_specFormatRecord(cells, delimiter) for cells in rows]
 			if compensate:
 				lines += _specPostamble(state, delimiter)
-			written = _specRewriteInPlace(load.parts[0], ''.join(line + '\n' for line in lines).encode('utf-8'), expect=stamp,
+			written = _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors), expect=stamp,
 										  memberSize=state.memberSize)
 			if written is None:
 				continue  # another writer committed after the read
@@ -3577,6 +3691,11 @@ class TSVZed(OrderedDict):
 		If True, enforces strict validation of column counts and raises errors on mismatch.
 	correctColumnNum : int, default=-1
 		Expected number of columns. -1 means auto-detect from header or first record.
+	errors : str, default='strict'
+		What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8
+		file name (os.fsdecode). 'strict' raises a ValueError (TSVZEncodeError) naming it, from the
+		call that gave the text (setting an item) or from the constructor (a header or defaults),
+		before anything is stored or written. 'replace' writes '?' for it, as 3.39 did.
 	Attributes
 	----------
 	version : str
@@ -3658,7 +3777,7 @@ class TSVZed(OrderedDict):
 
 	def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = ...,
 				  rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,
-				  verbose = False,encoding = 'utf8',delimiter = ...,defaults = None,strict = False,correctColumnNum = -1):
+				  verbose = False,encoding = 'utf8',delimiter = ...,defaults = None,strict = False,correctColumnNum = -1,errors = 'strict'):
 		super().__init__()
 		self._constructed = False  # setDefaults() writes a #_defaults_# marker only once this is True
 		self._spec = _isSpecPath(fileName)
@@ -3668,15 +3787,18 @@ class TSVZed(OrderedDict):
 		self.lastUpdateTime = self.externalFileUpdateTime
 		self._fileName = fileName
 		self.teeLogger = teeLogger
+		self.errors = errors
 		if self._spec:
 			reporter = _Reporter(fileName, teeLogger)
 			self.delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
 			reporter.flush()
 		else:
 			self.delimiter = get_delimiter(delimiter,file_name=fileName)
+		self.encoding = encoding
 		self.setDefaults(defaults)
 		self._constructorDefaults = list(self.defaults)
 		self.header = _formatHeader(header,verbose = verbose,teeLogger = self.teeLogger,delimiter=self.delimiter)
+		_checkRow(self.header, self.delimiter, self.encoding, self.errors, what='header')  # before a thread or a file exists
 		self.correctColumnNum = correctColumnNum
 		self.createIfNotExist = createIfNotExist
 		self.verifyHeader = verifyHeader
@@ -3738,6 +3860,7 @@ class TSVZed(OrderedDict):
 			defaults = []
 		if not defaults or defaults[0] != DEFAULTS_INDICATOR_KEY:
 			defaults = [DEFAULTS_INDICATOR_KEY]+defaults
+		_checkRow(defaults, self.delimiter, self.encoding, self.errors, what='defaults')
 		if self._spec and self._constructed:
 			# Spec rows are written sparse and read back under the file's
 			# #_defaults_#, so new defaults are written as that marker.
@@ -3763,7 +3886,7 @@ class TSVZed(OrderedDict):
 		readTabularFile(self._fileName, teeLogger = self.teeLogger, header = self.header,
 					createIfNotExist = self.createIfNotExist, verifyHeader = self.verifyHeader,
 					verbose = self.verbose, taskDic = self,encoding = self.encoding if self.encoding else None,
-					strict = self.strict, delimiter = self.delimiter, defaults=self.defaults)
+					strict = self.strict, delimiter = self.delimiter, defaults=self.defaults, errors = self.errors)
 		if self.verbose:
 			self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
 		if self.header and any(self.header) and self.verifyHeader:
@@ -3790,7 +3913,7 @@ class TSVZed(OrderedDict):
 		load = None
 		try:
 			if _specEnsureStore(self._fileName, self.createIfNotExist, self.header, self._constructorDefaults,
-								self.strict, self.teeLogger, self.delimiter):
+								self.strict, self.teeLogger, self.delimiter, self.errors):
 				load = _specLoad(self._fileName, self.delimiter, header=self.header, verifyHeader=self.verifyHeader,
 								 strict=self.strict, defaults=self._constructorDefaults, taskDic=OrderedDict(),
 								 reporter=reporter, teeLogger=self.teeLogger, verbose=self.verbose)
@@ -3888,6 +4011,11 @@ class TSVZed(OrderedDict):
 				return True
 		return False
 
+	def _checkWritable(self, cells):
+		"""Raise ``TSVZEncodeError`` now when ``cells`` could not be written: a row is refused before memory, the queue or the file change."""
+		if not self.memoryOnly:
+			_checkRow(cells, self.delimiter, self.encoding, self.errors, self.header)
+
 	def __setitem__(self,key,value):
 		if self._spec:
 			return self._specSetItem(key, value)
@@ -3903,6 +4031,8 @@ class TSVZed(OrderedDict):
 		# add it if it is not there
 		if not value or value[0] != key:
 			value = [key]+value
+		if (self.correctColumnNum == 1 or len(value) > 1) and (key == DEFAULTS_INDICATOR_KEY or not key.startswith('#')):
+			self._checkWritable(value)  # a lone key is a delete: it writes only a key that is already stored
 		# verify the value has the correct number of columns
 		if self.correctColumnNum != 1 and len(value) == 1:
 			# a lone key (no following values) means delete the key, per the
@@ -4066,6 +4196,7 @@ class TSVZed(OrderedDict):
 		if len(value) == 1:
 			del self[key]
 			return
+		self._checkWritable(value)
 		if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
 			self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
 			return
@@ -4091,6 +4222,7 @@ class TSVZed(OrderedDict):
 
 	def _specSetMarker(self, key, value):
 		"""Write a reserved-key marker (design §5.2 e); official markers also update the reader state."""
+		self._checkWritable(value)
 		keyLower = key.lower()
 		if keyLower in _SPEC_MARKER_KEYS:
 			reporter = _Reporter(self._fileName, self.teeLogger)
@@ -4143,7 +4275,7 @@ class TSVZed(OrderedDict):
 			items.append(self.appendQueue.popleft())
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		try:
-			payload = ''.join(item + '\n' for item in items).encode('utf-8', errors='replace')
+			payload = _encodeText(''.join(item + '\n' for item in items), 'utf-8', self.errors)
 			_specAppendPayload(self._activePath, payload, reporter, fsync=True, memberSize=self._specState.memberSize)
 			self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
 			if self._writeFailing:
@@ -4169,7 +4301,7 @@ class TSVZed(OrderedDict):
 					self.deSynced = True
 					return self
 				cleared = _specClearTabularFile(self._fileName, teeLogger=self.teeLogger, header=self.header,
-												verbose=self.verbose, delimiter=self.delimiter)
+												verbose=self.verbose, delimiter=self.delimiter, errors=self.errors)
 				self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
 			self.dirty = False
 			# A skipped clear (reported) left the store as it was: reload it into memory.
@@ -4201,9 +4333,10 @@ class TSVZed(OrderedDict):
 		file = None
 		try:
 			if self.header:
-				file = self.get_file_obj('wb')
 				header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
-				file.write(header.encode(self.encoding,errors='replace') + b'\n')
+				headerBytes = _encodeRow(_sanitize(self.header,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header')
+				file = self.get_file_obj('wb')  # opening it empties it: encode first
+				file.write(headerBytes + b'\n')
 				self.release_file_obj(file)
 				if self.verbose:
 					self.__teePrintOrNot(f"Header {header} written to {self._fileName}")
@@ -4257,6 +4390,8 @@ memoryOnly:{self.memoryOnly}
 		return f"TSVZed({self._fileName},{dict(self)})"
 
 	def __del__(self):
+		if 'appendThread' not in self.__dict__:
+			return  # the constructor refused its arguments before it started anything
 		return self.close()
 
 	def popitem(self, last=True):
@@ -4386,6 +4521,23 @@ memoryOnly:{self.memoryOnly}
 			self.deSynced = True
 			return False
 		
+	def _checkRewrite(self):
+		"""Raise ``TSVZEncodeError`` when the header, the defaults or a row held in memory could not be written.
+
+		Run before a rewrite opens the file, which empties it or writes it in
+		place: a refused rewrite must leave the file as it is.
+		"""
+		if self.errors != 'strict':
+			return
+		delimiter = self.delimiter
+		if self.header:
+			_checkRow(_sanitize(self.header,delimiter=delimiter), delimiter, self.encoding, self.errors, what='header')
+		if self.defaults and len(self.defaults) > 1:
+			_checkRow(_sanitize(self.defaults,delimiter=delimiter), delimiter, self.encoding, self.errors, what='defaults')
+		for value in self.values():
+			if value and not str(value[0]).startswith('#'):
+				_checkRow(_sanitize(value,delimiter=delimiter), delimiter, self.encoding, self.errors, self.header)
+
 	def hardMapToFile(self):
 		if self._spec:
 			_warnOnce(self, 'hardMapToFile()', self._fileName,
@@ -4396,22 +4548,21 @@ memoryOnly:{self.memoryOnly}
 		try:
 			if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
 				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
+			self._checkRewrite()
 			file = self.get_file_obj('wb')
 			buf = io.BufferedWriter(file, buffer_size=64*1024*1024)  # 64MB buffer
 			if self.header:
-				header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
-				buf.write(header.encode(self.encoding,errors='replace') + b'\n')
+				buf.write(_encodeRow(_sanitize(self.header,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header') + b'\n')
 			# Persist the defaults line (right after the header) so it survives a
 			# full rewrite -- it is not a regular mapping key.
 			if self.defaults and len(self.defaults) > 1:
-				defaultsLine = self.delimiter.join(_sanitize(self.defaults,delimiter=self.delimiter))
-				buf.write(defaultsLine.encode(self.encoding,errors='replace') + b'\n')
+				buf.write(_encodeRow(_sanitize(self.defaults,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='defaults') + b'\n')
 			for key in self:
 				# '#'-prefixed keys are in-memory only (comments / internal); never written.
 				if str(key).startswith('#'):
 					continue
 				segments = _sanitize(self[key],delimiter=self.delimiter)
-				buf.write(self.delimiter.join(segments).encode(encoding=self.encoding,errors='replace')+b'\n')
+				buf.write(_encodeRow(segments,self.delimiter,self.encoding,self.errors,self.header)+b'\n')
 			buf.flush()
 			self.release_file_obj(file)
 			if self.verbose:
@@ -4442,6 +4593,7 @@ memoryOnly:{self.memoryOnly}
 			if _isCompressedFile(self._fileName):
 				# if the file is compressed, we need to use the hardMapToFile method
 				return self.hardMapToFile()
+			self._checkRewrite()
 			file = self.get_file_obj('r+b')
 			overWrite = False
 			if self.header:
@@ -4450,7 +4602,7 @@ memoryOnly:{self.memoryOnly}
 				if not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
 					header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
 					file.seek(0)
-					file.write(f'{header}\n'.encode(encoding=self.encoding,errors='replace'))
+					file.write(_encodeRow(_sanitize(self.header,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header')+b'\n')
 					# if the header is not the same length as the line, we need to overwrite the file
 					if aftPos != file.tell():
 						overWrite = True
@@ -4465,11 +4617,11 @@ memoryOnly:{self.memoryOnly}
 			rowsToWrite.extend(v for v in self.values() if v and not str(v[0]).startswith('#'))
 			for value in rowsToWrite:
 				segments = _sanitize(value,delimiter=self.delimiter)
-				strToWrite = self.delimiter.join(segments)
+				encoded = _encodeRow(segments,self.delimiter,self.encoding,self.errors,self.header)
 				if overWrite:
 					if self.verbose:
 						self.__teePrintOrNot(f"Overwriting {value} to {self._fileName}")
-					file.write(strToWrite.encode(encoding=self.encoding,errors='replace')+b'\n')
+					file.write(encoded+b'\n')
 					continue
 				pos = file.tell()
 				line = file.readline()
@@ -4478,10 +4630,10 @@ memoryOnly:{self.memoryOnly}
 					if self.verbose:
 						self.__teePrintOrNot(f"End of file reached. Appending {value} to {self._fileName}")
 					# L6: 3.39 omitted this newline and glued the row to the next one.
-					file.write(strToWrite.encode(encoding=self.encoding,errors='replace')+b'\n')
+					file.write(encoded+b'\n')
 					overWrite = True
 					continue
-				strToWrite = strToWrite.encode(encoding=self.encoding,errors='replace').ljust(len(line)-1)+b'\n'
+				strToWrite = encoded.ljust(len(line)-1)+b'\n'
 				if line != strToWrite:
 					if self.verbose:
 						self.__teePrintOrNot(f"Modifing {value} to {self._fileName}")
@@ -4503,8 +4655,9 @@ memoryOnly:{self.memoryOnly}
 			import traceback
 			self.__teePrintOrNot(traceback.format_exc(),'error')
 			self.deSynced = True
-			self.__teePrintOrNot("Trying failback hardMapToFile()")
-			self.hardMapToFile()
+			if not isinstance(e, TSVZEncodeError):  # a refused rewrite would be refused again
+				self.__teePrintOrNot("Trying failback hardMapToFile()")
+				self.hardMapToFile()
 		self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 		self.monitor_external_changes = mec
 		return self
@@ -4563,7 +4716,7 @@ memoryOnly:{self.memoryOnly}
 				chunks = []
 				while self.appendQueue:
 					line = _sanitize(self.appendQueue.popleft(),delimiter=self.delimiter)
-					chunks.append(self.delimiter.join(line).encode(encoding=self.encoding,errors='replace')+b'\n')
+					chunks.append(_encodeRow(line,self.delimiter,self.encoding,self.errors,self.header)+b'\n')
 				payload = b''.join(chunks)
 				if not compressed and _endsWithoutNewline(file):
 					# L1: terminate a hand-edited last line instead of gluing onto it.
@@ -4725,6 +4878,11 @@ class TSVZedLite(MutableMapping):
 		Pre-existing index dictionary mapping keys to file positions (default: ...).
 	fileObj : file object, optional
 		Pre-existing file object to use (default: ...).
+	errors : str, optional
+		What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8
+		file name (os.fsdecode). 'strict' (default) raises a ValueError (TSVZEncodeError) naming it,
+		from the call that gave the text (setting an item) or from the constructor (a header or
+		defaults), before anything is stored or written. 'replace' writes '?' for it, as 3.39 did.
 	Attributes
 	----------
 	version : str
@@ -4766,22 +4924,25 @@ class TSVZedLite(MutableMapping):
 	def __init__ (self,fileName,header = '',createIfNotExist = True,verifyHeader = True,
 					verbose = False,encoding = 'utf8',
 					delimiter = ...,defaults = None,strict = True,correctColumnNum = -1,
-					indexes = ..., fileObj = ...
+					indexes = ..., fileObj = ..., errors = 'strict'
 					):
 		self._constructed = False  # setDefaults() writes a #_defaults_# marker only once this is True
 		self._spec = _isSpecPath(fileName)
 		self.version = version
 		self.strict = strict
 		self._fileName = fileName
+		self.errors = errors
 		if self._spec:
 			reporter = _Reporter(fileName)
 			self.delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
 			reporter.flush()
 		else:
 			self.delimiter = get_delimiter(delimiter,file_name=fileName)
+		self.encoding = encoding
 		self.setDefaults(defaults)
 		self._constructorDefaults = list(self.defaults)
 		self.header = _formatHeader(header,verbose = verbose,delimiter=self.delimiter)
+		_checkRow(self.header, self.delimiter, self.encoding, self.errors, what='header')  # before a file is created
 		self.correctColumnNum = correctColumnNum
 		self.createIfNotExist = createIfNotExist
 		self.verifyHeader = verifyHeader
@@ -4806,7 +4967,7 @@ class TSVZedLite(MutableMapping):
 				# raising a clear FileNotFoundError instead of a cryptic open error.
 				_verifyFileExistence(self._fileName, createIfNotExist = self.createIfNotExist,
 									  header = self.header, encoding = self.encoding,
-									  strict = self.strict, delimiter = self.delimiter)
+									  strict = self.strict, delimiter = self.delimiter, errors = self.errors)
 				self.fileObj = None if self._inMemoryRows else open(self._fileName,'r+b')
 			else:
 				self.fileObj = fileObj
@@ -4873,7 +5034,7 @@ class TSVZedLite(MutableMapping):
 		reporter = _Reporter(self._fileName)
 		try:
 			if not _specEnsureStore(self._fileName, self.createIfNotExist, self.header, self._constructorDefaults,
-									self.strict, None, self.delimiter):
+									self.strict, None, self.delimiter, self.errors):
 				return self
 			load = _specLoad(self._fileName, self.delimiter, header=self.header, verifyHeader=self.verifyHeader,
 							 strict=self.strict, defaults=self._constructorDefaults,
@@ -4954,6 +5115,7 @@ class TSVZedLite(MutableMapping):
 		if len(value) == 1:
 			del self[key]
 			return
+		_checkRow(value, self.delimiter, self.encoding, self.errors, self.header)  # before any state changes
 		if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
 			eprint(f"Error: Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...")
 			return
@@ -4973,6 +5135,7 @@ class TSVZedLite(MutableMapping):
 			self.indexes[key] = offset
 
 	def _specWriteMarker(self, key, value):
+		_checkRow(value, self.delimiter, self.encoding, self.errors, self.header)  # before any state changes
 		keyLower = key.lower()
 		if keyLower in _SPEC_MARKER_KEYS:
 			reporter = _Reporter(self._fileName)
@@ -4985,7 +5148,7 @@ class TSVZedLite(MutableMapping):
 
 	def _specWrite(self, line):
 		"""Append one record (or lines written together) to the active part; return its offset, or None for a compressed part."""
-		data = (line + '\n').encode('utf-8', errors='replace')
+		data = _encodeText(line + '\n', 'utf-8', self.errors)
 		if self.fileObj is None:
 			reporter = _Reporter(self._activePath)
 			try:
@@ -5041,6 +5204,7 @@ class TSVZedLite(MutableMapping):
 			defaults = []
 		if not defaults or defaults[0] != DEFAULTS_INDICATOR_KEY:
 			defaults = [DEFAULTS_INDICATOR_KEY]+defaults
+		_checkRow(defaults, self.delimiter, self.encoding, self.errors, what='defaults')
 		if self._spec and self._constructed:
 			# Spec rows are written sparse and read back under the file's
 			# #_defaults_#, so new defaults are written as that marker.
@@ -5058,7 +5222,8 @@ class TSVZedLite(MutableMapping):
 		readTabularFile(self._fileName, header = self.header, createIfNotExist = self.createIfNotExist,
 				   verifyHeader = self.verifyHeader, verbose = self.verbose, taskDic = self.indexes,
 				   encoding = self.encoding if self.encoding else None, strict = self.strict, 
-				   delimiter = self.delimiter, defaults=self.defaults,storeOffset=not self._inMemoryRows)
+				   delimiter = self.delimiter, defaults=self.defaults,storeOffset=not self._inMemoryRows,
+				   errors = self.errors)
 		return self
 
 	def positions(self):
@@ -5075,7 +5240,8 @@ class TSVZedLite(MutableMapping):
 		"""Clear the store. For .tsvz, raise OSError when the clear was refused (the reason is
 		reported as a warning); memory is reloaded from the store either way."""
 		if self._spec:
-			cleared = _specClearTabularFile(self._fileName, header=self.header, verbose=self.verbose, delimiter=self.delimiter)
+			cleared = _specClearTabularFile(self._fileName, header=self.header, verbose=self.verbose, delimiter=self.delimiter,
+											errors=self.errors)
 			if self.fileObj is not None:
 				self.fileObj.close()
 			self.indexes.clear()
@@ -5087,7 +5253,7 @@ class TSVZedLite(MutableMapping):
 			return self
 		if self.fileObj is None:
 			clearTabularFile(self._fileName, header=self.header, verbose=self.verbose,
-							 encoding=self.encoding, delimiter=self.delimiter)
+							 encoding=self.encoding, delimiter=self.delimiter, errors=self.errors)
 			return self
 		if self.verbose:
 			eprint(f"Clearing {self._fileName}")
@@ -5131,10 +5297,11 @@ class TSVZedLite(MutableMapping):
 	# Private methods for reading and writing values for TSVZedLite
 
 	def __writeValues(self,data):
+		# Encode first: a row that cannot be written must not even terminate the last line.
+		encoded = _encodeRow(_sanitize(data,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,self.header)
 		if self.fileObj is None:
-			line = self.delimiter.join(_sanitize(data,delimiter=self.delimiter))
 			with openFileAsCompressed(self._fileName, mode='ab', encoding=self.encoding) as f:
-				f.write(line.encode(encoding=self.encoding,errors='replace') + b'\n')
+				f.write(encoded + b'\n')
 			return list(data)
 		write_at = self.fileObj.seek(0, os.SEEK_END)
 		if write_at:
@@ -5148,9 +5315,7 @@ class TSVZedLite(MutableMapping):
 			self.fileObj.seek(write_at)
 		if self.verbose:
 			eprint(f"Writing at position {write_at}")
-		data = _sanitize(data,delimiter=self.delimiter)
-		data = self.delimiter.join(data)
-		bytes = self.fileObj.write((data.encode(encoding=self.encoding,errors='replace') + b'\n'))
+		bytes = self.fileObj.write(encoded + b'\n')
 		if self.verbose:
 			eprint(f"Wrote {bytes} bytes")
 		return write_at
@@ -5243,6 +5408,9 @@ class TSVZedLite(MutableMapping):
 		# add it if it is not there
 		if not value or value[0] != key:
 			value = [key]+value
+		if (self.correctColumnNum == 1 or len(value) > 1) and not key.startswith('#'):
+			# refuse a row that cannot be written before any state changes (a lone key is a delete)
+			_checkRow(value, self.delimiter, self.encoding, self.errors, self.header)
 		# verify the value has the correct number of columns
 		if self.correctColumnNum != 1 and len(value) == 1:
 			# a lone key (no following values) means delete the key, per the
@@ -6442,7 +6610,7 @@ class _ServeConnection(object):
 			text += ''.join(record + '\n' for record in bulk) + '#\n'
 		with self.lock:
 			try:
-				self.sock.sendall(text.encode('utf-8', 'replace'))
+				self.sock.sendall(_encodeText(text, 'utf-8'))  # nothing is sent for text that cannot be written
 				lines = []
 				while True:
 					raw = self.rfile.readline()
@@ -6779,9 +6947,13 @@ class TSVZClient(MutableMapping):
 	  split on the delimiter, cells are right-stripped, the key goes first).
 	- ``sync=True`` acknowledges every write only after it is on disk.
 	- ``timeout``: seconds to wait for each answer (None: no limit).
+	- ``errors``: 'strict' (the default) raises a ``ValueError`` (``TSVZEncodeError``) for a write whose
+	  key or value cannot be encoded as UTF-8 (a lone surrogate from a non-UTF-8 file name), before
+	  anything is sent; 'replace' writes '?' for it.
 	"""
 
-	def __init__(self, fileName, sync=False, timeout=None, teeLogger=None):
+	def __init__(self, fileName, sync=False, timeout=None, teeLogger=None, errors='strict'):
+		self._errors = errors
 		self._fileName = fileName
 		self._sync = sync
 		self._timeout = timeout
@@ -6810,6 +6982,13 @@ class TSVZClient(MutableMapping):
 
 	def _request(self, fields, write=False, bulk=None, retry=True):
 		"""Send a request; return ``(lines, status, message)``. Usage errors raise ``ValueError``."""
+		if write:
+			if self._errors == 'strict':
+				for text in fields + (bulk or []):
+					_encodeText(text, 'utf-8')
+			else:
+				fields = [_encodeText(text, 'utf-8', self._errors).decode('utf-8') for text in fields]
+				bulk = None if bulk is None else [_encodeText(text, 'utf-8', self._errors).decode('utf-8') for text in bulk]
 		options = (['--sync'] if write and self._sync else []) + (['--x-written'] if write else [])
 		line = '\t'.join(options + fields)
 		with self._lock:  # one request at a time on the shared connection
@@ -7079,13 +7258,16 @@ class _CliArgs(object):
 _CLI_UNDECODED_RE = re.compile('[\udc80-\udcff]')
 
 
-def _cliDecodeArgv(argv):
+def _cliDecodeArgv(argv, errors='replace'):
 	"""Re-decode as UTF-8 the arguments holding bytes the locale could not decode (Python 3.6 under LANG=C).
 
 	Only data arguments go through here: a STORE path stays as the OS decoded
-	it, so that ``open()`` encodes it back to the same bytes.
+	it, so that ``open()`` encodes it back to the same bytes. A byte that is
+	not UTF-8 becomes U+FFFD, as a reader reads it (spec §4.8), so a lookup
+	names the key that was stored; for ``errors='surrogateescape'`` it stays
+	a lone surrogate, which a writer refuses.
 	"""
-	return [os.fsencode(arg).decode('utf-8', 'replace') if _CLI_UNDECODED_RE.search(arg) else arg for arg in argv]
+	return [os.fsencode(arg).decode('utf-8', errors) if _CLI_UNDECODED_RE.search(arg) else arg for arg in argv]
 
 
 def _cliParseArgs(argv):
@@ -7802,10 +7984,13 @@ def _cliMain(argv, stdin=None, stdout=None, stderr=None):
 	except _CliUsageError as e:
 		_cliWrite(stderr, 'tsvz: {}\n{}\n'.format(e, _CLI_USAGE))
 		return 2
-	args.args = _cliDecodeArgv(args.args)
+	# What a write is given must not be changed silently: a byte that is not UTF-8 stays a lone surrogate
+	# and the writer says so (a lookup names U+FFFD, as the reader reads the byte).
+	decoding = 'surrogateescape' if args.operation in ('set', 'append', 'setdefault') else 'replace'
+	args.args = _cliDecodeArgv(args.args, decoding)
 	for name in ('header', 'defaults', 'delimiter'):
 		if isinstance(getattr(args, name), str):
-			setattr(args, name, _cliDecodeArgv([getattr(args, name)])[0])
+			setattr(args, name, _cliDecodeArgv([getattr(args, name)], decoding)[0])
 	if args.help:
 		_cliWrite(stdout, _CLI_HELP.format(version=version))
 		return 0
