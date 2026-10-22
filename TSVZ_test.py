@@ -6083,3 +6083,34 @@ def test_errors_survive_a_copy_a_pickle_and_fromkeys(tmp_path):
 	t = TSVZ.TSVZed.fromkeys(['x'], ['x', 'y'], fileName=str(tmp_path / 'g.tsv'), errors='replace')
 	assert t.errors == 'replace'
 	_stop(t)
+
+
+def _count_encodes(monkeypatch):
+	calls = []
+	real = TSVZ._encodeRow
+
+	def counting(cells, *args, **kwargs):
+		calls.append(list(cells))
+		return real(cells, *args, **kwargs)
+	monkeypatch.setattr(TSVZ, '_encodeRow', counting)
+	return calls
+
+
+def test_legacy_writers_encode_each_row_once(tmp_path, monkeypatch):
+	p = str(tmp_path / 'once.tsv')
+	calls = _count_encodes(monkeypatch)
+	TSVZ.appendLinesTabularFile(p, [['a', '1'], ['b', '2'], ['c', '3']], header='id\tv', createIfNotExist=True)
+	rows = [c for c in calls if c[0] in 'abc']
+	assert len(rows) == 3, calls
+	del calls[:]
+	TSVZ.scrubTabularFile(p, header='id\tv')
+	assert len([c for c in calls if c[0] in 'abc']) == 3, calls
+	del calls[:]
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=5, rewrite_on_load=False)
+	del calls[:]
+	t.hardMapToFile()
+	assert len([c for c in calls if c[0] in 'abc']) == 3, calls
+	del calls[:]
+	t.mapToFile()
+	assert len([c for c in calls if c[0] in 'abc']) == 3, calls
+	_stop(t)
