@@ -7182,3 +7182,31 @@ def test_unencodable_fffd_error_does_not_advise_replacing_it_with_a_question_mar
 	with pytest.raises(TSVZ.TSVZEncodeError) as e:
 		TSVZ._encodeText('bad\udcff', 'utf-8')
 	assert str(e.value).endswith("; escape it first or pass errors='replace'") and 'errors=' not in e.value.reason
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_cli_refusal_names_the_cell_and_no_option_it_lacks_with_or_without_a_handler(tmp_path, served, monkeypatch):
+	p = str(tmp_path / 'files.tsvz')
+	q = str(tmp_path / 'served.tsvz')
+	for path in (p, q):
+		assert _run('set', path, 'k', 'v')[0] == 0
+	served(q)
+	before = _bytes(q)
+	real = TSVZ._CLI_HANDLERS['set']
+
+	def onTheFiles(args, *rest):
+		assert args.store != q, 'not routed through the handler'
+		return real(args, *rest)
+
+	monkeypatch.setitem(TSVZ._CLI_HANDLERS, 'set', onTheFiles)
+	errors = []
+	for path in (p, q):
+		status, out, err = _run('set', path, 'k2', 'v\udcff')
+		assert status == 1 and out == '', (status, out, err)
+		errors.append(err.replace(path, 'STORE'))
+	assert errors[0] == errors[1], errors  # the same message through the handler as on the files
+	assert "cannot write 'v\\udcff' as UTF-8 (column 2 of key 'k2')" in errors[0]
+	assert 'errors=' not in errors[0] and '--x-written' not in errors[0], errors[0]
+	assert _bytes(q) == before
+	status, out, err = _run('setdefault', p, 'k3', 'v\udcff')
+	assert status == 1 and 'cannot write' in err and 'errors=' not in err, err

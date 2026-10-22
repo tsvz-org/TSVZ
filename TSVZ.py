@@ -8472,6 +8472,10 @@ def _cliRouted(connection, args, delimiter, logger, stdin, stdout):
 		finally:
 			source.flush()
 		bulk = [_serveRecordLine(cells, marker) for cells, marker in rows]
+	elif args.operation in ('set', 'append') and len(args.args) > 1:
+		# Checked as the files are, naming the cell, before anything is sent: a request cannot carry
+		# text that is not UTF-8 (and would be quoted whole).
+		_checkRow(_sanitize(args.args, delimiter=delimiter), delimiter, 'utf8', 'strict', None)
 	try:
 		written = ['--x-written'] if args.operation in ('set', 'append', 'delete') else []
 		response = connection.request('\t'.join(written + [_cliRequestLine(args)]), bulk)
@@ -8562,7 +8566,9 @@ def _cliMain(argv, stdin=None, stdout=None, stderr=None):
 	except KeyboardInterrupt:
 		return 130
 	except Exception as e:
-		logger.teelog('tsvz: {}: {}'.format(args.store, str(e) or type(e).__name__), 'error')
+		# A refusal's advice names options of the library (errors=), which this command does not take.
+		text = e.reason if isinstance(e, TSVZEncodeError) else str(e)
+		logger.teelog('tsvz: {}: {}'.format(args.store, text or type(e).__name__), 'error')
 		if args.verbose:
 			import traceback
 			logger.teelog(traceback.format_exc().rstrip(), 'error')

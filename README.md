@@ -206,7 +206,9 @@ refused (also the one `rewrite_on_load` makes, which then leaves the file as it 
 without failing), appends of rows that can be written still work, and the delete or
 update of a key that holds U+FFFD raises. Such a key stays until the file is edited, the
 store cleared, or the store opened with the encoding it was written in; `errors='replace'`
-would write `?` for U+FFFD, losing the bytes the file holds there. The `tsvz` command exits 1 with the message.
+would write `?` for U+FFFD, losing the bytes the file holds there. The `tsvz` command
+exits 1 with the message, naming the cell as it does on the files when a handler runs,
+and without the advice about `errors=`, an option it does not take.
 
 ## Breaking changes from 3.39
 
