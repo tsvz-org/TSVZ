@@ -4055,10 +4055,10 @@ class TSVZed(OrderedDict):
 				return True
 		return False
 
-	def _checkWritable(self, cells):
+	def _checkWritable(self, cells, what='row'):
 		"""Raise ``TSVZEncodeError`` now when ``cells`` could not be written: a row is refused before memory, the queue or the file change."""
 		if not self.memoryOnly:
-			_checkRow(cells, self.delimiter, self.encoding, self.errors, self.header)
+			_checkRow(cells, self.delimiter, self.encoding, self.errors, self.header, what)
 
 	def __setitem__(self,key,value):
 		if self._spec:
@@ -4076,7 +4076,7 @@ class TSVZed(OrderedDict):
 		if not value or value[0] != key:
 			value = [key]+value
 		if (self.correctColumnNum == 1 or len(value) > 1) and (key == DEFAULTS_INDICATOR_KEY or not key.startswith('#')):
-			self._checkWritable(value)  # a lone key is a delete: it writes only a key that is already stored
+			self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')  # a lone key is a delete: it writes only a key that is already stored
 		# verify the value has the correct number of columns
 		if self.correctColumnNum != 1 and len(value) == 1:
 			# a lone key (no following values) means delete the key, per the
@@ -4266,7 +4266,7 @@ class TSVZed(OrderedDict):
 
 	def _specSetMarker(self, key, value):
 		"""Write a reserved-key marker (design §5.2 e); official markers also update the reader state."""
-		self._checkWritable(value)
+		self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
 		keyLower = key.lower()
 		if keyLower in _SPEC_MARKER_KEYS:
 			reporter = _Reporter(self._fileName, self.teeLogger)
@@ -4528,10 +4528,10 @@ memoryOnly:{self.memoryOnly}
 		return size
 
 	@classmethod
-	def fromkeys(cls, iterable, value=None,fileName = None,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = ...,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,verbose = False):
+	def fromkeys(cls, iterable, value=None,fileName = None,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = ...,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,verbose = False,errors = 'strict'):
 		'''Create a new ordered dictionary with keys from iterable and values set to value.
 		'''
-		self = cls(fileName,teeLogger,header,createIfNotExist,verifyHeader,rewrite_on_load,rewrite_on_exit,rewrite_interval,append_check_delay,verbose)
+		self = cls(fileName,teeLogger,header,createIfNotExist,verifyHeader,rewrite_on_load,rewrite_on_exit,rewrite_interval,append_check_delay,verbose,errors = errors)
 		for key in iterable:
 			self[key] = value
 		return self
@@ -5221,7 +5221,8 @@ class TSVZedLite(MutableMapping):
 			self.indexes[key] = offset
 
 	def _specWriteMarker(self, key, value):
-		_checkRow(value, self.delimiter, self.encoding, self.errors, self.header)  # before any state changes
+		_checkRow(value, self.delimiter, self.encoding, self.errors, self.header,
+				  'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')  # before any state changes
 		keyLower = key.lower()
 		if keyLower in _SPEC_MARKER_KEYS:
 			reporter = _Reporter(self._fileName)
@@ -5406,6 +5407,15 @@ class TSVZedLite(MutableMapping):
 			eprint(f"Wrote {bytes} bytes")
 		return write_at
 
+	def _checkDelete(self, key):
+		"""Raise ``TSVZEncodeError`` now when the tombstone of ``key`` could not be written, before memory changes."""
+		if not _mayRaise(self.errors):
+			return
+		if self._spec:
+			_encodeText(_specTombstoneLines(key, self.delimiter, self._specState.strip) + '\n', 'utf-8', self.errors)
+		elif key == DEFAULTS_INDICATOR_KEY or not key.startswith('#'):
+			_checkRow([key], self.delimiter, self.encoding, self.errors, self.header)
+
 	def __mapDeleteToFile(self,key):
 		if self._spec:
 			self._specWrite(_specTombstoneLines(key, self.delimiter, self._specState.strip))
@@ -5494,9 +5504,9 @@ class TSVZedLite(MutableMapping):
 		# add it if it is not there
 		if not value or value[0] != key:
 			value = [key]+value
-		if (self.correctColumnNum == 1 or len(value) > 1) and not key.startswith('#'):
+		if (self.correctColumnNum == 1 or len(value) > 1) and (key == DEFAULTS_INDICATOR_KEY or not key.startswith('#')):
 			# refuse a row that cannot be written before any state changes (a lone key is a delete)
-			_checkRow(value, self.delimiter, self.encoding, self.errors, self.header)
+			_checkRow(value, self.delimiter, self.encoding, self.errors, self.header, what='defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
 		# verify the value has the correct number of columns
 		if self.correctColumnNum != 1 and len(value) == 1:
 			# a lone key (no following values) means delete the key, per the
@@ -5554,6 +5564,7 @@ class TSVZedLite(MutableMapping):
 				if self.verbose:
 					eprint(f"Key {key} not found")
 				return
+			self._checkDelete(key)
 			self.indexes.pop(key, None)
 			self.__mapDeleteToFile(key)
 			return
@@ -5564,6 +5575,7 @@ class TSVZedLite(MutableMapping):
 			if self.verbose:
 				eprint(f"Key {key} not found")
 			return
+		self._checkDelete(key)
 		# Remove from the index first, then persist the tombstone to the file.
 		self.indexes.pop(key,None)
 		self.__mapDeleteToFile(key)
@@ -5585,6 +5597,8 @@ class TSVZedLite(MutableMapping):
 		return self
 
 	def popitem(self, last=True,return_pos = False):
+		if self.indexes:
+			self._checkDelete(next(reversed(self.indexes)) if last else next(iter(self.indexes)))
 		if last:
 			key, pos = self.indexes.popitem()
 		else:
@@ -5603,6 +5617,8 @@ class TSVZedLite(MutableMapping):
 	__marker = object()
 	def pop(self, key, default=__marker, return_pos = False):
 		key = self._nameKey(key)
+		if key in self.indexes:
+			self._checkDelete(key)
 		try:
 			pos = self.indexes.pop(key)
 		except KeyError:
@@ -5656,7 +5672,7 @@ file_descriptor:{self.fileObj.fileno() if self.fileObj is not None else None}
 			self.__class__,
 			(self._fileName, self.header, self.createIfNotExist, self.verifyHeader,
 			 self.verbose, self.encoding, self.delimiter, self.defaults, self.strict, 
-			 self.correctColumnNum),
+			 self.correctColumnNum, ..., ..., self.errors),
 			None,
 			None,
 			None
@@ -5676,6 +5692,7 @@ file_descriptor:{self.fileObj.fileno() if self.fileObj is not None else None}
 			self.correctColumnNum,
 			self.indexes,
 			self.fileObj,
+			self.errors,
 		)
 		eprint("""
 		Warning: Copying TSVZedLite will share the same file object and indexes. 
@@ -5686,10 +5703,10 @@ file_descriptor:{self.fileObj.fileno() if self.fileObj is not None else None}
 
 	@classmethod
 	def fromkeys(cls, iterable, value=None,fileName = None,header = '',createIfNotExist = True,verifyHeader = True,verbose = False,encoding = 'utf8',
-					delimiter = ...,defaults = None,strict = True,correctColumnNum = -1):
+					delimiter = ...,defaults = None,strict = True,correctColumnNum = -1,errors = 'strict'):
 		'''Create a new ordered dictionary with keys from iterable and values set to value.
 		'''
-		self = cls(fileName,header,createIfNotExist,verifyHeader,verbose,encoding,delimiter,defaults,strict,correctColumnNum)
+		self = cls(fileName,header,createIfNotExist,verifyHeader,verbose,encoding,delimiter,defaults,strict,correctColumnNum,errors = errors)
 		for key in iterable:
 			self[key] = value
 		return self

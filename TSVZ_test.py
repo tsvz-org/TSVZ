@@ -6029,3 +6029,57 @@ def test_tsvzed_compressed_legacy_file_keeps_monitoring_after_a_rewrite(tmp_path
 	t.mapToFile()
 	assert t.monitor_external_changes
 	_stop(t)
+
+
+def _lite_with_a_stored_key(tmp_path, suffix, key):
+	"""A TSVZedLite holding ``key``, which set would refuse: it is put in the index the way a load does."""
+	p = str(tmp_path / ('lt' + suffix))
+	lite = TSVZ.TSVZedLite(p, header='id\tv')
+	lite['ok'] = ['ok', '1']
+	lite['k'] = ['k', '2']
+	lite.indexes[key] = lite.indexes['k']
+	return lite, p
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+@pytest.mark.parametrize('how', ['del', 'pop', 'popitem_last', 'popitem_first'])
+def test_tsvzedlite_refused_tombstone_leaves_memory_and_file_alone(tmp_path, suffix, how):
+	lite, p = _lite_with_a_stored_key(tmp_path, suffix, BAD_NAME)
+	if how == 'popitem_first':
+		rest = dict(lite.indexes)
+		lite.indexes.clear()
+		lite.indexes[BAD_NAME] = rest.pop(BAD_NAME)
+		lite.indexes.update(rest)
+	before, keys = _bytes(p), list(lite.indexes)
+	with pytest.raises(ValueError) as e:
+		if how == 'del':
+			del lite[BAD_NAME]
+		elif how == 'pop':
+			lite.pop(BAD_NAME)
+		else:
+			lite.popitem(last=(how == 'popitem_last'))
+	_expect_unencodable(e)
+	assert list(lite.indexes) == keys and _bytes(p) == before
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_tsvzedlite_refuses_unencodable_defaults_when_they_are_given(tmp_path, suffix):
+	lite = TSVZ.TSVZedLite(str(tmp_path / ('d' + suffix)), header='id\tv')
+	with pytest.raises(ValueError) as e:
+		lite[TSVZ.DEFAULTS_INDICATOR_KEY] = [TSVZ.DEFAULTS_INDICATOR_KEY, BAD_NAME]
+	_expect_unencodable(e, 'the defaults line')
+	lite['a'] = ['a', '1']  # not blamed on a cell the caller never gave
+
+
+def test_errors_survive_a_copy_a_pickle_and_fromkeys(tmp_path):
+	import pickle
+	p = str(tmp_path / 'p.tsv')
+	lite = TSVZ.TSVZedLite(p, header='id\tv', errors='replace')
+	assert pickle.loads(pickle.dumps(lite)).errors == 'replace'
+	lite2 = TSVZ.TSVZedLite.fromkeys(['x'], ['x', 'y'], fileName=str(tmp_path / 'f.tsv'), header='id\tv', errors='replace')
+	assert lite2.errors == 'replace'
+	lite2[BAD_NAME] = [BAD_NAME, 'z']
+	lite.close() if hasattr(lite, 'close') else None
+	t = TSVZ.TSVZed.fromkeys(['x'], ['x', 'y'], fileName=str(tmp_path / 'g.tsv'), errors='replace')
+	assert t.errors == 'replace'
+	_stop(t)
