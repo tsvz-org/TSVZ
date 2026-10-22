@@ -6831,6 +6831,80 @@ def test_tsvzed_legacy_append_that_cannot_open_the_file_keeps_the_rows_queued(tm
 	assert _bytes(p) == b'key\tval\nb\t1\n'
 
 
+
+class _ErrorLog(object):
+	"""A teeLogger that keeps the error lines."""
+
+	def __init__(self):
+		self.errors = []
+
+	def teelog(self, message, level='info'):
+		if level == 'error':
+			self.errors.append(message)
+
+
+def test_tsvzed_legacy_append_that_keeps_failing_is_reported_once_and_retried_less_often(tmp_path, monkeypatch):
+	p = str(tmp_path / 'deny.tsv')
+	log = _ErrorLog()
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001, teeLogger=log)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	real = TSVZ.openFileAsCompressed
+	opens = []
+
+	def denying(fileName, mode='rb', *args, **kwargs):
+		if mode != 'rb':
+			opens.append(mode)
+			raise PermissionError(13, 'Permission denied')
+		return real(fileName, mode, *args, **kwargs)
+
+	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', denying)
+	t['b'] = ['b', '1']
+	time.sleep(0.5)  # some 400 ticks of the background writer
+	monkeypatch.undo()
+	assert len(log.errors) == 1 and 'Permission denied' in log.errors[0], log.errors
+	assert 1 <= len(opens) <= 6, len(opens)  # tried after 0.1 s, 0.2 s, 0.4 s, ... not at every tick
+	assert list(t.appendQueue) == [['b', '1']]
+	t.commitAppendToFile()  # an explicit call does not wait
+	assert _bytes(p) == b'key\tval\na\t1\nb\t1\n'
+	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', denying)
+	t['c'] = ['c', '1']
+	t.commitAppendToFile()
+	monkeypatch.undo()
+	assert len(log.errors) == 2, 'a failure after one that went through is reported again'
+	t.close()
+	assert _bytes(p) == b'key\tval\na\t1\nb\t1\nc\t1\n'
+
+
+def test_tsvzed_legacy_reload_that_keeps_failing_is_reported_once_and_retried_less_often(tmp_path, monkeypatch):
+	p = str(tmp_path / 'strict.tsv')
+	log = _ErrorLog()
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001, strict=True, teeLogger=log)
+	time.sleep(0.05)
+	reads = []
+	real = TSVZ.readTabularFile
+
+	def reading(*args, **kwargs):
+		reads.append(1)
+		return real(*args, **kwargs)
+
+	monkeypatch.setattr(TSVZ, 'readTabularFile', reading)
+	with open(p, 'wb') as f:
+		f.write(b'other\theader\n')  # another process: a strict store cannot be reloaded
+	time.sleep(0.5)
+	monkeypatch.undo()
+	assert 1 <= len(reads) <= 6, len(reads)
+	failures = [e for e in log.errors if e.startswith('Failed') and 'Header mismatch' in e]
+	assert len(failures) == 1, log.errors
+	with open(p, 'wb') as f:
+		f.write(b'key\tval\nx\t1\n')  # put right
+	deadline = time.time() + 5
+	while 'x' not in t and time.time() < deadline:
+		time.sleep(0.01)
+	assert t['x'] == ['x', '1']
+	t.close()
+
+
 def test_tsvzed_legacy_reload_after_an_external_change_keeps_rows_set_since_the_last_append(tmp_path):
 	p = str(tmp_path / 'keep.tsv')
 	t = _stopped(p)

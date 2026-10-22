@@ -577,6 +577,8 @@ def _isSpecPath(path):
 
 _REFUSED_RETRY_SECONDS = 1.0  # shortest wait before a refused rewrite is tried again
 _DEFERRED_REWRITE_TRIES = 3  # rewrites rewrite() tries when another process keeps changing the file under them
+_FAILURE_RETRY_FIRST = 0.1  # seconds the background writer waits before it tries a failed legacy write again,
+_FAILURE_RETRY_MAX = 60.0  # doubled at each failure in a row up to this
 
 
 class TSVZEncodeError(ValueError):
@@ -3993,6 +3995,7 @@ class TSVZed(OrderedDict):
 		self.memoryOnly = False
 		self.writeLock = threading.Lock()
 		self._memLock = threading.Lock()  # held while memory and appendQueue change together (a set, a delete, reload's swap)
+		self._failures = {}  # legacy writes that fail, by kind: see _failed()
 		self.shutdownEvent = threading.Event()
 		if self._spec:
 			for flag, given in (('rewrite_on_load', rewrite_on_load), ('rewrite_on_exit', rewrite_on_exit),
@@ -4611,10 +4614,9 @@ class TSVZed(OrderedDict):
 				self.__teePrintOrNot(f"File {self._fileName} size: {os.path.getsize(self._fileName)}")
 			self.dirty = False
 			self.deSynced = False
+			self._worked('rewrite')
 		except Exception as e:
-			self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: {e}",'error')
-			import traceback
-			self.__teePrintOrNot(traceback.format_exc(),'error')
+			self._failed('rewrite', f"Failed to write at clear_file() to {self._fileName}: {e}")
 			self.deSynced = True
 		return self
 	
@@ -4791,11 +4793,10 @@ memoryOnly:{self.memoryOnly}
 				self.commitAppendToFile()
 			# else:
 			#     self.appendEvent.set()
+			self._worked('sync')
 			return True
 		except Exception as e:
-			self.__teePrintOrNot(f"Failed to write at sync() to {self._fileName}: {e}",'error')
-			import traceback
-			self.__teePrintOrNot(traceback.format_exc(),'error')
+			self._failed('sync', f"Failed to write at sync() to {self._fileName}: {e}")
 			self.deSynced = True
 			return False
 		
@@ -4847,6 +4848,37 @@ memoryOnly:{self.memoryOnly}
 		"""A rewrite went through, or memory was emptied or read again: a later refusal is reported again."""
 		self._refusedAt = None
 		self._refusalReported = False
+
+	def _failed(self, kind, message, trace=True):
+		"""A legacy write of ``kind`` failed: report ``message``, unless it was since that kind last went through.
+
+		``kind`` is 'append', 'rewrite' (a rewrite or clear writing the file) or 'sync' (rewrite() reading
+		another process's change). The background writer waits before it tries that kind again, 0.1 s at
+		first and twice as long at each failure in a row, up to a minute: a failure that lasts (a file it may
+		not open, a strict header another process changed) is neither retried at every tick nor reported at
+		every try. True when it was reported.
+		"""
+		state = self._failures.get(kind)
+		wait = min(state[0] * 2, _FAILURE_RETRY_MAX) if state else _FAILURE_RETRY_FIRST
+		reported = state[2] if state else set()
+		self._failures[kind] = (wait, _specClock() + wait, reported)
+		if message in reported:
+			return False
+		reported.add(message)
+		self.__teePrintOrNot(f"{message}; not reported again until it works",'error')
+		if trace:
+			import traceback
+			self.__teePrintOrNot(traceback.format_exc(),'error')
+		return True
+
+	def _worked(self, kind):
+		"""A legacy write of ``kind`` went through: the next failure is reported, and retried soon."""
+		self._failures.pop(kind, None)
+
+	def _failing(self, *kinds):
+		"""True while the background writer waits to try again a write of one of ``kinds`` that failed."""
+		now = _specClock()
+		return any(state is not None and now < state[1] for state in map(self._failures.get, kinds))
 
 	def _externalChangeStops(self, defer):
 		"""True when the rewrite about to start must not: another process changed the file since this object read it.
@@ -4940,12 +4972,11 @@ memoryOnly:{self.memoryOnly}
 			self.dirty = False
 			self.deSynced = False
 			self._accepted()
+			self._worked('rewrite')
 		except TSVZEncodeError as e:
 			self._refuse('hardMapToFile()', e, explicit)
 		except Exception as e:
-			self.__teePrintOrNot(f"Failed to write at hardMapToFile() to {self._fileName}: {e}",'error')
-			import traceback
-			self.__teePrintOrNot(traceback.format_exc(),'error')
+			self._failed('rewrite', f"Failed to write at hardMapToFile() to {self._fileName}: {e}")
 			self.deSynced = True
 		return self
 	
@@ -5027,15 +5058,14 @@ memoryOnly:{self.memoryOnly}
 			self.dirty = False
 			self.deSynced = False
 			self._accepted()
+			self._worked('rewrite')
 		except TSVZEncodeError as e:
 			self._refuse('mapToFile()', e, explicit)
 			return self
 		except Exception as e:
-			self.__teePrintOrNot(f"Failed to write at mapToFile() to {self._fileName}: {e}",'error')
-			import traceback
-			self.__teePrintOrNot(traceback.format_exc(),'error')
+			if self._failed('rewrite', f"Failed to write at mapToFile() to {self._fileName}: {e}"):
+				self.__teePrintOrNot("Trying failback hardMapToFile()")
 			self.deSynced = True
-			self.__teePrintOrNot("Trying failback hardMapToFile()")
 			self._hardMapToFile(defer, explicit)
 		return self
 	
@@ -5072,9 +5102,10 @@ memoryOnly:{self.memoryOnly}
 				self.checkExternalChanges()
 				if self._spec:
 					self._specSync()
-				else:
+				elif not self._failing('sync', 'rewrite'):
 					self.rewrite()
-				self.commitAppendToFile()
+				if self._spec or not self._failing('append'):
+					self.commitAppendToFile()
 			time.sleep(self.append_check_delay)
 			# self.appendEvent.wait()
 			# self.appendEvent.clear()
@@ -5120,14 +5151,13 @@ memoryOnly:{self.memoryOnly}
 					_warn(f'TSVZ warning: {self._fileName}: last line had no trailing newline; added one before appending', self.teeLogger)
 				file.write(payload)
 				self.release_file_obj(file)
+				self._worked('append')
 				if self.verbose:
 					self.__teePrintOrNot(f"Records commited to {self._fileName}")
 					self.__teePrintOrNot(f"After size of {self._fileName}: {os.path.getsize(self._fileName)}")
 			except Exception as e:
 				self.release_file_obj(file)
-				self.__teePrintOrNot(f"Failed to write at commitAppendToFile to {self._fileName}: {e}",'error')
-				import traceback
-				self.__teePrintOrNot(traceback.format_exc(),'error')
+				self._failed('append', f"Failed to write at commitAppendToFile to {self._fileName}: {e}")
 				self.deSynced = True
 		return self
 	
@@ -5191,7 +5221,7 @@ memoryOnly:{self.memoryOnly}
 				self.__teePrintOrNot(f"File {self._fileName} locked with mode {modes}")
 			return file
 		except Exception as e:
-			self.__teePrintOrNot(f"Failed to open file {self._fileName}: {e}",'error')
+			self._failed('append' if modes in ('ab', 'a+b') else 'rewrite', f"Failed to open file {self._fileName}: {e}", trace=False)
 			if file is not None:
 				try:
 					_closeFile(file)  # an unlocked file is never handed out
