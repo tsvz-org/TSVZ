@@ -6561,3 +6561,44 @@ def test_cli_routed_setdefault_is_one_atomic_request(tmp_path, served, monkeypat
 	assert status == 1 and 'cannot write' in err, err
 	assert sent == []
 	assert _run('has', p, 'k')[0] != 0
+
+
+@pytest.mark.parametrize('last', [True, False])
+def test_tsvzedlite_popitem_refuses_without_changing_the_index_or_the_file(tmp_path, last):
+	p = str(tmp_path / 'pi.tsv')
+	_touch(p, b'a\t1\nb\t2\n')
+	t = TSVZ.TSVZedLite(p, header='')
+	t.indexes['z' + BAD_NAME] = ['z' + BAD_NAME, 'x']  # an in-memory row whose tombstone cannot be written
+	if not last:
+		t.indexes = dict(reversed(list(t.indexes.items())))
+	order = list(t.indexes)
+	with pytest.raises(TSVZ.TSVZEncodeError):
+		t.popitem(last=last)
+	assert list(t.indexes) == order
+	assert _bytes(p) == b'a\t1\nb\t2\n'
+	if last:
+		t.indexes.pop('z' + BAD_NAME)
+		assert t.popitem()[0] == 'b'
+
+
+@pytest.mark.skipif(sys.version_info >= (3, 8), reason='a dict is reversible')
+def test_tsvzedlite_popitem_does_not_list_the_keys_before_python_3_8(tmp_path, monkeypatch):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, ''.join('k%d\t%d\n' % (i, i) for i in range(50)).encode())
+	t = TSVZ.TSVZedLite(p, header='')
+	listed = []
+	real = list
+
+	class Meta(type):
+		def __instancecheck__(cls, obj):
+			return isinstance(obj, real)
+
+	class CountingList(metaclass=Meta):  # the module's `list`: builds real lists and notes a pass over the keys
+		def __new__(cls, *args):
+			listed.append(bool(args) and args[0] is t.indexes)
+			return real(*args)
+
+	monkeypatch.setattr(TSVZ, 'list', CountingList, raising=False)
+	while len(t):
+		t.popitem()
+	assert True not in listed  # list(self.indexes) at every pop made emptying a store quadratic

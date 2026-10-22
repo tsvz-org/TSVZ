@@ -5675,16 +5675,32 @@ class TSVZedLite(MutableMapping):
 		return self
 
 	def popitem(self, last=True,return_pos = False):
-		if self.indexes:
-			if last:
-				try:
-					first = next(reversed(self.indexes))
-				except TypeError:  # a dict is not reversible before Python 3.8
-					first = list(self.indexes)[-1]
+		popped = None
+		if self.indexes and _mayRaise(self.errors):
+			# Refuse before anything changes, without a pass over the keys: the key of the tombstone is the next
+			# one, or, where a dict cannot be reversed (before Python 3.8) and is plain, the one popped, which
+			# is put back if its tombstone is refused.
+			if not last:
+				self._checkDelete(next(iter(self.indexes)))
 			else:
-				first = next(iter(self.indexes))
-			self._checkDelete(first)
-		if last:
+				try:
+					lastKey = next(reversed(self.indexes))
+				except TypeError:
+					lastKey = None
+				if lastKey is not None:
+					self._checkDelete(lastKey)
+				elif type(self.indexes) is dict:
+					popped = self.indexes.popitem()
+					try:
+						self._checkDelete(popped[0])
+					except BaseException:
+						self.indexes[popped[0]] = popped[1]
+						raise
+				else:
+					self._checkDelete(list(self.indexes)[-1])
+		if popped is not None:
+			key, pos = popped
+		elif last:
 			key, pos = self.indexes.popitem()
 		else:
 			try:
