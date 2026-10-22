@@ -4911,8 +4911,8 @@ memoryOnly:{self.memoryOnly}
 	def _snapshotForRewrite(self):
 		"""Lock the file, then encode what a rewrite writes, checking that all of it can be written; return the bytes.
 
-		The caller holds ``writeLock`` when this returns, and must open the file with
-		``get_file_obj(..., locked=True)``. The rows are encoded under the lock, so the
+		The caller holds ``writeLock`` when this returns, and writes the snapshot with
+		``_writeRewrite``, which lets go of it. The rows are encoded under the lock, so the
 		background writer cannot append a row after they were taken and before the file is
 		cut (that row would be lost); a row set later is appended after the rewrite. It is
 		``(header, lines)``: the header line (None for no header) and the defaults line and
@@ -4954,7 +4954,7 @@ memoryOnly:{self.memoryOnly}
 		Its own change is noted all the same (release_file_obj), so it is not reloaded over memory either.
 		"""
 		file = None
-		started = False
+		started = deferred = False
 		try:
 			missing = not os.path.isfile(self._fileName)  # under writeLock: this object does not remove it meanwhile
 			whole = whole or missing
@@ -4963,23 +4963,22 @@ memoryOnly:{self.memoryOnly}
 				self.deSynced = True  # tried again later
 				self.writeLock.release()
 				return False
-			if look and not missing and self._externalChangeStops(defer):  # created just now: nothing to keep
-				self.release_file_obj(file)  # untouched; its time is not noted: the change is reloaded first
-				return None
-			self.dirty = True  # until it is all written, the file does not hold memory: a rewrite that fails is made again
-			started = True
-			header, lines = snapshot
-			if not whole:
-				self._writeInPlace(file, header, lines)
-			else:
-				file.truncate(0)
-				file = _compressedWriter(self._fileName, file) or file
-				buf = io.BufferedWriter(file, buffer_size=64*1024*1024)  # 64MB buffer
-				if header is not None:
-					buf.write(header + b'\n')
-				for line in lines:
-					buf.write(line + b'\n')
-				buf.flush()
+			deferred = look and not missing and self._externalChangeStops(defer)  # created just now: nothing to keep
+			if not deferred:
+				self.dirty = True  # until it is all written, the file does not hold memory: a rewrite that fails is made again
+				started = True
+				header, lines = snapshot
+				if not whole:
+					self._writeInPlace(file, header, lines)
+				else:
+					file.truncate(0)
+					file = _compressedWriter(self._fileName, file) or file
+					buf = io.BufferedWriter(file, buffer_size=64*1024*1024)  # 64MB buffer
+					if header is not None:
+						buf.write(header + b'\n')
+					for line in lines:
+						buf.write(line + b'\n')
+					buf.flush()
 		except BaseException:
 			if started:
 				self.deSynced = True
@@ -4989,6 +4988,9 @@ memoryOnly:{self.memoryOnly}
 				self._keepFileTime = False
 				self.writeLock.release()
 			raise
+		if deferred:
+			self.release_file_obj(file)  # untouched; its time is not noted: the change is reloaded first
+			return None
 		try:
 			self.release_file_obj(file, ownChange=True)  # raises when what was written did not reach the file
 		except BaseException:
