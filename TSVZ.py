@@ -4932,6 +4932,7 @@ memoryOnly:{self.memoryOnly}
 		written whole, through its codec; else it is rewritten in place (mapToFile, for a file that is not
 		compressed). ``look``: another process's change stops it as _externalChangeStops says with ``defer``;
 		it is looked for once the file is locked and before it is emptied, so no change made until then is erased.
+		A file that is not there (removed by another process: rm, a log rotation) is made whole, from memory.
 
 		True when it is written; None when another process's change stopped it; False when the file could not be
 		opened or locked (get_file_obj reported why), left as it was. From the moment it starts changing the file,
@@ -4942,12 +4943,14 @@ memoryOnly:{self.memoryOnly}
 		file = None
 		started = False
 		try:
+			missing = not os.path.isfile(self._fileName)  # under writeLock: this object does not remove it meanwhile
+			whole = whole or missing
 			file = self.get_file_obj('wb' if whole else 'r+b', locked=True, empty=False)
 			if file is None:
 				self.deSynced = True  # tried again later
 				self.writeLock.release()
 				return False
-			if look and self._externalChangeStops(defer):
+			if look and not missing and self._externalChangeStops(defer):  # created just now: nothing to keep
 				self.release_file_obj(file)  # untouched; its time is not noted: the change is reloaded first
 				return None
 			self.dirty = True  # until it is all written, the file does not hold memory: a rewrite that fails is made again

@@ -7747,3 +7747,28 @@ def test_tsvzed_legacy_failed_release_reports_the_real_error(tmp_path, monkeypat
 	assert 'Input/output error' in out, out
 	assert 'closed file' not in out and 'has no attribute' not in out, out
 	assert not t.writeLock.locked()
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+@pytest.mark.parametrize('how', ['mapToFile', 'hardMapToFile', 'rewrite', 'rewrite_on_exit'])
+def test_tsvzed_legacy_rewrite_of_a_removed_file_makes_it_again_from_memory(tmp_path, suffix, how):
+	# mapToFile stopped when get_file_obj('r+b') could not open a file another process removed (main 1688d25 fell
+	# back on hardMapToFile, which made it again); a compressed rewrite looking once the file is locked took the
+	# file it had just created for another process's change.
+	p = str(tmp_path / ('gone.' + suffix))
+	t = _stopped(p, rewrite_on_exit=(how == 'rewrite_on_exit'))
+	_dirty(t)
+	t['b'] = ['b', '1']
+	t.commitAppendToFile()
+	rows = dict(t)
+	os.remove(p)  # rm, a log rotation
+	if how == 'rewrite_on_exit':
+		t.shutdownEvent.clear()  # the background writer is stopped: close() makes its exit rewrite() all the same
+		t.close()
+	elif how == 'rewrite':
+		assert t.rewrite(force=True)
+	else:
+		getattr(t, how)()
+	assert dict(t) == rows
+	assert os.path.exists(p) and _back(p) == rows
+	assert not t._externalChange() and not t.dirty and not t.deSynced
