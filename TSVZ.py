@@ -4201,18 +4201,31 @@ class TSVZed(OrderedDict):
 	def reload(self):
 		if self._spec:
 			return self._specReload()
-		self._reload()
+		self._reload(explicit=True)
 		self._accepted()  # memory is the file again: a refusal met later is reported again
 		return self
 
-	def _reload(self):
-		"""reload() for a legacy file, as rewrite() makes it after another process changed the file."""
+	def _reload(self, explicit=False):
+		"""reload() for a legacy file, as rewrite() makes it after another process changed the file; True when read.
+
+		Not while a rewrite of this object's has left the file damaged (``_damage``, looked at under writeLock: a
+		rewrite in another thread may fail until then): memory holds the only good copy, and the next rewrite
+		makes the file again from it, merging another process's appends (_mergeChange). ``explicit`` (reload()):
+		it is read all the same, as asked, with a warning that memory is replaced by the damaged file.
+		"""
 		# Load or refresh data from the TSV file. It is read into a dict of its own, apart from the live store:
 		# rows set meanwhile by another thread go to memory and the queue as ever (memoryOnly is never
 		# turned on for the read, which stored them in memory only), and are kept below.
-		if self.verbose:
-			self.__teePrintOrNot(f"Loading {self._fileName}")
 		with self.writeLock:
+			if self._damage is not None:
+				if not explicit:
+					return False
+				self.__teePrintOrNot(f"Warning: reload() replaces memory with {self._fileName}, which a rewrite of this "
+									 f"object's left damaged (it failed part way: a full disk, a KeyboardInterrupt, the file "
+									 f"removed); memory held the only good copy of the rows it was writing, and they are "
+									 f"dropped. Without reload(), the next rewrite makes the file again from memory",'warning')
+			if self.verbose:
+				self.__teePrintOrNot(f"Loading {self._fileName}")
 			# The time noted is the one of the content read: taken first, under the lock this object's writes
 			# take, so a change another process makes during or after the read is seen by the next check.
 			seen = getFileUpdateTimeNs(self._fileName)
@@ -4248,7 +4261,7 @@ class TSVZed(OrderedDict):
 			self.__teePrintOrNot(f"TSVZed({self._fileName}) loaded")
 		self.lastUpdateTime = seen
 		self.deSynced = False  # memory is the file again: a change seen before needs no rewrite
-		return self
+		return True
 
 	def _specReload(self):
 		"""Load a spec store into memory (design §4); rows bypass __setitem__ so nothing is re-normalised."""
@@ -4912,13 +4925,14 @@ memoryOnly:{self.memoryOnly}
 			if reloadInternalFromFile is None:
 				reloadInternalFromFile = self.monitor_external_changes
 			# Not while a rewrite of this object's has left the file damaged (_damage): memory holds the only good
-			# copy, and the rewrite below makes the file again from it. Looked at once _externalChange() could take
-			# writeLock: a rewrite under way then clears it once it is all written.
+			# copy, and the rewrite below makes the file again from it. Looked at here once _externalChange() could
+			# take writeLock (a rewrite under way then clears it once it is all written), and again by _reload()
+			# under writeLock: a rewrite in another thread may fail in between.
 			if reloadInternalFromFile and self._externalChange() and self._damage is None:
 				# this will be needed if more than 1 process is accessing the file
 				self.commitAppendToFile()
-				self._reload()
-				self.deSynced = False  # memory is the file again; a refused write below must not keep this set
+				if self._reload():
+					self.deSynced = False  # memory is the file again; a refused write below must not keep this set
 			self._worked('sync')
 			if self.memoryOnly:
 				if self.verbose:
@@ -4947,8 +4961,8 @@ memoryOnly:{self.memoryOnly}
 					# Another process changed the file after the reload above: that change is reloaded too, and the
 					# rewrite made then, not left to a next tick (at close() there is none: rewrite_on_exit was lost).
 					self.commitAppendToFile()
-					self._reload()
-					self.deSynced = False
+					if self._reload():  # not over a file another thread's rewrite damaged meanwhile: it merges it
+						self.deSynced = False
 				if made and self.verbose:
 					self.__teePrintOrNot(f"{len(self)} records rewrote to {self._fileName}")
 			if not self.appendThread.is_alive():

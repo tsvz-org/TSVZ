@@ -8386,3 +8386,50 @@ def test_tsvzed_legacy_background_writer_follows_a_removed_file_it_could_not_mak
 	assert _wait_for(lambda: not t.deSynced and 'ext' in t, 5), (dict(t), t.deSynced, t.dirty, t._damage)
 	t.close()
 	assert dict(t) == {'a': ['a', '1'], 'ext': ['ext', 'B']} and _back(p) == dict(t)
+
+
+def test_tsvzed_legacy_rewrite_never_reloads_a_file_another_thread_damaged_after_it_looked(tmp_path, monkeypatch, capsys):
+	# rewrite() looked at _damage outside writeLock, and _reload() did not look again: a rewrite failing in another
+	# thread between the look and the reload had its damaged file reloaded over memory, the only good copy.
+	p = str(tmp_path / 'race.tsv')
+	t = _stopped(p)
+	rows = _many(t, 5)
+	t.commitAppendToFile()
+	_append_external(p)  # another process's change: rewrite() reloads it
+	real = t.commitAppendToFile
+	state = {'armed': True}
+
+	def committing():  # rewrite() calls it between its look and _reload()
+		if state['armed']:
+			state['armed'] = False
+			_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
+			t.hardMapToFile()  # another thread's rewrite, which fails part way
+			monkeypatch.undo()
+			time.sleep(0.01)  # past the file time it noted (a merge decided by the time: see the next tests)
+			_append_external(p, b'ext2\tC\n')  # and another process appends after it
+		return real()
+
+	t.commitAppendToFile = committing
+	t.checkExternalChanges()  # the tick that sees the change
+	t.rewrite()
+	del t.commitAppendToFile
+	assert not state['armed']
+	# ext was in the file the failed rewrite overwrote (with a warning), never in memory
+	assert dict(t) == dict(rows, ext2=['ext2', 'C']), 'the damaged file was reloaded over memory'
+	assert _back(p) == dict(t) and not t.deSynced and t._damage is None
+
+
+def test_tsvzed_legacy_explicit_reload_of_a_damaged_file_warns_that_memory_is_replaced(tmp_path, monkeypatch, capsys):
+	p = str(tmp_path / 'explicit.tsv')
+	t = _stopped(p)
+	_many(t, 5)
+	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
+	t.hardMapToFile()
+	monkeypatch.undo()
+	capsys.readouterr()
+	t.reload()  # as asked: memory is what the file holds
+	out = capsys.readouterr().out
+	assert 'reload() replaces memory' in out and 'only good copy' in out, out
+	assert dict(t) == {'k0': ['k0', 'v0']} and t._damage is None and not t.deSynced
+	t.reload()
+	assert 'reload() replaces memory' not in capsys.readouterr().out
