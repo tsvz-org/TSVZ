@@ -3714,6 +3714,63 @@ def getListView(tsvzDic,header = [],delimiter = ...):
 			return [header] + values
 
 # create a tsv class that functions like a ordered dictionary but will update the file when modified
+class _TSVZedLoad(OrderedDict):
+	"""What ``TSVZed.reload()`` reads a legacy file into, apart from the live store.
+
+	Its rows are shaped as ``TSVZed.__setitem__`` shapes them in memory only (keys and cells right-stripped,
+	the column count and the defaults applied), with a column count and defaults of its own. ``dirty`` tells
+	that the file holds a key twice.
+	"""
+
+	def __init__(self, owner, columns, defaults):
+		super().__init__()
+		self.owner = owner
+		self.columns = columns
+		self.defaults = defaults
+		self.dirty = False
+
+	def __setitem__(self, key, value):
+		key = str(key).rstrip()
+		if not key:
+			return
+		shaped = self.owner._shapeRow(key, value, self.columns, self.defaults)
+		if shaped is None:
+			return
+		value, columns = shaped
+		if self.columns != 1 and len(value) == 1:
+			OrderedDict.pop(self, key, None)
+			return
+		self.columns = columns
+		if key == DEFAULTS_INDICATOR_KEY:
+			self.defaults[:] = value
+			return
+		old = OrderedDict.get(self, key)
+		if old is not None:
+			if old == value:
+				return
+			self.dirty = True
+		OrderedDict.__setitem__(self, key, value)
+
+	def __contains__(self, key):
+		key = str(key)
+		return OrderedDict.__contains__(self, key) or OrderedDict.__contains__(self, key.rstrip())
+
+	def __delitem__(self, key):
+		key = str(key)
+		OrderedDict.__delitem__(self, key if OrderedDict.__contains__(self, key) else key.rstrip())
+
+	def replay(self, rows):
+		"""Apply rows queued for the file, as reading them back will: a row whose values are all empty deletes."""
+		for row in rows:
+			key = row[0]
+			if key == DEFAULTS_INDICATOR_KEY:
+				self.defaults[:] = row if any(row[1:]) else [DEFAULTS_INDICATOR_KEY]
+			elif any(row[1:]) or (len(row) == 1 and self.columns == 1):
+				self[key] = row
+			else:
+				OrderedDict.pop(self, key, None)
+
+
 class TSVZed(OrderedDict):
 	"""
 	A thread-safe, file-backed ordered dictionary for managing TSV (Tab-Separated Values) files.
@@ -3885,6 +3942,7 @@ class TSVZed(OrderedDict):
 		self.memoryOnly = False
 		self.encoding = encoding
 		self.writeLock = threading.Lock()
+		self._memLock = threading.Lock()  # held while memory and appendQueue change together (a set, a delete, reload's swap)
 		self.shutdownEvent = threading.Event()
 		if self._spec:
 			for flag, given in (('rewrite_on_load', rewrite_on_load), ('rewrite_on_exit', rewrite_on_exit),
@@ -3940,32 +3998,40 @@ class TSVZed(OrderedDict):
 	def reload(self):
 		if self._spec:
 			return self._specReload()
-		# Load or refresh data from the TSV file
-		mo = self.memoryOnly
-		self.memoryOnly = True
+		# Load or refresh data from the TSV file. It is read into a dict of its own, apart from the live store:
+		# rows set meanwhile by another thread go to memory and the queue as ever (memoryOnly is never
+		# turned on for the read, which stored them in memory only), and are kept below.
 		if self.verbose:
 			self.__teePrintOrNot(f"Loading {self._fileName}")
-		super().clear()
-		readTabularFile(self._fileName, teeLogger = self.teeLogger, header = self.header,
-					createIfNotExist = self.createIfNotExist, verifyHeader = self.verifyHeader,
-					verbose = self.verbose, taskDic = self,encoding = self.encoding if self.encoding else None,
-					strict = self.strict, delimiter = self.delimiter, defaults=self.defaults, errors = self.errors)
+		with self.writeLock:
+			loaded = _TSVZedLoad(self, self.correctColumnNum, list(self.defaults))
+			readTabularFile(self._fileName, teeLogger = self.teeLogger, header = self.header,
+						createIfNotExist = self.createIfNotExist, verifyHeader = self.verifyHeader,
+						verbose = self.verbose, taskDic = loaded,encoding = self.encoding if self.encoding else None,
+						strict = self.strict, delimiter = self.delimiter, defaults=loaded.defaults, errors = self.errors)
+			with self._memLock:
+				# No set or delete is half done: each holds _memLock from its change of memory to its queueing.
+				# What is queued is not in the file (appends take writeLock, held here): replayed on what was
+				# read, as reading it once appended will, so memory stays what the file will hold.
+				loaded.replay(list(self.appendQueue))
+				OrderedDict.clear(self)
+				for key, row in loaded.items():
+					OrderedDict.__setitem__(self, key, row)
+				self.defaults = loaded.defaults
+				if loaded.dirty:
+					self.dirty = True  # a key the file holds twice
+				if self.header and any(self.header) and self.verifyHeader:
+					self.correctColumnNum = len(self.header)
+				elif self:
+					self.correctColumnNum = len(self[next(iter(self))])
+				else:
+					self.correctColumnNum = -1
+			self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 		if self.verbose:
 			self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
-		if self.header and any(self.header) and self.verifyHeader:
-			self.correctColumnNum = len(self.header)
-		elif self:
-			self.correctColumnNum = len(self[next(iter(self))])
-		else:
-			self.correctColumnNum = -1
-		if self.verbose:
 			self.__teePrintOrNot(f"correctColumnNum: {self.correctColumnNum}")
-		#super().update(loadedData)
-		if self.verbose:
 			self.__teePrintOrNot(f"TSVZed({self._fileName}) loaded")
-		self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 		self.lastUpdateTime = self.externalFileUpdateTime
-		self.memoryOnly = mo
 		return self
 
 	def _specReload(self):
@@ -4096,40 +4162,15 @@ class TSVZed(OrderedDict):
 		if not key:
 			self.__teePrintOrNot('Key cannot be empty','error')
 			return
-		if isinstance(value,str):
-			value = value.split(self.delimiter)
-		# sanitize the value
-		value = [str(s).rstrip() if s else '' for s in value]
-		# the first field in value should be the key
-		# add it if it is not there
-		if not value or value[0] != key:
-			value = [key]+value
-		# verify the value has the correct number of columns
+		shaped = self._shapeRow(key, value, self.correctColumnNum, self.defaults)
+		if shaped is None:
+			return
+		value, newColumnNum = shaped
 		if self.correctColumnNum != 1 and len(value) == 1:
 			# a lone key (no following values) means delete the key, per the
 			# TSVZ spec. del is a no-op when the key is absent (tolerated).
 			del self[key]
 			return
-		elif self.correctColumnNum > 0:
-			if len(value) != self.correctColumnNum:
-				if self.strict:
-					self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
-					return
-				elif self.verbose:
-					self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}, correcting...",'warning')
-				if len(value) < self.correctColumnNum:
-					value += ['']*(self.correctColumnNum-len(value))
-				elif len(value) > self.correctColumnNum:
-					value = value[:self.correctColumnNum]
-			newColumnNum = None
-		else:
-			newColumnNum = len(value)  # taken once the row is known to be writable
-		if self.defaults and len(self.defaults) > 1:
-			for i in range(1,len(value)):
-				if not value[i] and i < len(self.defaults) and self.defaults[i]:
-					value[i] = self.defaults[i]
-					if self.verbose:
-						self.__teePrintOrNot(f"    Replacing empty value at {i} with default: {self.defaults[i]}")
 		if (len(value) > 1 and not any(value[1:]) and key != DEFAULTS_INDICATOR_KEY
 				and not key.startswith('#') and not self.memoryOnly):
 			# L2: on disk this row is a delete; make memory agree with the file.
@@ -4142,44 +4183,83 @@ class TSVZed(OrderedDict):
 			# What is written is what is checked: the row as cut to the column count and filled with the defaults,
 			# and before memory, the queue or the column count change.
 			self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
-		if newColumnNum is not None:
-			self.correctColumnNum = newColumnNum
+		self.correctColumnNum = newColumnNum
 		if key == DEFAULTS_INDICATOR_KEY:
-			self.defaults = value
-			if self.verbose:
-				self.__teePrintOrNot(f"Defaults set to {value}")
-			if not self.memoryOnly:
-				self.appendQueue.append(value)
-				self.lastUpdateTime = get_time_ns()
+			with self._memLock:
+				self.defaults = value
 				if self.verbose:
-					self.__teePrintOrNot(f"Appending Defaults {key} to the appendQueue")
+					self.__teePrintOrNot(f"Defaults set to {value}")
+				if not self.memoryOnly:
+					self.appendQueue.append(value)
+					self.lastUpdateTime = get_time_ns()
+					if self.verbose:
+						self.__teePrintOrNot(f"Appending Defaults {key} to the appendQueue")
 			return
 		if self.verbose:
 			self.__teePrintOrNot(f"Setting {key} to {value}")
-		if key in self:
-			if self[key] == value:
+		with self._memLock:  # memory and the queue change together: see reload()
+			if key in self:
+				if self[key] == value:
+					if self.verbose:
+						self.__teePrintOrNot(f"Key {key} already exists with the same value")
+					return
+				self.dirty = True
+			# update the dictionary,
+			super().__setitem__(key,value)
+			if self.memoryOnly:
 				if self.verbose:
-					self.__teePrintOrNot(f"Key {key} already exists with the same value")
+					self.__teePrintOrNot(f"Key {key} updated in memory only")
 				return
-			self.dirty = True
-		# update the dictionary, 
-		super().__setitem__(key,value)
-		if self.memoryOnly:
+			elif key.startswith('#'):
+				if self.verbose:
+					self.__teePrintOrNot(f"Key {key} updated in memory only as it starts with #")
+				return
 			if self.verbose:
-				self.__teePrintOrNot(f"Key {key} updated in memory only")
-			return
-		elif key.startswith('#'):
-			if self.verbose:
-				self.__teePrintOrNot(f"Key {key} updated in memory only as it starts with #")
-			return
-		if self.verbose:
-			self.__teePrintOrNot(f"Appending {key} to the appendQueue")
-		self.appendQueue.append(value)
-		self.lastUpdateTime = get_time_ns()
+				self.__teePrintOrNot(f"Appending {key} to the appendQueue")
+			self.appendQueue.append(value)
+			self.lastUpdateTime = get_time_ns()
 		# if not self.appendThread.is_alive():
 		#     self.commitAppendToFile()
 		# else:
 		#     self.appendEvent.set()
+
+	def _shapeRow(self, key, value, columns, defaults):
+		"""The row ``__setitem__`` keeps for ``key`` (stripped, not empty) and the column count after it; None when strict refuses it.
+
+		A row of the key alone, while ``columns`` is not 1, is a delete; it is returned as it is. What reload()
+		reads into shapes its rows with it too, with its own column count and defaults.
+		"""
+		if isinstance(value,str):
+			value = value.split(self.delimiter)
+		# sanitize the value
+		value = [str(s).rstrip() if s else '' for s in value]
+		# the first field in value should be the key
+		# add it if it is not there
+		if not value or value[0] != key:
+			value = [key]+value
+		if columns != 1 and len(value) == 1:
+			return value, columns
+		# verify the value has the correct number of columns
+		if columns > 0:
+			if len(value) != columns:
+				if self.strict:
+					self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {columns}. Refuse adding key...",'error')
+					return None
+				elif self.verbose:
+					self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {columns}, correcting...",'warning')
+				if len(value) < columns:
+					value += ['']*(columns-len(value))
+				elif len(value) > columns:
+					value = value[:columns]
+		else:
+			columns = len(value)  # taken by __setitem__ once the row is known to be writable
+		if defaults and len(defaults) > 1:
+			for i in range(1,len(value)):
+				if not value[i] and i < len(defaults) and defaults[i]:
+					value[i] = defaults[i]
+					if self.verbose:
+						self.__teePrintOrNot(f"    Replacing empty value at {i} with default: {defaults[i]}")
+		return value, columns
 
 	def _nameKey(self, key):
 		"""The key a requested ``key`` names: the live key equal to it, else ``key`` right-stripped (spec §20.2.7).
@@ -4213,29 +4293,31 @@ class TSVZed(OrderedDict):
 			return self._specDelItem(key)
 		key = self._nameKey(key)
 		if key == DEFAULTS_INDICATOR_KEY:
-			self.defaults = [DEFAULTS_INDICATOR_KEY]
-			if self.verbose:
-				self.__teePrintOrNot("Defaults cleared")
-			if not self.memoryOnly:
-				self.__appendEmptyLine(key)
+			with self._memLock:
+				self.defaults = [DEFAULTS_INDICATOR_KEY]
 				if self.verbose:
-					self.__teePrintOrNot(f"Appending empty default line {key}")
+					self.__teePrintOrNot("Defaults cleared")
+				if not self.memoryOnly:
+					self.__appendEmptyLine(key)
+					if self.verbose:
+						self.__teePrintOrNot(f"Appending empty default line {key}")
 			return
 		# delete the key from the dictionary and update the file
-		if key not in self:
+		with self._memLock:  # memory and the queue change together: see reload()
+			if key not in self:
+				if self.verbose:
+					self.__teePrintOrNot(f"Key {key} not found")
+				return
+			self._checkDelete(key)
+			super().__delitem__(key)
+			if self.memoryOnly or key.startswith('#'):
+				if self.verbose:
+					self.__teePrintOrNot(f"Key {key} deleted in memory")
+				return
+			self.__appendEmptyLine(key)
 			if self.verbose:
-				self.__teePrintOrNot(f"Key {key} not found")
-			return
-		self._checkDelete(key)
-		super().__delitem__(key)
-		if self.memoryOnly or key.startswith('#'):
-			if self.verbose:
-				self.__teePrintOrNot(f"Key {key} deleted in memory")
-			return
-		self.__appendEmptyLine(key)
-		if self.verbose:
-			self.__teePrintOrNot(f"Appending empty line {key}")
-		self.lastUpdateTime = get_time_ns()
+				self.__teePrintOrNot(f"Appending empty line {key}")
+			self.lastUpdateTime = get_time_ns()
 		
 	def __appendEmptyLine(self,key):
 		# Append a tombstone line: the key followed by empty values. On read a
@@ -4495,16 +4577,17 @@ memoryOnly:{self.memoryOnly}
 		return self.close()
 
 	def popitem(self, last=True):
-		if not OrderedDict.__len__(self):
-			raise KeyError('dictionary is empty')
 		# Not OrderedDict.popitem: before Python 3.11 it goes through self[key] and del self[key], which strip the key.
-		key = next(OrderedDict.__reversed__(self)) if last else next(OrderedDict.__iter__(self))
-		self._checkDelete(key)
-		value = OrderedDict.__getitem__(self, key)
-		OrderedDict.__delitem__(self, key)
-		if not self.memoryOnly:
-			self.__appendEmptyLine(key)
-		self.lastUpdateTime = get_time_ns()
+		with self._memLock:  # memory and the queue change together: see reload()
+			if not OrderedDict.__len__(self):
+				raise KeyError('dictionary is empty')
+			key = next(OrderedDict.__reversed__(self)) if last else next(OrderedDict.__iter__(self))
+			self._checkDelete(key)
+			value = OrderedDict.__getitem__(self, key)
+			OrderedDict.__delitem__(self, key)
+			if not self.memoryOnly:
+				self.__appendEmptyLine(key)
+			self.lastUpdateTime = get_time_ns()
 		return key, value
 	
 	__marker = object()
@@ -4516,17 +4599,18 @@ memoryOnly:{self.memoryOnly}
 
 		'''
 		key = self._nameKey(key)
-		if not OrderedDict.__contains__(self, key):
-			if default is self.__marker:
-				raise KeyError(key)
-			return default
-		# Not OrderedDict.pop: before Python 3.11 it goes through del self[key], which writes a tombstone too.
-		self._checkDelete(key)
-		value = OrderedDict.__getitem__(self, key)
-		OrderedDict.__delitem__(self, key)
-		if not self.memoryOnly:
-			self.__appendEmptyLine(key)
-		self.lastUpdateTime = get_time_ns()
+		with self._memLock:  # memory and the queue change together: see reload()
+			if not OrderedDict.__contains__(self, key):
+				if default is self.__marker:
+					raise KeyError(key)
+				return default
+			# Not OrderedDict.pop: before Python 3.11 it goes through del self[key], which writes a tombstone too.
+			self._checkDelete(key)
+			value = OrderedDict.__getitem__(self, key)
+			OrderedDict.__delitem__(self, key)
+			if not self.memoryOnly:
+				self.__appendEmptyLine(key)
+			self.lastUpdateTime = get_time_ns()
 		return value
 	
 	def move_to_end(self, key, last=True):

@@ -6733,3 +6733,94 @@ def test_tsvzed_legacy_append_that_cannot_open_the_file_keeps_the_rows_queued(tm
 	assert not t.writeLock.locked() and list(t.appendQueue) == [['b', '1']]
 	t.commitAppendToFile()
 	assert _bytes(p) == b'key\tval\nb\t1\n'
+
+
+def test_tsvzed_legacy_reload_after_an_external_change_keeps_rows_set_since_the_last_append(tmp_path):
+	p = str(tmp_path / 'keep.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	with open(p, 'ab') as g:
+		g.write(b'ext\tB\n')  # so rewrite() reloads
+	real = t.commitAppendToFile
+	state = {'done': False}
+
+	def commit():
+		out = real()
+		if not state['done']:
+			state['done'] = True
+			t['late'] = ['late', '1']  # another thread sets a key between rewrite()'s append and its reload
+			del t['a']
+		return out
+
+	t.commitAppendToFile = commit
+	t.rewrite(force=True)
+	t.commitAppendToFile = real
+	assert dict(t) == {'ext': ['ext', 'B'], 'late': ['late', '1']}
+	t['ext'] = ['ext', 'C']  # dirty
+	t.rewrite(force=True)  # a later rewrite keeps it
+	t.commitAppendToFile()
+	assert dict(TSVZ.readTabularFile(p, header='key\tval')) == {'ext': ['ext', 'C'], 'late': ['late', '1']}
+
+
+def test_tsvzed_legacy_set_during_a_reload_is_written(tmp_path, monkeypatch):
+	import threading
+	p = str(tmp_path / 'during.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	real = TSVZ.readTabularFile
+
+	def reading(*args, **kwargs):
+		setter = threading.Thread(target=lambda: t.__setitem__('during', ['during', '1']))
+		setter.start()  # the main thread sets a key while the background writer reads the file
+		setter.join()
+		return real(*args, **kwargs)
+
+	monkeypatch.setattr(TSVZ, 'readTabularFile', reading)
+	t.reload()
+	monkeypatch.undo()
+	assert not t.memoryOnly and t['during'] == ['during', '1']
+	t.commitAppendToFile()
+	assert b'during\t1' in _bytes(p), 'the set was kept in memory only'
+
+
+_OTHER_WRITER = r'''
+import fcntl, os, sys, time
+path, stop = sys.argv[1], sys.argv[2]
+n = 0
+while not os.path.exists(stop):
+	with open(path, 'ab') as g:
+		fcntl.lockf(g, fcntl.LOCK_EX)
+		g.write(b'ext%d\tB\n' % n)
+		g.flush()
+		fcntl.lockf(g, fcntl.LOCK_UN)
+	n += 1
+	time.sleep(0.003)
+print(n)
+'''
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='uses fcntl')
+def test_tsvzed_legacy_rows_survive_rewrites_and_reloads_for_another_process_stress(tmp_path):
+	# The other writer is a process: lockf locks belong to a process, so a thread of this one would lose its
+	# lock whenever TSVZed closes a descriptor of the file.
+	import subprocess
+	p = str(tmp_path / 'two.tsv')
+	stop = str(tmp_path / 'stop')
+	t = TSVZ.TSVZed(p, header='key\tv', append_check_delay=0.0005, rewrite_interval=0.0001, rewrite_on_load=False)
+	other = subprocess.Popen([sys.executable, '-c', _OTHER_WRITER, p, stop], stdout=subprocess.PIPE)
+	try:
+		time.sleep(0.1)
+		for i in range(2000):
+			t['a%d' % i] = ['a%d' % i, 'A']
+			if i % 5 == 0:
+				t['a0'] = ['a0', str(i)]  # an overwrite keeps it dirty, so rewrites happen
+			if i % 10 == 0:
+				time.sleep(0.0005)
+	finally:
+		_touch(stop)
+		count = int(other.communicate(timeout=30)[0])
+	time.sleep(0.1)
+	t.close()
+	back = TSVZ.readTabularFile(p, header='key\tv')
+	assert count > 10
+	assert [k for k in ('a%d' % i for i in range(2000)) if k not in back] == []
