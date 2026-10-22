@@ -4925,6 +4925,9 @@ memoryOnly:{self.memoryOnly}
 					self.__teePrintOrNot("Memory only mode. Map to file skipped.")
 				return False
 			made = True
+			# A rewrite that left the file damaged (or removed: _damage) leaves dirty and deSynced set with it, so the
+			# file is made again from memory; _damage alone is not looked at: a rewrite in another thread sets it
+			# while it writes, and this one would follow it with a rewrite of its own.
 			if self.dirty:
 				if not force and self._refusalPending():
 					return False  # the last rewrite was refused (text that cannot be written): try again later, not at every tick

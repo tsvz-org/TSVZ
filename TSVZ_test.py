@@ -8334,3 +8334,55 @@ def test_tsvzed_legacy_rewrite_given_up_leaves_no_codec_writer_to_write_when_col
 	assert not seen and 'Exception ignored' not in capfd.readouterr().err, seen
 	assert not t.writeLock.locked() and t.deSynced
 	assert t.rewrite() and _back(p) == dict(t)
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_removed_file_that_cannot_be_made_again_does_not_leave_the_store_stuck(tmp_path, monkeypatch, suffix):
+	# A rewrite of a removed file set _damage before it opened the file, and dirty only once it started writing:
+	# when the open failed, _damage stayed set with dirty False, and rewrite() neither reloaded another process's
+	# file (damaged) nor rewrote (not dirty). The store never followed the file again (50ea158).
+	import errno
+	p = str(tmp_path / ('gone.' + suffix))
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	os.remove(p)  # rm, a log rotation
+
+	def denied(fileName):
+		raise OSError(errno.EACCES, 'Permission denied')
+
+	monkeypatch.setattr(TSVZ, '_openUntruncated', denied)
+	t.hardMapToFile()  # cannot make it again
+	monkeypatch.undo()
+	assert t.deSynced and t.dirty and not os.path.exists(p)
+	with open(p, 'wb') as g:  # another process makes it again, with a row of its own
+		g.write(_compressedAs(suffix, b'key\tval\next\tB\n'))
+	t.checkExternalChanges()  # the next tick
+	t._worked('rewrite')  # its wait after the failure is over
+	t.rewrite()
+	assert dict(t) == {'a': ['a', '1'], 'ext': ['ext', 'B']}
+	assert _back(p) == dict(t) and not t.deSynced and not t.dirty and t._damage is None
+
+
+def test_tsvzed_legacy_background_writer_follows_a_removed_file_it_could_not_make_again(tmp_path, monkeypatch):
+	import errno
+	p = str(tmp_path / 'gonebg.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001, teeLogger=_ErrorLog())
+	t['a'] = ['a', '1']
+	assert _wait_for(lambda: not t.appendQueue and b'a\t1' in _bytes(p))
+	real = TSVZ._openUntruncated
+
+	def denied(fileName):
+		raise OSError(errno.EACCES, 'Permission denied')
+
+	monkeypatch.setattr(TSVZ, '_openUntruncated', denied)
+	os.remove(p)
+	t.clear_file()  # cannot make it again
+	assert t.deSynced and t._failing('rewrite')
+	with open(p, 'wb') as g:  # another process makes it again
+		g.write(b'key\tval\next\tB\n')
+	monkeypatch.setattr(TSVZ, '_openUntruncated', real)
+	t._worked('rewrite')  # its wait after the failure is over
+	assert _wait_for(lambda: not t.deSynced and 'ext' in t, 5), (dict(t), t.deSynced, t.dirty, t._damage)
+	t.close()
+	assert dict(t) == {'a': ['a', '1'], 'ext': ['ext', 'B']} and _back(p) == dict(t)
