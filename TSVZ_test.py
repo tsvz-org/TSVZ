@@ -8221,3 +8221,22 @@ def test_tsvzed_legacy_rewrite_of_a_removed_file_merges_one_another_process_made
 	t.get_file_obj = real
 	assert dict(t) == dict(rows, new=['new', 'N'])
 	assert _back(p) == dict(t) and not t._externalChange()
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+@pytest.mark.parametrize('method', ['clear', 'clear_file', 'hardMapToFile'])
+def test_tsvzed_legacy_rewrite_needs_no_64_mib_buffer(tmp_path, suffix, method):
+	# A whole rewrite wrote through an io.BufferedWriter of 64 MiB, which clear() and clear_file() allocated to
+	# write one header line; it was flushed, never closed, and its buffer dropped in the GC on the failure path.
+	import tracemalloc
+	p = str(tmp_path / ('small.' + suffix))
+	t = _stopped(p)
+	_many(t, 20)
+	tracemalloc.start()
+	try:
+		getattr(t, method)()
+		peak = tracemalloc.get_traced_memory()[1]
+	finally:
+		tracemalloc.stop()
+	assert peak < 4 << 20, peak
+	assert _back(p) == ({} if method != 'hardMapToFile' else dict(t))

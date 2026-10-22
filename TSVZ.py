@@ -239,6 +239,26 @@ def _fsync(fd):
 			raise
 
 
+def _writeLines(file, header, lines, chunk=16 << 20):
+	"""Write ``header`` (None for none) and ``lines`` to ``file``, each with its newline, ``chunk`` bytes at a time.
+
+	Joined here rather than through a buffered writer: nothing is left in a buffer of its own that a failure would
+	drop when it is collected, or that would write into a file already closed; a header alone is one write.
+	"""
+	parts = [] if header is None else [header, b'\n']
+	size = 0 if header is None else len(header) + 1
+	for line in lines:
+		parts.append(line)
+		parts.append(b'\n')
+		size += len(line) + 1
+		if size >= chunk:
+			file.write(b''.join(parts))
+			parts = []
+			size = 0
+	if parts:
+		file.write(b''.join(parts))
+
+
 def _closeUnflushed(f):
 	"""Close the open file ``f`` without writing what its buffer still holds (after a write that failed)."""
 	inner = getattr(f, 'raw', None)  # the descriptor under a buffered file: closing it closes both
@@ -5060,12 +5080,7 @@ memoryOnly:{self.memoryOnly}
 						self._writeInPlace(file, header, lines)
 					else:
 						file = self._emptyLocked(file)
-						buf = io.BufferedWriter(file, buffer_size=64*1024*1024)  # 64MB buffer
-						if header is not None:
-							buf.write(header + b'\n')
-						for line in lines:
-							buf.write(line + b'\n')
-						buf.flush()
+						_writeLines(file, header, lines)
 					failed = False
 			except BaseException:
 				if own:
