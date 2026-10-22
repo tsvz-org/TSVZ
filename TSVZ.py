@@ -570,6 +570,8 @@ def _unencodable(text, error, encoding, where=None):
 		what = '{} (an undecodable byte 0x{:02x}, as os.fsdecode gives)'.format(shown, code - 0xDC00)
 	elif 0xD800 <= code <= 0xDFFF:
 		what = '{} (a lone surrogate)'.format(shown)
+	elif code == 0xFFFD:
+		what = '{} (U+FFFD, what reading puts for a byte it could not decode), which {} cannot encode'.format(shown, name)
 	else:
 		what = '{} (U+{:04X}), which {} cannot encode'.format(shown, code, name)
 	subject = ascii(text)
@@ -580,16 +582,6 @@ def _unencodable(text, error, encoding, where=None):
 
 
 _NEVER_RAISING_HANDLERS = frozenset(('replace', 'ignore', 'xmlcharrefreplace', 'backslashreplace', 'namereplace'))
-
-
-def _fffdHandler(error):
-	"""Codec error handler: U+FFFD, what the readers put for a byte they could not decode, becomes ``?``; anything else is refused."""
-	if isinstance(error, UnicodeEncodeError) and error.object[error.start] == '\ufffd':
-		return '?', error.start + 1
-	raise error
-
-
-codecs.register_error('tsvz-fffd', _fffdHandler)
 
 
 def _checkErrors(errors):
@@ -608,21 +600,11 @@ def _mayRaise(errors):
 	return errors not in _NEVER_RAISING_HANDLERS
 
 
-def _tryEncode(text, encoding, errors):
-	"""``text.encode(encoding, errors)``; under ``errors='strict'`` only U+FFFD (a read replacement) the encoding lacks is written as ``?``."""
-	if errors == 'strict':
-		try:
-			return text.encode(encoding)
-		except UnicodeEncodeError:
-			return text.encode(encoding, 'tsvz-fffd')
-	return text.encode(encoding, errors)
-
-
 def _encodeText(text, encoding='utf8', errors='strict', where=None):
 	"""``text.encode(encoding, errors)``; a failure is a ``TSVZEncodeError`` naming ``where``."""
 	encoding = encoding or 'utf8'
 	try:
-		return _tryEncode(text, encoding, errors)
+		return text.encode(encoding, errors)
 	except UnicodeEncodeError as e:
 		raise _unencodable(text, e, encoding, where) from None
 
@@ -632,7 +614,7 @@ def _encodeRow(cells, delimiter, encoding='utf8', errors='strict', header=None, 
 	encoding = encoding or 'utf8'
 	line = delimiter.join(cells)
 	try:
-		return _tryEncode(line, encoding, errors)
+		return line.encode(encoding, errors)
 	except UnicodeEncodeError as e:
 		char = e.object[e.start]
 		for i, cell in enumerate(cells):
@@ -4067,6 +4049,16 @@ class TSVZed(OrderedDict):
 		if not self.memoryOnly:
 			_checkRow(cells, self.delimiter, self.encoding, self.errors, self.header, what)
 
+	def _checkDelete(self, key):
+		"""Raise ``TSVZEncodeError`` now when the tombstone of ``key`` could not be written, before memory changes.
+
+		A key read from a file under a legacy ``encoding=`` can hold U+FFFD (what reading puts for a byte it
+		could not decode), which that encoding may lack: the store could not name that key again, so the
+		delete is refused, not written as the tombstone of another key.
+		"""
+		if key == DEFAULTS_INDICATOR_KEY or not key.startswith('#'):
+			self._checkWritable([key])
+
 	def __setitem__(self,key,value):
 		if self._spec:
 			return self._specSetItem(key, value)
@@ -4199,6 +4191,7 @@ class TSVZed(OrderedDict):
 			if self.verbose:
 				self.__teePrintOrNot(f"Key {key} not found")
 			return
+		self._checkDelete(key)
 		super().__delitem__(key)
 		if self.memoryOnly or key.startswith('#'):
 			if self.verbose:
@@ -4299,6 +4292,7 @@ class TSVZed(OrderedDict):
 			if self.verbose:
 				self.__teePrintOrNot(f"Key {key} not found")
 			return
+		self._checkDelete(key)
 		OrderedDict.__delitem__(self, key)
 		if self.memoryOnly:
 			return
@@ -4460,15 +4454,13 @@ memoryOnly:{self.memoryOnly}
 		return self.close()
 
 	def popitem(self, last=True):
-		if sys.version_info >= (3, 11):
-			key, value = OrderedDict.popitem(self, last)
-		else:
-			# Before Python 3.11 OrderedDict.popitem goes through self[key] and del self[key], which strip the key.
-			if not OrderedDict.__len__(self):
-				raise KeyError('dictionary is empty')
-			key = next(OrderedDict.__reversed__(self)) if last else next(OrderedDict.__iter__(self))
-			value = OrderedDict.__getitem__(self, key)
-			OrderedDict.__delitem__(self, key)
+		if not OrderedDict.__len__(self):
+			raise KeyError('dictionary is empty')
+		# Not OrderedDict.popitem: before Python 3.11 it goes through self[key] and del self[key], which strip the key.
+		key = next(OrderedDict.__reversed__(self)) if last else next(OrderedDict.__iter__(self))
+		self._checkDelete(key)
+		value = OrderedDict.__getitem__(self, key)
+		OrderedDict.__delitem__(self, key)
 		if not self.memoryOnly:
 			self.__appendEmptyLine(key)
 		self.lastUpdateTime = get_time_ns()
@@ -4488,6 +4480,7 @@ memoryOnly:{self.memoryOnly}
 				raise KeyError(key)
 			return default
 		# Not OrderedDict.pop: before Python 3.11 it goes through del self[key], which writes a tombstone too.
+		self._checkDelete(key)
 		value = OrderedDict.__getitem__(self, key)
 		OrderedDict.__delitem__(self, key)
 		if not self.memoryOnly:

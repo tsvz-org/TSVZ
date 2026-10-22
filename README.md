@@ -198,8 +198,11 @@ writing functions or to `TSVZed`, `TSVZedLite` and `TSVZClient` to get the old `
 is a `ValueError` where it is given). `TSVZed` and `TSVZedLite` refuse a row in
 `__setitem__`, so the background writer never meets one; a refused rewrite leaves
 the file as it is and is reported once. With a non-UTF-8 `encoding=`, U+FFFD (what
-the reader puts for a byte it could not decode) is written as `?`, so a store never
-refuses the text of its own file. The `tsvz` command exits 1 with the message.
+the reader puts for a byte it could not decode) is text that encoding may lack, and it
+is refused like any other: such a store's rewrite is refused (also the one `rewrite_on_load`
+makes, which then leaves the file as it is, without failing), appends of rows that can be
+written still work, the delete or update of a key that holds U+FFFD raises, and
+the rewrite goes through once the row is fixed or removed or the file edited. The `tsvz` command exits 1 with the message.
 
 ## Breaking changes from 3.39
 

@@ -5922,32 +5922,95 @@ def test_tsvzed_legacy_refused_rewrite_is_reported_once_and_retried_when_fixed(t
 	_stop(t)
 
 
-def test_tsvzed_with_a_legacy_encoding_rewrites_what_it_read_from_its_own_file(tmp_path, capsys):
+# A superseded row ('ok' twice) makes the store dirty on load, so rewrite_on_load has something to rewrite.
+LEGACY_KEY_ROW = b'id\tv\nr\xe9sum\xe9\t1\nok\t1\nok\t2\n'  # the first key is not ASCII: it reads as 'r\ufffdsum\ufffd'
+LEGACY_CELL_ROW = b'id\tv\nk\tr\xe9sum\xe9\nok\t1\nok\t2\n'  # so is the value of k
+
+
+def test_tsvzed_with_a_legacy_encoding_leaves_a_file_it_cannot_write_back_as_it_is(tmp_path, capsys):
+	# U+FFFD is what reading puts for an undecodable byte; ASCII lacks it, and writing '?' would lose the
+	# bytes and rename the key: the rewrite (rewrite_on_load is on by default) is refused, nothing is lost.
 	p = str(tmp_path / 'e.tsv')
-	with open(p, 'wb') as f:
-		f.write(b'r\xe9sum\xe9\t1\n')  # not ASCII: read as U+FFFD, which ASCII lacks
-	t = TSVZ.TSVZed(p, encoding='ascii', append_check_delay=0.01)
-	t.hardMapToFile()
-	t.close()
+	_touch(p, LEGACY_KEY_ROW)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.01)
 	out = capsys.readouterr().out
-	assert 'cannot write' not in out and 'Refused' not in out
-	assert b'r?sum?\t1\n' in _bytes(p)
-	t = TSVZ.TSVZed(p, encoding='ascii', append_check_delay=0.01, rewrite_on_load=False)
-	with pytest.raises(ValueError):  # text the caller passes in is still checked
-		t['k'] = ['k', '\u00e9']
+	assert out.count('Refused at') == 1 and 'U+FFFD' in out and 'ASCII' in out and 'Traceback' not in out, out
+	assert _bytes(p) == LEGACY_KEY_ROW
+	assert t['r�sum�'] == ['r�sum�', '1'] and t['ok'] == ['ok', '2']
+	t.rewrite(force=True)
+	t.hardMapToFile()
+	t.mapToFile()
+	assert capsys.readouterr().out.count('Refused at') == 0  # reported once, not at every try
+	assert _bytes(p) == LEGACY_KEY_ROW
+	t['new'] = ['new', '3']  # a row that can be written is appended as ever
+	assert _wait_for(lambda: _bytes(p) == LEGACY_KEY_ROW + b'new\t3\n')
 	t.close()
+	assert _bytes(p) == LEGACY_KEY_ROW + b'new\t3\n'
+	assert 'Refused' not in capsys.readouterr().out
 
 
-def test_scrub_with_a_legacy_encoding_keeps_a_row_it_read(tmp_path):
-	p = str(tmp_path / 's.tsv')
-	with open(p, 'wb') as f:
-		f.write(b'k\t\x81\n')  # 0x81 is undefined in cp1252
-	TSVZ.scrubTabularFile(p, encoding='cp1252')
-	assert b'k\t?\n' in _bytes(p)
-	before = _bytes(p)
+@pytest.mark.parametrize('how', ['fix', 'remove'])
+def test_tsvzed_with_a_legacy_encoding_writes_the_rest_once_the_bad_row_is_fixed_or_removed(tmp_path, capsys, how):
+	p = str(tmp_path / (how + '.tsv'))
+	_touch(p, LEGACY_CELL_ROW)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.005, rewrite_interval=0.05)
+	assert 'Refused at' in capsys.readouterr().out and _bytes(p) == LEGACY_CELL_ROW
+	time.sleep(0.3)
+	assert _bytes(p) == LEGACY_CELL_ROW and 'Refused' not in capsys.readouterr().out
+	if how == 'fix':
+		t['k'] = ['k', 'fixed']
+	else:
+		del t['k']
+	expected = b'id\tv\nk\tfixed\nok\t2\n' if how == 'fix' else b'id\tv\nok\t2\n'
+	rows = lambda: b'\n'.join(line.rstrip() for line in _bytes(p).split(b'\n'))  # an in-place rewrite pads a shorter line
+	assert _wait_for(lambda: rows() == expected, 4), _bytes(p)
+	_stop(t)
+
+
+@pytest.mark.parametrize('how', ['delete', 'update', 'pop', 'popitem', 'lone key'])
+def test_tsvzed_with_a_legacy_encoding_refuses_to_name_a_key_it_read_as_u_fffd(tmp_path, how):
+	# The tombstone or update of 'r�' would be written as 'r?', a key nobody can name again.
+	p = str(tmp_path / 'n.tsv')
+	original = b'id\tv\nok\t2\nr\xe9\t1\n'
+	_touch(p, original)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.01, rewrite_on_load=False)
+	key = 'r�'
+	with pytest.raises(ValueError) as e:
+		if how == 'delete':
+			del t[key]
+		elif how == 'update':
+			t[key] = [key, '9']
+		elif how == 'pop':
+			t.pop(key)
+		elif how == 'popitem':
+			t.popitem()
+		else:
+			t[key] = key
+	assert isinstance(e.value, TSVZ.TSVZEncodeError)
+	assert 'U+FFFD' in str(e.value) and 'ASCII' in str(e.value), e.value
+	assert t[key] == [key, '1'] and list(t) == ['ok', key]
+	time.sleep(0.1)
+	assert _bytes(p) == original
+	t.close()
+	assert _bytes(p) == original
+
+
+def test_a_legacy_encoding_refuses_a_u_fffd_the_caller_gives(tmp_path):
+	p = str(tmp_path / 'c.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='cp1252', append_check_delay=0.01)
+	with pytest.raises(ValueError) as e:
+		t['k'] = ['k', 'a�b']
+	assert 'U+FFFD' in str(e.value) and 'CP1252' in str(e.value)
+	assert 'k' not in t
 	with pytest.raises(ValueError):
-		TSVZ.scrubTabularFile(p, encoding='cp1252', taskDic={'z': ['z', '\u4e2d']})
-	assert _bytes(p) == before
+		TSVZ.appendTabularFile(p, ['k', 'a�b'], encoding='cp1252')
+	t.close()
+	assert _bytes(p) == b'id\tv\n'
+	u = str(tmp_path / 'u.tsv')
+	t = TSVZ.TSVZed(u, header='id\tv', append_check_delay=0.01)  # UTF-8 can write it
+	t['k'] = ['k', 'a�b']
+	t.close()
+	assert b'a\xef\xbf\xbdb' in _bytes(u)
 
 
 @pytest.mark.parametrize('bad', ['Replace', None, 3, 'nonesuch'])
