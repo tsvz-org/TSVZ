@@ -7692,8 +7692,9 @@ print(json.dumps(result))
 """
 
 
-def _full_tmpfs(tmp_path, *args):
-	"""Run _FULL_TMPFS_SCRIPT with ``args`` on a 1 MiB tmpfs of its own, in a private mount namespace (root on Linux)."""
+def _full_tmpfs(tmp_path, *args, **kwargs):
+	"""Run _FULL_TMPFS_SCRIPT (or ``script``) with ``args`` on a 1 MiB tmpfs of its own, in a private mount namespace
+	(root on Linux)."""
 	import json
 	import shutil
 	import subprocess
@@ -7702,7 +7703,7 @@ def _full_tmpfs(tmp_path, *args):
 	mnt = tmp_path / 'mnt'
 	mnt.mkdir()
 	script = tmp_path / 'full.py'
-	script.write_text(_FULL_TMPFS_SCRIPT)
+	script.write_text(kwargs.get('script', _FULL_TMPFS_SCRIPT))
 	command = 'mount -t tmpfs -o size=1m tmpfs "$1" || exit 77; shift; exec "$@"'
 	proc = subprocess.run(['unshare', '-m', 'sh', '-c', command, 'sh', str(mnt), sys.executable, str(script),
 						   os.path.dirname(os.path.abspath(TSVZ.__file__))] + list(args) + [str(mnt)],
@@ -8598,3 +8599,119 @@ def test_tsvzed_legacy_background_writer_does_not_append_to_a_file_its_rewrite_e
 	expected = dict((('k%d' % i, ['k%d' % i, 'v']) for i in range(1, 5)), k0=['k0', 'w'], mine=['mine', 'M'], new=['new', 'N'])
 	assert dict(t) == expected and _back(p) == expected
 	assert 'Overwriting external changes' not in capsys.readouterr().out
+
+
+class _QuotaFileIO(io.FileIO):
+	"""A file on a disk with room for ``room`` more bytes, as the kernel has it: a write takes what fits (a short
+	write) and the next one fails with ENOSPC. What reached the disk is exactly the first bytes written."""
+
+	def __init__(self, path, room):
+		io.FileIO.__init__(self, os.open(path, os.O_RDWR | os.O_CREAT, 0o666), 'r+', closefd=True)
+		self.room = room
+
+	def write(self, data):
+		import errno
+		if not self.room:
+			raise OSError(errno.ENOSPC, 'No space left on device')
+		data = bytes(data)[:self.room]
+		self.room -= len(data)
+		return io.FileIO.write(self, data)
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES[1:])
+@pytest.mark.parametrize('room', [10, 100, 5000, 20000])
+def test_tsvzed_legacy_compressed_rewrite_cut_short_mid_stream_then_appended_to_is_merged(tmp_path, monkeypatch, suffix, room):
+	# What an interrupted or full-disk compressed rewrite really leaves is a member cut short: its header and part of
+	# its stream, no end. The damage noted is exactly those bytes, so what another process appends after them (a
+	# whole member of its own) is the tail the merge decodes, from its first byte: a clean member sequence, which
+	# decodes whole, although the file read from its start stops at the cut. (The stub of _failing_rewrite writes
+	# raw bytes as the partial; this is the codec's own writer cut short by the disk.)
+	import random
+	p = str(tmp_path / ('cut.' + suffix))
+	codec = suffix.rpartition('.')[2]
+	t = _stopped(p)
+	rng = random.Random(1)
+	for i in range(3000):
+		t['k%d' % i] = ['k%d' % i, '%x' % rng.getrandbits(64)]
+	t.commitAppendToFile()
+	t['k1'] = ['k1', 'upd']
+	t.commitAppendToFile()
+	rows = dict(t)
+	monkeypatch.setattr(TSVZ, '_openUntruncated', lambda fileName: io.BufferedRandom(_QuotaFileIO(fileName, room)))
+	t.hardMapToFile()
+	monkeypatch.undo()
+	assert t.deSynced and dict(t) == rows
+	cut = _bytes(p)
+	assert len(cut) == room and t._damage == (room, __import__('hashlib').sha256(cut).digest())
+	member = TSVZ._compressBytes(codec, b'ext\tB\nk2\t\n')
+	_append_external(p, member)  # space is back: another process appends a member
+	whole = _bytes(p)
+	assert whole[room:] == member  # the tail the merge decodes starts at the member's first byte
+	text, error = TSVZ._decompressedUpToDamage(codec, whole)
+	assert error is not None and b'ext\tB' not in text  # read from the start, the file stops at the cut
+	assert TSVZ._decompressedUpToDamage(codec, whole[room:]) == (b'ext\tB\nk2\t\n', None)
+	assert t.rewrite()
+	expected = dict(rows, ext=['ext', 'B'])
+	del expected['k2']
+	assert dict(t) == expected and _back(p) == expected and not t.deSynced
+
+
+_CUT_TMPFS_SCRIPT = r"""
+import hashlib, json, os, random, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+suffix, d = sys.argv[2], sys.argv[3]
+codec = suffix.rpartition('.')[2]
+p = os.path.join(d, 'store.' + suffix)
+filler = os.path.join(d, 'filler')
+t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001, verbose=False)
+t.shutdownEvent.set()
+t.appendThread.join()
+rng = random.Random(1)
+for i in range(3000):
+	t['k%d' % i] = ['k%d' % i, '%x' % rng.getrandbits(64)]
+t.commitAppendToFile()
+t['k1'] = ['k1', 'upd']
+t.commitAppendToFile()
+rows = dict(t)
+real = TSVZ._codecWriter
+
+def filling(*args, **kwargs):  # once the rewrite emptied the file, another writer fills the disk but for 3 pages
+	with open(filler, 'wb', buffering=0) as f:  # unbuffered: nothing is left for its close to fail on
+		try:
+			while True:
+				f.write(b'\0' * 4096)
+		except OSError:
+			pass
+	os.truncate(filler, os.path.getsize(filler) - 3 * 4096)
+	return real(*args, **kwargs)
+
+TSVZ._codecWriter = filling
+t.hardMapToFile()  # runs out of room mid-stream
+TSVZ._codecWriter = real
+os.remove(filler)
+cut = open(p, 'rb').read()
+result = {'deSynced': t.deSynced, 'cut': len(cut), 'damage': list(t._damage[:1]) + [t._damage[1] == hashlib.sha256(cut).digest()]}
+member = TSVZ._compressBytes(codec, b'ext\tB\nk2\t\n')
+with open(p, 'ab') as g:
+	g.write(member)
+whole = open(p, 'rb').read()
+result['head'] = cut[:6].hex()
+result['tail'] = whole[len(cut):len(cut) + 6].hex()
+result['wholeStops'] = TSVZ._decompressedUpToDamage(codec, whole)[1] is not None
+result['rewrite'] = t.rewrite()
+expected = dict(rows, ext=['ext', 'B'])
+del expected['k2']
+result['memory'] = dict(t) == expected
+result['file'] = TSVZ.readTabularFile(p, header='key\tval', verbose=False) == expected
+print(json.dumps(result))
+"""
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES[1:])
+def test_tsvzed_legacy_compressed_rewrite_cut_short_by_a_really_full_disk_then_appended_to_is_merged(tmp_path, suffix):
+	result = _full_tmpfs(tmp_path, suffix, script=_CUT_TMPFS_SCRIPT)
+	print(result)
+	assert result['deSynced'] and 0 < result['cut'] and result['damage'] == [result['cut'], True], result
+	assert result['wholeStops'], result  # read from its start, the file stops at the cut
+	assert result == dict(result, rewrite=True, memory=True, file=True), result
