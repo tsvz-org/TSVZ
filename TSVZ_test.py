@@ -6824,6 +6824,7 @@ def test_tsvzed_legacy_rows_survive_rewrites_and_reloads_for_another_process_str
 	back = TSVZ.readTabularFile(p, header='key\tv')
 	assert count > 10
 	assert [k for k in ('a%d' % i for i in range(2000)) if k not in back] == []
+	assert [k for k in ('ext%d' % j for j in range(count)) if k not in back] == []
 
 
 def test_tsvzed_legacy_change_right_after_a_rewrite_is_not_taken_for_seen(tmp_path):
@@ -7001,3 +7002,61 @@ def test_tsvzed_legacy_own_writes_never_make_the_writer_rewrite_stress(tmp_path,
 	time.sleep(0.05)
 	t.close()
 	assert calls == [] and 'External changes detected' not in capsys.readouterr().out
+
+
+def _append_external(p, line=b'ext\tB\n'):
+	with open(p, 'ab') as g:
+		g.write(line)
+
+
+def test_tsvzed_legacy_append_notes_the_time_before_it_unlocks_the_file(tmp_path, monkeypatch):
+	p = str(tmp_path / 'unlock.tsv')
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	real = TSVZ._unlockFile
+
+	def unlocking(f):
+		real(f)
+		_append_external(p)  # another writer was waiting for the lock: it appends as soon as it is let go
+
+	monkeypatch.setattr(TSVZ, '_unlockFile', unlocking)
+	t.commitAppendToFile()
+	monkeypatch.undo()
+	assert t._externalChange(), "the other writer's append was taken for this one's"
+
+
+@pytest.mark.parametrize('how', ['append', 'rewrite'])
+def test_tsvzed_legacy_write_looks_for_external_changes_once_the_file_is_locked(tmp_path, monkeypatch, how):
+	p = str(tmp_path / 'lock.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	t['b'] = ['b', '1']
+	real = TSVZ._lockFile
+	state = {'done': False}
+
+	def locking(f):
+		if not state['done']:
+			state['done'] = True
+			_append_external(p)  # another writer held the lock and appends just before it is granted here
+		real(f)
+
+	monkeypatch.setattr(TSVZ, '_lockFile', locking)
+	if how == 'append':
+		t.commitAppendToFile()
+		monkeypatch.undo()
+		assert t._externalChange()
+	else:
+		t._mapToFile(defer=True)  # the rewrite rewrite() makes
+		monkeypatch.undo()
+		assert b'ext\tB' in _bytes(p) and t.deSynced and t._externalChange()
+	t.rewrite(force=True)
+	assert t['ext'] == ['ext', 'B'] and b'ext\tB' in _bytes(p)
+
+
+def test_tsvzed_legacy_deferred_rewrite_leaves_the_change_unseen(tmp_path):
+	p = str(tmp_path / 'defer.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	_append_external(p)
+	t._mapToFile(defer=True)
+	assert t.deSynced and t._externalChange() and b'ext\tB' in _bytes(p)

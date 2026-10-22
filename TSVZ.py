@@ -4747,13 +4747,23 @@ memoryOnly:{self.memoryOnly}
 		self._refusedAt = None
 		self._refusalReported = False
 
-	def _snapshotForRewrite(self, defer=False):
-		"""Lock the file, then copy what a rewrite writes and check that all of it can be written; return the copy.
+	def _externalChangeStops(self, defer):
+		"""True when the rewrite about to start must not: another process changed the file since this object read it.
 
-		First, under the lock, it looks for a change another process made that this object has not read: with
-		``defer`` (a rewrite() that reloads such changes) it returns None, with writeLock let go and ``deSynced``
-		set, so the change is reloaded before the next try instead of erased; else the rewrite overwrites it,
-		with a warning.
+		Called under writeLock, once the file is locked where it can be. With ``defer`` (a rewrite() that reloads
+		such changes) it sets ``deSynced``, so the change is reloaded before the next try instead of erased; else
+		the rewrite overwrites it, with a warning.
+		"""
+		if self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
+			if defer:
+				self.deSynced = True
+				self._keepFileTime = True  # letting go of the file must not mark the change seen
+				return True
+			self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
+		return False
+
+	def _snapshotForRewrite(self):
+		"""Lock the file, then copy what a rewrite writes and check that all of it can be written; return the copy.
 
 		The caller holds ``writeLock`` when this returns, and must open the file with
 		``get_file_obj(..., locked=True)``. The copy is taken under the lock, so the
@@ -4766,12 +4776,6 @@ memoryOnly:{self.memoryOnly}
 		"""
 		self.writeLock.acquire()
 		try:
-			if self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
-				if defer:
-					self.deSynced = True
-					self.writeLock.release()
-					return None
-				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
 			delimiter = self.delimiter
 			header = _sanitize(list(self.header),delimiter=delimiter) if self.header else None
 			defaults = _sanitize(list(self.defaults),delimiter=delimiter) if self.defaults and len(self.defaults) > 1 else None
@@ -4802,6 +4806,7 @@ memoryOnly:{self.memoryOnly}
 		if file is not None:
 			self.release_file_obj(file)  # lets go of writeLock too
 		else:
+			self._keepFileTime = False
 			self.writeLock.release()
 
 	def hardMapToFile(self):
@@ -4815,11 +4820,13 @@ memoryOnly:{self.memoryOnly}
 	def _hardMapToFile(self, defer=False):
 		"""hardMapToFile(); ``defer``: see _snapshotForRewrite."""
 		try:
-			snapshot = self._snapshotForRewrite(defer)  # checked, and the lock held: opening the file for writing empties it
-			if snapshot is None:
-				return self  # another process changed the file: reloaded first
+			snapshot = self._snapshotForRewrite()  # checked, and the lock held: opening the file for writing empties it
 			file = None
 			try:
+				# Opening it empties it, so this looks before the file is locked: a change another writer makes
+				# in between is lost (mapToFile, which rewrite() uses for a file that is not compressed, looks after).
+				if self._externalChangeStops(defer):
+					return self  # reloaded first
 				file = self.get_file_obj('wb',locked=True)
 				if file is None:
 					self.deSynced = True  # get_file_obj reported why; tried again later
@@ -4867,15 +4874,15 @@ memoryOnly:{self.memoryOnly}
 			if _isCompressedFile(self._fileName):
 				# if the file is compressed, we need to use the hardMapToFile method
 				return self._hardMapToFile(defer)
-			snapshot = self._snapshotForRewrite(defer)  # checked, and the lock held
-			if snapshot is None:
-				return self  # another process changed the file: reloaded first
+			snapshot = self._snapshotForRewrite()  # checked, and the lock held
 			file = None
 			try:
 				file = self.get_file_obj('r+b',locked=True)
 				if file is None:
 					self.deSynced = True  # get_file_obj reported why; the file is untouched, tried again later
 					return self
+				if self._externalChangeStops(defer):
+					return self  # reloaded first
 				overWrite = False
 				if snapshot[0] is not None:
 					line = file.readline().decode(self.encoding,errors='replace')
@@ -5059,9 +5066,6 @@ memoryOnly:{self.memoryOnly}
 			self.writeLock.acquire()
 		file = None
 		try:
-			# An append that finds another process's change not yet seen must not mark it seen (release_file_obj
-			# notes the time after it): the next check still reloads it. A rewrite replaces the file, so it does.
-			self._keepFileTime = modes in ('ab', 'a+b') and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName)
 			if not self.encoding:
 				self.encoding = 'utf8'
 			file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding,teeLogger=self.teeLogger)
@@ -5073,6 +5077,10 @@ memoryOnly:{self.memoryOnly}
 				#lock_length = max(1, os.path.getsize(self._fileName))
 				lock_length = 2147483647
 				msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, lock_length)
+			# An append that finds another process's change not yet seen must not mark it seen (release_file_obj
+			# notes the time after it): the next check still reloads it. A rewrite replaces the file, so it does.
+			# Looked at once the file is locked: another writer may append until then.
+			self._keepFileTime = modes in ('ab', 'a+b') and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName)
 			if self.verbose:
 				self.__teePrintOrNot(f"File {self._fileName} locked with mode {modes}")
 			return file
@@ -5096,10 +5104,16 @@ memoryOnly:{self.memoryOnly}
 			return
 		if file is None:
 			return
+		noted = False
 		try:
 			file.flush()  # Ensure the file is flushed before unlocking
 			os.fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
 			if not file.closed:
+				if not self._keepFileTime and not _isCompressedFile(self._fileName):
+					# Noted while the file is still locked: another writer appending right after the unlock
+					# must not have its change taken for this one's (a compressed file is complete only once closed).
+					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
+					noted = True
 				if os.name == 'posix':
 					_unlockFile(file)
 				elif os.name == 'nt':
@@ -5123,7 +5137,7 @@ memoryOnly:{self.memoryOnly}
 			self.__teePrintOrNot(traceback.format_exc(),'error')
 		# release the write lock if not already released
 		if self.writeLock.locked():
-			if not self._keepFileTime:
+			if not self._keepFileTime and not noted:
 				self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # before the lock is let go: see _externalChange()
 			self._keepFileTime = False
 			try:
