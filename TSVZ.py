@@ -5605,7 +5605,14 @@ class TSVZedLite(MutableMapping):
 
 	def popitem(self, last=True,return_pos = False):
 		if self.indexes:
-			self._checkDelete(next(reversed(self.indexes)) if last else next(iter(self.indexes)))
+			if last:
+				try:
+					first = next(reversed(self.indexes))
+				except TypeError:  # a dict is not reversible before Python 3.8
+					first = list(self.indexes)[-1]
+			else:
+				first = next(iter(self.indexes))
+			self._checkDelete(first)
 		if last:
 			key, pos = self.indexes.popitem()
 		else:
