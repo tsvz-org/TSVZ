@@ -7910,6 +7910,9 @@ def test_tsvzed_legacy_failed_rewrite_and_its_fallback_count_as_one_try(tmp_path
 def _interrupt_at(n, call, where=None):
 	"""Call ``call()``, raising KeyboardInterrupt at the ``n``-th line TSVZ.py runs in it; True when it got there.
 
+	``_interrupt_at.fds`` is then how many descriptors were open while the KeyboardInterrupt was being handled (its
+	traceback holding every frame): what a close() in the program's ``except KeyboardInterrupt`` meets.
+
 	``where``: count only the lines of that TSVZ.py function and of what it calls (the first time it runs). Two kinds
 	of line are skipped, where the tracer runs but CPython handles no signal: a ``try:`` line, before the try is set
 	up (3.6 makes the opcode before SETUP_FINALLY uninterruptible; from 3.11 on it is a NOP), and a ``with`` line,
@@ -7942,9 +7945,12 @@ def _interrupt_at(n, call, where=None):
 		return local if state['armed'] > 0 or where is not None else None
 
 	sys.settrace(tracer)
+	_interrupt_at.fds = None
 	try:
 		call()
 	except KeyboardInterrupt:
+		sys.settrace(None)
+		_interrupt_at.fds = _open_fds()
 		if not state['hit']:
 			raise
 	finally:
@@ -7958,6 +7964,7 @@ def _lets_go(t, fds):
 	import threading
 	assert not t.writeLock.locked(), 'writeLock is still held: close(), atexit and __del__ would hang'
 	assert _open_fds() == fds, 'the file was left open (and locked: the next rewrite waits for it)'
+	assert _interrupt_at.fds in (None, fds), 'the file was left open for as long as the KeyboardInterrupt was handled'
 	done = []
 	th = threading.Thread(target=lambda: done.append(t.rewrite(force=True)), daemon=True)
 	th.start()
@@ -7965,6 +7972,7 @@ def _lets_go(t, fds):
 	assert done, 'the next rewrite() waits for a lock left held'
 
 
+@pytest.mark.filterwarnings('ignore::pytest.PytestUnraisableExceptionWarning')  # a codec writer a Ctrl-C left unclosed
 @pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='counts open descriptors in /proc')
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 @pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile', 'clear_file', 'clear', 'defer'])
@@ -8013,6 +8021,7 @@ def test_tsvzed_legacy_rewrite_interrupted_at_any_line_lets_go_and_loses_nothing
 	assert n > 20, n  # it did get through all of it
 
 
+@pytest.mark.filterwarnings('ignore::pytest.PytestUnraisableExceptionWarning')  # a codec writer a Ctrl-C left unclosed
 @pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='counts open descriptors in /proc')
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2'])
 @pytest.mark.parametrize('first', ['none', 'fsync', 'write', 'defer'])
@@ -8051,7 +8060,7 @@ def test_tsvzed_legacy_rewrite_interrupted_again_in_its_release_lets_go_and_lose
 			try:
 				t._hardMapToFile(defer=True)
 			except KeyboardInterrupt:
-				pass  # the first one, or the second
+				_interrupt_at.fds = _open_fds()  # the first one, or the second
 		hit = _interrupt_at(m, call, where='_releaseRewrite')
 		monkeypatch.undo()
 		t._snapshotForRewrite = real
