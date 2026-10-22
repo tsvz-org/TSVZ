@@ -4004,11 +4004,16 @@ class TSVZed(OrderedDict):
 		if self.verbose:
 			self.__teePrintOrNot(f"Loading {self._fileName}")
 		with self.writeLock:
+			# The time noted is the one of the content read: taken first, under the lock this object's writes
+			# take, so a change another process makes during or after the read is seen by the next check.
+			seen = getFileUpdateTimeNs(self._fileName)
 			loaded = _TSVZedLoad(self, self.correctColumnNum, list(self.defaults))
 			readTabularFile(self._fileName, teeLogger = self.teeLogger, header = self.header,
 						createIfNotExist = self.createIfNotExist, verifyHeader = self.verifyHeader,
 						verbose = self.verbose, taskDic = loaded,encoding = self.encoding if self.encoding else None,
 						strict = self.strict, delimiter = self.delimiter, defaults=loaded.defaults, errors = self.errors)
+			if not seen:
+				seen = getFileUpdateTimeNs(self._fileName)  # the read created it
 			with self._memLock:
 				# No set or delete is half done: each holds _memLock from its change of memory to its queueing.
 				# What is queued is not in the file (appends take writeLock, held here): replayed on what was
@@ -4026,12 +4031,12 @@ class TSVZed(OrderedDict):
 					self.correctColumnNum = len(self[next(iter(self))])
 				else:
 					self.correctColumnNum = -1
-			self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
+			self.externalFileUpdateTime = seen
 		if self.verbose:
 			self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
 			self.__teePrintOrNot(f"correctColumnNum: {self.correctColumnNum}")
 			self.__teePrintOrNot(f"TSVZed({self._fileName}) loaded")
-		self.lastUpdateTime = self.externalFileUpdateTime
+		self.lastUpdateTime = seen
 		return self
 
 	def _specReload(self):
@@ -4720,6 +4725,7 @@ memoryOnly:{self.memoryOnly}
 		with self.writeLock:
 			return self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName)
 
+	_keepFileTime = False  # set by get_file_obj: the file changed under an append, which must not note the new time
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
 
@@ -4913,7 +4919,6 @@ memoryOnly:{self.memoryOnly}
 			self.deSynced = True
 			self.__teePrintOrNot("Trying failback hardMapToFile()")
 			self.hardMapToFile()
-		self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 		return self
 	
 	def checkExternalChanges(self):
@@ -5030,6 +5035,9 @@ memoryOnly:{self.memoryOnly}
 			self.writeLock.acquire()
 		file = None
 		try:
+			# An append that finds another process's change not yet seen must not mark it seen (release_file_obj
+			# notes the time after it): the next check still reloads it. A rewrite replaces the file, so it does.
+			self._keepFileTime = modes in ('ab', 'a+b') and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName)
 			if not self.encoding:
 				self.encoding = 'utf8'
 			file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding,teeLogger=self.teeLogger)
@@ -5091,7 +5099,9 @@ memoryOnly:{self.memoryOnly}
 			self.__teePrintOrNot(traceback.format_exc(),'error')
 		# release the write lock if not already released
 		if self.writeLock.locked():
-			self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # before the lock is let go: see _externalChange()
+			if not self._keepFileTime:
+				self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # before the lock is let go: see _externalChange()
+			self._keepFileTime = False
 			try:
 				self.writeLock.release()  # Ensure the thread lock is always released
 			except Exception as e:

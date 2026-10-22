@@ -6824,3 +6824,61 @@ def test_tsvzed_legacy_rows_survive_rewrites_and_reloads_for_another_process_str
 	back = TSVZ.readTabularFile(p, header='key\tv')
 	assert count > 10
 	assert [k for k in ('a%d' % i for i in range(2000)) if k not in back] == []
+
+
+def test_tsvzed_legacy_change_right_after_a_rewrite_is_not_taken_for_seen(tmp_path):
+	# mapToFile noted the file's time again after release_file_obj let go of the lock: a change another
+	# process made in between was never reloaded, and the next rewrite erased it.
+	p = str(tmp_path / 'mask.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	real = t.release_file_obj
+
+	def release(f):
+		real(f)
+		with open(p, 'ab') as g:  # another process appends right after the rewrite let go of the lock
+			g.write(b'ext\tB\n')
+
+	t.release_file_obj = release
+	t.mapToFile()
+	t.release_file_obj = real
+	assert t._externalChange()
+	t['a'] = ['a', '3']
+	t.rewrite(force=True)  # reloads the change first
+	assert t['ext'] == ['ext', 'B'] and b'ext\tB' in _bytes(p)
+
+
+def test_tsvzed_legacy_reload_notes_the_time_of_what_it_read(tmp_path, monkeypatch):
+	p = str(tmp_path / 'r.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	real = TSVZ.readTabularFile
+
+	def reading(*args, **kwargs):
+		out = real(*args, **kwargs)
+		with open(p, 'ab') as g:  # another process appends once the read is done
+			g.write(b'ext\tB\n')
+		return out
+
+	monkeypatch.setattr(TSVZ, 'readTabularFile', reading)
+	t.reload()
+	monkeypatch.undo()
+	assert 'ext' not in t and t._externalChange()  # not read, so not seen
+	t.rewrite(force=True)
+	assert t['ext'] == ['ext', 'B'] and b'ext\tB' in _bytes(p)
+
+
+def test_tsvzed_legacy_append_does_not_mark_an_earlier_external_change_seen(tmp_path):
+	p = str(tmp_path / 'ap.tsv')
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	assert not t._externalChange()
+	with open(p, 'ab') as g:  # another process appends before this object's next append
+		g.write(b'ext\tB\n')
+	t['b'] = ['b', '1']
+	t.commitAppendToFile()
+	assert t._externalChange()  # still to be reloaded
+	t['a'] = ['a', '2']
+	t.rewrite(force=True)
+	assert _bytes(p) == b'key\tval\na\t2\next\tB\nb\t1\n'
