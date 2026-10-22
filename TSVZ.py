@@ -4699,7 +4699,7 @@ memoryOnly:{self.memoryOnly}
 					return False  # the last rewrite was refused (text that cannot be written): try again later, not at every tick
 				if self.verbose:
 					self.__teePrintOrNot(f"Rewriting {self._fileName}")
-				self.mapToFile()
+				self._mapToFile(defer=reloadInternalFromFile)  # a change made since the reload is reloaded first
 				if self.verbose:
 					self.__teePrintOrNot(f"{len(self)} records rewrote to {self._fileName}")
 			if not self.appendThread.is_alive():
@@ -4746,8 +4746,13 @@ memoryOnly:{self.memoryOnly}
 		self._refusedAt = None
 		self._refusalReported = False
 
-	def _snapshotForRewrite(self):
+	def _snapshotForRewrite(self, defer=False):
 		"""Lock the file, then copy what a rewrite writes and check that all of it can be written; return the copy.
+
+		First, under the lock, it looks for a change another process made that this object has not read: with
+		``defer`` (a rewrite() that reloads such changes) it returns None, with writeLock let go and ``deSynced``
+		set, so the change is reloaded before the next try instead of erased; else the rewrite overwrites it,
+		with a warning.
 
 		The caller holds ``writeLock`` when this returns, and must open the file with
 		``get_file_obj(..., locked=True)``. The copy is taken under the lock, so the
@@ -4760,6 +4765,12 @@ memoryOnly:{self.memoryOnly}
 		"""
 		self.writeLock.acquire()
 		try:
+			if self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
+				if defer:
+					self.deSynced = True
+					self.writeLock.release()
+					return None
+				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
 			delimiter = self.delimiter
 			header = _sanitize(list(self.header),delimiter=delimiter) if self.header else None
 			defaults = _sanitize(list(self.defaults),delimiter=delimiter) if self.defaults and len(self.defaults) > 1 else None
@@ -4798,10 +4809,14 @@ memoryOnly:{self.memoryOnly}
 					  'hardMapToFile() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
 					  self.teeLogger)
 			return self
+		return self._hardMapToFile()
+
+	def _hardMapToFile(self, defer=False):
+		"""hardMapToFile(); ``defer``: see _snapshotForRewrite."""
 		try:
-			if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
-				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
-			snapshot = self._snapshotForRewrite()  # checked, and the lock held: opening the file for writing empties it
+			snapshot = self._snapshotForRewrite(defer)  # checked, and the lock held: opening the file for writing empties it
+			if snapshot is None:
+				return self  # another process changed the file: reloaded first
 			file = None
 			try:
 				file = self.get_file_obj('wb',locked=True)
@@ -4839,21 +4854,21 @@ memoryOnly:{self.memoryOnly}
 					  'mapToFile() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
 					  self.teeLogger)
 			return self
-		mec = self.monitor_external_changes
-		self.monitor_external_changes = False
-		try:
-			return self._mapToFile()
-		finally:
-			self.monitor_external_changes = mec
+		return self._mapToFile()
 
-	def _mapToFile(self):
+	def _mapToFile(self, defer=False):
+		"""mapToFile(), which rewrite() calls with ``defer`` (see _snapshotForRewrite).
+
+		Whether to overwrite a change another process made is an argument, not monitor_external_changes turned
+		off for the time of the call: two threads in it at once left monitoring off for good.
+		"""
 		try:
-			if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
-				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
 			if _isCompressedFile(self._fileName):
 				# if the file is compressed, we need to use the hardMapToFile method
-				return self.hardMapToFile()
-			snapshot = self._snapshotForRewrite()  # checked, and the lock held
+				return self._hardMapToFile(defer)
+			snapshot = self._snapshotForRewrite(defer)  # checked, and the lock held
+			if snapshot is None:
+				return self  # another process changed the file: reloaded first
 			file = None
 			try:
 				file = self.get_file_obj('r+b',locked=True)
@@ -4918,7 +4933,7 @@ memoryOnly:{self.memoryOnly}
 			self.__teePrintOrNot(traceback.format_exc(),'error')
 			self.deSynced = True
 			self.__teePrintOrNot("Trying failback hardMapToFile()")
-			self.hardMapToFile()
+			self._hardMapToFile(defer)
 		return self
 	
 	def checkExternalChanges(self):

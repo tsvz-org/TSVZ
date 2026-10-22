@@ -6317,8 +6317,8 @@ def test_tsvzed_legacy_refusal_is_timed_on_the_monotonic_clock(tmp_path, monkeyp
 	t.dirty = True
 	t.mapToFile()  # refused
 	calls = []
-	original = t.mapToFile
-	t.mapToFile = lambda: calls.append(1) or original()
+	original = t._mapToFile  # what rewrite() calls
+	t._mapToFile = lambda *args, **kwargs: calls.append(1) or original(*args, **kwargs)
 	real = time.time
 	monkeypatch.setattr(TSVZ.time, 'time', lambda: real() + 3600)  # the wall clock jumps forward an hour
 	time.sleep(0.1)
@@ -6882,3 +6882,68 @@ def test_tsvzed_legacy_append_does_not_mark_an_earlier_external_change_seen(tmp_
 	t['a'] = ['a', '2']
 	t.rewrite(force=True)
 	assert _bytes(p) == b'key\tval\na\t2\next\tB\nb\t1\n'
+
+
+def test_tsvzed_legacy_mapToFile_leaves_monitoring_alone(tmp_path):
+	import threading
+	p = str(tmp_path / 'mon.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	seen = []
+	original = t.get_file_obj
+
+	def hooked(modes='ab', locked=False):
+		seen.append(t.monitor_external_changes)  # what the background writer would see meanwhile
+		return original(modes, locked)
+
+	t.get_file_obj = hooked
+	t.mapToFile()
+	t.hardMapToFile()
+	assert seen == [True, True]
+	# Two threads in mapToFile at once: each saved and restored the attribute, so the one that saved it
+	# while the other had turned it off turned it off for good.
+	inside, release = threading.Event(), threading.Event()
+
+	def blocking(modes='ab', locked=False):
+		if threading.current_thread().name == 'first':
+			inside.set()
+			release.wait(5)
+		return original(modes, locked)
+
+	t.get_file_obj = blocking
+	t['a'] = ['a', '3']
+	first = threading.Thread(target=t.mapToFile, name='first')
+	first.start()
+	assert inside.wait(5)
+	second = threading.Thread(target=t.mapToFile, name='second')
+	second.start()
+	second.join(0.2)  # it is waiting for the lock the first one holds
+	release.set()
+	first.join(5)
+	second.join(5)
+	t.get_file_obj = original
+	assert t.monitor_external_changes is True
+
+
+def test_tsvzed_legacy_rewrite_reloads_a_change_made_after_its_reload_instead_of_erasing_it(tmp_path):
+	p = str(tmp_path / 'gap.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	with open(p, 'ab') as g:
+		g.write(b'ext1\tB\n')  # the rewrite reloads this one first
+	real = t._snapshotForRewrite
+	state = {'done': False}
+
+	def snapshot(*args, **kwargs):
+		if not state['done']:
+			state['done'] = True
+			with open(p, 'ab') as g:  # another process appends between the reload and the rewrite
+				g.write(b'ext2\tB\n')
+		return real(*args, **kwargs)
+
+	t._snapshotForRewrite = snapshot
+	t.rewrite(force=True)
+	assert b'ext2\tB' in _bytes(p), 'the rewrite erased a change it had not read'
+	t.rewrite(force=True)  # the next try reloads it, then rewrites
+	assert t['ext1'] == ['ext1', 'B'] and t['ext2'] == ['ext2', 'B']
+	assert _bytes(p) == b'key\tval\na\t2\next1\tB\next2\tB\n'
