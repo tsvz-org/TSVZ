@@ -171,6 +171,58 @@ def _compressedWriter(fileName, raw, compressLevel=1):
 
 
 _DAMAGE_UNKNOWN = (None, None)  # TSVZed._damage when what the file holds is not known
+_DAMAGE_EMPTY = (0, hashlib.sha256(b'').digest())  # TSVZed._damage for a file that holds nothing
+
+
+def _fileDigest(fd):
+	"""``(size, sha256)`` of what the open file ``fd`` holds on disk, read through ``fd`` itself (a buffer over it is
+	left alone: closing the file another way still drops it)."""
+	digest = hashlib.sha256()
+	size = 0
+	os.lseek(fd, 0, os.SEEK_SET)
+	while True:
+		chunk = os.read(fd, 1 << 20)
+		if not chunk:
+			return size, digest.digest()
+		digest.update(chunk)
+		size += len(chunk)
+
+
+def _bytesAfter(file, size, digest):
+	"""``(rest, (size, sha256))``: what the open ``file`` holds after its first ``size`` bytes, and the size and digest
+	of all of it; None when those first bytes are not the ones ``digest`` was taken of. ``file`` is left at offset 0."""
+	try:
+		file.seek(0)
+		whole = hashlib.sha256()
+		left = size
+		while left:
+			chunk = file.read(min(left, 1 << 20))
+			if not chunk:
+				return None  # shorter now: another process rewrote it
+			whole.update(chunk)
+			left -= len(chunk)
+		if whole.digest() != digest:
+			return None
+		rest = file.read()
+		whole.update(rest)
+		return rest, (size + len(rest), whole.digest())
+	finally:
+		file.seek(0)
+
+
+def _decompressedUpToDamage(codec, data):
+	"""``(text, error)``: what ``data`` (members or frames of ``codec`` one after another) holds, up to where it is
+	damaged, and the error met there (None when it is not)."""
+	parts = []
+	try:
+		with _codecModule(codec).open(io.BytesIO(data), 'rb') as stream:
+			while True:
+				chunk = stream.read(65536)
+				if not chunk:
+					return b''.join(parts), None
+				parts.append(chunk)
+	except Exception as e:
+		return b''.join(parts), e
 
 # What fsync(2) fails with on a file it cannot sync, whose data is written all the same: EINVAL and EROFS ("fd is
 # bound to a special file which does not support synchronization"), ENOTSUP / EOPNOTSUPP (some FUSE and network
@@ -4842,8 +4894,9 @@ memoryOnly:{self.memoryOnly}
 
 	_keepFileTime = False  # set by get_file_obj: the file changed under an append, which must not note the new time
 	# None, or the file is damaged by a rewrite of this object's that did not reach it all (a full disk, a
-	# KeyboardInterrupt): memory holds the only good copy, and until a rewrite makes the file again from memory
-	# another process's change is not reloaded over it (_rewrite). _DAMAGE_UNKNOWN: what the file holds is not known.
+	# KeyboardInterrupt) or removed: memory holds the only good copy, and until a rewrite makes the file again from
+	# memory another process's change is not reloaded over it (_rewrite) but merged into it (_mergeChange). It is
+	# (size, sha256) of what the file held when this object let go of it, _DAMAGE_UNKNOWN when that is not known.
 	_damage = None
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
@@ -4958,9 +5011,10 @@ memoryOnly:{self.memoryOnly}
 
 		``whole``: the file is emptied and written whole, through its codec; else it is rewritten in place
 		(mapToFile, for a file that is not compressed). ``look``: another process's change stops it as
-		_externalChangeStops says with ``defer``; it is looked for once the file is locked and before it is
-		emptied, so no change made until then is erased. A file that is not there (removed by another process:
-		rm, a log rotation) is made whole, from memory.
+		_externalChangeStops says with ``defer``, or is merged into memory while ``_damage`` is set (_mergeChange);
+		it is looked for once the file is locked and before it is emptied, so no change made until then is
+		erased. A file that is not there (removed by another process: rm, a log rotation) is made whole, from
+		memory, and one another process makes again before it is locked is merged too.
 
 		True when it is written; None when another process's change stopped it; False when the file could not be
 		opened or locked (get_file_obj reported why), left as it was. From the moment it starts changing the file,
@@ -4986,15 +5040,17 @@ memoryOnly:{self.memoryOnly}
 				missing = not os.path.isfile(self._fileName)  # under writeLock: this object does not remove it meanwhile
 				whole = whole or missing
 				if missing:
-					self._damage = _DAMAGE_UNKNOWN  # memory is the only copy left
+					self._damage = _DAMAGE_EMPTY  # memory is the only copy left: what another process writes is merged
 					own = True  # the file it makes is its own change
 				file = self.get_file_obj('wb' if whole else 'r+b', locked=True, empty=False)
 				if file is None:
 					self.deSynced = True  # tried again later
 					result = False
-				elif look and not missing and self._lookStops(defer):
+				elif look and self._damage is None and self._externalChangeStops(defer):
 					result = None  # untouched; its time is not noted: the change is reloaded first
 				else:
+					if look and self._damage is not None and self._mergeChange(file):
+						header, lines = (snapshot or self._snapshotForRewrite)()  # with what was merged
 					# Until it is all written, the file does not hold memory: a rewrite that stops is made again,
 					# and the file is not reloaded over memory meanwhile.
 					self._damage = _DAMAGE_UNKNOWN
@@ -5024,17 +5080,60 @@ memoryOnly:{self.memoryOnly}
 					raise
 		return result
 
-	def _lookStops(self, defer):
-		"""_externalChangeStops for _writeRewrite, with the file locked; while ``_damage`` is set, nothing stops it.
+	def _mergeChange(self, file):
+		"""While ``_damage`` is set, merge another process's change into memory from ``file`` (open and locked).
 
-		Memory then holds the only good copy: another process's change is overwritten, with a warning.
+		Memory then holds the only good copy, and the rewrite about to start makes the file again from it: the
+		change is not reloaded over memory (the rows the damage lost would go), nor erased. When the file still
+		begins with what the damage left (its size and digest), the rest is what other processes appended since
+		(appends, deletes, the file made again after it was removed): its rows are applied on top of memory, as a
+		read of the file would apply them, then the rows still queued, which are appended after the rewrite. Else
+		(another process rewrote it, or what it held is not known) memory is kept and the change is overwritten,
+		with a warning. True when memory changed: what the rewrite writes is encoded again.
 		"""
-		if self._damage is None:
-			return self._externalChangeStops(defer)
-		if self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
-			self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}: they were made after a rewrite "
-								 f"of this object's failed and left the file damaged, and memory holds what it was writing",'warning')
-		return False
+		if not self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
+			return False
+		size, digest = self._damage
+		found = None if size is None else _bytesAfter(file, size, digest)
+		if found is None:
+			self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}: they were made after a rewrite of "
+								 f"this object's failed and left the file damaged, and cannot be told apart from that damage; "
+								 f"memory holds what the rewrite was writing",'warning')
+			return False
+		rest, self._damage = found
+		self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # all of it is read: under the lock
+		if not rest:
+			return False
+		reporter = _Reporter(self._fileName, self.teeLogger)
+		codec = _fileCodec(self._fileName)
+		if codec:
+			rest, error = _decompressedUpToDamage(codec, rest)
+			if error is not None:
+				reporter.note('damaged', None, 'compressed stream another process appended is damaged ({}: {}); merged up to '
+							  'the damage, and the rest is overwritten'.format(type(error).__name__, error))
+		if self.header:  # another process made the file again: its header is not a row
+			first, _, after = rest.partition(b'\n')
+			if first.rstrip(b'\r') == _encodeRow(_sanitize(list(self.header),delimiter=self.delimiter),self.delimiter,self.encoding,'replace',what='header'):
+				rest = after
+		try:
+			with self._memLock:
+				merged = _TSVZedLoad(self, self.correctColumnNum, list(self.defaults))
+				for key, row in OrderedDict.items(self):
+					OrderedDict.__setitem__(merged, key, row)
+				_legacyReadLoop(io.BytesIO(rest), '', merged, self.correctColumnNum, 0, self.strict, self.delimiter,
+								merged.defaults, False, self.encoding, reporter)
+				merged.replay(list(self.appendQueue))  # appended after the rewrite: they come last
+				OrderedDict.clear(self)
+				for key, row in merged.items():
+					OrderedDict.__setitem__(self, key, row)
+				self.defaults = merged.defaults
+				if self.correctColumnNum == -1 and self:
+					self.correctColumnNum = len(self[next(iter(self))])
+		finally:
+			reporter.flush()
+		if self.verbose:
+			self.__teePrintOrNot(f"Merged what another process wrote to {self._fileName} after a failed rewrite: {len(self)} records")
+		return True
 
 	def _abandonRewrite(self, file, own):
 		"""Close ``file`` unflushed if _releaseRewrite left it open: a KeyboardInterrupt as it was called.
@@ -5412,7 +5511,13 @@ memoryOnly:{self.memoryOnly}
 				if not keepTime:
 					if not reached:
 						self.deSynced = True
+						self._damage = _DAMAGE_UNKNOWN
 					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # under writeLock: see _externalChange()
+					if not reached:
+						try:
+							self._damage = _fileDigest(raw.fileno())  # what it left: another process's appends are merged
+						except Exception:
+							pass
 					if reached:  # once its time is noted: until then the file is not reloaded over memory
 						self._damage = None
 						self.dirty = self.deSynced = False  # memory is the file again

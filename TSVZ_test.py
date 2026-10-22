@@ -7204,10 +7204,8 @@ def test_tsvzed_legacy_append_notes_the_time_before_it_unlocks_the_file(tmp_path
 
 
 def _compressedAs(suffix, data):
-	"""``data`` as another process appends it to a file with ``suffix``: a member of its codec."""
-	import bz2
-	import gzip
-	return {'tsv': lambda d: d, 'tsv.gz': gzip.compress, 'tsv.bz2': bz2.compress}[suffix](data)
+	"""``data`` as another process appends it to a file with ``suffix``: a member (a frame) of its codec."""
+	return TSVZ._compressBytes(suffix.rpartition('.')[2], data) if suffix != 'tsv' else data
 
 
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2'])
@@ -8100,3 +8098,126 @@ def test_tsvzed_legacy_write_on_a_file_system_that_cannot_fsync(tmp_path, monkey
 	assert not t.deSynced and len(calls) == 1, calls
 	assert t.dirty == (method == 'append')  # the append leaves the file holding a twice, as it did
 	assert _back(p) == ({} if method == 'clear_file' else dict(t))
+
+
+def _failing_rewrite(monkeypatch, partial=b''):
+	"""Make every rewrite fail with ENOSPC once it has emptied the file and written ``partial`` (not compressed)."""
+	import errno
+
+	def full(fileName=None, raw=None, *args, **kwargs):  # right after the truncate
+		if raw is not None:
+			raw.write(partial)
+			raw.flush()
+		raise OSError(errno.ENOSPC, 'No space left on device')
+
+	def inplace(self, file, header, lines):
+		file.write(partial)
+		file.truncate()
+		file.flush()
+		full()
+
+	monkeypatch.setattr(TSVZ, '_compressedWriter', full)
+	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', inplace)
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2', 'tsv.xz'])
+@pytest.mark.parametrize('method', ['rewrite', 'hardMapToFile', 'rewrite_on_exit'])
+def test_tsvzed_legacy_change_after_a_failed_rewrite_is_merged_into_memory_not_reloaded_over_it(tmp_path, monkeypatch, capsys, suffix, method):
+	# A rewrite that failed once it had emptied the file (a full disk) leaves memory the only good copy. Another
+	# process's change then made the next rewrite() reload the damaged file over memory: every row was lost, and
+	# since 73c6b67 the background writer reloads at every tick while the failed rewrite waits. Main 1688d25 lost
+	# them the same way. The rows the other process appended (a set and a delete) are now merged into memory.
+	p = str(tmp_path / ('merge.' + suffix))
+	t = _stopped(p, rewrite_on_exit=(method == 'rewrite_on_exit'))
+	rows = _many(t, 5)
+	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
+	if method == 'hardMapToFile':
+		t.hardMapToFile()
+	else:
+		assert not t.rewrite(force=True)
+	monkeypatch.undo()
+	assert dict(t) == rows and t.dirty and t.deSynced
+	assert _back(p) != rows  # damaged: emptied, or half written
+	_append_external(p, _compressedAs(suffix, b'ext\tB\nk2\t\n'))  # space is back; another process sets ext, deletes k2
+	t.checkExternalChanges()  # the next tick
+	if method == 'rewrite_on_exit':
+		t.shutdownEvent.clear()  # the background writer is stopped: close() makes its exit rewrite() all the same
+		t.close()
+	else:
+		assert t.rewrite()
+	expected = dict(rows, ext=['ext', 'B'])
+	del expected['k2']
+	assert dict(t) == expected
+	assert _back(p) == expected and not t.dirty and not t.deSynced and not t._externalChange()
+	assert 'Overwriting external changes' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_change_after_a_failed_rewrite_that_cannot_be_merged_keeps_memory(tmp_path, monkeypatch, capsys, suffix):
+	# Another process rewrote the damaged file (not only appended to it): its change cannot be told apart from the
+	# damage, so memory is kept and written, with a warning, rather than the damaged rows reloaded over it.
+	p = str(tmp_path / ('nomerge.' + suffix))
+	t = _stopped(p)
+	rows = _many(t, 5)
+	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
+	t.hardMapToFile()
+	monkeypatch.undo()
+	assert t.deSynced and _bytes(p) == b'key\tval\nk0\tv0\n'
+	time.sleep(0.01)
+	with open(p, 'wb') as g:
+		g.write(_compressedAs(suffix, b'key\tval\nother\tX\n'))
+	assert t.rewrite()
+	assert 'Overwriting external changes' in capsys.readouterr().out
+	assert dict(t) == rows and _back(p) == rows and not t.deSynced
+
+
+def test_tsvzed_legacy_background_writer_never_reloads_a_file_its_failed_rewrite_damaged(tmp_path, monkeypatch):
+	# 73c6b67: the background writer reloads another process's change at every tick while a failed rewrite waits to
+	# be tried again. When that rewrite had emptied the file, the reload dropped every row; it now merges the change.
+	p = str(tmp_path / 'tick.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001, teeLogger=_ErrorLog())
+	for i in range(5):
+		t['k%d' % i] = ['k%d' % i, 'v']
+	assert _wait_for(lambda: not t.appendQueue)
+	t['k0'] = ['k0', 'w']
+	rows = dict(t)
+	_failing_rewrite(monkeypatch)
+	t.deSynced = True  # a tick tries the rewrite, and fails
+	assert _wait_for(lambda: t._failing('rewrite'), 5)
+	for _ in range(10):
+		t._failed('rewrite', 'No space left on device', False)  # it keeps failing: the next try is a minute away
+	assert b'k1' not in _bytes(p), 'the rewrite did not empty the file'  # the queued k0 may be appended to it
+	_append_external(p)
+	deadline = time.time() + 0.5
+	while time.time() < deadline:  # many ticks
+		assert dict(t) == rows, 'a tick reloaded the damaged file over memory'
+		time.sleep(0.01)
+	monkeypatch.undo()
+	t._worked('rewrite')
+	assert _wait_for(lambda: not t.deSynced, 5)
+	t.close()
+	assert dict(t) == dict(rows, ext=['ext', 'B'])
+	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == dict(t)
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_rewrite_of_a_removed_file_merges_one_another_process_made_again_meanwhile(tmp_path, suffix):
+	# _writeRewrite decided the file was missing before it opened and locked it, and then skipped the look for
+	# another process's change: a file made again in that window was overwritten without a warning or a reload.
+	p = str(tmp_path / ('again.' + suffix))
+	t = _stopped(p)
+	rows = _many(t, 5)
+	os.remove(p)  # rm, a log rotation
+	real = t.get_file_obj
+
+	def opening(*args, **kwargs):
+		if not os.path.exists(p):  # another process makes it again, with a row, before this one opens it
+			with open(p, 'wb') as g:
+				g.write(_compressedAs(suffix, b'key\tval\nnew\tN\n'))
+		return real(*args, **kwargs)
+
+	t.get_file_obj = opening
+	assert t.rewrite(force=True)
+	t.get_file_obj = real
+	assert dict(t) == dict(rows, new=['new', 'N'])
+	assert _back(p) == dict(t) and not t._externalChange()
