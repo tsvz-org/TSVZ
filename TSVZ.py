@@ -3956,7 +3956,6 @@ class TSVZed(OrderedDict):
 		self.dirty = False
 		self.deSynced = False
 		self.memoryOnly = False
-		self.encoding = encoding
 		self.writeLock = threading.Lock()
 		self._memLock = threading.Lock()  # held while memory and appendQueue change together (a set, a delete, reload's swap)
 		self.shutdownEvent = threading.Event()
@@ -5319,7 +5318,6 @@ class TSVZedLite(MutableMapping):
 		self.createIfNotExist = createIfNotExist
 		self.verifyHeader = verifyHeader
 		self.verbose = verbose
-		self.encoding = encoding
 		if self._spec:
 			self._specInit(indexes, fileObj)
 		else:
