@@ -7059,7 +7059,11 @@ class TSVZClient(MutableMapping):
 	- ``timeout``: seconds to wait for each answer (None: no limit).
 	- ``errors``: 'strict' (the default) raises a ``ValueError`` (``TSVZEncodeError``) for a write whose
 	  key or value cannot be encoded as UTF-8 (a lone surrogate from a non-UTF-8 file name), before
-	  anything is sent; 'replace' writes '?' for it.
+	  anything is sent; 'replace' writes '?' for it. Any codec error handler is taken (a name that is
+	  not one is a ``ValueError`` at construction); text goes to the handler as UTF-8, so what
+	  ``'surrogateescape'`` would write as a raw byte arrives as U+FFFD. A read of a key that no store
+	  can hold (a lone surrogate) is answered here, with or without a handler: ``KeyError``, ``False``,
+	  the default.
 	"""
 
 	def __init__(self, fileName, sync=False, timeout=None, teeLogger=None, errors='strict'):

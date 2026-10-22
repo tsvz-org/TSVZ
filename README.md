@@ -194,7 +194,12 @@ Writing is stricter than reading: a key, value, header or marker that cannot be
 encoded as UTF-8, such as the lone surrogate `os.fsdecode` gives for a
 non-UTF-8 file name, raises a `ValueError` (`TSVZEncodeError`) that names it
 and writes nothing, instead of storing `?`. Pass `errors='replace'` to the
-writing functions or to `TSVZed`, `TSVZedLite` and `TSVZClient` to get the old `?`.
+writing functions or to `TSVZed`, `TSVZedLite` and `TSVZClient` to get the old `?` (any codec error handler is taken; a name that is not one
+is a `ValueError` where it is given). `TSVZed` and `TSVZedLite` refuse a row in
+`__setitem__`, so the background writer never meets one; a refused rewrite leaves
+the file as it is and is reported once. With a non-UTF-8 `encoding=`, U+FFFD (what
+the reader puts for a byte it could not decode) is written as `?`, so a store never
+refuses the text of its own file. The `tsvz` command exits 1 with the message.
 
 ## Breaking changes from 3.39
 
