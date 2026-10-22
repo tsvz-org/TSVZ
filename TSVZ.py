@@ -5290,7 +5290,7 @@ memoryOnly:{self.memoryOnly}
 				_unlockFile(file)  # on POSIX and Windows
 				_closeFile(file)  # Ensure file is closed after unlocking
 			if self.verbose:
-				self.__teePrintOrNot(f"File {file.name} unlocked / released")
+				self.__teePrintOrNot(f"File {self._fileName} unlocked / released")
 		except Exception as e:
 			# Unlocked and closed all the same (closing gives up what cannot be flushed): a file left open keeps its
 			# lock, and the next rewrite, hardMapToFile() right after a failed mapToFile() among them, waits for it for good.
@@ -5303,8 +5303,8 @@ memoryOnly:{self.memoryOnly}
 			try:
 				self.writeLock.release()  # Ensure the thread lock is always released
 			except Exception as e:
-				self.__teePrintOrNot(f"Failed to release writeLock for {file.name}: {e}",'error')
-			self.__teePrintOrNot(f"Failed to release file {file.name}: {e}",'error')
+				self.__teePrintOrNot(f"Failed to release writeLock for {self._fileName}: {e}",'error')
+			self.__teePrintOrNot(f"Failed to release file {self._fileName}: {e}",'error')
 			import traceback
 			self.__teePrintOrNot(traceback.format_exc(),'error')
 		# release the write lock if not already released
@@ -5315,7 +5315,7 @@ memoryOnly:{self.memoryOnly}
 			try:
 				self.writeLock.release()  # Ensure the thread lock is always released
 			except Exception as e:
-				self.__teePrintOrNot(f"Failed to release writeLock for {file.name}: {e}",'error')
+				self.__teePrintOrNot(f"Failed to release writeLock for {self._fileName}: {e}",'error')
 
 	def _releaseRewrite(self, file, failed):
 		"""Let go of the file a rewrite wrote (``file``: the codec's writer over it, or the file) and of writeLock.

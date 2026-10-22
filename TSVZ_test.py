@@ -7725,3 +7725,25 @@ def test_tsvzed_legacy_rewrite_is_all_on_disk_before_it_unlocks_the_file(tmp_pat
 	monkeypatch.undo()
 	assert sizes == [os.path.getsize(p)], 'bytes on disk when the file was unlocked, and in the end'
 	assert _back(p) == (dict(t) if method == 'hardMapToFile' else {})
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2', 'tsv.xz'])
+@pytest.mark.parametrize('verbose', [False, True])
+def test_tsvzed_legacy_failed_release_reports_the_real_error(tmp_path, monkeypatch, capsys, suffix, verbose):
+	# release_file_obj logged file.name once it had closed the file: BZ2File and LZMAFile have no name before
+	# Python 3.13 (AttributeError), and a closed one refuses it since (ValueError), which hid the real error.
+	import errno
+	p = str(tmp_path / ('r.' + suffix))
+	t = _stopped(p, verbose=verbose)
+	t['a'] = ['a', '1']
+
+	def failing(fd):
+		raise OSError(errno.EIO, 'Input/output error')
+
+	monkeypatch.setattr(TSVZ.os, 'fsync', failing)
+	t.commitAppendToFile()
+	monkeypatch.undo()
+	out = capsys.readouterr().out
+	assert 'Input/output error' in out, out
+	assert 'closed file' not in out and 'has no attribute' not in out, out
+	assert not t.writeLock.locked()
