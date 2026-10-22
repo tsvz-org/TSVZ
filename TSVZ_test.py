@@ -7841,3 +7841,33 @@ def test_tsvzed_legacy_rewrite_that_keeps_failing_still_reloads_another_process_
 	t._worked('rewrite')
 	t.close()
 	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == {'a': ['a', '2'], 'ext': ['ext', 'B']}
+
+
+def test_tsvzed_legacy_background_writer_makes_one_rewrite_a_tick_while_another_process_keeps_changing_the_file(tmp_path):
+	# A tick tried up to three rewrites, each after a commit and a full reload, when another process kept changing
+	# the file under them; main 1688d25 made one. The tries rewrite() makes are for an explicit call and close().
+	p = str(tmp_path / 'busy.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.01)
+	_dirty(t)
+	counts = {'ticks': 0, 'rewrites': 0, 'n': 0}
+	realMap, realCheck = t._mapToFile, t.checkExternalChanges
+
+	def checking(*args, **kwargs):
+		counts['ticks'] += 1  # once at every tick
+		return realCheck(*args, **kwargs)
+
+	def mapping(*args, **kwargs):
+		counts['rewrites'] += 1
+		counts['n'] += 1
+		_append_external(p, b'ext%d\tB\n' % counts['n'])  # it keeps changing: every rewrite is deferred
+		return realMap(*args, **kwargs)
+
+	t.checkExternalChanges, t._mapToFile = checking, mapping
+	t.deSynced = True
+	time.sleep(0.5)
+	t.checkExternalChanges, t._mapToFile = realCheck, realMap
+	assert counts['rewrites'] > 5, counts
+	assert counts['rewrites'] <= counts['ticks'] + 1, counts
+	assert _wait_for(lambda: not t.deSynced and not t.dirty, 3)  # once it stops changing, the next tick makes it
+	t.close()
+	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == dict(t) and 'ext%d' % counts['n'] in t

@@ -4749,7 +4749,8 @@ memoryOnly:{self.memoryOnly}
 
 	def _rewrite(self, force=False, reloadInternalFromFile=None, background=False):
 		"""rewrite(); ``background``: the background writer's tick, which reloads another process's change at every
-		tick but makes no rewrite while one that failed waits to be tried again (see _failed)."""
+		tick but makes no rewrite while one that failed waits to be tried again (see _failed), and tries one rewrite:
+		one that another process's change defers is made at the next tick, after the reload that tick makes."""
 		if self._spec:
 			_warnOnce(self, 'rewrite()', self._fileName,
 					  'rewrite() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
@@ -4783,13 +4784,14 @@ memoryOnly:{self.memoryOnly}
 					return False  # the last one failed: tried again later; another process's change was still reloaded above
 				if self.verbose:
 					self.__teePrintOrNot(f"Rewriting {self._fileName}")
-				for attempt in range(_DEFERRED_REWRITE_TRIES):
+				tries = 1 if background else _DEFERRED_REWRITE_TRIES  # a tick does one reload and one rewrite, as on main
+				for attempt in range(tries):
 					# What this call's rewrite did is what it returns, not state of the object: close()'s rewrite()
 					# and the background writer's ran at once, and one could take the other's for its own.
 					made = self._mapToFile(defer=reloadInternalFromFile)
 					if made is not None:
 						break
-					if attempt == _DEFERRED_REWRITE_TRIES - 1:
+					if attempt == tries - 1:
 						return False  # it keeps changing: deSynced is set, the next tick tries again
 					# Another process changed the file after the reload above: that change is reloaded too, and the
 					# rewrite made then, not left to a next tick (at close() there is none: rewrite_on_exit was lost).
