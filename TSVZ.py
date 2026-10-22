@@ -7387,6 +7387,7 @@ class _CliArgs(object):
 		self.operation = None
 		self.store = None
 		self.args = []
+		self.writeArgs = None  # setdefault: the arguments as a writer must see them (a non-UTF-8 byte kept), when they differ from args
 
 
 _CLI_UNDECODED_RE = re.compile('[\udc80-\udcff]')
@@ -7950,6 +7951,28 @@ def _cliEmitServed(args, delimiter, logger, stdout, response):
 	return status
 
 
+def _cliSetdefaultArgs(args, delimiter, creating, isLive):
+	"""Settle what ``setdefault`` is to run with, refusing before a store is created or written.
+
+	KEY is looked up as a reader reads it (§20.2.7). When it is live nothing is written, so the arguments stay
+	as they are; when it is not, what is written must be UTF-8: text that is not raises ``TSVZEncodeError``
+	(exit status 1 with its message), and a new store is not created for it. A header or defaults written to a
+	store this creates is looked at too.
+	"""
+	if creating:
+		header = _formatHeader(args.header, delimiter=delimiter)
+		if any(header):
+			_checkRow(header, delimiter, 'utf8', 'strict', what='header')
+		if args.defaults and len(args.defaults) > 1:
+			_checkRow(args.defaults, delimiter, 'utf8', 'strict', what='defaults')
+	if args.writeArgs is None:
+		return
+	if not isLive(args.args[0]):
+		if len(args.writeArgs) > 1:
+			_checkRow(_sanitize(args.writeArgs, delimiter=delimiter), delimiter, 'utf8', 'strict', None)
+		args.args = args.writeArgs
+
+
 def _cliEngineOp(args, delimiter, logger, stdin, stdout):
 	"""``has``, ``len``, ``keys``, ``pop``, ``popitem``, ``setdefault`` (spec §20.2) on the files.
 
@@ -7958,14 +7981,25 @@ def _cliEngineOp(args, delimiter, logger, stdin, stdout):
 	``setdefault`` are not atomic against other writers.
 	"""
 	create = args.operation == 'setdefault'
-	if not create and not _cliStoreExists(args.store):
+	exists = _cliStoreExists(args.store)
+	if not create and not exists:
 		raise _CliStoreMissing()
-	store = _ServeStore(args.store, delimiter=delimiter, header=args.header, defaults=args.defaults,
-						strict=args.strict, teeLogger=logger, verbose=args.verbose, create=create)
+
+	def openStore(creating):
+		return _ServeStore(args.store, delimiter=delimiter, header=args.header, defaults=args.defaults,
+						   strict=args.strict, teeLogger=logger, verbose=args.verbose, create=creating)
+	store = openStore(False) if exists else None
 	try:
+		if create:
+			# Before a missing store is created: a setdefault that will be refused creates nothing.
+			_cliSetdefaultArgs(args, delimiter, not exists, lambda key: exists and _ServeLocal(store).request(
+				'\t'.join(['has', _serveEncode(key)]))[2] == 0)
+			if store is None:
+				store = openStore(True)
 		response = _ServeLocal(store).request(_cliRequestLine(args))
 	finally:
-		store.close()
+		if store is not None:
+			store.close()
 	status = _cliEmitServed(args, delimiter, logger, stdout, response)
 	if store.writer.failures:
 		return 1  # the write was not made; the writer reported why
@@ -8040,6 +8074,7 @@ def _cliStop(args, delimiter, logger, stdin, stdout):
 	return 0 if status == 0 else 1
 
 
+_CLI_WRITES_HEADER = ('set', 'append', 'setdefault', 'clear', 'delete', 'scrub', 'serve')
 _CLI_READ_ONLY = ('read', 'get', 'has', 'len', 'keys', 'verify', 'parts')
 
 
@@ -8084,6 +8119,9 @@ def _cliRouted(connection, args, delimiter, logger, stdin, stdout):
 		finally:
 			source.flush()
 		bulk = [_serveRecordLine(cells, marker) for cells, marker in rows]
+	if args.operation == 'setdefault':
+		_cliSetdefaultArgs(args, delimiter, False,
+						   lambda key: connection.request('\t'.join(['has', _serveEncode(key)]))[2] == 0)
 	try:
 		written = ['--x-written'] if args.operation in ('set', 'append', 'delete') else []
 		response = connection.request('\t'.join(written + [_cliRequestLine(args)]), bulk)
@@ -8120,11 +8158,20 @@ def _cliMain(argv, stdin=None, stdout=None, stderr=None):
 		return 2
 	# What a write is given must not be changed silently: a byte that is not UTF-8 stays a lone surrogate
 	# and the writer says so (a lookup names U+FFFD, as the reader reads the byte).
-	decoding = 'surrogateescape' if args.operation in ('set', 'append', 'setdefault') else 'replace'
-	args.args = _cliDecodeArgv(args.args, decoding)
+	# A lone KEY of set or append is a delete, and setdefault looks KEY up first: those name a key as a reader
+	# reads it (U+FFFD); the data to be written keeps the byte. A header or defaults is written by every
+	# operation that can create or rewrite a store.
+	decoding = 'surrogateescape' if args.operation in ('set', 'append') and len(args.args) > 1 else 'replace'
+	if args.operation == 'setdefault':
+		raw = _cliDecodeArgv(args.args, 'surrogateescape')
+		args.args = _cliDecodeArgv(args.args, 'replace')
+		args.writeArgs = raw if raw != args.args else None
+	else:
+		args.args = _cliDecodeArgv(args.args, decoding)
+	headerDecoding = 'surrogateescape' if args.operation in _CLI_WRITES_HEADER else 'replace'
 	for name in ('header', 'defaults', 'delimiter'):
 		if isinstance(getattr(args, name), str):
-			setattr(args, name, _cliDecodeArgv([getattr(args, name)], decoding)[0])
+			setattr(args, name, _cliDecodeArgv([getattr(args, name)], headerDecoding if name != 'delimiter' else 'replace')[0])
 	if args.help:
 		_cliWrite(stdout, _CLI_HELP.format(version=version))
 		return 0

@@ -6114,3 +6114,52 @@ def test_legacy_writers_encode_each_row_once(tmp_path, monkeypatch):
 	t.mapToFile()
 	assert len([c for c in calls if c[0] in 'abc']) == 3, calls
 	_stop(t)
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+@pytest.mark.parametrize('extra', [(), ('--x-header', 'id\tv')])
+def test_cli_refused_setdefault_creates_nothing(tmp_path, suffix, extra):
+	p = str(tmp_path / ('sd' + suffix))
+	status, out, err = _run('setdefault', p, 'k', BAD_NAME, *extra)
+	assert status == 1 and out == '', (status, out, err)
+	assert 'cannot write' in err and '\\udcff' in err and 'Traceback' not in err, err
+	assert not os.path.exists(p) and os.listdir(str(tmp_path)) == []
+	status, out, err = _run('setdefault', p, 'k', 'v', '--x-header', 'id\tv' + BAD_NAME)
+	assert status == 1 and 'cannot write' in err and os.listdir(str(tmp_path)) == [], err
+	_touch(p, b'a\t1\n')
+	assert _run('setdefault', p, 'k', BAD_NAME)[0] == 1
+	assert _bytes(p) == b'a\t1\n'
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_cli_setdefault_and_lone_set_find_the_key_a_reader_reads(tmp_path, suffix):
+	p = str(tmp_path / ('live' + suffix))
+	_touch(p, b'\xff\t1\ns\t2\n')
+	assert _run('has', p, '\udcff')[0] == 0
+	status, out, err = _run('setdefault', p, '\udcff', 'new')  # live: its row, nothing written
+	assert (status, out) == (0, '\ufffd\t1\n') and err.count('U+FFFD') == 1, err
+	assert _run('setdefault', p, 's', BAD_NAME)[0] == 0  # live: the value is not written
+	assert _run('set', p, '\udcff')[0] == 0  # a lone key is a delete, as 'delete' does
+	assert _run('has', p, '�')[0] != 0
+	assert _run('get', p, 's')[1] == 's\t2\n'
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+@pytest.mark.parametrize('op', ['clear', 'delete'])
+def test_cli_clear_and_delete_refuse_a_header_that_is_not_utf8(tmp_path, suffix, op):
+	p = str(tmp_path / ('hd' + suffix))
+	argv = (op, p) + (('k',) if op == 'delete' else ()) + ('--x-header', 'id\tv' + BAD_NAME)
+	status, out, err = _run(*argv)
+	assert status == 1 and 'cannot write' in err and 'Traceback' not in err, (status, err)
+	assert os.listdir(str(tmp_path)) == []
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_cli_setdefault_through_a_handler_looks_up_as_a_reader_reads(tmp_path, served):
+	p = str(tmp_path / 'h.tsvz')
+	_touch(p, b'\xff\t1\n')
+	served(p)
+	assert _run('setdefault', p, '\udcff', 'new') == (0, '�\t1\n', '')
+	status, out, err = _run('setdefault', p, 'k', BAD_NAME)
+	assert status == 1 and 'cannot write' in err, err
+	assert _run('has', p, 'k')[0] != 0
