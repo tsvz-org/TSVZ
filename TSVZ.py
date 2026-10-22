@@ -66,8 +66,12 @@ def _codecModule(codec):
 	import importlib
 	return importlib.import_module(_CODECS[_CODEC_NAMES.get(codec, codec)][0])
 
+def _fileCodec(fileName):
+	"""The codec name ``fileName``'s compression suffix names, or None for a file that is not compressed."""
+	return _CODEC_NAMES.get(fileName.rpartition('.')[2].lower())
+
 def _isCompressedFile(fileName):
-	return fileName.rpartition('.')[2].lower() in COMPRESSED_FILE_EXTENSIONS
+	return _fileCodec(fileName) is not None
 
 def get_delimiter(delimiter = ...,file_name = ''):
 	"""
@@ -136,13 +140,11 @@ def eprint(*args, **kwargs):
 		print(*args, **kwargs)
 
 def _codecWriteOptions(codec, compressLevel):
-	"""The keyword arguments ``codec``'s ``open()`` takes to write at ``compressLevel``."""
+	"""The keyword arguments ``codec``'s ``open()`` and ``compress()`` take to write at ``compressLevel``."""
+	codec = _CODEC_NAMES.get(codec, codec)
 	if codec == 'zstd':  # a content checksum on every frame (spec §16.8)
-		try:
-			from compression.zstd import CompressionParameter
-			return {'options': {CompressionParameter.compression_level: compressLevel, CompressionParameter.checksum_flag: 1}}
-		except ImportError:
-			return {'level': compressLevel}
+		parameter = _codecModule(codec).CompressionParameter
+		return {'options': {parameter.compression_level: compressLevel, parameter.checksum_flag: 1}}
 	return {_CODECS[codec][2] if codec else 'compresslevel': compressLevel}
 
 
@@ -160,7 +162,7 @@ def _compressedWriter(fileName, raw, compressLevel=1):
 
 	Closing it does not close ``raw``: _closeFile closes both.
 	"""
-	codec = _CODEC_NAMES.get(fileName.rpartition('.')[2].lower())
+	codec = _fileCodec(fileName)
 	if not codec:
 		return None
 	writer = _codecModule(codec).open(raw, 'wb', **_codecWriteOptions(codec, compressLevel))
@@ -179,7 +181,7 @@ def _closeFile(file):
 
 
 def openFileAsCompressed(fileName,mode = 'rb',encoding = 'utf8',teeLogger = None,compressLevel = 1):
-	codec = _CODEC_NAMES.get(fileName.rpartition('.')[2].lower())
+	codec = _fileCodec(fileName)
 	if codec and any(c in mode for c in 'wax+'):
 		# Writing plain bytes into a compressed file destroys it: refuse when this Python lacks the codec.
 		_requireCodec(codec)
@@ -962,12 +964,7 @@ def _compressBytes(codec, data, level=1, memberSize=None):
 	member of its own. Zstandard frames carry their content checksum (spec §16.8)."""
 	_requireCodec(codec)
 	name = _CODEC_NAMES.get(codec, codec)
-	module = _codecModule(name)
-	if name == 'zstd':
-		options = {module.CompressionParameter.compression_level: level, module.CompressionParameter.checksum_flag: 1}
-		compress = functools.partial(module.compress, options=options)
-	else:
-		compress = functools.partial(module.compress, **{_CODECS[name][2]: level})
+	compress = functools.partial(_codecModule(name).compress, **_codecWriteOptions(name, level))
 	size = memberSize or _DEFAULT_MEMBER_SIZE
 	if len(data) <= size:
 		return compress(data)
@@ -5197,18 +5194,11 @@ memoryOnly:{self.memoryOnly}
 			if 'w' in modes:
 				# Opened as it is and emptied once locked: 'wb' would empty it before the lock is taken, under
 				# another writer that holds it, and for good when the lock then fails or is interrupted.
-				_requireCodec(_CODEC_NAMES.get(self._fileName.rpartition('.')[2].lower()))
+				_requireCodec(_fileCodec(self._fileName))
 				file = _openUntruncated(self._fileName)
 			else:
 				file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding,teeLogger=self.teeLogger)
-			# Lock the file after opening
-			if os.name == 'posix':
-				_lockFile(file)
-			elif os.name == 'nt':
-				# For Windows, locking the entire file, avoiding locking an empty file
-				#lock_length = max(1, os.path.getsize(self._fileName))
-				lock_length = 2147483647
-				msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, lock_length)
+			_lockFile(file)  # the whole file, on POSIX and Windows
 			if 'w' in modes:
 				file.truncate(0)
 				emptied = True
@@ -5256,16 +5246,7 @@ memoryOnly:{self.memoryOnly}
 					# must not have its change taken for this one's (a compressed file is complete only once closed).
 					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 					noted = True
-				if os.name == 'posix':
-					_unlockFile(file)
-				elif os.name == 'nt':
-					# Unlocking the entire file; for Windows, ensure not unlocking an empty file
-					#unlock_length = max(1, os.path.getsize(os.path.realpath(file.name)))
-					unlock_length = 2147483647
-					try:
-						msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, unlock_length)
-					except Exception:
-						pass
+				_unlockFile(file)  # on POSIX and Windows
 				_closeFile(file)  # Ensure file is closed after unlocking
 			if self.verbose:
 				self.__teePrintOrNot(f"File {file.name} unlocked / released")
@@ -5277,14 +5258,8 @@ memoryOnly:{self.memoryOnly}
 					pass
 			# Unlocked and closed all the same (closing gives up what cannot be flushed): a file left open keeps its
 			# lock, and the next rewrite, hardMapToFile() right after a failed mapToFile() among them, waits for it for good.
-			try:
-				if not file.closed:
-					if os.name == 'posix':
-						_unlockFile(file)
-					elif os.name == 'nt':
-						msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 2147483647)
-			except Exception:
-				pass
+			if not file.closed:
+				_unlockFile(file)  # never raises
 			try:
 				_closeFile(file)
 			except Exception:
