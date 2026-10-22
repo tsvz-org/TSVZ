@@ -6947,3 +6947,57 @@ def test_tsvzed_legacy_rewrite_reloads_a_change_made_after_its_reload_instead_of
 	t.rewrite(force=True)  # the next try reloads it, then rewrites
 	assert t['ext1'] == ['ext1', 'B'] and t['ext2'] == ['ext2', 'B']
 	assert _bytes(p) == b'key\tval\na\t2\next1\tB\next2\tB\n'
+
+
+def test_tsvzed_legacy_own_write_in_progress_is_not_an_external_change(tmp_path):
+	import threading
+	p = str(tmp_path / 'own.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	real = t.release_file_obj
+
+	def release(f):
+		f.flush()  # the file has changed; its time is noted next, under the lock
+		check = threading.Thread(target=t.checkExternalChanges)  # the background writer's look meanwhile
+		check.start()
+		check.join(0.2)
+		real(f)
+		check.join(5)
+		seen.append(t.deSynced)  # before clear_file sets it False on success, as the background writer sees it
+
+	seen = []
+	t.release_file_obj = release
+	t.clear_file()
+	t.release_file_obj = real
+	assert seen == [False], 'its own clear_file was taken for another process changing the file'
+
+
+def test_tsvzed_legacy_reload_clears_a_change_it_has_read(tmp_path):
+	p = str(tmp_path / 'rc.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	with open(p, 'ab') as g:
+		g.write(b'ext\tB\n')
+	t.checkExternalChanges()
+	assert t.deSynced
+	t.reload()  # memory is the file again
+	calls = []
+	original = t._mapToFile
+	t._mapToFile = lambda *args, **kwargs: calls.append(1) or original(*args, **kwargs)
+	t.rewrite()  # rewrite_interval=0: nothing to do
+	assert calls == [] and not t.deSynced and t['ext'] == ['ext', 'B']
+
+
+def test_tsvzed_legacy_own_writes_never_make_the_writer_rewrite_stress(tmp_path, capsys):
+	import threading
+	p = str(tmp_path / 'desync.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.0001, rewrite_interval=0, rewrite_on_load=False)
+	calls = []
+	original = t._mapToFile
+	t._mapToFile = lambda *args, **kwargs: calls.append(threading.current_thread().name) or original(*args, **kwargs)
+	for i in range(300):
+		t['k'] = ['k', str(i)]  # an overwrite: dirty
+		t.clear_file()  # a write of this thread's own while the background writer looks for changes
+	time.sleep(0.05)
+	t.close()
+	assert calls == [] and 'External changes detected' not in capsys.readouterr().out

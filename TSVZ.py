@@ -4037,6 +4037,7 @@ class TSVZed(OrderedDict):
 			self.__teePrintOrNot(f"correctColumnNum: {self.correctColumnNum}")
 			self.__teePrintOrNot(f"TSVZed({self._fileName}) loaded")
 		self.lastUpdateTime = seen
+		self.deSynced = False  # memory is the file again: a change seen before needs no rewrite
 		return self
 
 	def _specReload(self):
@@ -4946,13 +4947,21 @@ memoryOnly:{self.memoryOnly}
 				self.deSynced = True
 				self.__teePrintOrNot(f"External changes detected in {self._fileName}")
 			return self
-		realExternalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
-		if self.externalFileUpdateTime < realExternalFileUpdateTime:
-			self.deSynced = True
+		# Under writeLock, as _externalChange(): a write of this object's own that holds it has changed the file
+		# but not yet noted its time, and must not be taken for another process's change (it set deSynced,
+		# and the background writer rewrote the whole file, rewrite_interval=0 or not).
+		with self.writeLock:
+			realExternalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
+			changed = self.externalFileUpdateTime < realExternalFileUpdateTime
+			if changed:
+				self.deSynced = True
+			elif self.externalFileUpdateTime > realExternalFileUpdateTime:
+				self.externalFileUpdateTime = realExternalFileUpdateTime
+				changed = None
+		if changed:
 			self.__teePrintOrNot(f"External changes detected in {self._fileName}")
-		elif self.externalFileUpdateTime > realExternalFileUpdateTime:
+		elif changed is None:
 			self.__teePrintOrNot(f"Time anomalies detected in {self._fileName}, resetting externalFileUpdateTime")
-			self.externalFileUpdateTime = realExternalFileUpdateTime
 		return self
 
 	def _appendWorker(self):
