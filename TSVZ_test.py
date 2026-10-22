@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import time
+from collections import OrderedDict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import TSVZ
@@ -5779,7 +5780,7 @@ def test_tsvzed_legacy_rewrite_with_a_mutated_row_writes_nothing(tmp_path, capsy
 	t.hardMapToFile()
 	t.mapToFile()
 	assert _bytes(p) == before
-	assert t.deSynced
+	assert not t.deSynced and t._refusedAt  # refused, not broken: no retry at every tick
 	assert "cannot write 'bad\\udcff.txt' as UTF-8" in capsys.readouterr().out
 	t.shutdownEvent.set()
 	t.appendThread.join()
@@ -5852,3 +5853,134 @@ def test_tsvzclient_refuses_an_unencodable_write_and_sends_nothing(tmp_path, suf
 	c2 = TSVZ.TSVZClient(p, errors='replace')
 	c2[BAD_NAME] = [BAD_NAME, 'x']
 	assert b'bad?.txt\tx\n' in _bytes(p)
+
+
+# --- review fixes -----------------------------------------------------------
+def _stop(t):
+	t.shutdownEvent.set()
+	t.appendThread.join()
+
+
+def test_tsvzed_legacy_commit_keeps_the_good_rows_around_a_refused_one(tmp_path, capsys):
+	p = str(tmp_path / 'q.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=5, rewrite_on_load=False)
+	t['x'] = ['x', '1']
+	t['a'] = ['a', '1']
+	t['y'] = ['y', '1']
+	t['a'][1] = BAD_NAME  # in place: no __setitem__ sees it
+	t.commitAppendToFile()
+	assert _bytes(p) == b'id\tv\nx\t1\ny\t1\n'
+	assert not t.appendQueue
+	assert t.dirty  # a rewrite stores the row once it can be
+	assert 'cannot write' in capsys.readouterr().out
+	t['a'][1] = 'fixed'
+	t.hardMapToFile()
+	assert _bytes(p) == b'id\tv\nx\t1\na\tfixed\ny\t1\n'
+	_stop(t)
+
+
+class _FlipList(list):
+	"""A row another thread changes between the check and the write: the first read is good, later ones are not."""
+	reads = 0
+
+	def __iter__(self):
+		type(self).reads += 1
+		return iter(['a', '1'] if type(self).reads == 1 else ['a', BAD_NAME])
+
+
+@pytest.mark.parametrize('method', ['hardMapToFile', 'mapToFile'])
+def test_tsvzed_legacy_rewrite_encodes_everything_before_it_touches_the_file(tmp_path, method):
+	p = str(tmp_path / 'r.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=5, rewrite_on_load=False)
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '2']
+	t.commitAppendToFile()
+	before = _bytes(p)
+	_FlipList.reads = 0
+	OrderedDict.__setitem__(t, 'a', _FlipList(['a', '1']))
+	getattr(t, method)()
+	assert _bytes(p) == before  # not emptied
+	_stop(t)
+
+
+def test_tsvzed_legacy_refused_rewrite_is_reported_once_and_retried_when_fixed(tmp_path, capsys):
+	p = str(tmp_path / 'f.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.005, rewrite_on_load=False, rewrite_interval=0.05)
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '2']
+	assert _wait_for(lambda: b'b\t2' in _bytes(p))
+	capsys.readouterr()
+	t['a'][1] = BAD_NAME
+	t.dirty = True
+	time.sleep(0.6)
+	out = capsys.readouterr().out
+	assert out.count('cannot write') == 1, out
+	assert 'Traceback' not in out
+	t['a'][1] = 'fixed'
+	t['c'] = ['c', '3']
+	assert _wait_for(lambda: b'a\tfixed' in _bytes(p) and b'c\t3' in _bytes(p), 4)
+	_stop(t)
+
+
+def test_tsvzed_with_a_legacy_encoding_rewrites_what_it_read_from_its_own_file(tmp_path, capsys):
+	p = str(tmp_path / 'e.tsv')
+	with open(p, 'wb') as f:
+		f.write(b'r\xe9sum\xe9\t1\n')  # not ASCII: read as U+FFFD, which ASCII lacks
+	t = TSVZ.TSVZed(p, encoding='ascii', append_check_delay=0.01)
+	t.hardMapToFile()
+	t.close()
+	out = capsys.readouterr().out
+	assert 'cannot write' not in out and 'Refused' not in out
+	assert b'r?sum?\t1\n' in _bytes(p)
+	t = TSVZ.TSVZed(p, encoding='ascii', append_check_delay=0.01, rewrite_on_load=False)
+	with pytest.raises(ValueError):  # text the caller passes in is still checked
+		t['k'] = ['k', '\u00e9']
+	t.close()
+
+
+def test_scrub_with_a_legacy_encoding_keeps_a_row_it_read(tmp_path):
+	p = str(tmp_path / 's.tsv')
+	with open(p, 'wb') as f:
+		f.write(b'k\t\x81\n')  # 0x81 is undefined in cp1252
+	TSVZ.scrubTabularFile(p, encoding='cp1252')
+	assert b'k\t?\n' in _bytes(p)
+	before = _bytes(p)
+	with pytest.raises(ValueError):
+		TSVZ.scrubTabularFile(p, encoding='cp1252', taskDic={'z': ['z', '\u4e2d']})
+	assert _bytes(p) == before
+
+
+@pytest.mark.parametrize('bad', ['Replace', None, 3, 'nonesuch'])
+def test_errors_is_checked_where_it_is_given(tmp_path, bad):
+	p = str(tmp_path / 'v.tsv')
+	exc = (ValueError, TypeError)
+	with pytest.raises(exc):
+		TSVZ.TSVZed(p, errors=bad)
+	with pytest.raises(exc):
+		TSVZ.TSVZedLite(p, errors=bad)
+	with pytest.raises(exc):
+		TSVZ.appendTabularFile(p, ['a', '1'], createIfNotExist=True, errors=bad)
+	with pytest.raises(exc):
+		TSVZ.clearTabularFile(p, errors=bad)
+	with pytest.raises(exc):
+		TSVZ.scrubTabularFile(p, errors=bad)
+	with pytest.raises(exc):
+		TSVZ.TSVZClient(p, errors=bad)
+	assert not os.path.exists(p)
+
+
+def test_tsvzed_spec_strict_refuses_a_bad_record_and_writes_the_good_ones(tmp_path, capsys):
+	p = str(tmp_path / 's.tsvz')
+	t = TSVZ.TSVZed(p, append_check_delay=0.01)
+	t['x'] = ['x', '1']
+	t.memoryOnly = True  # the check at set time is skipped for a memory-only store
+	t['bad'] = ['bad', BAD_NAME]
+	t.memoryOnly = False
+	t.appendQueue.append('bad\t' + BAD_NAME)  # a record queued before the toggle
+	t['c'] = ['c', '1']
+	assert _wait_for(lambda: b'c\t1\n' in _bytes(p))
+	assert b'x\t1\n' in _bytes(p) and b'bad' not in _bytes(p)
+	assert t.appendThread.is_alive()
+	t.close()
+	assert b'c\t1\n' in _bytes(p) and not t.appendQueue
+	assert capsys.readouterr().out.count('cannot write') == 1

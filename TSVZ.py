@@ -541,6 +541,9 @@ def _isSpecPath(path):
 	return _parsePartName(path).ext in STRICT_EXTENSIONS
 
 
+_REFUSED_RETRY_SECONDS = 1.0  # shortest wait before a refused rewrite is tried again
+
+
 class TSVZEncodeError(ValueError):
 	"""Text to write cannot be encoded: a lone surrogate (what ``os.fsdecode`` gives for a non-UTF-8 file name), or a character the encoding lacks.
 
@@ -576,25 +579,60 @@ def _unencodable(text, error, encoding, where=None):
 		subject, name, ' ({})'.format(where) if where else '', what))
 
 
-def _encodeText(text, encoding='utf8', errors='strict', where=None):
-	"""``text.encode(encoding, errors)``; under ``errors='strict'`` a failure is a ``TSVZEncodeError`` naming ``where``."""
-	encoding = encoding or 'utf8'
-	if errors != 'strict':
-		return text.encode(encoding, errors)
+_NEVER_RAISING_HANDLERS = frozenset(('replace', 'ignore', 'xmlcharrefreplace', 'backslashreplace', 'namereplace'))
+
+
+def _fffdHandler(error):
+	"""Codec error handler: U+FFFD, what the readers put for a byte they could not decode, becomes ``?``; anything else is refused."""
+	if isinstance(error, UnicodeEncodeError) and error.object[error.start] == '\ufffd':
+		return '?', error.start + 1
+	raise error
+
+
+codecs.register_error('tsvz-fffd', _fffdHandler)
+
+
+def _checkErrors(errors):
+	"""Return ``errors`` if it names a codec error handler, else raise ``ValueError`` (or ``TypeError``) now, not in the background writer."""
+	if not isinstance(errors, str):
+		raise TypeError("errors must be the name of a codec error handler such as 'strict' or 'replace', not {}".format(ascii(errors)))
 	try:
-		return text.encode(encoding)
+		codecs.lookup_error(errors)
+	except LookupError:
+		raise ValueError("unknown errors= handler {}; use 'strict', 'replace' or a registered codec error handler".format(ascii(errors))) from None
+	return errors
+
+
+def _mayRaise(errors):
+	"""True when encoding with ``errors`` can fail, so a writer has to check text before it changes anything."""
+	return errors not in _NEVER_RAISING_HANDLERS
+
+
+def _tryEncode(text, encoding, errors):
+	"""``text.encode(encoding, errors)``; under ``errors='strict'`` only U+FFFD (a read replacement) the encoding lacks is written as ``?``."""
+	if errors == 'strict':
+		try:
+			return text.encode(encoding)
+		except UnicodeEncodeError:
+			return text.encode(encoding, 'tsvz-fffd')
+	return text.encode(encoding, errors)
+
+
+def _encodeText(text, encoding='utf8', errors='strict', where=None):
+	"""``text.encode(encoding, errors)``; a failure is a ``TSVZEncodeError`` naming ``where``."""
+	encoding = encoding or 'utf8'
+	try:
+		return _tryEncode(text, encoding, errors)
 	except UnicodeEncodeError as e:
 		raise _unencodable(text, e, encoding, where) from None
 
 
 def _encodeRow(cells, delimiter, encoding='utf8', errors='strict', header=None, what='row'):
-	"""The bytes of ``cells`` joined by ``delimiter``; a strict failure names the cell (``what``: 'row', 'header' or 'defaults')."""
+	"""The bytes of ``cells`` joined by ``delimiter``; a failure names the cell (``what``: 'row', 'header' or 'defaults')."""
 	encoding = encoding or 'utf8'
 	line = delimiter.join(cells)
-	if errors != 'strict':
-		return line.encode(encoding, errors)
 	try:
-		return line.encode(encoding)
+		return _tryEncode(line, encoding, errors)
 	except UnicodeEncodeError as e:
 		char = e.object[e.start]
 		for i, cell in enumerate(cells):
@@ -612,7 +650,7 @@ def _encodeRow(cells, delimiter, encoding='utf8', errors='strict', header=None, 
 
 def _checkRow(cells, delimiter, encoding='utf8', errors='strict', header=None, what='row'):
 	"""Raise ``TSVZEncodeError`` now when ``cells`` could not be written (nothing else: used before state changes)."""
-	if errors == 'strict':
+	if _mayRaise(errors):
 		_encodeRow(cells, delimiter, encoding, errors, header, what)
 
 
@@ -1323,6 +1361,7 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
 	- Exception: If the file is not found or there is a data format error.
 
 	"""
+	errors = _checkErrors(errors)
 	return readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,
 						   lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
 						   encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults,
@@ -1358,6 +1397,7 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 	- Exception: If the file is not found or there is a data format error.
 
 	"""
+	errors = _checkErrors(errors)
 	if _isSpecPath(fileName):
 		return _specReadTabularFile(fileName, teeLogger=teeLogger, header=header, createIfNotExist=createIfNotExist,
 									lastLineOnly=lastLineOnly, verifyHeader=verifyHeader, verbose=verbose,
@@ -1483,6 +1523,7 @@ def appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createI
 	- Exception: If the existing header does not match the provided header.
 	- ValueError (TSVZEncodeError): If a value, key or header cannot be encoded and errors is 'strict'. Nothing is written.
 	"""
+	errors = _checkErrors(errors)
 	return appendLinesTabularFile(fileName,[lineToAppend],teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding, strict = strict, delimiter = delimiter, errors = errors)
 
 def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = ..., errors = 'strict'):
@@ -1505,6 +1546,7 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 	- Exception: If the existing header does not match the provided header.
 	- ValueError (TSVZEncodeError): If a value, key or header cannot be encoded and errors is 'strict'. Nothing is written.
 	"""
+	errors = _checkErrors(errors)
 	if _isSpecPath(fileName):
 		return _specAppendLinesTabularFile(fileName, linesToAppend, teeLogger=teeLogger, header=header,
 										   createIfNotExist=createIfNotExist, verifyHeader=verifyHeader,
@@ -1623,6 +1665,7 @@ def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,
 	- strict (bool, optional): If True, the function will raise an exception if there is a data format error. If False, the function will ignore the error and continue.
 	- errors (str, optional): What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8 file name (os.fsdecode). 'strict' (the default) raises a ValueError (TSVZEncodeError) naming it, before anything is written; 'replace' writes '?' instead.
 	"""
+	errors = _checkErrors(errors)
 	if _isSpecPath(fileName):
 		_specClearTabularFile(fileName, teeLogger=teeLogger, header=header, verifyHeader=verifyHeader,
 							  verbose=verbose, encoding=encoding, strict=strict, delimiter=delimiter, errors=errors)
@@ -1723,6 +1766,7 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 	- Exception: If the file is not found or there is a data format error.
 
 	"""
+	errors = _checkErrors(errors)
 	if _isSpecPath(fileName):
 		return _specScrubTabularFile(fileName, teeLogger=teeLogger, header=header, createIfNotExist=createIfNotExist,
 									 lastLineOnly=lastLineOnly, verifyHeader=verifyHeader, verbose=verbose,
@@ -3787,7 +3831,7 @@ class TSVZed(OrderedDict):
 		self.lastUpdateTime = self.externalFileUpdateTime
 		self._fileName = fileName
 		self.teeLogger = teeLogger
-		self.errors = errors
+		self.errors = _checkErrors(errors)
 		if self._spec:
 			reporter = _Reporter(fileName, teeLogger)
 			self.delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
@@ -4275,7 +4319,21 @@ class TSVZed(OrderedDict):
 			items.append(self.appendQueue.popleft())
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		try:
-			payload = _encodeText(''.join(item + '\n' for item in items), 'utf-8', self.errors)
+			# A record that cannot be encoded is refused (reported, not kept): left in the queue it
+			# would hold back every later write for good. The others are written.
+			chunks = []
+			good = []
+			for item in items:
+				try:
+					chunks.append(_encodeText(item + '\n', 'utf-8', self.errors))
+					good.append(item)
+				except TSVZEncodeError as e:
+					self.dirty = True
+					self.__teePrintOrNot(f"Refused at commitAppendToFile() to {self._activePath}: {e}; the record is not written, the others are",'error')
+			items = good
+			if not chunks:
+				return self
+			payload = b''.join(chunks)
 			_specAppendPayload(self._activePath, payload, reporter, fsync=True, memberSize=self._specState.memberSize)
 			self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
 			if self._writeFailing:
@@ -4486,6 +4544,8 @@ memoryOnly:{self.memoryOnly}
 					  self.teeLogger)
 			self._specSync(reloadInternalFromFile)
 			return False
+		if not force and self._refusedAt and time.time() - self._refusedAt < max(self.rewrite_interval, _REFUSED_RETRY_SECONDS):
+			return False  # the last rewrite was refused (text that cannot be written): try again later, not at every tick
 		if not self.deSynced and not force:
 			if not self.dirty:
 				return False
@@ -4521,22 +4581,41 @@ memoryOnly:{self.memoryOnly}
 			self.deSynced = True
 			return False
 		
-	def _checkRewrite(self):
-		"""Raise ``TSVZEncodeError`` when the header, the defaults or a row held in memory could not be written.
+	_refusedAt = 0.0  # when a rewrite or an append was last refused for text that cannot be written; 0 when none is
+	_refusalReported = False
 
-		Run before a rewrite opens the file, which empties it or writes it in
-		place: a refused rewrite must leave the file as it is.
+	def _refuse(self, where, error, detail):
+		"""Remember that ``where`` was refused with ``error`` and report it once per run of refusals (no traceback: it is not a bug)."""
+		self._refusedAt = time.time()
+		if not self._refusalReported:
+			self._refusalReported = True
+			self.__teePrintOrNot(f"Refused at {where} to {self._fileName}: {error}; {detail}",'error')
+
+	def _accepted(self):
+		"""A write went through: a later refusal is reported again."""
+		self._refusedAt = 0.0
+		self._refusalReported = False
+
+	def _encodeRewrite(self):
+		"""Encode everything a rewrite writes before the file is opened; return ``(header, rows)`` as bytes.
+
+		``header`` is the header line (``None`` without one), ``rows`` the
+		defaults line then every stored row, none newline-terminated. A
+		``TSVZEncodeError`` here leaves the file as it is, and a row another
+		thread changes later cannot make the write fail half-way.
 		"""
-		if self.errors != 'strict':
-			return
 		delimiter = self.delimiter
+		header = None
 		if self.header:
-			_checkRow(_sanitize(self.header,delimiter=delimiter), delimiter, self.encoding, self.errors, what='header')
+			header = _encodeRow(_sanitize(self.header,delimiter=delimiter),delimiter,self.encoding,self.errors,what='header')
+		rows = []
 		if self.defaults and len(self.defaults) > 1:
-			_checkRow(_sanitize(self.defaults,delimiter=delimiter), delimiter, self.encoding, self.errors, what='defaults')
-		for value in self.values():
+			rows.append(_encodeRow(_sanitize(self.defaults,delimiter=delimiter),delimiter,self.encoding,self.errors,what='defaults'))
+		# '#'-prefixed keys are in-memory only (comments / internal); never written.
+		for value in list(self.values()):
 			if value and not str(value[0]).startswith('#'):
-				_checkRow(_sanitize(value,delimiter=delimiter), delimiter, self.encoding, self.errors, self.header)
+				rows.append(_encodeRow(_sanitize(value,delimiter=delimiter),delimiter,self.encoding,self.errors,self.header))
+		return header, rows
 
 	def hardMapToFile(self):
 		if self._spec:
@@ -4548,21 +4627,15 @@ memoryOnly:{self.memoryOnly}
 		try:
 			if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
 				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
-			self._checkRewrite()
+			header, rows = self._encodeRewrite()  # all of it, before the file is emptied
 			file = self.get_file_obj('wb')
 			buf = io.BufferedWriter(file, buffer_size=64*1024*1024)  # 64MB buffer
-			if self.header:
-				buf.write(_encodeRow(_sanitize(self.header,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header') + b'\n')
-			# Persist the defaults line (right after the header) so it survives a
+			if header is not None:
+				buf.write(header + b'\n')
+			# The defaults line comes right after the header, so it survives a
 			# full rewrite -- it is not a regular mapping key.
-			if self.defaults and len(self.defaults) > 1:
-				buf.write(_encodeRow(_sanitize(self.defaults,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='defaults') + b'\n')
-			for key in self:
-				# '#'-prefixed keys are in-memory only (comments / internal); never written.
-				if str(key).startswith('#'):
-					continue
-				segments = _sanitize(self[key],delimiter=self.delimiter)
-				buf.write(_encodeRow(segments,self.delimiter,self.encoding,self.errors,self.header)+b'\n')
+			for line in rows:
+				buf.write(line + b'\n')
 			buf.flush()
 			self.release_file_obj(file)
 			if self.verbose:
@@ -4570,6 +4643,9 @@ memoryOnly:{self.memoryOnly}
 				self.__teePrintOrNot(f"File {self._fileName} size: {os.path.getsize(self._fileName)}")
 			self.dirty = False
 			self.deSynced = False
+			self._accepted()
+		except TSVZEncodeError as e:
+			self._refuse('hardMapToFile()', e, 'the file is left as it is; will retry')
 		except Exception as e:
 			self.release_file_obj(file)
 			self.__teePrintOrNot(f"Failed to write at hardMapToFile() to {self._fileName}: {e}",'error')
@@ -4586,6 +4662,12 @@ memoryOnly:{self.memoryOnly}
 			return self
 		mec = self.monitor_external_changes
 		self.monitor_external_changes = False
+		try:
+			return self._mapToFile()
+		finally:
+			self.monitor_external_changes = mec
+
+	def _mapToFile(self):
 		file = None
 		try:
 			if (not self.monitor_external_changes) and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
@@ -4593,7 +4675,7 @@ memoryOnly:{self.memoryOnly}
 			if _isCompressedFile(self._fileName):
 				# if the file is compressed, we need to use the hardMapToFile method
 				return self.hardMapToFile()
-			self._checkRewrite()
+			headerBytes, rowsToWrite = self._encodeRewrite()  # all of it, before the file is touched
 			file = self.get_file_obj('r+b')
 			overWrite = False
 			if self.header:
@@ -4602,25 +4684,18 @@ memoryOnly:{self.memoryOnly}
 				if not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
 					header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
 					file.seek(0)
-					file.write(_encodeRow(_sanitize(self.header,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header')+b'\n')
+					file.write(headerBytes+b'\n')
 					# if the header is not the same length as the line, we need to overwrite the file
 					if aftPos != file.tell():
 						overWrite = True
 					if self.verbose:
 						self.__teePrintOrNot(f"Header {header} written to {self._fileName}")
 			# Rows to (re)write, in order: the defaults line first (right after the
-			# header, if set) then every data row. '#'-prefixed keys are in-memory
-			# only (comments / internal) and are never written.
-			rowsToWrite = []
-			if self.defaults and len(self.defaults) > 1:
-				rowsToWrite.append(self.defaults)
-			rowsToWrite.extend(v for v in self.values() if v and not str(v[0]).startswith('#'))
-			for value in rowsToWrite:
-				segments = _sanitize(value,delimiter=self.delimiter)
-				encoded = _encodeRow(segments,self.delimiter,self.encoding,self.errors,self.header)
+			# header, if set) then every data row.
+			for encoded in rowsToWrite:
 				if overWrite:
 					if self.verbose:
-						self.__teePrintOrNot(f"Overwriting {value} to {self._fileName}")
+						self.__teePrintOrNot(f"Overwriting {encoded!r} to {self._fileName}")
 					file.write(encoded+b'\n')
 					continue
 				pos = file.tell()
@@ -4628,7 +4703,7 @@ memoryOnly:{self.memoryOnly}
 				aftPos = file.tell()
 				if not line or pos == aftPos:
 					if self.verbose:
-						self.__teePrintOrNot(f"End of file reached. Appending {value} to {self._fileName}")
+						self.__teePrintOrNot(f"End of file reached. Appending {encoded!r} to {self._fileName}")
 					# L6: 3.39 omitted this newline and glued the row to the next one.
 					file.write(encoded+b'\n')
 					overWrite = True
@@ -4636,7 +4711,7 @@ memoryOnly:{self.memoryOnly}
 				strToWrite = encoded.ljust(len(line)-1)+b'\n'
 				if line != strToWrite:
 					if self.verbose:
-						self.__teePrintOrNot(f"Modifing {value} to {self._fileName}")
+						self.__teePrintOrNot(f"Modifing {encoded!r} to {self._fileName}")
 					file.seek(pos)
 					# fill the string with space to write to the correct length
 					file.write(strToWrite)
@@ -4649,17 +4724,19 @@ memoryOnly:{self.memoryOnly}
 				self.__teePrintOrNot(f"File {self._fileName} size: {os.path.getsize(self._fileName)}")
 			self.dirty = False
 			self.deSynced = False
+			self._accepted()
+		except TSVZEncodeError as e:
+			self._refuse('mapToFile()', e, 'the file is left as it is; will retry')
+			return self
 		except Exception as e:
 			self.release_file_obj(file)
 			self.__teePrintOrNot(f"Failed to write at mapToFile() to {self._fileName}: {e}",'error')
 			import traceback
 			self.__teePrintOrNot(traceback.format_exc(),'error')
 			self.deSynced = True
-			if not isinstance(e, TSVZEncodeError):  # a refused rewrite would be refused again
-				self.__teePrintOrNot("Trying failback hardMapToFile()")
-				self.hardMapToFile()
+			self.__teePrintOrNot("Trying failback hardMapToFile()")
+			self.hardMapToFile()
 		self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
-		self.monitor_external_changes = mec
 		return self
 	
 	def checkExternalChanges(self):
@@ -4715,9 +4792,18 @@ memoryOnly:{self.memoryOnly}
 				file = self.get_file_obj('ab' if compressed else 'a+b')
 				chunks = []
 				while self.appendQueue:
-					line = _sanitize(self.appendQueue.popleft(),delimiter=self.delimiter)
-					chunks.append(_encodeRow(line,self.delimiter,self.encoding,self.errors,self.header)+b'\n')
+					row = self.appendQueue.popleft()
+					try:
+						chunks.append(_encodeRow(_sanitize(row,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,self.header)+b'\n')
+					except TSVZEncodeError as e:
+						# A row changed in place after it was set. It is not written, but it must not take
+						# the good rows with it: those are written. A rewrite stores it once it can be.
+						self.dirty = True
+						self.__teePrintOrNot(f"Refused at commitAppendToFile() to {self._fileName}: {e}; the row is not appended, the others are",'error')
 				payload = b''.join(chunks)
+				if not payload:
+					self.release_file_obj(file)
+					return self
 				if not compressed and _endsWithoutNewline(file):
 					# L1: terminate a hand-edited last line instead of gluing onto it.
 					payload = b'\n' + payload
@@ -4931,7 +5017,7 @@ class TSVZedLite(MutableMapping):
 		self.version = version
 		self.strict = strict
 		self._fileName = fileName
-		self.errors = errors
+		self.errors = _checkErrors(errors)
 		if self._spec:
 			reporter = _Reporter(fileName)
 			self.delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
@@ -6953,7 +7039,7 @@ class TSVZClient(MutableMapping):
 	"""
 
 	def __init__(self, fileName, sync=False, timeout=None, teeLogger=None, errors='strict'):
-		self._errors = errors
+		self._errors = _checkErrors(errors)
 		self._fileName = fileName
 		self._sync = sync
 		self._timeout = timeout
@@ -6987,8 +7073,8 @@ class TSVZClient(MutableMapping):
 				for text in fields + (bulk or []):
 					_encodeText(text, 'utf-8')
 			else:
-				fields = [_encodeText(text, 'utf-8', self._errors).decode('utf-8') for text in fields]
-				bulk = None if bulk is None else [_encodeText(text, 'utf-8', self._errors).decode('utf-8') for text in bulk]
+				fields = [_encodeText(text, 'utf-8', self._errors).decode('utf-8', 'replace') for text in fields]
+				bulk = None if bulk is None else [_encodeText(text, 'utf-8', self._errors).decode('utf-8', 'replace') for text in bulk]
 		options = (['--sync'] if write and self._sync else []) + (['--x-written'] if write else [])
 		line = '\t'.join(options + fields)
 		with self._lock:  # one request at a time on the shared connection
@@ -7030,17 +7116,35 @@ class TSVZClient(MutableMapping):
 		"""'tsvz' for tsvz-spec-v1 files (.tsvz/.csvz/.nsvz/.psvz), 'tsv' for 3.39-format files."""
 		return 'tsvz' if self._spec else 'tsv'
 
+	@staticmethod
+	def _cannotExist(key):
+		"""True for a key no store holds: text that is not UTF-8 (a lone surrogate) is read as U+FFFD, never as itself.
+
+		A read of it is answered here, the same with a handler and without: nothing is sent.
+		"""
+		try:
+			str(key).encode('utf-8')
+		except UnicodeEncodeError:
+			return True
+		return False
+
 	def __getitem__(self, key):
+		if self._cannotExist(key):
+			raise KeyError(key)
 		lines = self._request(['get', _serveEncode(str(key))])[0]
 		if not lines:
 			raise KeyError(key)
 		return _serveDecodeLine(lines[0])
 
 	def get(self, key, default=None):
+		if self._cannotExist(key):
+			return default
 		lines, status, _ = self._request(['get', _serveEncode(str(key))])
 		return _serveDecodeLine(lines[0]) if status == 0 and lines else default
 
 	def __contains__(self, key):
+		if self._cannotExist(key):
+			return False
 		return self._request(['has', _serveEncode(str(key))])[1] == 0
 
 	def __len__(self):
@@ -7068,6 +7172,8 @@ class TSVZClient(MutableMapping):
 	def __delitem__(self, key):
 		"""Delete ``key``; a missing key is not an error (as in ``TSVZed``)."""
 		key = str(key)
+		if self._cannotExist(key):
+			return  # no such key: a missing key is not an error
 		# Resending the delete of a key ending in whitespace could name, and delete, the stripped key (spec §20.2.7).
 		retry = not (self._spec and _specStrippable(key, self.delimiter))
 		self._request(['delete', _serveEncode(key)], write=True, retry=retry)
@@ -7075,6 +7181,10 @@ class TSVZClient(MutableMapping):
 	_marker = object()
 
 	def pop(self, key, default=_marker):
+		if self._cannotExist(key):
+			if default is TSVZClient._marker:
+				raise KeyError(key)
+			return default
 		lines, status, _ = self._request(['pop', _serveEncode(str(key))], write=True, retry=False)
 		if lines:
 			return _serveDecodeLine(lines[0])
