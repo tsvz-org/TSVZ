@@ -7139,9 +7139,12 @@ class TSVZClient(MutableMapping):
 	  key or value cannot be encoded as UTF-8 (a lone surrogate from a non-UTF-8 file name), before
 	  anything is sent; 'replace' writes '?' for it. Any codec error handler is taken (a name that is
 	  not one is a ``ValueError`` at construction); text goes to the handler as UTF-8, so what
-	  ``'surrogateescape'`` would write as a raw byte arrives as U+FFFD. A read of a key that no store
-	  can hold (a lone surrogate) is answered here, with or without a handler: ``KeyError``, ``False``,
-	  the default.
+	  ``'surrogateescape'`` would write as a raw byte arrives as U+FFFD. With 'strict' a
+	  key that no store can hold (a lone surrogate) is a missing key, answered here with or without a
+	  handler as ``TSVZed`` answers it (``KeyError`` or, while the store returns defaults for a missing
+	  key, the defaults row; ``False``; the default; a delete that does nothing); with another handler
+	  the key is the one a write of it stores (``'k?'`` for ``replace``). ``setdefault`` of a live key
+	  returns its row whatever the default holds.
 	"""
 
 	def __init__(self, fileName, sync=False, timeout=None, teeLogger=None, errors='strict'):
@@ -7176,11 +7179,10 @@ class TSVZClient(MutableMapping):
 		"""Send a request; return ``(lines, status, message)``. Usage errors raise ``ValueError``."""
 		if write:
 			if self._errors == 'strict':
-				for text in fields + (bulk or []):
-					_encodeText(text, 'utf-8')
+				self._checkSendable(fields, bulk)
 			else:
-				fields = [_encodeText(text, 'utf-8', self._errors).decode('utf-8', 'replace') for text in fields]
-				bulk = None if bulk is None else [_encodeText(text, 'utf-8', self._errors).decode('utf-8', 'replace') for text in bulk]
+				fields = [self._encoded(text) for text in fields]
+				bulk = None if bulk is None else [self._encoded(text) for text in bulk]
 		options = (['--sync'] if write and self._sync else []) + (['--x-written'] if write else [])
 		line = '\t'.join(options + fields)
 		with self._lock:  # one request at a time on the shared connection
@@ -7203,6 +7205,16 @@ class TSVZClient(MutableMapping):
 			_warn('TSVZ warning: {}: {}'.format(self._fileName, message), self.teeLogger)
 		return lines, status, message
 
+	@staticmethod
+	def _checkSendable(fields, bulk=None):
+		"""Raise ``TSVZEncodeError`` when a field of a request cannot be sent as UTF-8."""
+		for text in fields + (bulk or []):
+			_encodeText(text, 'utf-8')
+
+	def _encoded(self, text):
+		"""``text`` as this client's ``errors=`` handler turns it into UTF-8 text: what a writer would store."""
+		return _encodeText(text, 'utf-8', self._errors).decode('utf-8', 'replace')
+
 	def _cells(self, key, value):
 		"""``value`` normalised as ``TSVZed.__setitem__`` does, with ``key`` first."""
 		key = str(key).rstrip()
@@ -7222,36 +7234,52 @@ class TSVZClient(MutableMapping):
 		"""'tsvz' for tsvz-spec-v1 files (.tsvz/.csvz/.nsvz/.psvz), 'tsv' for 3.39-format files."""
 		return 'tsvz' if self._spec else 'tsv'
 
-	@staticmethod
-	def _cannotExist(key):
-		"""True for a key no store holds: text that is not UTF-8 (a lone surrogate) is read as U+FFFD, never as itself.
+	def _named(self, key):
+		"""``(text, absent)``: the key as it is sent, and whether no store can hold it.
 
-		A read of it is answered here, the same with a handler and without: nothing is sent.
+		With ``errors='strict'`` text that is not UTF-8 (a lone surrogate) names no key: a writer
+		refuses it and a reader reads the byte as U+FFFD, never as itself, so nothing is sent
+		and the answer is that of a missing key, as ``TSVZed`` and ``TSVZedLite`` answer it.
+		With another handler the key is what a write of it would store (``'k?'`` for ``replace``),
+		as a ``TSVZed`` with that ``errors=`` writes the tombstone of it.
 		"""
+		key = str(key)
 		try:
-			str(key).encode('utf-8')
+			key.encode('utf-8')
 		except UnicodeEncodeError:
-			return True
-		return False
+			if self._errors == 'strict':
+				return key, True
+			return self._encoded(key), False
+		return key, False
 
 	def __getitem__(self, key):
-		if self._cannotExist(key):
-			raise KeyError(key)
-		lines = self._request(['get', _serveEncode(str(key))])[0]
+		name, absent = self._named(key)
+		if absent:
+			# A missing key reads as the defaults while the store says so (spec §14.5), which only the handler
+			# knows: ask for a key that is not in the store (nobody writes 96 random bits) and name the row as asked.
+			lines = self._request(['get', 'tsvz-absent-' + os.urandom(12).hex()])[0]
+			if not lines:
+				raise KeyError(key)
+			row = _serveDecodeLine(lines[0])
+			row[0] = name.rstrip()
+			return row
+		lines = self._request(['get', _serveEncode(name)])[0]
 		if not lines:
 			raise KeyError(key)
 		return _serveDecodeLine(lines[0])
 
 	def get(self, key, default=None):
-		if self._cannotExist(key):
+		name, absent = self._named(key)
+		if absent:
 			return default
-		lines, status, _ = self._request(['get', _serveEncode(str(key))])
+		lines, status, _ = self._request(['get', _serveEncode(name)])
 		return _serveDecodeLine(lines[0]) if status == 0 and lines else default
 
 	def __contains__(self, key):
-		if self._cannotExist(key):
+		name, absent = self._named(key)
+		if absent:
 			return False
-		return self._request(['has', _serveEncode(str(key))])[1] == 0
+		return self._request(['has', _serveEncode(name)])[1] == 0
 
 	def __len__(self):
 		return int(self._request(['len'])[0][0])
@@ -7277,8 +7305,8 @@ class TSVZClient(MutableMapping):
 
 	def __delitem__(self, key):
 		"""Delete ``key``; a missing key is not an error (as in ``TSVZed``)."""
-		key = str(key)
-		if self._cannotExist(key):
+		key, absent = self._named(key)
+		if absent:
 			return  # no such key: a missing key is not an error
 		# Resending the delete of a key ending in whitespace could name, and delete, the stripped key (spec §20.2.7).
 		retry = not (self._spec and _specStrippable(key, self.delimiter))
@@ -7287,11 +7315,12 @@ class TSVZClient(MutableMapping):
 	_marker = object()
 
 	def pop(self, key, default=_marker):
-		if self._cannotExist(key):
+		name, absent = self._named(key)
+		if absent:
 			if default is TSVZClient._marker:
 				raise KeyError(key)
 			return default
-		lines, status, _ = self._request(['pop', _serveEncode(str(key))], write=True, retry=False)
+		lines, status, _ = self._request(['pop', _serveEncode(name)], write=True, retry=False)
 		if lines:
 			return _serveDecodeLine(lines[0])
 		if default is TSVZClient._marker:
@@ -7317,6 +7346,16 @@ class TSVZClient(MutableMapping):
 			row = self.get(key)
 			if row is not None:
 				return row
+		if self._errors == 'strict':
+			try:
+				self._checkSendable(['setdefault'] + self._fields(cells))
+			except TSVZEncodeError:
+				# Nothing is written for it, so the handler need not decide: when the key is live the default is
+				# never looked at (as TSVZed.setdefault, which asks `in` first), else the write is refused.
+				row = self.get(cells[0])
+				if row is not None:
+					return row
+				raise
 		lines = self._request(['setdefault'] + self._fields(cells), write=True, retry=False)[0]
 		return _serveDecodeLine(lines[0]) if lines else None
 

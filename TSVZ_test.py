@@ -6060,8 +6060,9 @@ def test_client_reads_of_a_key_that_cannot_exist_agree_with_and_without_a_handle
 	c['ok'] = ['ok', '1']
 	assert (BAD_NAME in c) is False
 	assert c.get(BAD_NAME, 'dflt') == 'dflt'
-	with pytest.raises(KeyError):
-		c[BAD_NAME]
+	t = TSVZ.TSVZed(p, append_check_delay=0.01)  # a missing key reads as the (here empty) defaults, for both
+	assert c[BAD_NAME] == t[BAD_NAME] == [BAD_NAME, '']
+	_stop(t)
 	del c[BAD_NAME]  # no such key: not an error
 	assert c.pop(BAD_NAME, 'dflt') == 'dflt'
 	with pytest.raises(KeyError):
@@ -6458,3 +6459,80 @@ def test_spec_scrub_names_a_refused_cell_and_keeps_no_copy_of_a_part_it_did_not_
 	assert _bytes(p) == raw and os.listdir(str(tmp_path)) == ['d.tsvz']
 	TSVZ.scrubTabularFile(p, taskDic={'z': ['z', 'fine']})
 	assert any(n.startswith('d.tsvz.damaged-') for n in os.listdir(str(tmp_path)))
+
+
+# --- second review round: TSVZClient answers for a key no store holds as TSVZed does ------------------
+def _client(p, served, mode, **kwargs):
+	if mode == 'served':
+		if not hasattr(__import__('socket'), 'AF_UNIX'):
+			pytest.skip('Unix sockets')
+		served(p)
+	return TSVZ.TSVZClient(p, **kwargs)
+
+
+@pytest.mark.parametrize('mode', ['local', 'served'])
+def test_client_setdefault_of_a_live_key_ignores_a_default_it_could_not_write(tmp_path, served, mode):
+	p = str(tmp_path / 'q.tsvz')
+	_touch(p, b'k\tv\n')
+	c = _client(p, served, mode)
+	assert c.setdefault('k', ['k', 'x' + BAD_NAME]) == ['k', 'v']  # as TSVZed, TSVZedLite and the CLI
+	assert c.setdefault('k ', ['k ', BAD_NAME]) == ['k', 'v']
+	with pytest.raises(TSVZ.TSVZEncodeError):  # not live: the write is refused, nothing is written
+		c.setdefault('new', ['new', BAD_NAME])
+	with pytest.raises(TSVZ.TSVZEncodeError):
+		c.setdefault(BAD_NAME, [BAD_NAME, 'x'])
+	assert 'new' not in c and len(c) == 1
+	c.close()
+	assert _bytes(p) == b'k\tv\n'
+
+
+DEFAULTS_STORE = b'#_return_defaults_when_missing_#\ttrue\n#_defaults_#\tD\nk\tv\n'
+
+
+@pytest.mark.parametrize('mode', ['local', 'served'])
+def test_client_reads_a_key_that_cannot_exist_as_a_missing_key_of_the_store(tmp_path, served, mode):
+	p = str(tmp_path / 'r.tsvz')
+	_touch(p, DEFAULTS_STORE)
+	t = TSVZ.TSVZed(p, append_check_delay=0.01)
+	l = TSVZ.TSVZedLite(p)
+	c = _client(p, served, mode)
+	key = 'z' + BAD_NAME[3:]
+	assert t[key] == l[key] == [key, 'D']
+	assert c[key] == [key, 'D']  # the store returns its defaults for a missing key (§14.5)
+	assert c['plain'] == ['plain', 'D']
+	assert (key in c, c.get(key, 'dflt')) == (key in t, t.get(key, 'dflt')) == (False, 'dflt')
+	c.close()
+	_stop(t)
+
+
+@pytest.mark.parametrize('mode', ['local', 'served'])
+def test_client_reads_a_key_that_cannot_exist_as_a_missing_key_without_defaults(tmp_path, served, mode):
+	p = str(tmp_path / 'n.tsvz')
+	raw = b'#_return_defaults_when_missing_#\tfalse\nk\tv\n'
+	_touch(p, raw)
+	c = _client(p, served, mode)
+	key = 'z' + BAD_NAME[3:]
+	with pytest.raises(KeyError):
+		c[key]
+	with pytest.raises(KeyError):
+		c.pop(key)
+	assert c.pop(key, 'dflt') == 'dflt'
+	del c[key]
+	c.close()
+	assert _bytes(p) == raw
+
+
+@pytest.mark.parametrize('mode', ['local', 'served'])
+def test_client_errors_replace_reads_deletes_and_pops_the_key_it_wrote(tmp_path, served, mode):
+	p = str(tmp_path / 'e.tsvz')
+	_touch(p, b'x\t0\n')
+	c = _client(p, served, mode, errors='replace')
+	c['k\udcff'] = ['k\udcff', 'v']  # stores 'k?'
+	assert c['k\udcff'] == ['k?', 'v'] and 'k\udcff' in c and c.get('k\udcff') == ['k?', 'v']
+	del c['k\udcff']  # TSVZed under errors='replace' writes the tombstone of 'k?' too
+	assert 'k?' not in c and 'k\udcff' not in c
+	c['j\udcff'] = ['j\udcff', 'w']
+	assert c.pop('j\udcff') == ['j?', 'w']
+	assert list(c.keys()) == ['x']
+	c.close()
+	assert _bytes(p) == b'x\t0\nk?\tv\nk?\nj?\tw\nj?\n'
