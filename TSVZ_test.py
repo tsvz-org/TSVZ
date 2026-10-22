@@ -6225,7 +6225,8 @@ def test_cli_setdefault_through_a_handler_looks_up_as_a_reader_reads(tmp_path, s
 	p = str(tmp_path / 'h.tsvz')
 	_touch(p, b'\xff\t1\n')
 	served(p)
-	assert _run('setdefault', p, '\udcff', 'new') == (0, '�\t1\n', '')
+	status, out, err = _run('setdefault', p, '\udcff', 'new')  # not forwarded (see _cliHandler): the files are read here
+	assert (status, out) == (0, '�\t1\n') and err.count('U+FFFD') == 1, err
 	status, out, err = _run('setdefault', p, 'k', BAD_NAME)
 	assert status == 1 and 'cannot write' in err, err
 	assert _run('has', p, 'k')[0] != 0
@@ -6536,3 +6537,27 @@ def test_client_errors_replace_reads_deletes_and_pops_the_key_it_wrote(tmp_path,
 	assert list(c.keys()) == ['x']
 	c.close()
 	assert _bytes(p) == b'x\t0\nk?\tv\nk?\nj?\tw\nj?\n'
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_cli_routed_setdefault_is_one_atomic_request(tmp_path, served, monkeypatch):
+	p = str(tmp_path / 'one.tsvz')
+	_touch(p, b'\xff\t1\n')
+	served(p)
+	sent = []
+	request = TSVZ._ServeConnection.request
+
+	def spy(self, line, bulk=None):
+		sent.append(line.split('\t')[0:3])
+		return request(self, line, bulk)
+
+	monkeypatch.setattr(TSVZ._ServeConnection, 'request', spy)
+	assert _run('setdefault', p, 'new', 'v') == (0, 'new\tv\n', '')
+	assert [line[1] if line[0].startswith('--') else line[0] for line in sent] == ['setdefault']  # no probe first
+	del sent[:]
+	# data that holds a byte a request cannot carry: not forwarded, KEY looked up as a reader reads it, then refused
+	assert _run('setdefault', p, '\udcff', 'ignored' + BAD_NAME)[:2] == (0, '�\t1\n')
+	status, out, err = _run('setdefault', p, 'k', BAD_NAME)
+	assert status == 1 and 'cannot write' in err, err
+	assert sent == []
+	assert _run('has', p, 'k')[0] != 0

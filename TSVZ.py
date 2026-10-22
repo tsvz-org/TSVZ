@@ -8205,12 +8205,16 @@ def _cliHandler(args, delimiter, logger):
 	TSVZ routes a command line only when its result does not depend on
 	options the handler does not share: no --x-direct, --x-header,
 	--x-defaults or --x-strict, and for a loose file the handler's own
-	delimiter. A pointer whose handler does not answer is reported and the
-	files are used; another host's handler, or one this user may not
-	connect to, is skipped quietly.
+	delimiter. A setdefault whose data holds a byte that is not UTF-8 is not
+	forwarded either: a request cannot carry the byte, so the handler could not
+	refuse it when it has to write it, and one atomic request is all a forwarded
+	setdefault is (spec §21.8.2); it runs on the files, where KEY is looked up as a
+	reader reads it and only then is the data refused (§20.2.5). A pointer whose
+	handler does not answer is reported and the files are used; another host's
+	handler, or one this user may not connect to, is skipped quietly.
 	"""
 	if args.operation in ('serve', 'stop', 'parts', 'verify') or args.direct or args.header or args.defaults \
-			or args.strict:
+			or args.strict or args.writeArgs is not None:
 		return None  # parts and verify read the files themselves, so they gain nothing from a handler
 	info, problem = _serveLookup(args.store)
 	if problem:
@@ -8240,9 +8244,6 @@ def _cliRouted(connection, args, delimiter, logger, stdin, stdout):
 		finally:
 			source.flush()
 		bulk = [_serveRecordLine(cells, marker) for cells, marker in rows]
-	if args.operation == 'setdefault':
-		_cliSetdefaultArgs(args, delimiter, False,
-						   lambda key: connection.request('\t'.join(['has', _serveEncode(key)]))[2] == 0)
 	try:
 		written = ['--x-written'] if args.operation in ('set', 'append', 'delete') else []
 		response = connection.request('\t'.join(written + [_cliRequestLine(args)]), bulk)
