@@ -3998,7 +3998,8 @@ class TSVZed(OrderedDict):
 		self.memoryOnly = False
 		self.writeLock = threading.Lock()
 		self._memLock = threading.Lock()  # held while memory and appendQueue change together (a set, a delete, reload's swap)
-		self._failures = {}  # legacy writes that fail, by kind: see _failed()
+		self._failures = {}  # legacy writes that fail, by kind: when each is tried again, see _failed()
+		self._reported = {}  # and the failures of each kind reported since it last went through
 		self.shutdownEvent = threading.Event()
 		if self._spec:
 			for flag, given in (('rewrite_on_load', rewrite_on_load), ('rewrite_on_exit', rewrite_on_exit),
@@ -4858,19 +4859,21 @@ memoryOnly:{self.memoryOnly}
 		self._refusedAt = None
 		self._refusalReported = False
 
-	def _failed(self, kind, message, trace=True):
+	def _failed(self, kind, message, trace=True, retry=True):
 		"""A legacy write of ``kind`` failed: report ``message``, unless it was since that kind last went through.
 
 		``kind`` is 'append', 'rewrite' (a rewrite or clear writing the file) or 'sync' (rewrite() reading
 		another process's change). The background writer waits before it tries that kind again, 0.1 s at
 		first and twice as long at each failure in a row, up to a minute: a failure that lasts (a file it may
 		not open, a strict header another process changed) is neither retried at every tick nor reported at
-		every try. True when it was reported.
+		every try. ``retry=False``: the write goes on another way (mapToFile() falls back on hardMapToFile()),
+		and how that ends counts the try, once. True when it was reported.
 		"""
-		state = self._failures.get(kind)
-		wait = min(state[0] * 2, _FAILURE_RETRY_MAX) if state else _FAILURE_RETRY_FIRST
-		reported = state[2] if state else set()
-		self._failures[kind] = (wait, _specClock() + wait, reported)
+		if retry:
+			state = self._failures.get(kind)
+			wait = min(state[0] * 2, _FAILURE_RETRY_MAX) if state else _FAILURE_RETRY_FIRST
+			self._failures[kind] = (wait, _specClock() + wait)
+		reported = self._reported.setdefault(kind, set())
 		if message in reported:
 			return False
 		reported.add(message)
@@ -4883,6 +4886,7 @@ memoryOnly:{self.memoryOnly}
 	def _worked(self, kind):
 		"""A legacy write of ``kind`` went through: the next failure is reported, and retried soon."""
 		self._failures.pop(kind, None)
+		self._reported.pop(kind, None)
 
 	def _failing(self, *kinds):
 		"""True while the background writer waits to try again a write of one of ``kinds`` that failed."""
@@ -5062,7 +5066,7 @@ memoryOnly:{self.memoryOnly}
 			self._refuse('mapToFile()', e, explicit)
 			return False
 		except Exception as e:
-			if self._failed('rewrite', f"Failed to write at mapToFile() to {self._fileName}: {e}"):
+			if self._failed('rewrite', f"Failed to write at mapToFile() to {self._fileName}: {e}", retry=False):
 				self.__teePrintOrNot("Trying failback hardMapToFile()")
 			self.deSynced = True
 			return self._hardMapToFile(defer, explicit)

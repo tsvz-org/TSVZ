@@ -7871,3 +7871,25 @@ def test_tsvzed_legacy_background_writer_makes_one_rewrite_a_tick_while_another_
 	assert _wait_for(lambda: not t.deSynced and not t.dirty, 3)  # once it stops changing, the next tick makes it
 	t.close()
 	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == dict(t) and 'ext%d' % counts['n'] in t
+
+
+def test_tsvzed_legacy_failed_rewrite_and_its_fallback_count_as_one_try(tmp_path, monkeypatch, capsys):
+	# A failed mapToFile and the hardMapToFile it falls back on each counted a failure: the wait before the next
+	# try grew four times at each failed rewrite, not twice as documented.
+	p = str(tmp_path / 'twice.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	realOpen, realUntruncated = TSVZ.openFileAsCompressed, TSVZ._openUntruncated
+	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', lambda fileName, mode='rb', *a, **k: (
+		_FullDiskFile(realOpen(fileName, mode, *a, **k)) if mode == 'r+b' else realOpen(fileName, mode, *a, **k)))
+	monkeypatch.setattr(TSVZ, '_openUntruncated', lambda fileName: _FullDiskFile(realUntruncated(fileName)))
+	waits = []
+	for _ in range(3):
+		t.rewrite(force=True)  # mapToFile fails, then the hardMapToFile it falls back on
+		waits.append(t._failures['rewrite'][0])
+	monkeypatch.undo()
+	out = capsys.readouterr().out
+	assert 'Failed to write at mapToFile()' in out and 'Failed to write at hardMapToFile()' in out, out
+	assert waits == [TSVZ._FAILURE_RETRY_FIRST * f for f in (1, 2, 4)], waits
+	t.rewrite()
+	assert 'rewrite' not in t._failures and _bytes(p) == b'key\tval\na\t2\n'
