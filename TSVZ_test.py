@@ -7060,3 +7060,44 @@ def test_tsvzed_legacy_deferred_rewrite_leaves_the_change_unseen(tmp_path):
 	_append_external(p)
 	t._mapToFile(defer=True)
 	assert t.deSynced and t._externalChange() and b'ext\tB' in _bytes(p)
+
+
+def test_tsvzed_legacy_clear_drops_the_rows_set_before_it(tmp_path):
+	p = str(tmp_path / 'clr.tsv')
+	t = _stopped(p)
+	t['#_defaults_#'] = ['#_defaults_#', 'd']
+	for i in range(50):
+		t['k%d' % i] = ['k%d' % i, 'x']  # queued, not yet appended
+	t.clear()
+	assert len(t) == 0
+	t.commitAppendToFile()
+	assert dict(TSVZ.readTabularFile(p, header='key\tval')) == {}, 'rows set before clear() came back'
+	assert _bytes(p) == b'key\tval\n#_defaults_#\td\n'  # the defaults stay
+	t['after'] = ['after', '1']
+	t.commitAppendToFile()
+	assert dict(TSVZ.readTabularFile(p, header='key\tval')) == {'after': ['after', '1']}
+
+
+def test_tsvzed_legacy_clear_and_sets_in_another_thread_agree_stress(tmp_path):
+	import threading
+	p = str(tmp_path / 'clrs.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.0002, rewrite_on_load=False)
+	stop = threading.Event()
+
+	def setter():
+		i = 0
+		while not stop.is_set():
+			t['k%d' % i] = ['k%d' % i, str(i)]
+			i += 1
+			if i % 20 == 0:
+				time.sleep(0.0002)
+
+	other = threading.Thread(target=setter)
+	other.start()
+	for _ in range(50):
+		time.sleep(0.002)
+		t.clear()
+	stop.set()
+	other.join()
+	t.close()
+	assert dict(TSVZ.readTabularFile(p, header='key\tval')) == dict(t)

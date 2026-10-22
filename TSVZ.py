@@ -4500,45 +4500,61 @@ class TSVZed(OrderedDict):
 
 	def clear(self):
 		# clear the dictionary and update the file
-		super().clear()
 		if self.verbose:
 			self.__teePrintOrNot(f"Clearing {self._fileName}")
-		if self.memoryOnly:
-			return self
-		self.clear_file()
+		if self.memoryOnly or self._spec:
+			super().clear()
+			if self.memoryOnly:
+				return self
+			self.clear_file()
+		else:
+			self._clearFile(dropRows=True)
 		self.lastUpdateTime = self.externalFileUpdateTime
 		return self
 
 	def clear_file(self):
 		if self._spec:
 			return self._specClearFile()
+		return self._clearFile(dropRows=False)
+
+	def _clearFile(self, dropRows):
+		"""clear_file() for a legacy file; ``dropRows`` (clear()) also empties memory and drops the queued rows.
+
+		Both are done under writeLock and _memLock, with the file emptied in the same hold of writeLock: no append
+		runs in between and no set is half done, so a row set before it is neither kept in memory nor appended
+		after the emptied file (where it came back). Queued defaults lines are kept: the defaults stay.
+		"""
 		file = None
 		try:
+			headerBytes = None
 			if self.header:
 				header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
 				headerBytes = _encodeRow(_sanitize(self.header,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header')
-				file = self.get_file_obj('wb')  # opening it empties it: encode first
+			self.writeLock.acquire()
+			try:
+				if dropRows:
+					with self._memLock:
+						OrderedDict.clear(self)
+						kept = [row for row in self.appendQueue if row and row[0] == DEFAULTS_INDICATOR_KEY]
+						self.appendQueue.clear()
+						self.appendQueue.extend(kept)
+				file = self.get_file_obj('wb',locked=True)  # opening it empties it: encode first
 				if file is None:
 					self.deSynced = True  # get_file_obj reported why
 					return self
-				file.write(headerBytes + b'\n')
-				self.release_file_obj(file)
-				if self.verbose:
+				if headerBytes is not None:
+					file.write(headerBytes + b'\n')
+			finally:
+				self._endRewrite(file)
+			if self.verbose:
+				if headerBytes is not None:
 					self.__teePrintOrNot(f"Header {header} written to {self._fileName}")
-					self.__teePrintOrNot(f"File {self._fileName} size: {os.path.getsize(self._fileName)}")
-			else:
-				file = self.get_file_obj('wb')
-				if file is None:
-					self.deSynced = True  # get_file_obj reported why
-					return self
-				self.release_file_obj(file)
-				if self.verbose:
+				else:
 					self.__teePrintOrNot(f"File {self._fileName} cleared empty")
-					self.__teePrintOrNot(f"File {self._fileName} size: {os.path.getsize(self._fileName)}")
+				self.__teePrintOrNot(f"File {self._fileName} size: {os.path.getsize(self._fileName)}")
 			self.dirty = False
 			self.deSynced = False
 		except Exception as e:
-			self.release_file_obj(file)
 			self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: {e}",'error')
 			import traceback
 			self.__teePrintOrNot(traceback.format_exc(),'error')
