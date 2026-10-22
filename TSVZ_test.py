@@ -6697,9 +6697,8 @@ def test_tsvzed_legacy_rewrite_whose_file_lock_fails_never_writes_unlocked(tmp_p
 	assert not t.writeLock.locked()
 	assert _open_fds() == fds, 'the file was left open'
 	assert out.count('No locks available') == 1 and 'NoneType' not in out and 'failback' not in out, out
-	if method == 'mapToFile':
-		assert _bytes(p) == before  # it never wrote to a file it could not lock
-	assert not t._externalChange()  # emptying it on open ('wb') is this object's own change: no reload of it
+	assert _bytes(p) == before  # it never wrote to a file it could not lock, nor emptied it
+	assert not t._externalChange()
 	assert t.dirty and dict(t) == {'a': ['a', '2']}
 	getattr(t, method)()
 	assert _bytes(p) == b'key\tval\na\t2\n'
@@ -6719,12 +6718,47 @@ def test_tsvzed_legacy_rewrite_that_cannot_open_the_file_reports_why_once(tmp_pa
 		return real(fileName, mode, *args, **kwargs)
 
 	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', failing)
+	monkeypatch.setattr(TSVZ, '_openUntruncated', lambda fileName: failing(fileName, 'wb'), raising=False)
 	getattr(t, method)()
 	monkeypatch.undo()
 	out = capsys.readouterr().out
 	assert not t.writeLock.locked()
 	assert out.count('Permission denied') == 1 and 'NoneType' not in out and 'failback' not in out, out
 	assert _bytes(p) == before and t.dirty
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+@pytest.mark.parametrize('how', ['lock fails', 'interrupted'])
+@pytest.mark.parametrize('method', ['hardMapToFile', 'clear_file', 'clear'])
+def test_tsvzed_legacy_rewrite_empties_the_file_only_once_it_is_locked(tmp_path, monkeypatch, capsys, suffix, how, method):
+	import errno
+	p = str(tmp_path / ('lockwait.' + suffix))
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	before = _bytes(p)
+	real = TSVZ._lockFile
+
+	def locking(f):
+		mode = getattr(f, 'mode', '')
+		if 'w' in str(mode) or mode == 'rb+':  # the rewrite's lock, which another writer holds
+			if how == 'interrupted':
+				raise KeyboardInterrupt  # Ctrl-C while it waits
+			raise OSError(errno.ENOLCK, 'No locks available')
+		real(f)
+
+	monkeypatch.setattr(TSVZ, '_lockFile', locking)
+	try:
+		getattr(t, method)()
+	except KeyboardInterrupt:
+		pass
+	monkeypatch.undo()
+	capsys.readouterr()
+	assert not t.writeLock.locked()
+	assert _bytes(p) == before, 'the file was emptied before it was locked'
+	assert not t._externalChange()
+	t.mapToFile()
+	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == dict(t)
 
 
 def test_tsvzed_legacy_append_that_cannot_open_the_file_keeps_the_rows_queued(tmp_path, monkeypatch, capsys):

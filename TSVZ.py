@@ -135,6 +135,49 @@ def eprint(*args, **kwargs):
 		print(f"Error: Cannot print to stderr: {e}")
 		print(*args, **kwargs)
 
+def _codecWriteOptions(codec, compressLevel):
+	"""The keyword arguments ``codec``'s ``open()`` takes to write at ``compressLevel``."""
+	if codec == 'zstd':  # a content checksum on every frame (spec §16.8)
+		try:
+			from compression.zstd import CompressionParameter
+			return {'options': {CompressionParameter.compression_level: compressLevel, CompressionParameter.checksum_flag: 1}}
+		except ImportError:
+			return {'level': compressLevel}
+	return {_CODECS[codec][2] if codec else 'compresslevel': compressLevel}
+
+
+def _openUntruncated(fileName):
+	"""Open ``fileName`` for reading and writing at offset 0, creating it when missing, without emptying it.
+
+	A rewrite opens it so and empties it only once it holds the file lock: opening it with 'wb' empties it
+	before the lock is taken, under another writer that holds it, and for good when the lock then fails.
+	"""
+	return open(fileName, 'r+b', opener=lambda path, flags: os.open(path, flags | os.O_CREAT, 0o666))
+
+
+def _compressedWriter(fileName, raw, compressLevel=1):
+	"""A writer that compresses into the open file ``raw`` with the codec ``fileName`` names, or None for none.
+
+	Closing it does not close ``raw``: _closeFile closes both.
+	"""
+	codec = _CODEC_NAMES.get(fileName.rpartition('.')[2].lower())
+	if not codec:
+		return None
+	writer = _codecModule(codec).open(raw, 'wb', **_codecWriteOptions(codec, compressLevel))
+	writer._tsvzRaw = raw
+	return writer
+
+
+def _closeFile(file):
+	"""Close ``file`` and, for a writer _compressedWriter made, the file under it."""
+	try:
+		file.close()
+	finally:
+		raw = getattr(file, '_tsvzRaw', None)
+		if raw is not None:
+			raw.close()
+
+
 def openFileAsCompressed(fileName,mode = 'rb',encoding = 'utf8',teeLogger = None,compressLevel = 1):
 	codec = _CODEC_NAMES.get(fileName.rpartition('.')[2].lower())
 	if codec and any(c in mode for c in 'wax+'):
@@ -142,16 +185,7 @@ def openFileAsCompressed(fileName,mode = 'rb',encoding = 'utf8',teeLogger = None
 		_requireCodec(codec)
 	if 'b' not in mode:
 		mode += 't'
-	kwargs = {}
-	if 'r' not in mode:
-		if codec == 'zstd':  # a content checksum on every frame (spec §16.8)
-			try:
-				from compression.zstd import CompressionParameter
-				kwargs['options'] = {CompressionParameter.compression_level: compressLevel, CompressionParameter.checksum_flag: 1}
-			except ImportError:
-				kwargs['level'] = compressLevel
-		else:
-			kwargs[_CODECS[codec][2] if codec else 'compresslevel'] = compressLevel
+	kwargs = _codecWriteOptions(codec, compressLevel) if 'r' not in mode else {}
 	if 'b' not in mode:
 		kwargs['encoding'] = encoding
 	if codec:
@@ -4560,7 +4594,7 @@ class TSVZed(OrderedDict):
 						kept = [row for row in self.appendQueue if row and row[0] == DEFAULTS_INDICATOR_KEY]
 						self.appendQueue.clear()
 						self.appendQueue.extend(kept)
-				file = self.get_file_obj('wb',locked=True)  # opening it empties it: encode first
+				file = self.get_file_obj('wb',locked=True)  # it empties the file once locked: encode first
 				if file is None:
 					self.deSynced = True  # get_file_obj reported why
 					return self
@@ -4865,11 +4899,11 @@ memoryOnly:{self.memoryOnly}
 	def _hardMapToFile(self, defer=False, explicit=False):
 		"""hardMapToFile(); ``defer``: see _externalChangeStops, ``explicit``: see _refuse."""
 		try:
-			snapshot = self._snapshotForRewrite()  # checked, and the lock held: opening the file for writing empties it
+			snapshot = self._snapshotForRewrite()  # checked, and the lock held: get_file_obj('wb') empties the file
 			file = None
 			try:
-				# Opening it empties it, so this looks before the file is locked: a change another writer makes
-				# in between is lost (mapToFile, which rewrite() uses for a file that is not compressed, looks after).
+				# get_file_obj('wb') empties it as soon as it is locked, so this looks before: a change another writer
+				# makes in between is lost (mapToFile, which rewrite() uses for a file that is not compressed, looks after).
 				if self._externalChangeStops(defer):
 					return self  # reloaded first
 				file = self.get_file_obj('wb',locked=True)
@@ -5110,10 +5144,17 @@ memoryOnly:{self.memoryOnly}
 		if not locked:
 			self.writeLock.acquire()
 		file = None
+		emptied = False
 		try:
 			if not self.encoding:
 				self.encoding = 'utf8'
-			file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding,teeLogger=self.teeLogger)
+			if 'w' in modes:
+				# Opened as it is and emptied once locked: 'wb' would empty it before the lock is taken, under
+				# another writer that holds it, and for good when the lock then fails or is interrupted.
+				_requireCodec(_CODEC_NAMES.get(self._fileName.rpartition('.')[2].lower()))
+				file = _openUntruncated(self._fileName)
+			else:
+				file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding,teeLogger=self.teeLogger)
 			# Lock the file after opening
 			if os.name == 'posix':
 				_lockFile(file)
@@ -5122,6 +5163,10 @@ memoryOnly:{self.memoryOnly}
 				#lock_length = max(1, os.path.getsize(self._fileName))
 				lock_length = 2147483647
 				msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, lock_length)
+			if 'w' in modes:
+				file.truncate(0)
+				emptied = True
+				file = _compressedWriter(self._fileName, file) or file
 			# An append that finds another process's change not yet seen must not mark it seen (release_file_obj
 			# notes the time after it): the next check still reloads it. A rewrite replaces the file, so it does.
 			# Looked at once the file is locked: another writer may append until then.
@@ -5133,11 +5178,11 @@ memoryOnly:{self.memoryOnly}
 			self.__teePrintOrNot(f"Failed to open file {self._fileName}: {e}",'error')
 			if file is not None:
 				try:
-					file.close()  # an unlocked file is never handed out
+					_closeFile(file)  # an unlocked file is never handed out
 				except Exception:
 					pass
-				if 'w' in modes:
-					# Opening it emptied it: that change is this object's own, not another process's.
+				if emptied:
+					# It was emptied under the lock: that change is this object's own, not another process's.
 					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 			if not locked:
 				self.writeLock.release()
@@ -5169,7 +5214,7 @@ memoryOnly:{self.memoryOnly}
 						msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, unlock_length)
 					except Exception:
 						pass
-				file.close()  # Ensure file is closed after unlocking
+				_closeFile(file)  # Ensure file is closed after unlocking
 			if self.verbose:
 				self.__teePrintOrNot(f"File {file.name} unlocked / released")
 		except Exception as e:
