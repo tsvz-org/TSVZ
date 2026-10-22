@@ -6728,8 +6728,14 @@ def test_tsvzed_legacy_rewrite_that_cannot_open_the_file_reports_why_once(tmp_pa
 
 
 
+def _touch_mtime(f):
+	"""What a write that fails with ENOSPC does on Linux all the same: change the file's modification time."""
+	now = max(time.time_ns() if hasattr(time, 'time_ns') else int(time.time() * 1e9), os.fstat(f.fileno()).st_mtime_ns + 1000)
+	os.utime(f.fileno(), ns=(now, now))
+
+
 class _FullDiskFile(object):
-	"""A file on a full disk: a write stores its first line and fails, and so does every flush."""
+	"""A file on a full disk: a write stores its first line and fails, and so does every flush; each changes the time."""
 
 	def __init__(self, f):
 		self._f = f
@@ -6739,10 +6745,12 @@ class _FullDiskFile(object):
 		data = bytes(data)
 		self._f.write(data[:data.find(b'\n') + 1])
 		self._f.flush()
+		_touch_mtime(self._f)
 		raise OSError(errno.ENOSPC, 'No space left on device')
 
 	def flush(self):
 		import errno
+		_touch_mtime(self._f)
 		raise OSError(errno.ENOSPC, 'No space left on device')
 
 	def __getattr__(self, name):
@@ -7536,3 +7544,184 @@ def test_tsvzed_legacy_rewrite_stopped_right_after_the_file_is_emptied_is_made_a
 	t.rewrite()
 	assert dict(t) == rows
 	assert _back(p) == rows, 'the emptied file was never written again'  # clear_file() keeps memory: so does the file
+
+
+class _BufferedFullDiskFile(object):
+	"""A buffered file on a disk with room for ``room`` more bytes, as Linux has it: a write only fills the buffer,
+	and flush() (close() too) writes what fits, changes the file's time and fails with ENOSPC when not all of it
+	fits, keeping the rest for the next try. A rewrite under 8 KB, or any compressed one, fails there only."""
+
+	def __init__(self, f, room=0):
+		self._f = f
+		self._room = room
+		self._pending = b''
+
+	def write(self, data):
+		self._pending += bytes(data)
+		return len(data)
+
+	def flush(self):
+		import errno
+		if not self._pending:
+			return
+		fits, self._pending = self._pending[:self._room], self._pending[self._room:]
+		self._room -= len(fits)
+		self._f.write(fits)
+		self._f.flush()
+		_touch_mtime(self._f)
+		if self._pending:
+			raise OSError(errno.ENOSPC, 'No space left on device')
+
+	def close(self):
+		try:
+			self.flush()
+		finally:
+			self._f.close()
+
+	def __getattr__(self, name):
+		return getattr(self._f, name)
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2', 'tsv.xz'])
+@pytest.mark.parametrize('where', ['flush', 'fsync'])
+@pytest.mark.parametrize('method', ['hardMapToFile', 'rewrite', 'clear_file'])
+def test_tsvzed_legacy_rewrite_whose_flush_or_fsync_fails_is_made_again(tmp_path, monkeypatch, capsys, suffix, where, method):
+	# release_file_obj swallowed a failed flush, fsync or close: the rewrite whose bytes never reached the disk (they
+	# sat in the file's or the codec's buffer) was marked done, and after close() the file was empty or header-only.
+	# Its time was also noted before close() wrote the buffer again, which changes it: the damage was then reloaded.
+	import errno
+	p = str(tmp_path / ('buf.' + suffix))
+	t = _stopped(p)
+	rows = _many(t, 20)
+	if method == 'rewrite':
+		t.deSynced = True  # what a tick rewrites with rewrite_interval=0
+	real = TSVZ._openUntruncated
+	monkeypatch.setattr(TSVZ, '_openUntruncated', lambda fileName: _BufferedFullDiskFile(real(fileName), 0 if where == 'flush' else 1 << 20))
+	if where == 'fsync':
+		def failing(fd):
+			raise OSError(errno.EIO, 'Input/output error')
+		monkeypatch.setattr(TSVZ.os, 'fsync', failing)
+	if method == 'rewrite' and suffix == 'tsv':
+		# the in-place rewrite mapToFile makes, failing, then the hardMapToFile it falls back on
+		realOpen = TSVZ.openFileAsCompressed
+		monkeypatch.setattr(TSVZ, 'openFileAsCompressed', lambda fileName, mode='rb', *a, **k: (
+			_BufferedFullDiskFile(realOpen(fileName, mode, *a, **k), 0 if where == 'flush' else 1 << 20) if mode == 'r+b' else realOpen(fileName, mode, *a, **k)))
+	if method == 'rewrite':
+		t.rewrite()
+	else:
+		getattr(t, method)()
+	monkeypatch.undo()
+	out = capsys.readouterr().out
+	assert ('No space left' if where == 'flush' else 'Input/output error') in out, out
+	assert not t.writeLock.locked()
+	assert t.dirty and t.deSynced, 'a rewrite that did not reach the file was marked done'
+	assert not t._externalChange(), "its own damage was taken for another process's change"
+	t.checkExternalChanges()  # the next tick, once there is room again
+	t.rewrite()
+	assert dict(t) == rows
+	assert _back(p) == rows and not t.dirty and not t.deSynced
+
+
+_FULL_TMPFS_SCRIPT = r"""
+import json, os, sys, time
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+suffix, method, d = sys.argv[2], sys.argv[3], sys.argv[4]
+p = os.path.join(d, 'store.' + suffix)
+filler = os.path.join(d, 'filler')
+t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001, verbose=False)
+t.shutdownEvent.set()
+t.appendThread.join()  # every write is driven from here
+for i in range(20):
+	t['k%d' % i] = ['k%d' % i, 'v%d' % i]
+t.commitAppendToFile()
+t['k1'] = ['k1', 'upd']
+t.commitAppendToFile()
+rows = dict(t)
+real = TSVZ._compressedWriter
+
+def filling(*args, **kwargs):  # right after the rewrite emptied the file: another writer fills the disk
+	with open(filler, 'wb') as f:
+		try:
+			while True:
+				f.write(b'\0' * 4096)
+				f.flush()
+		except OSError:
+			pass
+	return real(*args, **kwargs)
+
+TSVZ._compressedWriter = filling
+if method == 'rewrite':
+	t.deSynced = True
+	t.rewrite()
+else:
+	getattr(t, method)()
+TSVZ._compressedWriter = real
+result = {'failed': os.path.exists(filler), 'dirty': t.dirty, 'deSynced': t.deSynced, 'external': t._externalChange()}
+if result['failed']:
+	os.remove(filler)
+t.checkExternalChanges()
+t.rewrite()
+result['memory'] = dict(t) == rows
+t.shutdownEvent.clear()
+t.close()
+try:
+	result['file'] = TSVZ.readTabularFile(p, header='key\tval', verbose=False) == rows
+except Exception as e:
+	result['file'] = repr(e)
+print(json.dumps(result))
+"""
+
+
+def _full_tmpfs(tmp_path, *args):
+	"""Run _FULL_TMPFS_SCRIPT with ``args`` on a 1 MiB tmpfs of its own, in a private mount namespace (root on Linux)."""
+	import json
+	import shutil
+	import subprocess
+	if not sys.platform.startswith('linux') or os.geteuid() != 0 or not shutil.which('unshare'):
+		pytest.skip('a real full disk needs root on Linux and unshare (a tmpfs in a private mount namespace)')
+	mnt = tmp_path / 'mnt'
+	mnt.mkdir()
+	script = tmp_path / 'full.py'
+	script.write_text(_FULL_TMPFS_SCRIPT)
+	command = 'mount -t tmpfs -o size=1m tmpfs "$1" || exit 77; shift; exec "$@"'
+	proc = subprocess.run(['unshare', '-m', 'sh', '-c', command, 'sh', str(mnt), sys.executable, str(script),
+						   os.path.dirname(os.path.abspath(TSVZ.__file__))] + list(args) + [str(mnt)],
+						  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+	if proc.returncode == 77 or (proc.returncode and 'unshare' in proc.stderr):
+		pytest.skip('cannot mount a tmpfs in a private mount namespace here: ' + proc.stderr.strip()[-200:])
+	assert proc.returncode == 0, proc.stderr
+	return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2', 'tsv.xz'])
+@pytest.mark.parametrize('method', ['hardMapToFile', 'rewrite'])
+def test_tsvzed_legacy_rewrite_on_a_really_full_disk_is_made_again_from_memory(tmp_path, suffix, method):
+	result = _full_tmpfs(tmp_path, suffix, method)
+	if method == 'rewrite' and suffix == 'tsv':
+		assert not result['failed']  # rewritten in place: it needs no room it did not have
+	else:
+		assert result['failed'] and result['dirty'] and result['deSynced'], result
+	assert result == dict(result, external=False, memory=True, file=True), result
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2', 'tsv.xz'])
+@pytest.mark.parametrize('method', ['hardMapToFile', 'clear_file'])
+def test_tsvzed_legacy_rewrite_is_all_on_disk_before_it_unlocks_the_file(tmp_path, monkeypatch, suffix, method):
+	# BZ2File.flush() and LZMAFile.flush() do not flush the compressor: release_file_obj unlocked a .bz2 or .xz
+	# rewrite with nothing on disk (a .gz one without its trailer), and another writer could append in between.
+	p = str(tmp_path / ('u.' + suffix))
+	t = _stopped(p)
+	_many(t, 500)
+	real = TSVZ._unlockFile
+	sizes = []
+
+	def unlocking(f):
+		sizes.append(os.path.getsize(p))
+		real(f)
+
+	monkeypatch.setattr(TSVZ, '_unlockFile', unlocking)
+	getattr(t, method)()
+	monkeypatch.undo()
+	assert sizes == [os.path.getsize(p)], 'bytes on disk when the file was unlocked, and in the end'
+	assert _back(p) == (dict(t) if method == 'hardMapToFile' else {})

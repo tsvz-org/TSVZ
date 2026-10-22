@@ -39,11 +39,19 @@ opinion's, 15 and 12.
    Script: `steal.py DIR`. Main and branch: thread B's `with t.writeLock` fails with
    `RuntimeError: release unlocked lock`, and `{'locked_while_B_holds_it': False}`.
 
-4. **A compressed append is unlocked before its trailer is written.** For a compressed file,
-   `release_file_obj` unlocks before `file.close()` writes the gzip trailer. Another writer that
-   appends in that window corrupts the stream.
+4. **A compressed append is unlocked before it is all written.** For a compressed file,
+   `release_file_obj` calls the codec writer's `flush()`, unlocks, and only then `close()`s it.
+   `GzipFile.flush()` writes all but the trailer, but `BZ2File.flush()` and `LZMAFile.flush()`
+   write nothing: a .bz2 or .xz append is written whole after the unlock (500 rows: 0 of 1047
+   bytes on disk at the unlock for .bz2, 0 of 712 for .xz, 1698 of 1708 for .gz). Another
+   writer that appends in that window corrupts the stream.
    Script: `gzrace.py DIR`. Main and branch: `gzip read fails ... invalid block type`, and
    `readTabularFile: {}`.
+   Rewrites had this too, and wider: every .bz2 or .xz rewrite (hardMapToFile, clear) was written
+   after the unlock (2000 rows: 0 of 4700 bytes on disk at the unlock for .bz2, 0 of 1808 for
+   .xz, 8052 of 8062 for .gz; the same on main). The branch now closes a rewrite's codec writer,
+   and flushes and syncs the file, before it unlocks it, so that a failure there is seen as the
+   rewrite's own; only appends are left.
 
 5. **A failed clear() empties memory and never tries again.** `_clearFile(dropRows=True)` empties
    memory and the queue before it knows it can open and lock the file. When it cannot, only

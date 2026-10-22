@@ -170,6 +170,12 @@ def _compressedWriter(fileName, raw, compressLevel=1):
 	return writer
 
 
+def _closeUnflushed(f):
+	"""Close the open file ``f`` without writing what its buffer still holds (after a write that failed)."""
+	inner = getattr(f, 'raw', None)  # the descriptor under a buffered file: closing it closes both
+	(inner if inner is not None else f).close()
+
+
 def _closeFile(file):
 	"""Close ``file`` and, for a writer _compressedWriter made, the file under it."""
 	try:
@@ -4962,12 +4968,16 @@ memoryOnly:{self.memoryOnly}
 			if started:
 				self.deSynced = True
 			if file is not None:
-				self.release_file_obj(file, ownChange=True)  # lets go of writeLock too
+				self.release_file_obj(file, ownChange=True, failed=True)  # lets go of writeLock too
 			else:
 				self._keepFileTime = False
 				self.writeLock.release()
 			raise
-		self.release_file_obj(file, ownChange=True)
+		try:
+			self.release_file_obj(file, ownChange=True)  # raises when what was written did not reach the file
+		except BaseException:
+			self.deSynced = True
+			raise
 		return True
 
 	def hardMapToFile(self):
@@ -5255,18 +5265,18 @@ memoryOnly:{self.memoryOnly}
 				raise
 			return None
 
-	def release_file_obj(self,file,ownChange=False):
+	def release_file_obj(self,file,ownChange=False,failed=False):
 		"""Unlock and close ``file``, note the file's modification time as this object's own, and let go of writeLock.
 
-		``ownChange``: the file of a rewrite, whose change is this object's own even when flushing or closing
-		it fails (a full disk): its time is noted then too. Else the next check takes the damage for another
-		process's change and reloads it over memory, instead of writing the file again from memory.
+		``ownChange``: the file of a rewrite, let go of as _releaseRewrite says (``failed``: see there).
 		"""
 		# if write lock is already released, return
 		if not self.writeLock.locked():
 			return
 		if file is None:
 			return
+		if ownChange:
+			return self._releaseRewrite(file, failed)
 		noted = False
 		try:
 			file.flush()  # Ensure the file is flushed before unlocking
@@ -5282,11 +5292,6 @@ memoryOnly:{self.memoryOnly}
 			if self.verbose:
 				self.__teePrintOrNot(f"File {file.name} unlocked / released")
 		except Exception as e:
-			if ownChange and not self._keepFileTime and not noted:
-				try:
-					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # still under writeLock
-				except Exception:
-					pass
 			# Unlocked and closed all the same (closing gives up what cannot be flushed): a file left open keeps its
 			# lock, and the next rewrite, hardMapToFile() right after a failed mapToFile() among them, waits for it for good.
 			if not file.closed:
@@ -5311,6 +5316,49 @@ memoryOnly:{self.memoryOnly}
 				self.writeLock.release()  # Ensure the thread lock is always released
 			except Exception as e:
 				self.__teePrintOrNot(f"Failed to release writeLock for {file.name}: {e}",'error')
+
+	def _releaseRewrite(self, file, failed):
+		"""Let go of the file a rewrite wrote (``file``: the codec's writer over it, or the file) and of writeLock.
+
+		All of it reaches the file before it is unlocked: the codec's writer is closed first (its flush() writes
+		nothing for bz2 and xz, and only gzip's trailer is left), then the file is flushed and synced. Its time is
+		noted after that, the last write there is (a write that fails on a full disk changes it too), and before
+		it is unlocked: the change is this object's own, never reloaded over memory, and another writer's
+		append right after the unlock is not taken for it. A buffer that could not be written is then dropped,
+		not written again by close().
+
+		Raises what made flushing, syncing or closing fail, once the file and writeLock are let go of: the
+		rewrite did not reach the file, and the caller's failure path makes it again. ``failed``: the rewrite
+		already failed (the caller raises that); the file is let go of without flushing, and nothing is raised.
+		"""
+		raw = getattr(file, '_tsvzRaw', None) or file
+		error = None
+		try:
+			try:
+				if raw is not file:
+					file.close()  # the codec writes what it holds into the file, also after a failure: closed for good
+				if not failed:
+					raw.flush()
+					os.fsync(raw.fileno())
+			except BaseException as e:
+				error = e
+			if not self._keepFileTime:
+				self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # under writeLock: see _externalChange()
+		finally:
+			_unlockFile(raw)  # never raises
+			try:
+				if failed or error is not None:
+					_closeUnflushed(raw)
+				else:
+					raw.close()
+			except Exception as e:
+				error = error or e
+			self._keepFileTime = False
+			self.writeLock.release()
+		if self.verbose:
+			self.__teePrintOrNot(f"File {self._fileName} unlocked / released")
+		if error is not None and (not failed or not isinstance(error, Exception)):
+			raise error
 
 class TSVZedLite(MutableMapping):
 	"""
