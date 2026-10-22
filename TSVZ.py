@@ -162,12 +162,69 @@ def _compressedWriter(fileName, raw, compressLevel=1):
 
 	Closing it does not close ``raw``: _closeFile closes both.
 	"""
+	writer = _codecWriter(fileName, raw, compressLevel)
+	if writer is not None:
+		writer._tsvzRaw = raw
+	return writer
+
+
+def _codecWriter(fileName, raw, compressLevel=1):
+	"""_compressedWriter without the file noted on it: a rewrite holds the file itself, and takes the writer in the
+	line that makes it (a KeyboardInterrupt never leaves one made and not held, whose collection writes)."""
 	codec = _fileCodec(fileName)
 	if not codec:
 		return None
-	writer = _codecModule(codec).open(raw, 'wb', **_codecWriteOptions(codec, compressLevel))
-	writer._tsvzRaw = raw
-	return writer
+	return _codecModule(codec).open(raw, 'wb', **_codecWriteOptions(codec, compressLevel))
+
+
+class _Discard(object):
+	"""A file that keeps nothing written to it: what a codec writer a rewrite gives up on writes into (_discardWriter)."""
+	closed = False
+
+	def write(self, data):
+		return len(data)
+
+	def flush(self):
+		pass
+
+
+def _discardWriter(writer):
+	"""Close the codec ``writer`` (GzipFile, BZ2File, LZMAFile, ZstdFile) without writing anything more into the file
+	under it.
+
+	It is pointed at a _Discard first (``fileobj`` for gzip, ``_fp`` for the others; also when a close it began set
+	it to None): what it still holds and its trailer go there, and neither this close nor its collection later
+	writes into the file, closed or not ('ValueError: write to closed file', 'RuntimeError: lost gzip_file').
+	"""
+	sink = _Discard()
+	for name in ('fileobj', '_fp'):
+		if hasattr(writer, name):
+			setattr(writer, name, sink)
+	try:
+		writer.close()
+	except Exception:
+		pass  # a close it began and could not end: nothing it says can reach the file now
+
+
+class _Rewrite(object):
+	"""How far a legacy rewrite (TSVZed._writeRewrite) has got: what _releaseRewrite lets go of, and what it did
+	already, so that a second call (after a KeyboardInterrupt stopped the first) goes on from there."""
+	__slots__ = ('raw', 'writer', 'started', 'written', 'failed', 'reached', 'noted', 'error')
+
+	def __init__(self):
+		self.raw = None  # the file, open and locked: None until get_file_obj hands it out
+		self.writer = None  # the codec's writer over it, until it is closed
+		self.started = False  # the rewrite changes (or makes) the file: its own change, noted once it lets go
+		self.written = False  # all of it was handed to the file (or its codec): left to close, flush and sync
+		self.failed = False  # closing, flushing or syncing failed: ``error``
+		self.reached = False  # all of it is on disk
+		self.noted = False  # the file's time and what it holds are noted
+		self.error = None
+
+	def fail(self, error):
+		self.failed = True
+		if self.error is None:
+			self.error = error
 
 
 _DAMAGE_UNKNOWN = (None, None)  # TSVZed._damage when what the file holds is not known
@@ -5044,15 +5101,15 @@ memoryOnly:{self.memoryOnly}
 		memory (see _damage). All three are cleared once all of it reached the file, before writeLock is let go
 		of (not before: a tick that saw ``deSynced`` meanwhile would make a rewrite of its own).
 
-		One try/finally from the moment writeLock is taken lets go of the file, once, with _releaseRewrite,
-		whatever stops it where; writeLock is let go of by the ``with`` statement, which nothing skips. Whether
-		the file's time is noted as this object's own is decided here: only once the look found nothing to keep
-		(or the file was missing), never for a file another process's change was found in or not yet looked at.
+		One try/finally from the moment writeLock is taken lets go of the file with _releaseRewrite, whatever stops
+		it where: a _Rewrite says how far it got, and when a KeyboardInterrupt stops the release, it is called
+		again and goes on from there. writeLock is let go of by the ``with`` statement, which nothing skips.
+		Whether the file's time is noted as this object's own is decided here (``rw.started``): only once the look
+		found nothing to keep (or the file was missing), never for a file another process's change was found in or
+		not yet looked at.
 		"""
 		with self.writeLock:
-			file = None
-			failed = True
-			own = False
+			rw = _Rewrite()
 			result = True
 			# Nothing returns from inside the try: the line a return is on is outside its handlers.
 			try:
@@ -5060,37 +5117,39 @@ memoryOnly:{self.memoryOnly}
 				missing = not os.path.isfile(self._fileName)  # under writeLock: this object does not remove it meanwhile
 				whole = whole or missing
 				if missing:
-					self._damage = _DAMAGE_EMPTY  # memory is the only copy left: what another process writes is merged
-					own = True  # the file it makes is its own change
-				file = self.get_file_obj('wb' if whole else 'r+b', locked=True, empty=False)
-				if file is None:
+					rw.started = True  # first: the release notes what the file holds from here on
+					self.dirty = True  # memory is the only copy left: made again until a rewrite gets through, and
+					self._damage = _DAMAGE_EMPTY  # what another process writes meanwhile is merged
+				rw.raw = self.get_file_obj('wb' if whole else 'r+b', locked=True, empty=False)
+				if rw.raw is None:
 					self.deSynced = True  # tried again later
 					result = False
 				elif look and self._damage is None and self._externalChangeStops(defer):
 					result = None  # untouched; its time is not noted: the change is reloaded first
 				else:
-					if look and self._damage is not None and self._mergeChange(file):
+					if look and self._damage is not None and self._mergeChange(rw.raw):
 						header, lines = (snapshot or self._snapshotForRewrite)()  # with what was merged
 					# Until it is all written, the file does not hold memory: a rewrite that stops is made again,
-					# and the file is not reloaded over memory meanwhile.
+					# and the file is not reloaded over memory meanwhile. ``started`` first: a release that sees it
+					# notes what the file then holds as the damage, which another process's appends are merged after.
+					rw.started = True
 					self._damage = _DAMAGE_UNKNOWN
 					self.dirty = True
-					own = True
-					if not whole:
-						self._writeInPlace(file, header, lines)
+					if whole:
+						rw.raw.truncate(0)
+						rw.writer = _codecWriter(self._fileName, rw.raw)
+						_writeLines(rw.writer or rw.raw, header, lines)
 					else:
-						file = self._emptyLocked(file)
-						_writeLines(file, header, lines)
-					failed = False
-			except BaseException:
-				if own:
-					self.deSynced = True  # the next rewrite() makes it again (_releaseRewrite sets it too)
-				raise
+						self._writeInPlace(rw.raw, header, lines)
+					rw.written = True
 			finally:
 				try:
-					self._releaseRewrite(file, failed, keepTime=not own)
+					self._releaseRewrite(rw)
 				except BaseException:
-					self._abandonRewrite(file, own)  # in case it could not even start
+					# A KeyboardInterrupt stopped it (or it raised what made the release fail, once done): it goes
+					# on from where it stopped, without waiting out a flush or a sync a Ctrl-C may have stopped.
+					rw.written = False
+					self._releaseRewrite(rw)
 					raise
 		return result
 
@@ -5150,23 +5209,6 @@ memoryOnly:{self.memoryOnly}
 		if self.verbose:
 			self.__teePrintOrNot(f"Merged what another process wrote to {self._fileName} after a failed rewrite: {len(self)} records")
 		return True
-
-	def _abandonRewrite(self, file, own):
-		"""Close ``file`` unflushed if _releaseRewrite left it open: a KeyboardInterrupt as it was called.
-
-		The file is let go of now, not once the traceback that holds it is dropped: a close() in the program's
-		``except KeyboardInterrupt`` waited for its lock for good. ``own``: the rewrite had started; unless the
-		release saw all of it reach the file (and cleared ``_damage``), it is made again.
-		"""
-		if own and self._damage is not None:
-			self.deSynced = True
-		raw = getattr(file, '_tsvzRaw', None) or file
-		if raw is not None and not raw.closed:
-			_unlockFile(raw)  # never raises
-			try:
-				_closeUnflushed(raw)
-			except Exception:
-				pass
 
 	def _rewritten(self):
 		"""What mapToFile and hardMapToFile do once _writeRewrite wrote every row; True."""
@@ -5440,11 +5482,6 @@ memoryOnly:{self.memoryOnly}
 				raise
 			return None
 
-	def _emptyLocked(self, file):
-		"""Empty the open, locked ``file`` and return what to write it through: its codec's writer, or the file."""
-		file.truncate(0)
-		return _compressedWriter(self._fileName, file) or file
-
 	def release_file_obj(self,file):
 		"""Unlock and close ``file``, note the file's modification time as this object's own, and let go of writeLock."""
 		# if write lock is already released, return
@@ -5492,74 +5529,77 @@ memoryOnly:{self.memoryOnly}
 			except Exception as e:
 				self.__teePrintOrNot(f"Failed to release writeLock for {self._fileName}: {e}",'error')
 
-	def _releaseRewrite(self, file, failed, keepTime):
-		"""Let go of the file _writeRewrite opened (``file``: the codec's writer over it, the file, or None).
+	def _releaseRewrite(self, rw):
+		"""Let go of the file a rewrite opened, from where ``rw`` (a _Rewrite) says it is: safe to call again.
 
-		All of it reaches the file before it is unlocked: the codec's writer is closed first (its flush() writes
-		nothing for bz2 and xz, and only gzip's trailer is left), then the file is flushed and synced. Unless
-		``keepTime``, its time is noted after that, the last write there is (a write that fails on a full disk
-		changes it too), and before it is unlocked: the change is this object's own, never reloaded over memory,
-		and another writer's append right after the unlock is not taken for it. When it all reached the file,
-		``dirty``, ``deSynced`` and ``_damage`` are cleared, still under the lock; else a buffer that could not be
-		written is dropped, not written by close() after the time is noted.
+		Each step is made once, and ``rw`` notes it done:
 
-		Raises what made flushing, syncing or closing fail, once the file is let go of: the rewrite did not reach
-		the file (``deSynced`` is set), and the caller's failure path makes it again. ``failed``: there is nothing
-		to flush (the rewrite failed, and the caller raises that, or it wrote nothing); the file is let go of
-		without flushing, and only a KeyboardInterrupt is raised. ``keepTime``: the rewrite did not start, and
-		another process's change may be in the file: its time is not noted. The note, the unlock and the close
-		are each made in a finally of their own, so a KeyboardInterrupt at any point skips none of them; the
-		caller holds writeLock and lets go of it after this.
+		1. the codec's writer is closed: into the file when all of it was written (its trailer, and for bz2 and xz
+		   all it holds), else pointed at nothing first (_discardWriter): nothing more reaches the file, now or
+		   when it is collected;
+		2. when all of it was written, the file is flushed and synced: it reached the disk;
+		3. when the rewrite started, the file's time is noted as this object's own, under writeLock and before
+		   the unlock (see _externalChange; a write that fails on a full disk changes it too). Once it reached the
+		   disk, ``dirty``, ``deSynced`` and ``_damage`` are cleared; else ``dirty`` and ``deSynced`` stay set
+		   (the next rewrite() makes it again from memory) and ``_damage`` is what the file now holds, read
+		   through its own descriptor, which another process's appends are merged after (_mergeChange);
+		4. the file is unlocked and closed, unflushed unless it reached the disk: a buffer that could not be
+		   written is dropped, not written by a close after its time was noted.
+
+		An error in a step (``rw.failed``) makes the next ones let go of a failed rewrite; it is raised at the end
+		when all of it had been written (the caller's failure path makes the rewrite again), not when the write
+		itself failed (the caller raises that). A KeyboardInterrupt stops it where it lands: _writeRewrite calls
+		it again, with ``written`` cleared. The caller holds writeLock and lets go of it after this.
 		"""
-		if file is None:
-			return
-		raw = getattr(file, '_tsvzRaw', None) or file
-		error = None
-		reached = False
-		try:
-			if failed and not keepTime:
-				self.deSynced = True  # its own rewrite failed: made again from memory
-			if raw is not file:
-				file.close()  # the codec writes what it holds into the file, also after a failure: closed for good
-			if not failed:
+		raw = rw.raw
+		if rw.writer is not None:
+			if rw.written and not rw.failed:
+				try:
+					rw.writer.close()
+				except Exception as e:
+					rw.fail(e)
+			if not rw.written or rw.failed:
+				_discardWriter(rw.writer)
+			rw.writer = None
+		if rw.written and not rw.failed and not rw.reached:
+			try:
 				raw.flush()
 				_fsync(raw.fileno())
-				reached = True
-		except BaseException as e:
-			error = e
-		finally:
-			try:
-				if not keepTime:
-					if not reached:
-						self.deSynced = True
-						self._damage = _DAMAGE_UNKNOWN
-					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # under writeLock: see _externalChange()
-					if not reached:
-						try:
-							self._damage = _fileDigest(raw.fileno())  # what it left: another process's appends are merged
-						except Exception:
-							pass
-					if reached:  # once its time is noted: until then the file is not reloaded over memory
-						self._damage = None
-						self.dirty = self.deSynced = False  # memory is the file again
-			finally:
-				try:
-					_unlockFile(raw)  # never raises
-				finally:
+				rw.reached = True
+			except Exception as e:
+				rw.fail(e)
+		if rw.started and not rw.noted:
+			self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # under writeLock: see _externalChange()
+			if rw.reached:  # once its time is noted: until then the file is not reloaded over memory
+				self._damage = None
+				self.dirty = self.deSynced = False  # memory is the file again
+			else:
+				self.dirty = self.deSynced = True
+				if raw is None:
+					self._damage = _DAMAGE_EMPTY  # the file was missing, and could not be made again
+				else:
 					try:
-						if reached:
-							raw.close()
-						else:
-							_closeUnflushed(raw)
-					except Exception as e:
-						if not keepTime:
-							self._damage = _DAMAGE_UNKNOWN  # what close() wrote last did not reach the file
-							self.dirty = self.deSynced = True
-						error = error or e
-		if self.verbose:
-			self.__teePrintOrNot(f"File {self._fileName} unlocked / released")
-		if error is not None and (not failed or not isinstance(error, Exception)):
-			raise error
+						self._damage = _fileDigest(raw.fileno())  # what it left: another process's appends are merged
+					except Exception:
+						self._damage = _DAMAGE_UNKNOWN
+			rw.noted = True
+		if raw is not None and not raw.closed:
+			_unlockFile(raw)  # never raises
+			try:
+				if rw.reached:
+					raw.close()
+				else:
+					_closeUnflushed(raw)
+			except Exception as e:
+				if rw.reached:
+					self._damage = _DAMAGE_UNKNOWN  # what close() wrote last did not reach the file
+					self.dirty = self.deSynced = True
+				rw.fail(e)
+			if self.verbose:
+				self.__teePrintOrNot(f"File {self._fileName} unlocked / released")
+		if rw.failed and rw.written:
+			rw.written = False  # raised once
+			raise rw.error
 
 class TSVZedLite(MutableMapping):
 	"""
