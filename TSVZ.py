@@ -1536,13 +1536,22 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 										   errors=errors)
 	delimiter = get_delimiter(delimiter,file_name=fileName)
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
-	# Look at every row before the file is created or touched: a refused row writes nothing.
 	rows = _legacyRows(linesToAppend, delimiter)
-	encoded = [_encodeRow(row, delimiter, encoding, errors, header) for row in rows] if _mayRaise(errors) else None  # kept: encoded once
-	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter,errors = errors):
+	formatted = None
+	if createIfNotExist and _mayRaise(errors) and not os.path.isfile(fileName):
+		# The file is about to be created with ``header``: format, and so look at, what is written to it before it
+		# exists, so that a refused row leaves nothing behind.
+		formatted = _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding,
+										 strict, delimiter, errors, rows, assume=header)
+	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter = delimiter,errors = errors):
 		return
-	payload, count = _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding,
-										  strict, delimiter, errors, rows, encoded)
+	payload, count = formatted or _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose,
+													   encoding, strict, delimiter, errors, rows)
+	_legacyWritePayload(fileName, payload, count, teeLogger, verbose, encoding)
+
+
+def _legacyWritePayload(fileName, payload, count, teeLogger, verbose, encoding):
+	"""Append the ``payload`` of ``count`` rows to the existing file (all of it, or nothing)."""
 	if not count:
 		if verbose:
 			__teePrintOrNot(f"No lines to append to {fileName}",teeLogger=teeLogger)
@@ -1589,37 +1598,53 @@ def _legacyRows(linesToAppend, delimiter):
 
 
 def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding, strict, delimiter,
-						 errors='strict', rows=None, encoded=None):
+						 errors='strict', rows=None, assume=None):
 	"""Format rows as 3.39's ``appendLinesTabularFile`` writes them; return ``(payload, count)``.
 
 	``header`` is a formatted header list and ``delimiter`` a resolved
 	delimiter. Rows are sanitised and padded or cut to the column count: the
 	header's when the file's first line matches it, else the longest row's.
-	``rows`` are the rows already made by ``_legacyRows``, ``encoded`` their
-	bytes when they were encoded already (a row is encoded again only when
-	it is padded or cut).
+	The bytes are what is written, so a ``TSVZEncodeError`` names a cell that
+	would be written, never one that is cut. ``rows`` are the rows already made
+	by ``_legacyRows``. ``assume`` is the header list that the file's first line
+	is (or is to be) when the file is not to be read: the file is about to be
+	created, or emptied with that header left.
 	"""
 	formatedLines = _legacyRows(linesToAppend, delimiter) if rows is None else rows
 	if not formatedLines:
 		return b'', 0
 	correctColumnNum = max([len(line) for line in formatedLines])
 	if any(header) and verifyHeader:
+		if assume is not None:
+			line = delimiter.join(assume)
+		else:
+			with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
+				line = file.readline().decode(encoding=encoding,errors='replace')
+		if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
+			correctColumnNum = len(header)
+			if verbose:
+				__teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
+	# truncate / fill the lines to the correct number of columns
+	fitted = []
+	for line in formatedLines:
+		if len(line) < correctColumnNum:
+			line = line + ['']*(correctColumnNum-len(line))
+		elif len(line) > correctColumnNum:
+			line = line[:correctColumnNum]
+		fitted.append(line)
+	payload = b'\n'.join([_encodeRow(line,delimiter,encoding,errors,header) for line in fitted]) + b'\n'
+	return payload, len(fitted)
+
+def _legacyKeptHeader(fileName, header, verifyHeader, verbose, teeLogger, encoding, strict, delimiter, warn=True):
+	"""The header ``clearTabularFile`` leaves in the file: the file's own when a header is given and ``verifyHeader``, else ``header``."""
+	if any(header) and verifyHeader:
 		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
 			line = file.readline().decode(encoding=encoding,errors='replace')
-			if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
-				correctColumnNum = len(header)
-				if verbose:
-					__teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
-	widths = [len(line) for line in formatedLines]
-	# truncate / fill the lines to the correct number of columns
-	for i in range(len(formatedLines)):
-		if len(formatedLines[i]) < correctColumnNum:
-			formatedLines[i] += ['']*(correctColumnNum-len(formatedLines[i]))
-		elif len(formatedLines[i]) > correctColumnNum:
-			formatedLines[i] = formatedLines[i][:correctColumnNum]
-	payload = b'\n'.join([encoded[i] if encoded is not None and widths[i] == len(line) else _encodeRow(line,delimiter,encoding,errors,header)
-						  for i, line in enumerate(formatedLines)]) + b'\n'
-	return payload, len(formatedLines)
+		if warn and not _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
+			__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
+		return _formatHeader(line,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
+	return header
+
 
 def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False,delimiter = '\t',errors = 'strict'):
 	"""
@@ -1660,12 +1685,7 @@ def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,
 	if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = header,encoding = encoding,strict = False,delimiter=delimiter,errors = errors):
 		raise FileNotFoundError("Something catastrophic happened! File still not found after creation")
 	else:
-		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
-			if any(header) and verifyHeader:
-				line = file.readline().decode(encoding=encoding,errors='replace')
-				if not _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
-					__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
-				header = _formatHeader(line,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
+		header = _legacyKeptHeader(fileName, header, verifyHeader, verbose, teeLogger, encoding, strict, delimiter)
 		# Encode before the file is opened for writing, which empties it.
 		headerBytes = _encodeRow(_sanitize(header,delimiter=delimiter),delimiter,encoding,errors,what='header') if header else None
 		with openFileAsCompressed(fileName, mode ='wb',encoding=encoding,teeLogger=teeLogger) as file:
@@ -1761,16 +1781,17 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 							lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
 							encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults,correctColumnNum = correctColumnNum,errors = errors)
 	if file:
-		if taskDic:
-			# Rows a caller supplied can hold text that cannot be written: look before the file is cleared,
-			# which must not cost it its data. Rows read from the file always encode (U+FFFD is written as
-			# '?' where the encoding lacks it), so those are encoded once, by the append.
-			dlm = get_delimiter(delimiter,file_name=fileName)
-			formatted = _formatHeader(header,delimiter=dlm)
-			for row in _legacyRows(file, dlm):
-				_checkRow(row, dlm, encoding, errors, formatted)
+		# Everything that is to be written is looked at, and encoded, before the file is touched: the clear
+		# below empties it, and rows that took the caller's defaults can hold text it cannot write.
+		dlm = get_delimiter(delimiter,file_name=fileName)
+		formatted = _formatHeader(header,delimiter=dlm)
+		kept = _legacyKeptHeader(fileName, formatted, verifyHeader, verbose, teeLogger, encoding, strict, dlm, warn=False)
+		if kept:
+			_checkRow(_sanitize(kept,delimiter=dlm), dlm, encoding, errors, what='header')
+		payload, count = _legacyFormatPayload(fileName, file, teeLogger, formatted, verifyHeader, verbose, encoding,
+											  strict, dlm, errors, assume=_sanitize(kept,delimiter=dlm) if kept else [])
 		clearTabularFile(fileName,teeLogger = teeLogger,header = header,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter,errors = errors)
-		appendLinesTabularFile(fileName,file,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter,errors = errors)
+		_legacyWritePayload(fileName, payload, count, teeLogger, verbose, encoding)
 	return file
 
 # ===========================================================================

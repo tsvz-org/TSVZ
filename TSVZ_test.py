@@ -6336,3 +6336,59 @@ def test_tsvzed_fromkeys_passes_verbose_as_verbose_and_keeps_monitoring_on(tmp_p
 	t = TSVZ.TSVZed.fromkeys(['a'], ['x', 'y'], fileName=str(tmp_path / 'fv.tsv'), header='id\tv\tw', verbose=True)
 	assert t.verbose is True and t.monitor_external_changes is True
 	_stop(t)
+
+
+# --- second review round: scrub looks at everything before it clears; a cut cell is not written ---------
+SCRUB_ROWS = b'key\tv1\tv2\nk1\tx\t\nk2\ty\tz\n'
+
+
+def test_legacy_scrub_refuses_defaults_it_cannot_write_before_it_empties_the_file(tmp_path):
+	p = str(tmp_path / 'a.tsv')
+	_touch(p, SCRUB_ROWS)
+	with pytest.raises(TSVZ.TSVZEncodeError) as e:  # k1's empty v2 takes the default
+		TSVZ.scrubTabularFile(p, header='key\tv1\tv2', defaults=['', '', BAD_NAME])
+	assert "key 'k1'" in str(e.value) and "column 3 'v2'" in str(e.value), e.value
+	assert _bytes(p) == SCRUB_ROWS  # the rows are still there
+	TSVZ.scrubTabularFile(p, header='key\tv1\tv2', defaults=['', '', BAD_NAME], errors='replace')
+	assert _bytes(p) == b'key\tv1\tv2\nk1\tx\tbad?.txt\nk2\ty\tz\n'
+
+
+def test_legacy_scrub_with_a_legacy_encoding_refuses_a_row_it_read_and_keeps_the_file(tmp_path):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'k\t\x81\n')  # 0x81 is undefined in cp1252: it reads as U+FFFD, which cp1252 lacks
+	with pytest.raises(TSVZ.TSVZEncodeError) as e:
+		TSVZ.scrubTabularFile(p, encoding='cp1252')
+	assert 'U+FFFD' in str(e.value) and "key 'k'" in str(e.value)
+	assert _bytes(p) == b'k\t\x81\n'
+	TSVZ.scrubTabularFile(p, encoding='cp1252', errors='replace')
+	assert b'k\t?\n' in _bytes(p)
+
+
+def test_legacy_scrub_checks_a_header_it_keeps_and_a_header_it_writes(tmp_path):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, SCRUB_ROWS)
+	# the file's own header is kept, so an argument that cannot be written is not written either
+	TSVZ.scrubTabularFile(p, header='key\tv1\tv2é' + BAD_NAME, verifyHeader=True)
+	assert _bytes(p) == SCRUB_ROWS
+
+
+def test_cli_scrub_with_defaults_that_are_not_utf8_leaves_the_rows(tmp_path):
+	p = str(tmp_path / 'c.tsv')
+	_touch(p, SCRUB_ROWS)
+	status, out, err = _run('--x-defaults', 'k\t\t' + BAD_NAME, 'scrub', p)
+	assert status == 1 and 'cannot write' in err and 'Traceback' not in err, err
+	assert _bytes(p) == SCRUB_ROWS
+
+
+@pytest.mark.parametrize('create', [False, True])
+def test_append_lines_checks_what_is_written_after_the_row_is_cut(tmp_path, create):
+	# A third cell the header's width drops is never written, so it cannot be a reason to refuse the call.
+	p = str(tmp_path / 'cut.tsv')
+	if not create:
+		_touch(p, b'key\tval\n')
+	TSVZ.appendLinesTabularFile(p, [['k', 'v', 'extra' + BAD_NAME], ['j', 'w']], header='key\tval', createIfNotExist=create)
+	assert _bytes(p) == b'key\tval\nk\tv\nj\tw\n'
+	with pytest.raises(ValueError) as e:  # the cell that is written still is
+		TSVZ.appendLinesTabularFile(p, [['z', BAD_NAME, 'extra']], header='key\tval')
+	assert "column 2 'val'" in str(e.value)
+	assert _bytes(p) == b'key\tval\nk\tv\nj\tw\n'
