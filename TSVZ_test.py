@@ -7203,12 +7203,25 @@ def test_tsvzed_legacy_append_notes_the_time_before_it_unlocks_the_file(tmp_path
 	assert t._externalChange(), "the other writer's append was taken for this one's"
 
 
+def _has_zstd():
+	try:
+		TSVZ._codecModule('zstd')
+		return True
+	except ImportError:
+		return False
+
+
+# Every codec a legacy store can be written with; .tsv.zst where this Python has compression.zstd (3.14+).
+ALL_SUFFIXES = ['tsv', 'tsv.gz', 'tsv.bz2', 'tsv.xz',
+				pytest.param('tsv.zst', marks=pytest.mark.skipif(not _has_zstd(), reason='zstd needs Python 3.14'))]
+
+
 def _compressedAs(suffix, data):
 	"""``data`` as another process appends it to a file with ``suffix``: a member (a frame) of its codec."""
 	return TSVZ._compressBytes(suffix.rpartition('.')[2], data) if suffix != 'tsv' else data
 
 
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2'])
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
 @pytest.mark.parametrize('how', ['append', 'rewrite'])
 def test_tsvzed_legacy_write_looks_for_external_changes_once_the_file_is_locked(tmp_path, monkeypatch, how, suffix):
 	# A compressed rewrite (hardMapToFile) looked before it took the lock: a change appended in between was erased.
@@ -7249,7 +7262,7 @@ def test_tsvzed_legacy_deferred_rewrite_leaves_the_change_unseen(tmp_path):
 	assert t.deSynced and t._externalChange() and b'ext\tB' in _bytes(p)
 
 
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
 def test_tsvzed_legacy_rewrite_deferred_for_a_change_after_its_reload_is_made_then(tmp_path, suffix):
 	p = str(tmp_path / ('late.' + suffix))
 	t = _stopped(p)
@@ -7260,7 +7273,7 @@ def test_tsvzed_legacy_rewrite_deferred_for_a_change_after_its_reload_is_made_th
 	def mapping(*args, **kwargs):
 		if state['changes']:
 			state['changes'] -= 1
-			_append_external(p, b'ext\tB\n' if suffix == 'tsv' else __import__('gzip').compress(b'ext\tB\n'))
+			_append_external(p, _compressedAs(suffix, b'ext\tB\n'))  # a member of the store's own codec
 		return real(*args, **kwargs)
 
 	t._mapToFile = mapping  # another process appends after rewrite() looked for changes, before the rewrite
@@ -7580,7 +7593,7 @@ class _BufferedFullDiskFile(object):
 		return getattr(self._f, name)
 
 
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2', 'tsv.xz'])
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
 @pytest.mark.parametrize('where', ['flush', 'fsync'])
 @pytest.mark.parametrize('method', ['hardMapToFile', 'rewrite', 'clear_file'])
 def test_tsvzed_legacy_rewrite_whose_flush_or_fsync_fails_is_made_again(tmp_path, monkeypatch, capsys, suffix, where, method):
@@ -7692,7 +7705,7 @@ def _full_tmpfs(tmp_path, *args):
 	return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2', 'tsv.xz'])
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
 @pytest.mark.parametrize('method', ['hardMapToFile', 'rewrite'])
 def test_tsvzed_legacy_rewrite_on_a_really_full_disk_is_made_again_from_memory(tmp_path, suffix, method):
 	result = _full_tmpfs(tmp_path, suffix, method)
@@ -7703,7 +7716,7 @@ def test_tsvzed_legacy_rewrite_on_a_really_full_disk_is_made_again_from_memory(t
 	assert result == dict(result, external=False, memory=True, file=True), result
 
 
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2', 'tsv.xz'])
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
 @pytest.mark.parametrize('method', ['hardMapToFile', 'clear_file'])
 def test_tsvzed_legacy_rewrite_is_all_on_disk_before_it_unlocks_the_file(tmp_path, monkeypatch, suffix, method):
 	# BZ2File.flush() and LZMAFile.flush() do not flush the compressor: release_file_obj unlocked a .bz2 or .xz
@@ -7725,7 +7738,7 @@ def test_tsvzed_legacy_rewrite_is_all_on_disk_before_it_unlocks_the_file(tmp_pat
 	assert _back(p) == (dict(t) if method == 'hardMapToFile' else {})
 
 
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2', 'tsv.xz'])
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
 @pytest.mark.parametrize('verbose', [False, True])
 def test_tsvzed_legacy_failed_release_reports_the_real_error(tmp_path, monkeypatch, capsys, suffix, verbose):
 	# release_file_obj logged file.name once it had closed the file: BZ2File and LZMAFile have no name before
@@ -8120,7 +8133,7 @@ def _failing_rewrite(monkeypatch, partial=b''):
 	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', inplace)
 
 
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2', 'tsv.xz'])
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
 @pytest.mark.parametrize('method', ['rewrite', 'hardMapToFile', 'rewrite_on_exit'])
 def test_tsvzed_legacy_change_after_a_failed_rewrite_is_merged_into_memory_not_reloaded_over_it(tmp_path, monkeypatch, capsys, suffix, method):
 	# A rewrite that failed once it had emptied the file (a full disk) leaves memory the only good copy. Another
