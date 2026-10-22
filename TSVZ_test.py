@@ -6424,3 +6424,37 @@ def test_a_refused_row_leaves_the_column_count_unset(tmp_path, cls):
 	assert t.correctColumnNum == 3
 	if cls == 'TSVZed':
 		_stop(t)
+
+
+# --- second review round: a .tsvz clear or scrub looks only at what it writes -------------------------
+def test_spec_clear_and_scrub_do_not_refuse_a_header_argument_the_store_does_not_take(tmp_path):
+	# The store has its own header line, which is kept: an argument that could not be written is not written.
+	p = str(tmp_path / 'h.tsvz')
+	for operation in ('clear', 'scrub'):
+		_touch(p, b'#id\tv\nk\t1\n')
+		getattr(TSVZ, operation + 'TabularFile')(p, header=['id', 'v' + BAD_NAME])
+		assert _bytes(p) == (b'#id\tv\n' if operation == 'clear' else b'#id\tv\n#_version_#\t1\nk\t1\n')
+	_touch(p, b'#id\tv\nk\t1\n')
+	assert _run('--x-header', 'id\tv' + BAD_NAME, 'clear', p) == (0, '', '')
+	assert _bytes(p) == b'#id\tv\n'
+	_touch(p, b'#id\tv\nk\t1\n')
+	assert _run('--x-header', 'id\tv' + BAD_NAME, 'scrub', p)[0] == 0
+	# a store without one gets it written, and is refused when it cannot be
+	_touch(p, b'k\t1\n')
+	for operation in ('clear', 'scrub'):
+		with pytest.raises(ValueError) as e:
+			getattr(TSVZ, operation + 'TabularFile')(p, header=['id', 'v' + BAD_NAME])
+		assert 'the header' in str(e.value)
+		assert _bytes(p) == b'k\t1\n'
+
+
+def test_spec_scrub_names_a_refused_cell_and_keeps_no_copy_of_a_part_it_did_not_touch(tmp_path):
+	p = str(tmp_path / 'd.tsvz')
+	raw = b'k\tv\n\0\0\0j\tw\n'  # damaged: a scrub keeps the original as d.tsvz.damaged-<time> before it rewrites
+	_touch(p, raw)
+	with pytest.raises(TSVZ.TSVZEncodeError) as e:
+		TSVZ.scrubTabularFile(p, taskDic={'z': ['z', BAD_NAME]})
+	assert "column 2 of key 'z'" in str(e.value) and 'k\\tv' not in str(e.value), e.value
+	assert _bytes(p) == raw and os.listdir(str(tmp_path)) == ['d.tsvz']
+	TSVZ.scrubTabularFile(p, taskDic={'z': ['z', 'fine']})
+	assert any(n.startswith('d.tsvz.damaged-') for n in os.listdir(str(tmp_path)))

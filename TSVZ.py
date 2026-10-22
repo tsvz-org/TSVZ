@@ -3484,7 +3484,6 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 	try:
 		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
 		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
-		_checkRow(header, delimiter, 'utf-8', errors, what='header')  # before anything is cleared
 		name = _parsePartName(fileName)
 		if name.ordinal is not None or name.rotated:
 			reporter.note('fragment', None, 'clear skipped: {} names one part of a multi-part store; clear the store path instead; nothing was written'.format(fileName))
@@ -3524,6 +3523,8 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			lines = []
 			headerLine = load.headerLine or (_specHeaderComment(header, delimiter) if any(header) else None)
 			if headerLine:
+				if not load.headerLine:
+					_checkRow(header, delimiter, 'utf-8', errors, what='header')  # the header is written only when the store has none
 				lines.append(headerLine)
 			lines += _specPreamble(load.state, delimiter, version=False)
 			if _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors), expect=stamp,
@@ -3613,7 +3614,6 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
 		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
 		initial = _normalizeDefaults(defaults, delimiter)
-		_checkRow(header, delimiter, 'utf-8', errors, what='header')  # before anything is rewritten
 		if not _specEnsureStore(fileName, createIfNotExist, header, initial, strict, teeLogger, delimiter, errors):
 			return taskDic, False
 		name = _parsePartName(fileName)
@@ -3645,6 +3645,26 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 							 'nothing was written'.format(MAX_SPEC_VERSION))
 				return taskDic, False
 			info = load.infos[0]
+			state = load.state
+			rows = [_specScrubCells(row, state) for row in taskDic.values()]
+			compensate = not all(_specRoundTrips(cells, state) for cells in rows)
+			lines = []
+			headerLine = load.headerLine or (_specHeaderComment(header, delimiter) if any(header) else None)
+			if headerLine:
+				if not load.headerLine:
+					_checkRow(header, delimiter, 'utf-8', errors, what='header')  # the header is written only when the store has none
+				lines.append(headerLine)
+			preamble = _specPreamble(state, delimiter, compensate=compensate)
+			lines += preamble
+			# Everything that is to be written is looked at before a copy of a damaged part is kept or the part is
+			# touched, and a refused cell is named (its key and column), not the file.
+			for line in preamble:
+				_encodeText(line, 'utf-8', errors, 'a marker line')
+			for cells in rows:
+				_checkRow(cells, delimiter, 'utf-8', errors, header)
+			lines += [_specFormatRecord(cells, delimiter) for cells in rows]
+			if compensate:
+				lines += _specPostamble(state, delimiter)
 			if (info.lost or info.damaged) and backedUp != stamp:
 				# Damaged data is not in what is written, or only unverified (spec §4.10, §16.6): keep the original
 				# bytes, again whenever the part changed since the last copy.
@@ -3654,17 +3674,6 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 					attempt.note('refused', None, 'scrub skipped: could not keep a copy of the damaged part ({}); nothing was written'.format(e))
 					return taskDic, False
 				backedUp = stamp
-			state = load.state
-			rows = [_specScrubCells(row, state) for row in taskDic.values()]
-			compensate = not all(_specRoundTrips(cells, state) for cells in rows)
-			lines = []
-			headerLine = load.headerLine or (_specHeaderComment(header, delimiter) if any(header) else None)
-			if headerLine:
-				lines.append(headerLine)
-			lines += _specPreamble(state, delimiter, compensate=compensate)
-			lines += [_specFormatRecord(cells, delimiter) for cells in rows]
-			if compensate:
-				lines += _specPostamble(state, delimiter)
 			written = _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors), expect=stamp,
 										  memberSize=state.memberSize)
 			if written is None:
