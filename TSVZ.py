@@ -4531,7 +4531,9 @@ memoryOnly:{self.memoryOnly}
 	def fromkeys(cls, iterable, value=None,fileName = None,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = ...,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,verbose = False,errors = 'strict'):
 		'''Create a new ordered dictionary with keys from iterable and values set to value.
 		'''
-		self = cls(fileName,teeLogger,header,createIfNotExist,verifyHeader,rewrite_on_load,rewrite_on_exit,rewrite_interval,append_check_delay,verbose,errors = errors)
+		self = cls(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,
+				   rewrite_on_load = rewrite_on_load,rewrite_on_exit = rewrite_on_exit,rewrite_interval = rewrite_interval,
+				   append_check_delay = append_check_delay,verbose = verbose,errors = errors)
 		for key in iterable:
 			self[key] = value
 		return self

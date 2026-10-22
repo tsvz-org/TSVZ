@@ -6323,3 +6323,16 @@ def test_tsvzed_legacy_refusal_is_timed_on_the_monotonic_clock(tmp_path, monkeyp
 	t.rewrite()
 	assert calls == []  # still inside the retry window: it is not the wall clock that counts
 	_stop(t)
+
+
+def test_tsvzed_fromkeys_passes_verbose_as_verbose_and_keeps_monitoring_on(tmp_path):
+	# verbose used to land in the tenth positional parameter, monitor_external_changes
+	for suffix in ('.tsv', '.tsvz'):
+		t = TSVZ.TSVZed.fromkeys(['a', 'b'], ['x', 'y'], fileName=str(tmp_path / ('fk' + suffix)), header='id\tv\tw',
+								 verbose=False, rewrite_on_load=False, rewrite_interval=0, append_check_delay=0.01)
+		assert t.monitor_external_changes is True and t.verbose is False
+		assert t.rewrite_interval == 0 and t.append_check_delay == 0.01 and t.rewrite_on_load is False
+		_stop(t)
+	t = TSVZ.TSVZed.fromkeys(['a'], ['x', 'y'], fileName=str(tmp_path / 'fv.tsv'), header='id\tv\tw', verbose=True)
+	assert t.verbose is True and t.monitor_external_changes is True
+	_stop(t)
