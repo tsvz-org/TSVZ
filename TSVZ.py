@@ -3970,6 +3970,34 @@ class _TSVZedLoad(OrderedDict):
 				OrderedDict.pop(self, key, None)
 
 
+class _TSVZedMerge(_TSVZedLoad):
+	"""What ``TSVZed._mergeChange`` reads the rows another process appended into, apart from the live store: the
+	last change of each key, its row shaped as a read shapes it or None for a delete, to apply to memory after."""
+
+	def __setitem__(self, key, value):
+		key = str(key).rstrip()
+		if not key:
+			return
+		shaped = self.owner._shapeRow(key, value, self.columns, self.defaults)
+		if shaped is None:
+			return
+		value, columns = shaped
+		if self.columns != 1 and len(value) == 1:
+			OrderedDict.__setitem__(self, key, None)
+			return
+		self.columns = columns
+		if key == DEFAULTS_INDICATOR_KEY:
+			self.defaults[:] = value
+			return
+		OrderedDict.__setitem__(self, key, value)
+
+	def __contains__(self, key):
+		return True  # a delete of a key memory holds: _processLine deletes only what it is told is there
+
+	def __delitem__(self, key):
+		OrderedDict.__setitem__(self, str(key).rstrip(), None)
+
+
 class TSVZed(OrderedDict):
 	"""
 	A thread-safe, file-backed ordered dictionary for managing TSV (Tab-Separated Values) files.
@@ -5177,9 +5205,15 @@ memoryOnly:{self.memoryOnly}
 		change is not reloaded over memory (the rows the damage lost would go), nor erased. When the file still
 		begins with what the damage left (its size and digest), the rest is what other processes appended since
 		(appends, deletes, the file made again after it was removed): its rows are applied on top of memory, as a
-		read of the file would apply them, then the rows still queued, which are appended after the rewrite. Else
-		(another process rewrote it, or what it held is not known) memory is kept and the change is overwritten,
-		with a warning. True when memory changed: what the rewrite writes is encoded again.
+		read of the file would apply them, except for a key still queued (set or deleted since, the queue is
+		appended after the rewrite: memory holds its last change). Else (another process rewrote it, or what it
+		held is not known) memory is kept and the change is overwritten, with a warning. True when memory changed:
+		what the rewrite writes is encoded again.
+
+		The rows are read apart from memory first (_TSVZedMerge), without _memLock: other threads' sets wait only
+		for the appended rows to be applied. Each is applied to memory in place, the last change of its key: a
+		KeyboardInterrupt leaves memory with some of them applied, and the next merge applies all of them again
+		(``_damage`` is noted only once they are), which ends the same.
 		"""
 		if not self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
 			return False
@@ -5206,22 +5240,28 @@ memoryOnly:{self.memoryOnly}
 			first, _, after = rest.partition(b'\n')
 			if first.rstrip(b'\r') == _encodeRow(_sanitize(list(self.header),delimiter=self.delimiter),self.delimiter,self.encoding,'replace',what='header'):
 				rest = after
+		defaults = list(self.defaults)
+		changes = _TSVZedMerge(self, self.correctColumnNum, list(defaults))
 		try:
-			with self._memLock:
-				merged = _TSVZedLoad(self, self.correctColumnNum, list(self.defaults))
-				for key, row in OrderedDict.items(self):
-					OrderedDict.__setitem__(merged, key, row)
-				_legacyReadLoop(io.BytesIO(rest), '', merged, self.correctColumnNum, 0, self.strict, self.delimiter,
-								merged.defaults, False, self.encoding, reporter)
-				merged.replay(list(self.appendQueue))  # appended after the rewrite: they come last
-				OrderedDict.clear(self)
-				for key, row in merged.items():
-					OrderedDict.__setitem__(self, key, row)
-				self.defaults = merged.defaults
-				if self.correctColumnNum == -1 and self:
-					self.correctColumnNum = len(self[next(iter(self))])
+			_legacyReadLoop(io.BytesIO(rest), '', changes, self.correctColumnNum, 0, self.strict, self.delimiter,
+							changes.defaults, False, self.encoding, reporter)
 		finally:
 			reporter.flush()
+		with self._memLock:
+			# No set or delete is half done: each holds _memLock from its change of memory to its queueing.
+			queued = set(row[0] for row in self.appendQueue if row)
+			for key, row in changes.items():
+				if key in queued:
+					continue
+				if row is None:
+					if OrderedDict.__contains__(self, key):
+						OrderedDict.__delitem__(self, key)  # not OrderedDict.pop: on 3.6 it calls TSVZed.__delitem__, which takes _memLock
+				else:
+					OrderedDict.__setitem__(self, key, row)
+			if changes.defaults != defaults and DEFAULTS_INDICATOR_KEY not in queued:
+				self.defaults = changes.defaults
+			if self.correctColumnNum == -1 and self:
+				self.correctColumnNum = len(self[next(iter(self))])
 		self._damage, self.externalFileUpdateTime = whole, seen  # a rewrite that does not start now merges only what comes next
 		if self.verbose:
 			self.__teePrintOrNot(f"Merged what another process wrote to {self._fileName} after a failed rewrite: {len(self)} records")

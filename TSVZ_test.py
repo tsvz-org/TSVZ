@@ -8433,3 +8433,44 @@ def test_tsvzed_legacy_explicit_reload_of_a_damaged_file_warns_that_memory_is_re
 	assert dict(t) == {'k0': ['k0', 'v0']} and t._damage is None and not t.deSynced
 	t.reload()
 	assert 'reload() replaces memory' not in capsys.readouterr().out
+
+
+def _damaged_with_appends(p, monkeypatch, suffix='tsv'):
+	"""A store whose rewrite failed part way, a row set since and queued, and another process's appends after the
+	damage: a set of rows, a delete, an update and an update of the queued key. Returns it and what to expect."""
+	t = _stopped(p)
+	rows = _many(t, 5)
+	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
+	t.hardMapToFile()
+	monkeypatch.undo()
+	assert t._damage is not None and t.deSynced
+	t['k4'] = ['k4', 'mine']  # queued, appended after the rewrite
+	time.sleep(0.01)
+	theirs = b''.join(b'x%d\tX\n' % i for i in range(3)) + b'k2\t\nk3\tnew\nk4\ttheirs\n'
+	_append_external(p, _compressedAs(suffix, theirs))
+	expected = dict(rows, k3=['k3', 'new'], k4=['k4', 'mine'], **dict(('x%d' % i, ['x%d' % i, 'X']) for i in range(3)))
+	del expected['k2']
+	return t, expected
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_merge_interrupted_at_any_line_keeps_memory_whole(tmp_path, monkeypatch, suffix):
+	# _mergeChange swapped the merged rows in by emptying memory and filling it again row by row: a KeyboardInterrupt
+	# in the refill left memory, the only good copy, partly empty, and the next rewrite wrote what was left (4 of 21
+	# rows on 50ea158). The appended rows are now applied to memory in place, and applied again by the next merge.
+	n = 0
+	while True:
+		n += 1
+		t, expected = _damaged_with_appends(str(tmp_path / ('m%d.%s' % (n, suffix))), monkeypatch, suffix)
+		before = dict(t)
+		hit = _interrupt_at(n, t.rewrite, where='_mergeChange')
+		assert not t.writeLock.locked(), n
+		for key, row in before.items():  # each key holds its row before the merge or after it
+			assert t.get(key) in (row, expected.get(key)), (n, key)
+		assert t.rewrite() or not hit, n
+		assert dict(t) == expected, n
+		assert _back(str(tmp_path / ("m%d.%s" % (n, suffix)))) == expected, n
+		t.close()
+		if not hit:
+			break
+	assert n > 30, n
