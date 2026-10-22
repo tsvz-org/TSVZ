@@ -4116,7 +4116,8 @@ class TSVZed(OrderedDict):
 	load()
 		Load or reload data from the TSV file.
 	reload()
-		Refresh data from the TSV file, discarding in-memory changes.
+		Refresh data from the TSV file, discarding in-memory changes. Unsafe after a failed rewrite
+		(see Notes): it replaces memory, the only good copy then, with the damaged file, and warns.
 	rewrite(force=False, reloadInternalFromFile=None)
 		Rewrite the entire file with current in-memory data.
 	mapToFile()
@@ -4149,6 +4150,15 @@ class TSVZed(OrderedDict):
 	- The special key '#_defaults_#' is used to store column default values.
 	- Supports compressed file formats through automatic detection.
 	- Thread-safe for concurrent access from multiple threads.
+	- A rewrite of a legacy file (.tsv, .csv, .nsv, .psv, compressed or not) that fails part way (a full
+	  disk, a KeyboardInterrupt, an I/O error), or cannot make again a removed file, leaves the file
+	  damaged and memory the only good copy. Until a rewrite gets through, the file is not reloaded over
+	  memory and the background writer does not append to it; the next rewrite (the background writer's,
+	  rewrite(), close()) makes it again from memory. Another process's change made meanwhile is merged
+	  into memory first when the file still begins with exactly the bytes the failed rewrite left (all
+	  after them was appended; a file left empty must then begin with this store's header); otherwise
+	  memory is kept and that change is overwritten, with a warning. reload() is unsafe then: it replaces
+	  memory with the damaged file, as asked, and warns.
 	Examples
 	--------
 	>>> with TSVZed('data.tsv', header='id\tname\tvalue') as tsv:

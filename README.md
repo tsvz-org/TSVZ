@@ -210,6 +210,20 @@ would write `?` for U+FFFD, losing the bytes the file holds there. The `tsvz` co
 exits 1 with the message, naming the cell as it does on the files when a handler runs,
 and without the advice about `errors=`, an option it does not take.
 
+A `TSVZed` rewrite of a `.tsv`, `.csv`, `.nsv` or `.psv` file (compressed or not)
+that fails part way, on a full disk, a `KeyboardInterrupt` or an I/O error, or that
+cannot make again a file that was removed, leaves the file damaged: memory then holds
+the only good copy. Until a rewrite gets through, `TSVZed` does not reload the file
+over memory and its background writer does not append to it; the next rewrite (the
+background writer's, `rewrite()`, `close()`) makes the file again from memory. A change
+another process made to the file meanwhile is merged into memory first when the file
+still begins with exactly the bytes the failed rewrite left, so that the rest can only
+have been appended (a file left empty, or made again, must then begin with this store's
+header). Otherwise (another process rewrote the file, or it begins with another header)
+memory is kept, and that change is overwritten with the warning `Overwriting external
+changes`. An explicit `reload()` while the file is damaged is unsafe: it replaces memory
+with the damaged file, as asked, and warns that the rows only memory held are dropped.
+
 ## Breaking changes from 3.39
 
 ### `.tsv`, `.csv`, `.nsv`, `.psv`: bug fixes only
