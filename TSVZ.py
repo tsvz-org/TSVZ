@@ -5114,9 +5114,10 @@ memoryOnly:{self.memoryOnly}
 								 f"this object's failed and left the file damaged, and cannot be told apart from that damage; "
 								 f"memory holds what the rewrite was writing",'warning')
 			return False
-		rest, self._damage = found
-		self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # all of it is read: under the lock
+		rest, whole = found
+		seen = getFileUpdateTimeNs(self._fileName)  # all of it is read, under the lock: noted once it is merged
 		if not rest:
+			self._damage, self.externalFileUpdateTime = whole, seen
 			return False
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		codec = _fileCodec(self._fileName)
@@ -5145,6 +5146,7 @@ memoryOnly:{self.memoryOnly}
 					self.correctColumnNum = len(self[next(iter(self))])
 		finally:
 			reporter.flush()
+		self._damage, self.externalFileUpdateTime = whole, seen  # a rewrite that does not start now merges only what comes next
 		if self.verbose:
 			self.__teePrintOrNot(f"Merged what another process wrote to {self._fileName} after a failed rewrite: {len(self)} records")
 		return True
