@@ -5241,10 +5241,17 @@ memoryOnly:{self.memoryOnly}
 			if error is not None:
 				reporter.note('damaged', None, 'compressed stream another process appended is damaged ({}: {}); merged up to '
 							  'the damage, and the rest is overwritten'.format(type(error).__name__, error))
-		if self.header:  # another process made the file again: its header is not a row
-			first, _, after = rest.partition(b'\n')
-			if first.rstrip(b'\r') == _encodeRow(_sanitize(list(self.header),delimiter=self.delimiter),self.delimiter,self.encoding,'replace',what='header'):
-				rest = after
+		if size == 0 and self.header and any(self.header) and self.verifyHeader:
+			# The damage left nothing (the file emptied, or removed): what another process wrote there begins with a
+			# header, as a read takes the first line of the file. Not after a damage that holds bytes: a row there
+			# that reads as the header is a row. A header that is not this store's: another store's file, not merged.
+			first, _, rest = rest.partition(b'\n')
+			line = first.decode(self.encoding or 'utf8', errors='replace')
+			if not _headerMatches(self.header, line, self.delimiter):
+				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}: another process made it again "
+									 f"after a rewrite of this object's failed, with a first line that is not this store's "
+									 f"header ({line.rstrip()!r}); memory holds what the rewrite was writing",'warning')
+				return False
 		defaults = list(self.defaults)
 		changes = _TSVZedMerge(self, self.correctColumnNum, list(defaults))
 		try:
@@ -5413,7 +5420,10 @@ memoryOnly:{self.memoryOnly}
 					self._specSync()
 				elif not self._failing('sync'):
 					self._rewrite(background=True)  # it waits after a failed rewrite itself, but never to reload
-				if self._spec or not self._failing('append'):
+				# Not to a file a failed rewrite damaged (_damage): the rewrite that makes it again from memory, which
+				# holds the queued rows, comes first, and rows of this object's after the damage would be taken for
+				# another process's, merged after it (at close() they are appended all the same: nothing follows).
+				if self._spec or (not self._failing('append') and self._damage is None):
 					self.commitAppendToFile()
 			time.sleep(self.append_check_delay)
 			# self.appendEvent.wait()
