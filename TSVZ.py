@@ -549,8 +549,15 @@ class TSVZEncodeError(ValueError):
 
 	Writers raise it, before writing anything, unless they were given
 	``errors='replace'`` (or another codec error handler) to take the old
-	behaviour of writing ``?`` for the character.
+	behaviour of writing ``?`` for the character. ``reason`` is the message
+	without its advice, which names options of the library (the ``tsvz``
+	command prints it alone).
 	"""
+
+	def __init__(self, reason, advice=''):
+		ValueError.__init__(self, reason + ('; ' + advice if advice else ''))
+		self.reason = reason
+		self.advice = advice
 
 
 def _encodingName(encoding):
@@ -574,11 +581,17 @@ def _unencodable(text, error, encoding, where=None):
 		what = '{} (U+FFFD, what reading puts for a byte it could not decode), which {} cannot encode'.format(shown, name)
 	else:
 		what = '{} (U+{:04X}), which {} cannot encode'.format(shown, code, name)
+	if code == 0xFFFD:
+		# '?' in its place would lose for good the bytes the file holds there.
+		advice = ("open the store with the encoding it was written in; errors='replace' would write '?' for it, "
+				  "losing the bytes it stands for")
+	else:
+		advice = "escape it first or pass errors='replace'"
 	subject = ascii(text)
 	if len(subject) > 100:
 		subject = subject[:97] + '...'
-	return TSVZEncodeError("cannot write {} as {}{}: it holds {}; escape it first or pass errors='replace'".format(
-		subject, name, ' ({})'.format(where) if where else '', what))
+	return TSVZEncodeError("cannot write {} as {}{}: it holds {}".format(
+		subject, name, ' ({})'.format(where) if where else '', what), advice)
 
 
 _NEVER_RAISING_HANDLERS = frozenset(('replace', 'ignore', 'xmlcharrefreplace', 'backslashreplace', 'namereplace'))
@@ -3815,7 +3828,10 @@ class TSVZed(OrderedDict):
 		What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8
 		file name (os.fsdecode). 'strict' raises a ValueError (TSVZEncodeError) naming it, from the
 		call that gave the text (setting an item) or from the constructor (a header or defaults),
-		before anything is stored or written. 'replace' writes '?' for it, as 3.39 did.
+		before anything is stored or written. 'replace' writes '?' for it, as 3.39 did. A rewrite
+		that meets such text (a row changed in place, or U+FFFD under a legacy encoding) leaves the
+		file as it is: mapToFile() and hardMapToFile() raise the error, the rewrites TSVZed makes
+		itself report it once.
 	Attributes
 	----------
 	version : str
@@ -3998,6 +4014,12 @@ class TSVZed(OrderedDict):
 	def reload(self):
 		if self._spec:
 			return self._specReload()
+		self._reload()
+		self._accepted()  # memory is the file again: a refusal met later is reported again
+		return self
+
+	def _reload(self):
+		"""reload() for a legacy file, as rewrite() makes it after another process changed the file."""
 		# Load or refresh data from the TSV file. It is read into a dict of its own, apart from the live store:
 		# rows set meanwhile by another thread go to memory and the queue as ever (memoryOnly is never
 		# turned on for the read, which stored them in memory only), and are kept below.
@@ -4509,6 +4531,7 @@ class TSVZed(OrderedDict):
 			self.clear_file()
 		else:
 			self._clearFile(dropRows=True)
+		self._accepted()  # nothing is left to refuse: a later refusal is reported again
 		self.lastUpdateTime = self.externalFileUpdateTime
 		return self
 
@@ -4705,7 +4728,7 @@ memoryOnly:{self.memoryOnly}
 			if reloadInternalFromFile and self._externalChange():
 				# this will be needed if more than 1 process is accessing the file
 				self.commitAppendToFile()
-				self.reload()
+				self._reload()
 				self.deSynced = False  # memory is the file again; a refused write below must not keep this set
 			if self.memoryOnly:
 				if self.verbose:
@@ -4746,20 +4769,36 @@ memoryOnly:{self.memoryOnly}
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
 
-	def _refuse(self, where, error):
-		"""Remember that a rewrite was refused with ``error`` and report it once per run of refusals (no traceback: it is not a bug)."""
+	def _refuse(self, where, error, explicit=False):
+		"""Remember that a rewrite was refused with ``error``; raise it for an ``explicit`` call, else report it once.
+
+		mapToFile() and hardMapToFile() called by the program raise it, as a refused set does: the caller learns
+		that nothing was written. The rewrites TSVZed makes itself report it, once for each different refusal
+		until a rewrite goes through, clear() or reload() (no traceback: it is not a bug).
+		"""
 		self._refusedAt = _specClock()
-		if not self._refusalReported:
-			self._refusalReported = True
-			self.__teePrintOrNot(f"Refused at {where} to {self._fileName}: {error}; the file is left as it is and rows that can be written are still appended; "
-								 f"a later rewrite stores the rest once the row is fixed or removed (tried at most every {max(self.rewrite_interval, _REFUSED_RETRY_SECONDS):g} s)",'error')
+		if explicit:
+			raise error
+		message = str(error)
+		if self._refusalReported == message:
+			return
+		self._refusalReported = message
+		if self.rewrite_interval:
+			retry = f"A rewrite is tried again at most every {max(self.rewrite_interval, _REFUSED_RETRY_SECONDS):g} s."
+		else:
+			retry = ("With rewrite_interval=0 none is tried again on its own, only one asked for (mapToFile(), "
+					 "rewrite(force=True), rewrite_on_exit) or one made after another process changes the file.")
+		self.__teePrintOrNot(f"Refused at {where} to {self._fileName}: {message}. The file is left as it is, and rows that can "
+							 f"be written are still appended. It is rewritten once every row can be written: set or delete the row; "
+							 f"a key that cannot be written cannot be deleted either, so for one, edit the file, clear() the store "
+							 f"or open it with the encoding it was written in. {retry}",'error')
 
 	def _refusalPending(self):
 		"""True while the last rewrite was refused less than ``max(rewrite_interval, 1 s)`` ago."""
 		return self._refusedAt is not None and _specClock() - self._refusedAt < max(self.rewrite_interval, _REFUSED_RETRY_SECONDS)
 
 	def _accepted(self):
-		"""A rewrite went through: a later refusal is reported again."""
+		"""A rewrite went through, or memory was emptied or read again: a later refusal is reported again."""
 		self._refusedAt = None
 		self._refusalReported = False
 
@@ -4822,10 +4861,10 @@ memoryOnly:{self.memoryOnly}
 					  'hardMapToFile() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
 					  self.teeLogger)
 			return self
-		return self._hardMapToFile()
+		return self._hardMapToFile(explicit=True)
 
-	def _hardMapToFile(self, defer=False):
-		"""hardMapToFile(); ``defer``: see _snapshotForRewrite."""
+	def _hardMapToFile(self, defer=False, explicit=False):
+		"""hardMapToFile(); ``defer``: see _externalChangeStops, ``explicit``: see _refuse."""
 		try:
 			snapshot = self._snapshotForRewrite()  # checked, and the lock held: opening the file for writing empties it
 			file = None
@@ -4854,7 +4893,7 @@ memoryOnly:{self.memoryOnly}
 			self.deSynced = False
 			self._accepted()
 		except TSVZEncodeError as e:
-			self._refuse('hardMapToFile()', e)
+			self._refuse('hardMapToFile()', e, explicit)
 		except Exception as e:
 			self.__teePrintOrNot(f"Failed to write at hardMapToFile() to {self._fileName}: {e}",'error')
 			import traceback
@@ -4868,10 +4907,10 @@ memoryOnly:{self.memoryOnly}
 					  'mapToFile() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
 					  self.teeLogger)
 			return self
-		return self._mapToFile()
+		return self._mapToFile(explicit=True)
 
-	def _mapToFile(self, defer=False):
-		"""mapToFile(), which rewrite() calls with ``defer`` (see _snapshotForRewrite).
+	def _mapToFile(self, defer=False, explicit=False):
+		"""mapToFile(); rewrite() calls it with ``defer`` (see _externalChangeStops), ``explicit``: see _refuse.
 
 		Whether to overwrite a change another process made is an argument, not monitor_external_changes turned
 		off for the time of the call: two threads in it at once left monitoring off for good.
@@ -4879,7 +4918,7 @@ memoryOnly:{self.memoryOnly}
 		try:
 			if _isCompressedFile(self._fileName):
 				# if the file is compressed, we need to use the hardMapToFile method
-				return self._hardMapToFile(defer)
+				return self._hardMapToFile(defer, explicit)
 			snapshot = self._snapshotForRewrite()  # checked, and the lock held
 			file = None
 			try:
@@ -4940,7 +4979,7 @@ memoryOnly:{self.memoryOnly}
 			self.deSynced = False
 			self._accepted()
 		except TSVZEncodeError as e:
-			self._refuse('mapToFile()', e)
+			self._refuse('mapToFile()', e, explicit)
 			return self
 		except Exception as e:
 			self.__teePrintOrNot(f"Failed to write at mapToFile() to {self._fileName}: {e}",'error')
@@ -4948,7 +4987,7 @@ memoryOnly:{self.memoryOnly}
 			self.__teePrintOrNot(traceback.format_exc(),'error')
 			self.deSynced = True
 			self.__teePrintOrNot("Trying failback hardMapToFile()")
-			self._hardMapToFile(defer)
+			self._hardMapToFile(defer, explicit)
 		return self
 	
 	def checkExternalChanges(self):

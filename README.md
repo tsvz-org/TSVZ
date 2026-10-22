@@ -197,12 +197,16 @@ and writes nothing, instead of storing `?`. Pass `errors='replace'` to the
 writing functions or to `TSVZed`, `TSVZedLite` and `TSVZClient` to get the old `?` (any codec error handler is taken; a name that is not one
 is a `ValueError` where it is given). `TSVZed` and `TSVZedLite` refuse a row in
 `__setitem__`, so the background writer never meets one; a refused rewrite leaves
-the file as it is and is reported once. With a non-UTF-8 `encoding=`, U+FFFD (what
-the reader puts for a byte it could not decode) is text that encoding may lack, and it
-is refused like any other: such a store's rewrite is refused (also the one `rewrite_on_load`
-makes, which then leaves the file as it is, without failing), appends of rows that can be
-written still work, the delete or update of a key that holds U+FFFD raises, and
-the rewrite goes through once the row is fixed or removed or the file edited. The `tsvz` command exits 1 with the message.
+the file as it is: `mapToFile()` and `hardMapToFile()` raise the error, and a rewrite
+`TSVZed` makes itself reports it once (again after `clear()` or `reload()`, or for
+another row; with `rewrite_interval=0` it is not tried again on its own). With a
+non-UTF-8 `encoding=`, U+FFFD (what the reader puts for a byte it could not decode) is
+text that encoding may lack, and it is refused like any other: such a store's rewrite is
+refused (also the one `rewrite_on_load` makes, which then leaves the file as it is,
+without failing), appends of rows that can be written still work, and the delete or
+update of a key that holds U+FFFD raises. Such a key stays until the file is edited, the
+store cleared, or the store opened with the encoding it was written in; `errors='replace'`
+would write `?` for U+FFFD, losing the bytes the file holds there. The `tsvz` command exits 1 with the message.
 
 ## Breaking changes from 3.39
 

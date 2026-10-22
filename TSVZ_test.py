@@ -5777,10 +5777,13 @@ def test_tsvzed_legacy_rewrite_with_a_mutated_row_writes_nothing(tmp_path, capsy
 	before = _bytes(p)
 	t['a'][1] = BAD_NAME  # in place: no __setitem__ sees it
 	t.dirty = True
-	t.hardMapToFile()
-	t.mapToFile()
+	for method in (t.hardMapToFile, t.mapToFile):  # asked for by the program: it raises, as a refused set does
+		with pytest.raises(TSVZ.TSVZEncodeError) as e:
+			method()
+		assert "cannot write 'bad\\udcff.txt' as UTF-8" in str(e.value)
 	assert _bytes(p) == before
 	assert not t.deSynced and t._refusedAt  # refused, not broken: no retry at every tick
+	t.rewrite(force=True)  # one TSVZed makes itself is reported
 	assert "cannot write 'bad\\udcff.txt' as UTF-8" in capsys.readouterr().out
 	t.shutdownEvent.set()
 	t.appendThread.join()
@@ -5938,8 +5941,9 @@ def test_tsvzed_with_a_legacy_encoding_leaves_a_file_it_cannot_write_back_as_it_
 	assert _bytes(p) == LEGACY_KEY_ROW
 	assert t['r�sum�'] == ['r�sum�', '1'] and t['ok'] == ['ok', '2']
 	t.rewrite(force=True)
-	t.hardMapToFile()
-	t.mapToFile()
+	for method in (t.hardMapToFile, t.mapToFile):
+		with pytest.raises(TSVZ.TSVZEncodeError, match='U\\+FFFD'):
+			method()
 	assert capsys.readouterr().out.count('Refused at') == 0  # reported once, not at every try
 	assert _bytes(p) == LEGACY_KEY_ROW
 	t['new'] = ['new', '3']  # a row that can be written is appended as ever
@@ -6299,7 +6303,8 @@ def test_tsvzed_legacy_refused_rewrite_does_not_delay_reloading_an_external_chan
 	assert _wait_for(lambda: b'a\t1' in _bytes(p))
 	t['a'][1] = BAD_NAME  # a row changed in place
 	t.dirty = True
-	getattr(t, method)()  # refused
+	with pytest.raises(TSVZ.TSVZEncodeError):
+		getattr(t, method)()  # refused
 	assert t._refusedAt is not None
 	with open(p, 'ab') as f:  # another process appends
 		f.write(b'ext\t9\n')
@@ -6314,7 +6319,8 @@ def test_tsvzed_legacy_refusal_is_timed_on_the_monotonic_clock(tmp_path, monkeyp
 	t.commitAppendToFile()
 	t['a'][1] = BAD_NAME
 	t.dirty = True
-	t.mapToFile()  # refused
+	with pytest.raises(TSVZ.TSVZEncodeError):
+		t.mapToFile()  # refused
 	calls = []
 	original = t._mapToFile  # what rewrite() calls
 	t._mapToFile = lambda *args, **kwargs: calls.append(1) or original(*args, **kwargs)
@@ -7101,3 +7107,78 @@ def test_tsvzed_legacy_clear_and_sets_in_another_thread_agree_stress(tmp_path):
 	t.close()
 	assert dict(TSVZ.readTabularFile(p, header='key\tval')) == dict(t)
 
+
+
+# --- third review round: what a refused rewrite says, and to whom ----------
+def _refusals(capsys):
+	"""The refused rewrites reported (a row changed in place is also refused by the append, reported apart)."""
+	return [line for line in capsys.readouterr().out.splitlines() if line.startswith(('Refused at mapToFile', 'Refused at hardMapToFile'))]
+
+
+def test_tsvzed_legacy_refusal_is_reported_again_after_clear_reload_or_for_another_row(tmp_path, capsys):
+	p = str(tmp_path / 'again.tsv')
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '1']
+	t.commitAppendToFile()
+	t['a'][1] = BAD_NAME  # a row changed in place: the rewrite is refused
+	t.dirty = True
+	t.rewrite(force=True)
+	assert len(_refusals(capsys)) == 1
+	t.rewrite(force=True)
+	assert _refusals(capsys) == []  # the same refusal: reported once
+	t['a'] = ['a', '2']
+	t['b'][1] = 'x' + BAD_NAME  # another row now
+	t.dirty = True
+	t.rewrite(force=True)
+	assert len(_refusals(capsys)) == 1, 'a different refusal was not reported'
+	t.clear()
+	t['c'] = ['c', '1']
+	t['c'][1] = BAD_NAME
+	t.dirty = True
+	t.rewrite(force=True)
+	refused = _refusals(capsys)
+	assert len(refused) == 1 and "'c'" in refused[0], 'a refusal after clear() was not reported'
+
+
+def test_tsvzed_legacy_encoding_refusal_is_reported_again_after_reload(tmp_path, capsys):
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, LEGACY_KEY_ROW)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.01)
+	assert len(_refusals(capsys)) == 1
+	t.reload()
+	t.rewrite(force=True)
+	assert len(_refusals(capsys)) == 1
+	_stop(t)
+	assert _bytes(p) == LEGACY_KEY_ROW
+
+
+@pytest.mark.parametrize('interval', [0, 0.05])
+def test_tsvzed_legacy_refusal_says_what_the_user_can_do_and_when_it_is_tried_again(tmp_path, capsys, interval):
+	p = str(tmp_path / 'say.tsv')
+	_touch(p, LEGACY_KEY_ROW)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.01, rewrite_interval=interval)
+	refused = _refusals(capsys)
+	_stop(t)
+	assert len(refused) == 1
+	message = refused[0]
+	assert 'fixed or removed' not in message  # a key holding U+FFFD cannot be removed through the API
+	for part in ('edit the file', 'clear() the store', 'open it with the encoding it was written in'):
+		assert part in message, (part, message)
+	# errors='replace' would put '?' where the file holds bytes it could not decode: never advised as a way out
+	assert "errors='replace' would write '?'" in message and "or pass errors='replace'" not in message
+	if interval:
+		assert 'tried again at most every 1 s' in message
+	else:
+		assert 'at most every' not in message and 'rewrite_interval=0 none is tried again on its own' in message
+
+
+def test_unencodable_fffd_error_does_not_advise_replacing_it_with_a_question_mark():
+	with pytest.raises(TSVZ.TSVZEncodeError) as e:
+		TSVZ._encodeText('r�sum', 'cp1252')
+	assert "or pass errors='replace'" not in str(e.value)
+	assert "errors='replace' would write '?' for it, losing the bytes it stands for" in str(e.value)
+	assert e.value.reason == "cannot write 'r\\ufffdsum' as CP1252: it holds \\ufffd (U+FFFD, what reading puts for a byte it could not decode), which CP1252 cannot encode"
+	with pytest.raises(TSVZ.TSVZEncodeError) as e:
+		TSVZ._encodeText('bad\udcff', 'utf-8')
+	assert str(e.value).endswith("; escape it first or pass errors='replace'") and 'errors=' not in e.value.reason
