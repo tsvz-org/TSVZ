@@ -7812,3 +7812,32 @@ def test_tsvzed_legacy_rewrite_deferred_in_one_thread_is_not_taken_for_done_by_a
 	t._mapToFile = real
 	assert made and written == b'key\tval\na\t2\next\tB\n', (made, written)
 	assert t['ext'] == ['ext', 'B']
+
+
+def test_tsvzed_legacy_rewrite_that_keeps_failing_still_reloads_another_process_change_at_every_tick(tmp_path, monkeypatch):
+	# The background writer skipped all of rewrite() while a failed rewrite waited to be tried again; rewrite() is
+	# also its only reload of another process's change, which it then saw up to a minute late.
+	p = str(tmp_path / 'ro.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001, teeLogger=_ErrorLog())
+	_dirty(t)
+	real = TSVZ.openFileAsCompressed
+
+	def denying(fileName, mode='rb', *args, **kwargs):
+		if mode in ('r+b', 'wb'):
+			raise PermissionError(13, 'Permission denied')  # a file this process may append to but not rewrite
+		return real(fileName, mode, *args, **kwargs)
+
+	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', denying)
+	monkeypatch.setattr(TSVZ, '_openUntruncated', lambda fileName: denying(fileName, 'wb'))
+	t.deSynced = True  # a tick tries the rewrite, and fails
+	assert _wait_for(lambda: t._failing('rewrite'), 5)
+	for _ in range(10):
+		t._failed('rewrite', 'Permission denied', False)  # it kept failing: the next try is a minute away
+	_append_external(p)
+	started = time.time()
+	assert _wait_for(lambda: 'ext' in t, 3), 'another process\'s change was not reloaded while the rewrite waits'
+	assert time.time() - started < 3
+	monkeypatch.undo()
+	t._worked('rewrite')
+	t.close()
+	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == {'a': ['a', '2'], 'ext': ['ext', 'B']}

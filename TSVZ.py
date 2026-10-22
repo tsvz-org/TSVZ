@@ -4745,6 +4745,11 @@ memoryOnly:{self.memoryOnly}
 
 
 	def rewrite(self,force = False,reloadInternalFromFile = None):
+		return self._rewrite(force, reloadInternalFromFile)
+
+	def _rewrite(self, force=False, reloadInternalFromFile=None, background=False):
+		"""rewrite(); ``background``: the background writer's tick, which reloads another process's change at every
+		tick but makes no rewrite while one that failed waits to be tried again (see _failed)."""
 		if self._spec:
 			_warnOnce(self, 'rewrite()', self._fileName,
 					  'rewrite() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
@@ -4765,6 +4770,7 @@ memoryOnly:{self.memoryOnly}
 				self.commitAppendToFile()
 				self._reload()
 				self.deSynced = False  # memory is the file again; a refused write below must not keep this set
+			self._worked('sync')
 			if self.memoryOnly:
 				if self.verbose:
 					self.__teePrintOrNot("Memory only mode. Map to file skipped.")
@@ -4773,6 +4779,8 @@ memoryOnly:{self.memoryOnly}
 			if self.dirty:
 				if not force and self._refusalPending():
 					return False  # the last rewrite was refused (text that cannot be written): try again later, not at every tick
+				if background and self._failing('rewrite'):
+					return False  # the last one failed: tried again later; another process's change was still reloaded above
 				if self.verbose:
 					self.__teePrintOrNot(f"Rewriting {self._fileName}")
 				for attempt in range(_DEFERRED_REWRITE_TRIES):
@@ -4794,7 +4802,6 @@ memoryOnly:{self.memoryOnly}
 				self.commitAppendToFile()
 			# else:
 			#     self.appendEvent.set()
-			self._worked('sync')
 			return made  # False when the rewrite failed or was refused (reported)
 		except Exception as e:
 			self._failed('sync', f"Failed to write at sync() to {self._fileName}: {e}")
@@ -5135,8 +5142,8 @@ memoryOnly:{self.memoryOnly}
 				self.checkExternalChanges()
 				if self._spec:
 					self._specSync()
-				elif not self._failing('sync', 'rewrite'):
-					self.rewrite()
+				elif not self._failing('sync'):
+					self._rewrite(background=True)  # it waits after a failed rewrite itself, but never to reload
 				if self._spec or not self._failing('append'):
 					self.commitAppendToFile()
 			time.sleep(self.append_check_delay)
