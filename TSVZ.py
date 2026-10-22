@@ -5215,17 +5215,22 @@ memoryOnly:{self.memoryOnly}
 		KeyboardInterrupt leaves memory with some of them applied, and the next merge applies all of them again
 		(``_damage`` is noted only once they are), which ends the same.
 		"""
-		if not self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
-			return False
 		size, digest = self._damage
-		found = None if size is None else _bytesAfter(file, size, digest)
+		# Taken before the bytes are read, as _reload takes it: a write landing after the read (a writer that takes
+		# no file lock) is not noted as seen. Noted once what was read is merged.
+		seen = getFileUpdateTimeNs(self._fileName)
+		# Decided by what the file holds, not by its time: on a file system with coarse timestamps, an append in the
+		# same tick as the failed rewrite leaves the time as it was. Only an unknown damage looks at the time.
+		if size is None:
+			found = None if self.externalFileUpdateTime < seen else (b'', self._damage)
+		else:
+			found = _bytesAfter(file, size, digest)
 		if found is None:
 			self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}: they were made after a rewrite of "
 								 f"this object's failed and left the file damaged, and cannot be told apart from that damage; "
 								 f"memory holds what the rewrite was writing",'warning')
 			return False
 		rest, whole = found
-		seen = getFileUpdateTimeNs(self._fileName)  # all of it is read, under the lock: noted once it is merged
 		if not rest:
 			self._damage, self.externalFileUpdateTime = whole, seen
 			return False

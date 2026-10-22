@@ -8405,7 +8405,6 @@ def test_tsvzed_legacy_rewrite_never_reloads_a_file_another_thread_damaged_after
 			_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
 			t.hardMapToFile()  # another thread's rewrite, which fails part way
 			monkeypatch.undo()
-			time.sleep(0.01)  # past the file time it noted (a merge decided by the time: see the next tests)
 			_append_external(p, b'ext2\tC\n')  # and another process appends after it
 		return real()
 
@@ -8445,7 +8444,6 @@ def _damaged_with_appends(p, monkeypatch, suffix='tsv'):
 	monkeypatch.undo()
 	assert t._damage is not None and t.deSynced
 	t['k4'] = ['k4', 'mine']  # queued, appended after the rewrite
-	time.sleep(0.01)
 	theirs = b''.join(b'x%d\tX\n' % i for i in range(3)) + b'k2\t\nk3\tnew\nk4\ttheirs\n'
 	_append_external(p, _compressedAs(suffix, theirs))
 	expected = dict(rows, k3=['k3', 'new'], k4=['k4', 'mine'], **dict(('x%d' % i, ['x%d' % i, 'X']) for i in range(3)))
@@ -8474,3 +8472,50 @@ def test_tsvzed_legacy_merge_interrupted_at_any_line_keeps_memory_whole(tmp_path
 		if not hit:
 			break
 	assert n > 30, n
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_change_after_a_failed_rewrite_in_the_same_tick_is_merged(tmp_path, monkeypatch, capsys, suffix):
+	# The merge was made only when the file's time had moved past the one noted: on a file system with coarse
+	# timestamps (or within one tick) another process's append after the failed rewrite kept the time, and the next
+	# rewrite overwrote it without a warning though the file held more bytes than the damage. It is decided by them.
+	p = str(tmp_path / ('tick.' + suffix))
+	t, expected = _damaged_with_appends(p, monkeypatch, suffix)
+	noted = t.externalFileUpdateTime
+	os.utime(p, ns=(noted, noted))  # the append left the time as the failed rewrite noted it
+	assert not t._externalChange()
+	assert t.rewrite()
+	assert dict(t) == expected and _back(p) == expected
+	assert 'Overwriting external changes' not in capsys.readouterr().out
+
+
+def test_tsvzed_legacy_merge_notes_the_time_from_before_it_read(tmp_path, monkeypatch):
+	# _mergeChange took the file's time after it read the appended bytes: a write landing in between (a writer that
+	# takes no file lock: a hand edit, open(p, 'ab'), a log rotation) was noted as seen though it was never read.
+	p = str(tmp_path / 'seen.tsv')
+	t, expected = _damaged_with_appends(p, monkeypatch)
+	real = TSVZ._bytesAfter
+
+	def reading(*args):
+		found = real(*args)
+		_append_external(p, b'late\tL\n')
+		later = os.stat(p).st_mtime_ns + 10 ** 9
+		os.utime(p, ns=(later, later))
+		return found
+
+	monkeypatch.setattr(TSVZ, '_bytesAfter', reading)
+	snapshot = t._snapshotForRewrite
+	calls = []
+
+	def refusing():  # the rewrite is refused once the merge is made: what the merge noted stays
+		calls.append(1)
+		if len(calls) > 1:
+			raise TSVZ.TSVZEncodeError('a row changed in place')
+		return snapshot()
+
+	t._snapshotForRewrite = refusing
+	t.rewrite()
+	monkeypatch.undo()
+	del t._snapshotForRewrite
+	assert len(calls) == 2 and dict(t) == expected
+	assert t._externalChange(), 'the late write was noted as seen'
