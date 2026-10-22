@@ -172,6 +172,20 @@ def _compressedWriter(fileName, raw, compressLevel=1):
 
 _DAMAGE_UNKNOWN = (None, None)  # TSVZed._damage when what the file holds is not known
 
+# What fsync(2) fails with on a file it cannot sync, whose data is written all the same: EINVAL and EROFS ("fd is
+# bound to a special file which does not support synchronization"), ENOTSUP / EOPNOTSUPP (some FUSE and network
+# file systems). Not EIO, ENOSPC or EDQUOT: those mean the data may not be on disk.
+_FSYNC_UNSUPPORTED = frozenset([errno.EINVAL, errno.EROFS] + [getattr(errno, name) for name in ('ENOTSUP', 'EOPNOTSUPP') if hasattr(errno, name)])
+
+
+def _fsync(fd):
+	"""os.fsync(fd), which does nothing where the file system cannot sync (_FSYNC_UNSUPPORTED), as main 1688d25 did."""
+	try:
+		os.fsync(fd)
+	except OSError as e:
+		if e.errno not in _FSYNC_UNSUPPORTED:
+			raise
+
 
 def _closeUnflushed(f):
 	"""Close the open file ``f`` without writing what its buffer still holds (after a write that failed)."""
@@ -5321,7 +5335,7 @@ memoryOnly:{self.memoryOnly}
 		noted = False
 		try:
 			file.flush()  # Ensure the file is flushed before unlocking
-			os.fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
+			_fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
 			if not file.closed:
 				if not self._keepFileTime and not _isCompressedFile(self._fileName):
 					# Noted while the file is still locked: another writer appending right after the unlock
@@ -5389,7 +5403,7 @@ memoryOnly:{self.memoryOnly}
 				file.close()  # the codec writes what it holds into the file, also after a failure: closed for good
 			if not failed:
 				raw.flush()
-				os.fsync(raw.fileno())
+				_fsync(raw.fileno())
 				reached = True
 		except BaseException as e:
 			error = e

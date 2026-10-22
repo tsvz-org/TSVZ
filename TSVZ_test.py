@@ -8058,3 +8058,45 @@ def test_tsvzed_legacy_rewrite_interrupted_again_in_its_release_lets_go_and_lose
 		t['a'] = ['a', str(m)]  # dirty again, for the next try
 		t.commitAppendToFile()
 	assert m > 10, m
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+@pytest.mark.parametrize('method', ['rewrite', 'hardMapToFile', 'clear_file', 'append'])
+@pytest.mark.parametrize('code', ['EINVAL', 'EROFS', 'ENOTSUP', 'EOPNOTSUPP', 'EIO', 'ENOSPC'])
+def test_tsvzed_legacy_write_on_a_file_system_that_cannot_fsync(tmp_path, monkeypatch, capsys, suffix, method, code):
+	# a2107b4 made a failed fsync a failed rewrite: where fsync always fails with EINVAL (a file system that
+	# cannot sync) every rewrite and clear_file() failed though its data was written, and the background writer
+	# rewrote the file twice at every try, for good (main 1688d25 took it for written). Only an fsync error that
+	# may mean the data is not on disk fails it.
+	import errno
+	if not hasattr(errno, code):
+		pytest.skip('no errno.' + code + ' here')
+	p = str(tmp_path / ('nosync.' + suffix))
+	t = _stopped(p)
+	_dirty(t)
+	calls = []
+
+	def fsync(fd):
+		calls.append(fd)
+		raise OSError(getattr(errno, code), os.strerror(getattr(errno, code)))
+
+	monkeypatch.setattr(TSVZ.os, 'fsync', fsync)
+	if method == 'rewrite':
+		t.rewrite(force=True)
+	elif method == 'append':
+		t['b'] = ['b', '1']
+		t.commitAppendToFile()
+	else:
+		getattr(t, method)()
+	monkeypatch.undo()
+	out = capsys.readouterr().out
+	assert calls
+	if code in ('EIO', 'ENOSPC'):
+		assert os.strerror(getattr(errno, code)) in out, out
+		if method != 'append':
+			assert t.deSynced, 'a rewrite whose fsync failed was taken for done'
+		return
+	assert 'Failed' not in out and 'rror' not in out, out
+	assert not t.deSynced and len(calls) == 1, calls
+	assert t.dirty == (method == 'append')  # the append leaves the file holding a twice, as it did
+	assert _back(p) == ({} if method == 'clear_file' else dict(t))
