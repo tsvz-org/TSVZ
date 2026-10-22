@@ -8300,13 +8300,12 @@ def _cliEmitServed(args, delimiter, logger, stdout, response):
 	return status
 
 
-def _cliSetdefaultArgs(args, delimiter, creating, isLive):
-	"""Settle what ``setdefault`` is to run with, refusing before a store is created or written.
+def _cliSetdefaultArgs(args, delimiter, creating):
+	"""Refuse, before a store is created or written, what a ``setdefault`` would have to write and cannot.
 
-	KEY is looked up as a reader reads it (§20.2.7). When it is live nothing is written, so the arguments stay
-	as they are; when it is not, what is written must be UTF-8: text that is not raises ``TSVZEncodeError``
-	(exit status 1 with its message), and a new store is not created for it. A header or defaults written to a
-	store this creates is looked at too.
+	A header or defaults written to a store this creates is looked at. Arguments that hold a byte that is not
+	UTF-8 (``args.writeArgs``) are refused here when the store does not exist: KEY is not live, so they would
+	have to be written. When it exists, see ``_cliSetdefaultLookup``.
 	"""
 	if creating:
 		header = _formatHeader(args.header, delimiter=delimiter)
@@ -8314,12 +8313,30 @@ def _cliSetdefaultArgs(args, delimiter, creating, isLive):
 			_checkRow(header, delimiter, 'utf8', 'strict', what='header')
 		if args.defaults and len(args.defaults) > 1:
 			_checkRow(args.defaults, delimiter, 'utf8', 'strict', what='defaults')
-	if args.writeArgs is None:
-		return
-	if not isLive(args.args[0]):
-		if len(args.writeArgs) > 1:
-			_checkRow(_sanitize(args.writeArgs, delimiter=delimiter), delimiter, 'utf8', 'strict', None)
-		args.args = args.writeArgs
+		if args.writeArgs is not None:
+			_cliRefuseSetdefault(args, delimiter)
+
+
+def _cliRefuseSetdefault(args, delimiter):
+	"""Raise the ``TSVZEncodeError`` a write of ``args.writeArgs`` meets: they hold a byte that is not UTF-8."""
+	_checkRow(_sanitize(args.writeArgs, delimiter=delimiter), delimiter, 'utf8', 'strict', None)
+	raise TSVZEncodeError('cannot write {} as UTF-8'.format(ascii(args.writeArgs)))  # not reached: they cannot be encoded
+
+
+def _cliSetdefaultLookup(args, delimiter, logger, stdout, request):
+	"""``setdefault`` whose arguments hold a byte that is not UTF-8 (spec §20.2.5): it never writes.
+
+	A live KEY is printed as ``setdefault`` prints it and nothing is written; a missing one would have to be
+	written with the byte, so it is refused. KEY is looked up as a reader reads it (U+FFFD for the byte, §20.2.7)
+	with one ``get`` request (``request``): through a handler that is the handler's own view, in one request, never
+	a write with the byte replaced; on the files it is the in-process engine's.
+	"""
+	lines, diagnostics, status, message = request('\t'.join(['get', _serveEncode(args.args[0])]))
+	if status == 3:
+		for text in diagnostics:
+			logger.teelog(text, 'warning')
+		_cliRefuseSetdefault(args, delimiter)
+	return _cliEmitServed(args, delimiter, logger, stdout, (lines[:1] if status == 0 else [], diagnostics, status, message))
 
 
 def _cliEngineOp(args, delimiter, logger, stdin, stdout):
@@ -8341,8 +8358,9 @@ def _cliEngineOp(args, delimiter, logger, stdin, stdout):
 	try:
 		if create:
 			# Before a missing store is created: a setdefault that will be refused creates nothing.
-			_cliSetdefaultArgs(args, delimiter, not exists, lambda key: exists and _ServeLocal(store).request(
-				'\t'.join(['has', _serveEncode(key)]))[2] == 0)
+			_cliSetdefaultArgs(args, delimiter, not exists)
+			if args.writeArgs is not None:
+				return _cliSetdefaultLookup(args, delimiter, logger, stdout, _ServeLocal(store).request)
 			if store is None:
 				store = openStore(True)
 		response = _ServeLocal(store).request(_cliRequestLine(args))
@@ -8433,16 +8451,14 @@ def _cliHandler(args, delimiter, logger):
 	TSVZ routes a command line only when its result does not depend on
 	options the handler does not share: no --x-direct, --x-header,
 	--x-defaults or --x-strict, and for a loose file the handler's own
-	delimiter. A setdefault whose data holds a byte that is not UTF-8 is not
-	forwarded either: a request cannot carry the byte, so the handler could not
-	refuse it when it has to write it, and one atomic request is all a forwarded
-	setdefault is (spec §21.8.2); it runs on the files, where KEY is looked up as a
-	reader reads it and only then is the data refused (§20.2.5). A pointer whose
+	delimiter. A setdefault whose arguments hold a byte that is not UTF-8, which a
+	request cannot carry, is answered with one forwarded get of KEY (see
+	_cliSetdefaultLookup): it never writes. A pointer whose
 	handler does not answer is reported and the files are used; another host's
 	handler, or one this user may not connect to, is skipped quietly.
 	"""
 	if args.operation in ('serve', 'stop', 'parts', 'verify') or args.direct or args.header or args.defaults \
-			or args.strict or args.writeArgs is not None:
+			or args.strict:
 		return None  # parts and verify read the files themselves, so they gain nothing from a handler
 	info, problem = _serveLookup(args.store)
 	if problem:
@@ -8472,6 +8488,13 @@ def _cliRouted(connection, args, delimiter, logger, stdin, stdout):
 		finally:
 			source.flush()
 		bulk = [_serveRecordLine(cells, marker) for cells, marker in rows]
+	elif args.operation == 'setdefault' and args.writeArgs is not None:
+		try:
+			return _cliSetdefaultLookup(args, delimiter, logger, stdout, connection.request)
+		except _ServeLost as e:  # a lookup only: the files answer it as well
+			logger.teelog('TSVZ warning: {}: lost the handler ({}); using the files directly'.format(args.store, e),
+						  'warning')
+			return _CLI_HANDLERS[args.operation](args, delimiter, logger, stdin, stdout)
 	elif args.operation in ('set', 'append') and len(args.args) > 1:
 		# Checked as the files are, naming the cell, before anything is sent: a request cannot carry
 		# text that is not UTF-8 (and would be quoted whole).

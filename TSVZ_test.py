@@ -6228,8 +6228,8 @@ def test_cli_setdefault_through_a_handler_looks_up_as_a_reader_reads(tmp_path, s
 	p = str(tmp_path / 'h.tsvz')
 	_touch(p, b'\xff\t1\n')
 	served(p)
-	status, out, err = _run('setdefault', p, '\udcff', 'new')  # not forwarded (see _cliHandler): the files are read here
-	assert (status, out) == (0, '�\t1\n') and err.count('U+FFFD') == 1, err
+	status, out, err = _run('setdefault', p, '\udcff', 'new')  # one get through the handler (see _cliSetdefaultLookup)
+	assert (status, out, err) == (0, '�\t1\n', '')
 	status, out, err = _run('setdefault', p, 'k', BAD_NAME)
 	assert status == 1 and 'cannot write' in err, err
 	assert _run('has', p, 'k')[0] != 0
@@ -6560,11 +6560,12 @@ def test_cli_routed_setdefault_is_one_atomic_request(tmp_path, served, monkeypat
 	assert _run('setdefault', p, 'new', 'v') == (0, 'new\tv\n', '')
 	assert [line[1] if line[0].startswith('--') else line[0] for line in sent] == ['setdefault']  # no probe first
 	del sent[:]
-	# data that holds a byte a request cannot carry: not forwarded, KEY looked up as a reader reads it, then refused
+	# Arguments that hold a byte a request cannot carry: such a setdefault never writes, so it is one get of
+	# KEY as a reader reads it (U+FFFD for the byte), answered by the handler; a missing KEY is then refused.
 	assert _run('setdefault', p, '\udcff', 'ignored' + BAD_NAME)[:2] == (0, '�\t1\n')
 	status, out, err = _run('setdefault', p, 'k', BAD_NAME)
 	assert status == 1 and 'cannot write' in err, err
-	assert sent == []
+	assert sent == [['get', '�'], ['get', 'k']]
 	assert _run('has', p, 'k')[0] != 0
 
 
@@ -7210,3 +7211,27 @@ def test_cli_refusal_names_the_cell_and_no_option_it_lacks_with_or_without_a_han
 	assert _bytes(q) == before
 	status, out, err = _run('setdefault', p, 'k3', 'v\udcff')
 	assert status == 1 and 'cannot write' in err and 'errors=' not in err, err
+
+
+@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
+def test_cli_setdefault_with_a_byte_it_cannot_write_never_writes_even_when_the_key_goes(tmp_path, monkeypatch, suffix):
+	# It looked KEY up with `has`, then sent `setdefault` with the byte replaced (U+FFFD): a delete in between
+	# made it write U+FFFD for the user's byte, exit 0.
+	p = str(tmp_path / ('sd' + suffix))
+	TSVZ.appendLinesTabularFile(p, [['k', 'old']], createIfNotExist=True)
+	real = TSVZ._ServeLocal.request
+	sent = []
+
+	def request(self, line, bulk=None):
+		sent.append(line.split('\t')[0])
+		out = real(self, line, bulk)
+		TSVZ.appendLinesTabularFile(p, [['k']])  # another writer deletes the key right after
+		return out
+
+	monkeypatch.setattr(TSVZ._ServeLocal, 'request', request)
+	assert _run('setdefault', p, 'k', 'v\udcff') == (0, 'k\told\n', '')
+	assert sent == ['get'] and b'\xef\xbf\xbd' not in _bytes(p)
+	del sent[:]
+	status, out, err = _run('setdefault', p, 'k', 'v\udcff')  # now missing: refused
+	assert status == 1 and out == '' and "cannot write 'v\\udcff'" in err, err
+	assert sent == ['get'] and b'\xef\xbf\xbd' not in _bytes(p)
