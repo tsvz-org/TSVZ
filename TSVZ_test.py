@@ -6392,3 +6392,35 @@ def test_append_lines_checks_what_is_written_after_the_row_is_cut(tmp_path, crea
 		TSVZ.appendLinesTabularFile(p, [['z', BAD_NAME, 'extra']], header='key\tval')
 	assert "column 2 'val'" in str(e.value)
 	assert _bytes(p) == b'key\tval\nk\tv\nj\tw\n'
+
+
+@pytest.mark.parametrize('cls', ['TSVZed', 'TSVZedLite'])
+def test_setitem_checks_the_row_that_is_written_after_it_is_cut_to_the_column_count(tmp_path, cls):
+	p = str(tmp_path / 'cut.tsv')
+	kwargs = {'append_check_delay': 0.01, 'rewrite_on_load': False} if cls == 'TSVZed' else {}
+	t = getattr(TSVZ, cls)(p, header='key\tval', correctColumnNum=2, strict=False, **kwargs)
+	t['k'] = ['k', 'v', 'extra' + BAD_NAME]  # the third cell is dropped, never written
+	assert t['k'] == ['k', 'v']
+	with pytest.raises(TSVZ.TSVZEncodeError):
+		t['j'] = ['j', BAD_NAME, 'extra']
+	assert 'j' not in t
+	if cls == 'TSVZed':
+		_stop(t)
+	else:
+		t.fileObj.close()
+	assert _bytes(p) == b'key\tval\nk\tv\n'
+
+
+@pytest.mark.parametrize('cls', ['TSVZed', 'TSVZedLite'])
+def test_a_refused_row_leaves_the_column_count_unset(tmp_path, cls):
+	p = str(tmp_path / 'n.tsv')
+	kwargs = {'append_check_delay': 0.01, 'rewrite_on_load': False} if cls == 'TSVZed' else {}
+	t = getattr(TSVZ, cls)(p, **kwargs)
+	assert t.correctColumnNum == -1
+	with pytest.raises(TSVZ.TSVZEncodeError):
+		t['k'] = ['k', BAD_NAME]
+	assert t.correctColumnNum == -1 and len(t) == 0
+	t['j'] = ['j', '1', '2']
+	assert t.correctColumnNum == 3
+	if cls == 'TSVZed':
+		_stop(t)

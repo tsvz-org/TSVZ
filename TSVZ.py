@@ -4095,8 +4095,6 @@ class TSVZed(OrderedDict):
 		# add it if it is not there
 		if not value or value[0] != key:
 			value = [key]+value
-		if (self.correctColumnNum == 1 or len(value) > 1) and (key == DEFAULTS_INDICATOR_KEY or not key.startswith('#')):
-			self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')  # a lone key is a delete: it writes only a key that is already stored
 		# verify the value has the correct number of columns
 		if self.correctColumnNum != 1 and len(value) == 1:
 			# a lone key (no following values) means delete the key, per the
@@ -4114,8 +4112,9 @@ class TSVZed(OrderedDict):
 					value += ['']*(self.correctColumnNum-len(value))
 				elif len(value) > self.correctColumnNum:
 					value = value[:self.correctColumnNum]
+			newColumnNum = None
 		else:
-			self.correctColumnNum = len(value)
+			newColumnNum = len(value)  # taken once the row is known to be writable
 		if self.defaults and len(self.defaults) > 1:
 			for i in range(1,len(value)):
 				if not value[i] and i < len(self.defaults) and self.defaults[i]:
@@ -4130,6 +4129,12 @@ class TSVZed(OrderedDict):
 					  self.teeLogger)
 			del self[key]
 			return
+		if key == DEFAULTS_INDICATOR_KEY or not key.startswith('#'):
+			# What is written is what is checked: the row as cut to the column count and filled with the defaults,
+			# and before memory, the queue or the column count change.
+			self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
+		if newColumnNum is not None:
+			self.correctColumnNum = newColumnNum
 		if key == DEFAULTS_INDICATOR_KEY:
 			self.defaults = value
 			if self.verbose:
@@ -5564,9 +5569,6 @@ class TSVZedLite(MutableMapping):
 		# add it if it is not there
 		if not value or value[0] != key:
 			value = [key]+value
-		if (self.correctColumnNum == 1 or len(value) > 1) and (key == DEFAULTS_INDICATOR_KEY or not key.startswith('#')):
-			# refuse a row that cannot be written before any state changes (a lone key is a delete)
-			_checkRow(value, self.delimiter, self.encoding, self.errors, self.header, what='defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
 		# verify the value has the correct number of columns
 		if self.correctColumnNum != 1 and len(value) == 1:
 			# a lone key (no following values) means delete the key, per the
@@ -5584,8 +5586,9 @@ class TSVZedLite(MutableMapping):
 					value += ['']*(self.correctColumnNum-len(value))
 				elif len(value) > self.correctColumnNum:
 					value = value[:self.correctColumnNum]
+			newColumnNum = None
 		else:
-			self.correctColumnNum = len(value)
+			newColumnNum = len(value)  # taken once the row is known to be writable
 		if self.defaults and len(self.defaults) > 1:
 			for i in range(1,len(value)):
 				if not value[i] and i < len(self.defaults) and self.defaults[i]:
@@ -5599,6 +5602,12 @@ class TSVZedLite(MutableMapping):
 					  f'in .tsv files a row whose values are all empty is a delete; deleted {key!r} (use .tsvz to store empty rows)')
 			del self[key]
 			return
+		if key == DEFAULTS_INDICATOR_KEY or not key.startswith('#'):
+			# What is written is what is checked: the row as cut to the column count and filled with the defaults,
+			# and before the index or the column count change.
+			_checkRow(value, self.delimiter, self.encoding, self.errors, self.header, what='defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
+		if newColumnNum is not None:
+			self.correctColumnNum = newColumnNum
 		if key == DEFAULTS_INDICATOR_KEY:
 			self.defaults = value
 			if self.verbose:
