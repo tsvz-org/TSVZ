@@ -5984,3 +5984,48 @@ def test_tsvzed_spec_strict_refuses_a_bad_record_and_writes_the_good_ones(tmp_pa
 	t.close()
 	assert b'c\t1\n' in _bytes(p) and not t.appendQueue
 	assert capsys.readouterr().out.count('cannot write') == 1
+
+
+@pytest.mark.parametrize('mode', ['local', 'served'])
+def test_client_reads_of_a_key_that_cannot_exist_agree_with_and_without_a_handler(tmp_path, served, mode):
+	p = str(tmp_path / 'c.tsvz')
+	if mode == 'served':
+		if not hasattr(__import__('socket'), 'AF_UNIX'):
+			pytest.skip('Unix sockets')
+		served(p)
+	c = TSVZ.TSVZClient(p)
+	c['ok'] = ['ok', '1']
+	assert (BAD_NAME in c) is False
+	assert c.get(BAD_NAME, 'dflt') == 'dflt'
+	with pytest.raises(KeyError):
+		c[BAD_NAME]
+	del c[BAD_NAME]  # no such key: not an error
+	assert c.pop(BAD_NAME, 'dflt') == 'dflt'
+	with pytest.raises(KeyError):
+		c.pop(BAD_NAME)
+	assert 'ok' in c
+	c.close()
+
+
+@pytest.mark.parametrize('mode', ['local', 'served'])
+def test_client_takes_the_errors_handlers_it_accepts(tmp_path, served, mode):
+	p = str(tmp_path / 'e.tsvz')
+	if mode == 'served':
+		if not hasattr(__import__('socket'), 'AF_UNIX'):
+			pytest.skip('Unix sockets')
+		served(p)
+	for name, handler in (('r', 'replace'), ('s', 'surrogateescape'), ('b', 'backslashreplace')):
+		c = TSVZ.TSVZClient(p, errors=handler)
+		c[name] = [name, BAD_NAME]
+		assert c[name][1].startswith('bad')
+		c.close()
+
+
+def test_tsvzed_compressed_legacy_file_keeps_monitoring_after_a_rewrite(tmp_path):
+	p = str(tmp_path / 'z.tsv.gz')
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=5)
+	t['a'] = ['a', '1']
+	assert t.monitor_external_changes
+	t.mapToFile()
+	assert t.monitor_external_changes
+	_stop(t)
