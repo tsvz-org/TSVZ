@@ -7772,3 +7772,43 @@ def test_tsvzed_legacy_rewrite_of_a_removed_file_makes_it_again_from_memory(tmp_
 	assert dict(t) == rows
 	assert os.path.exists(p) and _back(p) == rows
 	assert not t._externalChange() and not t.dirty and not t.deSynced
+
+
+def test_tsvzed_legacy_rewrite_deferred_in_one_thread_is_not_taken_for_done_by_another(tmp_path):
+	# rewrite() learned that its rewrite was deferred from an attribute of the object: the background writer's
+	# rewrite() starting meanwhile cleared it, and close()'s exit rewrite was skipped while True was returned.
+	import threading
+	p = str(tmp_path / 'race.tsv')
+	t = _stopped(p)
+	_dirty(t)
+	real = t._mapToFile
+	main = threading.current_thread()
+	inside, release = threading.Event(), threading.Event()
+	state = {'calls': 0}
+
+	def mapping(*args, **kwargs):
+		if threading.current_thread() is not main:
+			inside.set()  # the other rewrite() has started its loop
+			release.wait(5)
+			return real(*args, **kwargs)
+		state['calls'] += 1
+		if state['calls'] == 1:
+			_append_external(p)  # another process appends after this rewrite() looked for changes
+			result = real(*args, **kwargs)  # deferred
+			state['worker'] = threading.Thread(target=t.rewrite, name='worker')  # the background writer's tick meanwhile
+			state['worker'].start()
+			assert inside.wait(5)
+			return result
+		return real(*args, **kwargs)
+
+	t._mapToFile = mapping
+	try:
+		made = t.rewrite(force=True)
+		written = _bytes(p)
+	finally:
+		release.set()
+		if 'worker' in state:
+			state['worker'].join(5)
+	t._mapToFile = real
+	assert made and written == b'key\tval\na\t2\next\tB\n', (made, written)
+	assert t['ext'] == ['ext', 'B']

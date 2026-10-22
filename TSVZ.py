@@ -4769,15 +4769,17 @@ memoryOnly:{self.memoryOnly}
 				if self.verbose:
 					self.__teePrintOrNot("Memory only mode. Map to file skipped.")
 				return False
+			made = True
 			if self.dirty:
 				if not force and self._refusalPending():
 					return False  # the last rewrite was refused (text that cannot be written): try again later, not at every tick
 				if self.verbose:
 					self.__teePrintOrNot(f"Rewriting {self._fileName}")
 				for attempt in range(_DEFERRED_REWRITE_TRIES):
-					self._rewriteDeferred = False
-					self._mapToFile(defer=reloadInternalFromFile)
-					if not self._rewriteDeferred:
+					# What this call's rewrite did is what it returns, not state of the object: close()'s rewrite()
+					# and the background writer's ran at once, and one could take the other's for its own.
+					made = self._mapToFile(defer=reloadInternalFromFile)
+					if made is not None:
 						break
 					if attempt == _DEFERRED_REWRITE_TRIES - 1:
 						return False  # it keeps changing: deSynced is set, the next tick tries again
@@ -4786,14 +4788,14 @@ memoryOnly:{self.memoryOnly}
 					self.commitAppendToFile()
 					self._reload()
 					self.deSynced = False
-				if self.verbose:
+				if made and self.verbose:
 					self.__teePrintOrNot(f"{len(self)} records rewrote to {self._fileName}")
 			if not self.appendThread.is_alive():
 				self.commitAppendToFile()
 			# else:
 			#     self.appendEvent.set()
 			self._worked('sync')
-			return True
+			return made  # False when the rewrite failed or was refused (reported)
 		except Exception as e:
 			self._failed('sync', f"Failed to write at sync() to {self._fileName}: {e}")
 			self.deSynced = True
@@ -4811,7 +4813,6 @@ memoryOnly:{self.memoryOnly}
 			return self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName)
 
 	_keepFileTime = False  # set by get_file_obj: the file changed under an append, which must not note the new time
-	_rewriteDeferred = False  # set by _externalChangeStops when it stops a rewrite: rewrite() reloads and tries again
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
 
@@ -4890,7 +4891,6 @@ memoryOnly:{self.memoryOnly}
 			if defer:
 				self.deSynced = True
 				self._keepFileTime = True  # letting go of the file must not mark the change seen
-				self._rewriteDeferred = True  # rewrite() reloads it and tries again
 				return True
 			self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
 		return False
