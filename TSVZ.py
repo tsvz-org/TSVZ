@@ -355,19 +355,43 @@ def _bytesAfter(file, size, digest):
 		file.seek(0)
 
 
-def _decompressedUpToDamage(codec, data):
-	"""``(text, error)``: what ``data`` (members or frames of ``codec`` one after another) holds, up to where it is
-	damaged, and the error met there (None when it is not)."""
-	parts = []
-	try:
-		with _codecModule(codec).open(io.BytesIO(data), 'rb') as stream:
-			while True:
-				chunk = stream.read(65536)
-				if not chunk:
-					return b''.join(parts), None
-				parts.append(chunk)
-	except Exception as e:
-		return b''.join(parts), e
+def _decodeMembers(codec, data):
+	"""``(text, damage)``: what ``data`` (members or frames of ``codec`` one after another, such as what other
+	processes appended to a legacy file after a damage) holds, decoded member by member (_readMember), and a note
+	for each place it is damaged (an empty list when it is not).
+
+	Every complete member is kept; a member cut short (by the end of ``data``, or by the next member: a writer
+	that stopped part way, and another one that appended after it) gives its whole lines; bytes that are not a
+	member that decodes (a corrupt one, garbage) give nothing, and decoding goes on at the next member start, as a
+	spec part is read (spec §16.6). A codec's file reader (GzipFile, BZ2File, LZMAFile) instead stops at the first
+	damage, dropping what the members it buffered held, and BZ2File and LZMAFile take bytes after a stream that do
+	not begin one for its end, without an error.
+	"""
+	f = io.BytesIO(data)
+	src = _PartBytes(f)
+	out = []
+	damage = []
+	while True:
+		status, output, start, end, error = _readMember(src, codec)
+		if status == 'none':
+			break
+		if status == 'complete':
+			out.append(output)
+			continue
+		following = _nextMemberStart(f, codec, start + 1)
+		raw = data[start:len(data) if following is None else following]
+		if _CODEC_NAMES[codec] == 'gzip':
+			raw = _gzipUnpad(raw)  # zero padding before the next member (spec §16.6)
+		cutShort, output, error = _decodeAlone(raw, codec)
+		if cutShort:
+			out.append(output[:output.rfind(b'\n') + 1])
+			damage.append('the member at byte {} is cut short: its whole lines are kept'.format(start))
+		else:
+			damage.append('the {} bytes at byte {} do not decode ({}): left out'.format(len(raw), start, error))
+		if following is None:
+			break
+		src.seek(following)
+	return b''.join(out), damage
 
 # What fsync(2) fails with on a file it cannot sync, whose data is written all the same: EINVAL and EROFS ("fd is
 # bound to a special file which does not support synchronization"), ENOTSUP / EOPNOTSUPP (some FUSE and network
@@ -5426,10 +5450,10 @@ memoryOnly:{self.memoryOnly}
 		try:  # what it notes is reported however it ends (a refused header, an error, a KeyboardInterrupt)
 			codec = _fileCodec(self._fileName)
 			if codec:
-				rest, error = _decompressedUpToDamage(codec, rest)
-				if error is not None:
-					reporter.note('damaged', None, 'compressed stream another process appended is damaged ({}: {}); merged up to '
-								  'the damage, and the rest is overwritten'.format(type(error).__name__, error))
+				rest, damage = _decodeMembers(codec, rest)
+				if damage:
+					reporter.note('damaged', None, 'compressed stream another process appended is damaged ({}); the rest is '
+								  'merged, and the damaged bytes are overwritten'.format('; '.join(damage)))
 			if size == 0 and self.header and any(self.header) and self.verifyHeader:
 				# The damage left nothing (the file emptied, or removed): what another process wrote there begins with a
 				# header, as a read takes the first line of the file. Not after a damage that holds bytes: a row there

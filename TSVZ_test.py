@@ -8666,6 +8666,17 @@ def test_tsvzed_legacy_damaged_store_whose_rewrite_is_refused_still_appends_its_
 	t.appendThread.join()
 
 
+def _readerStops(codec, data):
+	"""True when the codec's file reader (GzipFile, BZ2File, ...), reading ``data`` from its start, fails before its
+	end, as a read of the file does."""
+	try:
+		with TSVZ._codecModule(codec).open(io.BytesIO(data), 'rb') as f:
+			f.read()
+	except Exception:
+		return True
+	return False
+
+
 class _QuotaFileIO(io.FileIO):
 	"""A file on a disk with room for ``room`` more bytes, as the kernel has it: a write takes what fits (a short
 	write) and the next one fails with ENOSPC. What reached the disk is exactly the first bytes written."""
@@ -8712,9 +8723,8 @@ def test_tsvzed_legacy_compressed_rewrite_cut_short_mid_stream_then_appended_to_
 	_append_external(p, member)  # space is back: another process appends a member
 	whole = _bytes(p)
 	assert whole[room:] == member  # the tail the merge decodes starts at the member's first byte
-	text, error = TSVZ._decompressedUpToDamage(codec, whole)
-	assert error is not None and b'ext\tB' not in text  # read from the start, the file stops at the cut
-	assert TSVZ._decompressedUpToDamage(codec, whole[room:]) == (b'ext\tB\nk2\t\n', None)
+	assert _readerStops(codec, whole)  # read from the start by the codec's reader, the file stops at the cut
+	assert TSVZ._decodeMembers(codec, whole[room:]) == (b'ext\tB\nk2\t\n', [])
 	assert t.rewrite()
 	expected = dict(rows, ext=['ext', 'B'])
 	del expected['k2']
@@ -8763,7 +8773,12 @@ with open(p, 'ab') as g:
 whole = open(p, 'rb').read()
 result['head'] = cut[:6].hex()
 result['tail'] = whole[len(cut):len(cut) + 6].hex()
-result['wholeStops'] = TSVZ._decompressedUpToDamage(codec, whole)[1] is not None
+try:
+	with TSVZ._codecModule(codec).open(__import__('io').BytesIO(whole), 'rb') as f:
+		f.read()
+	result['wholeStops'] = False
+except Exception:
+	result['wholeStops'] = True
 result['rewrite'] = t.rewrite()
 expected = dict(rows, ext=['ext', 'B'])
 del expected['k2']
@@ -9299,3 +9314,52 @@ def test_tsvzedlite_encodes_its_header_only_to_write_it(tmp_path, monkeypatch):
 	assert len(headers) == 1
 	lite.close()
 	assert _bytes(p) == b'key\tval\nz\t1\n'
+
+
+def _damaged_compressed(p, monkeypatch, suffix):
+	"""A compressed store whose rewrite failed once it had written a whole member (the header and k0): the damage
+	holds bytes, and what another process appends after it is merged. Returns it and its rows."""
+	t = _stopped(p)
+	rows = _many(t, 5)
+	_failing_rewrite(monkeypatch, partial=_compressedAs(suffix, b'key\tval\nk0\tv0\n'))
+	t.hardMapToFile()
+	monkeypatch.undo()
+	assert t._damage is not None and t._damage[0] > 0 and t.deSynced
+	return t, rows
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES[1:])
+def test_tsvzed_legacy_merge_keeps_an_intact_member_another_process_appended_before_one_cut_short(tmp_path, monkeypatch, capsys, suffix):
+	# The merge decoded what followed the damage through the codec's buffered reader (GzipFile, BZ2File, LZMAFile,
+	# ZstdFile): an intact member followed by one cut short (another process stopped part way) decoded to nothing,
+	# so the intact member's rows were not merged, and the rewrite erased them from the file. It decodes member by
+	# member: every complete one is kept, and the whole lines of one cut short.
+	p = str(tmp_path / ('members.' + suffix))
+	t, rows = _damaged_compressed(p, monkeypatch, suffix)
+	rng = random.Random(3)
+	cut = _compressedAs(suffix, b''.join(b'c%d\t%x\n' % (i, rng.getrandbits(32)) for i in range(30000)))
+	_append_external(p, _compressedAs(suffix, b'B1\tfromB\nB2\tfromB\n') + cut[:len(cut) // 2])
+	capsys.readouterr()
+	assert t.rewrite()
+	err = capsys.readouterr().err
+	assert 'cut short' in err and 'Overwriting external changes' not in err, err
+	assert t['B1'] == ['B1', 'fromB'] and t['B2'] == ['B2', 'fromB']
+	kept = [key for key in t if key.startswith('c')]
+	assert len(kept) < 30000 and kept == ['c%d' % i for i in range(len(kept))]  # its whole lines, in order
+	assert kept or suffix.endswith('bz2'), kept  # bzip2 decodes whole blocks only (900 kB): half of its one block gives none
+	assert dict(t) == dict(rows, **dict((key, t[key]) for key in ['B1', 'B2'] + kept)) and _back(p) == dict(t)
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES[1:])
+def test_tsvzed_legacy_merge_reports_bytes_after_another_process_member_that_do_not_decode(tmp_path, monkeypatch, capsys, suffix):
+	# Bytes after a complete bz2 or xz stream that do not begin one were taken for its end by BZ2File and LZMAFile,
+	# without an error: the merge said nothing of them, where gzip's were reported as damage. Every codec reports
+	# them now; the member before them is merged.
+	p = str(tmp_path / ('garbage.' + suffix))
+	t, rows = _damaged_compressed(p, monkeypatch, suffix)
+	_append_external(p, _compressedAs(suffix, b'B1\tfromB\n') + b'not a member of any codec')
+	capsys.readouterr()
+	assert t.rewrite()
+	err = capsys.readouterr().err
+	assert 'compressed stream another process appended is damaged' in err and 'do not decode' in err, err
+	assert dict(t) == dict(rows, B1=['B1', 'fromB']) and _back(p) == dict(t)
