@@ -346,11 +346,21 @@ def _fileDigest(fd, limit):
 	return size, digest.digest()
 
 
+#: A file changed less than this long before its stamp is taken may change again within the same tick of the file
+#: system's clock (2 s on FAT; 1 s on HFS+ and ext3) and keep its times: such a stamp cannot tell that change.
+_STAMP_RACY_SECONDS = 2.0
+_wallClock = time.time  # the clock file times are compared with (tests move it)
+
+
 def _fileStamp(st):
-	"""``(st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns)`` of the os.stat_result ``st``: which file it is, and how
-	large and when last changed; the file's identity is None where the platform gives no inode number."""
+	"""``(st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns, settled)`` of the os.stat_result ``st``, taken now: which
+	file it is (None, None where the platform gives no inode number), how large and when last changed, and whether
+	that change is older than _STAMP_RACY_SECONDS. Only a settled stamp that a later one equals shows the file
+	unchanged: a change after it gets a later time, where one within the tick of a racy stamp may keep its times
+	(and its size: a same-size rewrite in place), as git's racily clean index entries."""
 	identity = (st.st_dev, st.st_ino) if st.st_ino else (None, None)
-	return identity + (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+	settled = _wallClock() - max(st.st_mtime_ns, st.st_ctime_ns) / 1e9 >= _STAMP_RACY_SECONDS
+	return identity + (st.st_size, st.st_mtime_ns, st.st_ctime_ns, settled)
 
 
 def _bytesAfter(file, size, digest):
@@ -5473,8 +5483,10 @@ memoryOnly:{self.memoryOnly}
 		# Taken before the bytes are read, as _reload takes it: a write landing after the read (a writer that takes
 		# no file lock) is not noted as seen. Noted once what was read is merged.
 		seen = getFileUpdateTimeNs(self._fileName)
-		# Decided by what the file holds, not by its time: on a file system with coarse timestamps, an append in the
-		# same tick as the failed rewrite leaves the time as it was. Only an unknown damage looks at the time.
+		# Decided by what the file holds (its size and digest), not by its time: on a file system with coarse
+		# timestamps, an append in the same tick as the failed rewrite leaves the time as it was. The stamp only spares
+		# the read where it proves the file unchanged: the same file, size and times, noted settled (_fileStamp). Only
+		# an unknown damage is judged by the time alone.
 		try:
 			at = _fileStamp(os.fstat(file.fileno()))
 		except Exception:
@@ -5486,10 +5498,11 @@ memoryOnly:{self.memoryOnly}
 			# Another file now: another process replaced it (renamed one over it, removed it and made it again), even
 			# if what it holds begins with the damage. Not appended to.
 			found = None
-		elif noted is not None and at == noted:
-			# The same file, as large and last changed when the damage was noted: nothing to read and hash again (a
-			# rewrite that keeps failing tried every time). Any change of its size or times reads it: the digest
-			# decides then.
+		elif noted is not None and at is not None and noted[5] and at[:5] == noted[:5]:
+			# The same file, as large and last changed when the damage was noted, which was then long enough ago that
+			# any change since would show in its times: nothing to read and hash again (a rewrite that keeps failing
+			# tried every time). A change of its size or times, or a stamp noted within the file system's clock tick
+			# of the file's last change, reads it: the digest decides then.
 			found = (b'', self._damage)
 		else:
 			found = _bytesAfter(file, size, digest)

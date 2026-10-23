@@ -9200,7 +9200,9 @@ def test_tsvzed_legacy_rewrite_in_place_that_begins_with_the_damage_is_merged_as
 
 def test_tsvzed_legacy_rewrite_that_keeps_failing_does_not_read_an_unchanged_damage_again(tmp_path, monkeypatch):
 	# Every rewrite tried while the file was damaged read and hashed the whole damaged prefix first, also when
-	# nothing had changed it since the damage was noted. Its size and times are compared first now.
+	# nothing had changed it since the damage was noted. Its size and times are compared first now, once the damage
+	# is noted long enough after the file's last change (the clock is moved on: see the next test).
+	monkeypatch.setattr(TSVZ, '_wallClock', lambda: time.time() + 10)
 	p = str(tmp_path / 'again.tsv')
 	t = _stopped(p)
 	rows = _many(t, 50)
@@ -9651,3 +9653,39 @@ def test_tsvzed_legacy_rewrite_keeps_queued_a_row_changed_in_place_after_its_sna
 	t.commitAppendToFile()
 	assert _back(p) == {'a': ['a', 'x'], 'b': ['b', '1']} == dict(t)
 	t.close()
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_same_size_rewrite_within_a_clock_tick_of_the_damage_is_not_taken_for_no_change(tmp_path, monkeypatch, capsys, suffix):
+	# ccc66b4 skipped reading the file when its size, mtime and ctime equalled the damage's stamp, though the comment
+	# said the decision is by what the file holds: on a file system whose clock ticks once a second (here: times cut
+	# to the second), another process's rewrite to the same size within that second kept all three, and was
+	# overwritten without the warning the digest gave. The stamp is trusted only when noted at least
+	# _STAMP_RACY_SECONDS after the file's last change; the digest decides otherwise.
+	def coarse(st):
+		class Coarse(object):
+			st_dev, st_ino, st_size = st.st_dev, st.st_ino, st.st_size
+			st_mtime_ns = st.st_mtime_ns // 10**9 * 10**9
+			st_ctime_ns = st.st_ctime_ns // 10**9 * 10**9
+		return real_stamp(Coarse())
+
+	real_stamp = TSVZ._fileStamp
+	monkeypatch.setattr(TSVZ, '_fileStamp', coarse)
+	time.sleep(1.05 - time.time() % 1)  # early in a second: the damage and the change land in the same one
+	p = str(tmp_path / ('tick.' + suffix))
+	t = _stopped(p)
+	rows = _many(t, 5)
+	real_codec, real_inplace = TSVZ._codecWriter, TSVZ.TSVZed._writeInPlace
+	_failing_rewrite(monkeypatch, partial=_compressedAs(suffix, b'key\tval\nk0\tv0\n'))
+	t.hardMapToFile()
+	damaged = _bytes(p)
+	theirs = _compressedAs(suffix, b'key\tval\nk0\tv9\n')
+	assert len(theirs) == len(damaged) and theirs != damaged
+	with open(p, 'r+b') as g:  # another process rewrites it in place, to the same size, in the same second
+		g.write(theirs)
+	capsys.readouterr()
+	monkeypatch.setattr(TSVZ, '_codecWriter', real_codec)
+	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', real_inplace)
+	assert t.rewrite()
+	assert 'Overwriting external changes' in capsys.readouterr().out, 'a same-size change was taken for no change'
+	assert dict(t) == rows and _back(p) == rows
