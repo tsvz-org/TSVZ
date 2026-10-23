@@ -9387,9 +9387,12 @@ def test_tsvzed_legacy_merge_reports_bytes_after_another_process_member_that_do_
 
 def _empty_stream(p):
 	"""Make ``p`` a compressed file that holds only an empty stream, as a codec's writer closed with nothing
-	written leaves it."""
+	written leaves it (ZstdFile writes no frame then: an empty frame is written instead)."""
 	with TSVZ.openFileAsCompressed(p, mode='wb'):
 		pass
+	if not os.path.getsize(p):
+		with open(p, 'wb') as g:
+			g.write(TSVZ._compressBytes(p.rpartition('.')[2], b''))
 	assert os.path.getsize(p) > 0 and _text(p) == b''
 
 
