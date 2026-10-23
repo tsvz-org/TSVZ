@@ -1227,9 +1227,9 @@ def _appendOpen(f, payload, codec=None, header=None, tailPolicy='newline', repor
 	held by the caller: locked (_lockedAppend, TSVZed.commitAppendToFile) or, for TSVZedLite, which never locks a
 	legacy file, owned alone. What is written depends on what the file holds:
 
-	- nothing (_holdsNothing: no byte, or only empty compressed streams): ``header`` first, when it is not None: a legacy store's header line without its newline,
-	  or a function that makes it, called only then (a header that cannot be encoded refuses only an append that
-	  would write it). An append to an empty file writes the header first, as creating the file does: a file a
+	- nothing (_holdsNothing: no byte, or only empty compressed streams): ``header`` first, when it is not None:
+	  a legacy store's header line without its newline, or a function that makes it, called only then (a header
+	  that cannot be encoded refuses only an append that would write it). An append to an empty file writes the header first, as creating the file does: a file a
 	  rewrite cut short (a full disk, a KeyboardInterrupt) or another process emptied is left empty, and rows
 	  there with no header would read with the first one taken for the header (a mismatch, the row lost);
 	- else, for a file that is not compressed, a last line with no b'\\n' is terminated first (``tailPolicy``
@@ -5468,10 +5468,11 @@ memoryOnly:{self.memoryOnly}
 		(appends, deletes, the file made again after it was removed): its rows are applied on top of memory, as a
 		read of the file would apply them, except for a key still queued. A queued row is a change memory holds
 		that is not known to be in the file: set or deleted since the last append got through, or one whose append
-		failed (commitAppendToFile keeps a row queued until it is on disk; a write cut short is cut off again, where it
-		can be). What the file holds of such a key is older, or a row torn by that failed append, so memory's is kept:
-		the rewrite writes it, and once that is on disk the queued rows it wrote leave the queue (_releaseRewrite). Else (another process rewrote it, or what it
-		held is not known) memory is kept and the change is overwritten, with a warning. True when memory changed:
+		failed (commitAppendToFile keeps a row queued until it is on disk; a write cut short is cut off again, where
+		it can be). What the file holds of such a key is older, or a row torn by that failed append, so memory's is
+		kept: the rewrite writes it, and once that is on disk the queued rows it wrote leave the queue
+		(_releaseRewrite). Else (another process rewrote it, or what it held is not known) memory is kept and the
+		change is overwritten, with a warning. True when memory changed:
 		what the rewrite writes is encoded again.
 
 		The rows are read apart from memory first (_TSVZedMerge), without _memLock: other threads' sets wait only
@@ -5874,7 +5875,8 @@ memoryOnly:{self.memoryOnly}
 				file.flush()  # Ensure the file is flushed before unlocking
 				_fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
 			if not file.closed:
-				if not self._keepFileTime and (not _isCompressedFile(self._fileName) or isinstance(file, (io.BufferedRandom, io.BufferedWriter))):
+				plain = not _isCompressedFile(self._fileName) or isinstance(file, (io.BufferedRandom, io.BufferedWriter))
+				if not self._keepFileTime and plain:
 					# Noted while the file is still locked: another writer appending right after the unlock
 					# must not have its change taken for this one's (written through a codec's writer, a compressed
 					# file is complete only once closed; commitAppendToFile writes whole members into the file itself).
