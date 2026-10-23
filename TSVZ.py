@@ -297,7 +297,7 @@ class _Rewrite(object):
 		self.reached = False  # all of it is on disk
 		self.noted = False  # the file's time and what it holds are noted
 		self.error = None
-		self.queued = 0  # how many queued rows (the first ones) the rows written hold: dropped once on disk
+		self.queued = ()  # _queuedRowHashes of the queued rows (the first ones) the rows written hold: dropped once on disk
 		self.kept = None  # the queue without them, once it is
 		self.hashing = False  # the read of what the file holds, to note the damage, has begun
 		self.damage = None  # (_damage, _damageAt) it noted, once it has
@@ -306,6 +306,21 @@ class _Rewrite(object):
 		self.failed = True
 		if self.error is None:
 			self.error = error
+
+
+def _rowHash(row):
+	"""hash() of the cells of the queued ``row``, to tell later whether it was changed in place; -1, which hash()
+	never gives, when it cannot be taken."""
+	try:
+		return hash(tuple(row))
+	except TypeError:
+		return -1
+
+
+def _queuedRowHashes(queue):
+	"""An array of _rowHash of each row of the legacy append ``queue``: what a rewrite's snapshot notes of the rows
+	queued when it is taken, 8 bytes a row."""
+	return array.array('q', map(_rowHash, queue))
 
 
 _DAMAGE_UNKNOWN = (None, None)  # TSVZed._damage when what the file holds is not known
@@ -5345,7 +5360,7 @@ memoryOnly:{self.memoryOnly}
 		with self._memLock:
 			values = list(self.values())
 			defaults = list(self.defaults)
-			queued = len(self.appendQueue)  # memory holds the change of every one of them
+			queued = _queuedRowHashes(self.appendQueue)  # memory holds the change of every one of them
 		first = []
 		if defaults and len(defaults) > 1:
 			# The defaults line comes right after the header, so it survives a
@@ -5389,7 +5404,7 @@ memoryOnly:{self.memoryOnly}
 			# Nothing returns from inside the try: the line a return is on is outside its handlers.
 			try:
 				header, lines = (snapshot or self._snapshotForRewrite)()
-				rw.queued = getattr(lines, 'queued', 0)
+				rw.queued = getattr(lines, 'queued', ())
 				missing = not os.path.isfile(self._fileName)  # under writeLock: this object does not remove it meanwhile
 				whole = whole or missing
 				if missing:
@@ -5409,7 +5424,7 @@ memoryOnly:{self.memoryOnly}
 						# store alive at once.
 						header = lines = None
 						header, lines = (snapshot or self._snapshotForRewrite)()
-						rw.queued = getattr(lines, 'queued', 0)
+						rw.queued = getattr(lines, 'queued', ())
 					# Until it is all written, the file does not hold memory: a rewrite that stops is made again,
 					# and the file is not reloaded over memory meanwhile. ``started`` first: a release that sees it
 					# notes what the file then holds as the damage, which another process's appends are merged after.
@@ -5954,12 +5969,17 @@ memoryOnly:{self.memoryOnly}
 			rw.noted = True
 		if rw.reached and rw.queued:
 			# The queued rows the rewrite wrote are dropped, not appended again after it (that undid another process's
-			# later change of their key, and a merge skipped such a key as still queued). The queue is replaced whole,
-			# under _memLock: a second call after a KeyboardInterrupt drops them only once.
+			# later change of their key, and a merge skipped such a key as still queued); only those that hold what
+			# they held at the snapshot: a row changed in place since (set() queues the list memory holds) was not
+			# written so, and stays queued. The queue is replaced whole, under _memLock: a second call after a
+			# KeyboardInterrupt drops them only once.
 			with self._memLock:
 				if self.appendQueue is not rw.kept:
-					rw.kept = deque(itertools.islice(self.appendQueue, rw.queued, None))
-					self.appendQueue = rw.kept
+					count = len(rw.queued)
+					kept = deque(row for row, seen in zip(itertools.islice(self.appendQueue, count), rw.queued)
+								 if seen == -1 or _rowHash(row) != seen)
+					kept.extend(itertools.islice(self.appendQueue, count, None))
+					rw.kept = self.appendQueue = kept
 		if raw is not None and not raw.closed:
 			_unlockFile(raw)  # never raises
 			try:

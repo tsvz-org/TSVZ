@@ -9625,3 +9625,29 @@ def test_tsvzed_legacy_append_landing_while_the_damage_is_read_is_merged_not_tak
 	assert t.rewrite()
 	assert t['late'] == ['late', 'L'] and dict(t) == dict(rows, late=['late', 'L']) and _back(p) == dict(t)
 	assert 'Overwriting external changes' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_rewrite_keeps_queued_a_row_changed_in_place_after_its_snapshot(tmp_path, monkeypatch, suffix):
+	# 700c8b2 dropped from the queue every row the rewrite's snapshot held once it was on disk; set() queues the very
+	# list memory holds, so a stored row changed in place after the snapshot (unsupported, docs item 10) lost its
+	# queue entry: memory had the change, the queue was empty and the file kept the old value (haiku inplace). Main
+	# appended it after the rewrite. Only the rows that still hold what they held at the snapshot are dropped.
+	p = str(tmp_path / ('inplace.' + suffix))
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '1']
+	real = TSVZ._writeLines
+
+	def writing(*args, **kwargs):
+		result = real(*args, **kwargs)  # the snapshot ('a 1') is written
+		t['a'][1] = 'x'  # the caller changes the row it got back, while the rewrite runs
+		return result
+
+	monkeypatch.setattr(TSVZ, '_writeLines', writing)
+	assert t.hardMapToFile()
+	monkeypatch.undo()
+	assert [row[0] for row in t.appendQueue] == ['a']  # 'b' was written as queued: dropped
+	t.commitAppendToFile()
+	assert _back(p) == {'a': ['a', 'x'], 'b': ['b', '1']} == dict(t)
+	t.close()
