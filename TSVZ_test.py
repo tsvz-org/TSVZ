@@ -9552,3 +9552,49 @@ def test_tsvzed_legacy_map_to_file_of_a_strict_store_writes_the_header_to_an_emp
 	t.mapToFile()
 	assert _bytes(p) == b'key\tval\na\t1\n'
 	t.close()
+
+
+def test_tsvzed_legacy_merging_rewrite_holds_one_snapshot_at_a_time(tmp_path, monkeypatch):
+	# A rewrite that merged another process's append made its second snapshot while the first was still held, so
+	# two flat snapshots of the store were alive at once (1,000,000 rows: 48.1 MiB against 33.3 MiB for a plain
+	# rewrite, rv8 r8_merge_peak.py). The first is let go of first. What is measured is the peak before the write
+	# begins (snapshots, the merge), which the write's own chunk would hide at this size.
+	import tracemalloc
+	p = str(tmp_path / 'peak.tsv')
+	t = _stopped(p, verbose=False)
+	for i in range(100000):
+		OrderedDict.__setitem__(t, 'key%08d' % i, ['key%08d' % i, 'v%d' % i])
+	t.dirty = True
+	t.hardMapToFile()
+	real = TSVZ._writeLines
+	peaks = []
+
+	def writing(*args, **kwargs):
+		peaks.append(tracemalloc.get_traced_memory()[1])
+		return real(*args, **kwargs)
+
+	def measured():
+		del peaks[:]
+		tracemalloc.start()
+		try:
+			assert t.hardMapToFile()
+		finally:
+			tracemalloc.stop()
+		return peaks[-1]
+
+	monkeypatch.setattr(TSVZ, '_writeLines', writing)
+	t.dirty = True
+	plain = measured()
+	monkeypatch.undo()
+	_failing_rewrite(monkeypatch, partial=b'key\tval\n')
+	t.dirty = True
+	t.hardMapToFile()
+	monkeypatch.undo()
+	_append_external(p, b'ext\tB\n')
+	t._worked('rewrite')
+	monkeypatch.setattr(TSVZ, '_writeLines', writing)
+	merged = measured()
+	monkeypatch.undo()
+	assert t['ext'] == ['ext', 'B'] and len(t) == 100001
+	assert merged < plain * 1.15, (plain, merged)
+	t.close()

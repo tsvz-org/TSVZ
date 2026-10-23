@@ -5400,7 +5400,10 @@ memoryOnly:{self.memoryOnly}
 					result = None  # untouched; its time is not noted: the change is reloaded first
 				else:
 					if look and self._damage is not None and self._mergeChange(rw.raw):
-						header, lines = (snapshot or self._snapshotForRewrite)()  # with what was merged
+						# Made again with what was merged, once the first is let go of: never two snapshots of the
+						# store alive at once.
+						header = lines = None
+						header, lines = (snapshot or self._snapshotForRewrite)()
 						rw.queued = getattr(lines, 'queued', 0)
 					# Until it is all written, the file does not hold memory: a rewrite that stops is made again,
 					# and the file is not reloaded over memory meanwhile. ``started`` first: a release that sees it
