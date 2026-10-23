@@ -330,16 +330,22 @@ def _heldRow(store, key):
 		return None
 
 
-def _queuedKeys(queue):
-	"""The keys of the legacy ``queue``'s rows, their first cells, but for a cell a caller changed in place to one that
-	cannot be a key (a list), which is left out rather than raising."""
+def _queuedKeys(store, queue):
+	"""The keys of the rows queued in the legacy ``store``'s ``queue``: their first cells, but for a row whose first cell
+	a caller changed in place to one that cannot be a key (a list), the key memory still holds that row under (the
+	defaults' for the defaults row), found by identity, rather than raising."""
 	keys = set()
+	lost = set()
 	for row in queue:
 		if row:
 			try:
 				keys.add(row[0])
 			except TypeError:
-				pass
+				lost.add(id(row))
+	if lost:
+		keys.update(key for key, row in dict.items(store) if id(row) in lost)
+		if id(store.defaults) in lost:
+			keys.add(DEFAULTS_INDICATOR_KEY)
 	return keys
 
 
@@ -5577,7 +5583,7 @@ memoryOnly:{self.memoryOnly}
 			reporter.flush()
 		with self._memLock:
 			# No set or delete is half done: each holds _memLock from its change of memory to its queueing.
-			queued = _queuedKeys(self.appendQueue)
+			queued = _queuedKeys(self, self.appendQueue)
 			for key, (row, readded) in changes.items():
 				if key in queued:
 					continue

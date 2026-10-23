@@ -9724,7 +9724,8 @@ def test_tsvzed_legacy_rewrite_goes_through_when_a_queued_row_key_cell_was_chang
 def test_tsvzed_legacy_merge_after_a_failed_rewrite_goes_through_when_a_queued_row_key_cell_was_changed_to_a_list(tmp_path, monkeypatch, capsys):
 	# The merge of another process's change into a damaged store took the set of the queued rows' first cells, and a
 	# caller that had changed one in place to a list made it raise TypeError: every rewrite after it failed, so the
-	# damage stayed for good. Such a cell is left out of the set, as it cannot be a key the file holds.
+	# damage stayed for good. The row is still queued under the key memory holds it under, so the other process's row
+	# for that key is still skipped, while its other rows are merged.
 	p = str(tmp_path / 'merge.tsv')
 	t = _stopped(p)
 	t['a'] = ['a', '1']
@@ -9735,13 +9736,15 @@ def test_tsvzed_legacy_merge_after_a_failed_rewrite_goes_through_when_a_queued_r
 	monkeypatch.undo()
 	assert t._damage is not None
 	with open(p, 'ab') as g:  # another process appends
-		g.write(b'b\t1\n')
-	t['a'][0] = ['x']
+		g.write(b'a\tother\nb\t1\n')
+	row = t['a']
+	row[0] = ['x']
 	capsys.readouterr()
 	t.hardMapToFile()  # merges the other process's change, then rewrites
 	captured = capsys.readouterr()
 	assert 'unhashable' not in captured.out + captured.err, captured
 	assert t._damage is None
+	assert dict.get(t, 'a') is row and row[1] == '2'  # memory's queued change to 'a' is kept
 	assert dict.get(t, 'b') == ['b', '1']
 	t.shutdownEvent.set()
 
