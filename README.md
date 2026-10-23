@@ -254,7 +254,8 @@ and warns that the rows only memory held are dropped.
 | L5 | A damaged compressed file is read up to the damage instead of raising. |
 | L6 | `mapToFile` no longer glues a row it adds at the end of the file to the next one. |
 | L7 | `TSVZed`'s `in` and `get` find a key as `t[key]` does: the live key equal to it, else the key right-stripped. 3.39 matched them exactly, so `'x ' in t` was false while `t['x ']` read `x`, and `t.setdefault('x ', …)` overwrote `x`. |
-| L8 | Appending (`TSVZed`, `TSVZedLite`, `appendTabularFile`, `appendLinesTabularFile`) to an existing empty file writes the store's header first, as creating the file does; 3.39 wrote the rows alone (a read then took the first one for the header), and `appendTabularFile` with `strict` refused the file. |
+| L8 | Appending (`TSVZed`, `TSVZedLite`, `appendTabularFile`, `appendLinesTabularFile`) to an existing empty file (no byte, or a compressed file holding only empty streams) writes the store's header first, as creating the file does; 3.39 wrote the rows alone (a read then took the first one for the header), and `appendTabularFile` with `strict` refused the file. |
+| L9 | Reading such an empty file with a header (and `verifyHeader`) gives an empty store with that header: `readTabularFile`, `TSVZed` and `TSVZedLite` with `strict` no longer refuse it with `Header mismatch` (a `TSVZed` restarted after a rewrite that left the file empty failed in its constructor), and without `strict` no longer print a header mismatch. |
 
 ### `.tsvz`, `.csvz`, `.nsvz`, `.psvz`: now tsvz-spec-v1
 

@@ -9504,3 +9504,51 @@ def test_tsvzed_legacy_append_whose_sync_fails_keeps_its_rows_queued(tmp_path, m
 	assert list(t.appendQueue) == [['b', '2']] and t._failing('append') and not t.writeLock.locked()
 	t.close()
 	assert _back(p) == {'a': ['a', '1'], 'b': ['b', '2']}
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
+@pytest.mark.parametrize('empty', ['no byte', 'empty stream'])
+def test_strict_readers_take_an_existing_empty_legacy_file_for_an_empty_store(tmp_path, suffix, empty):
+	# A strict read refused an existing empty legacy file ('Header mismatch'), as main 1688d25 and 3.39 did, though
+	# an append now takes it for a store missing its header and writes the header first: a TSVZed(strict=True)
+	# restarted after a rewrite that left the file empty failed in its constructor. Such a file (no byte, or only
+	# empty compressed streams) reads as an empty store with the given header (the spec says nothing of legacy
+	# stores, §5.2); README L9.
+	p = str(tmp_path / ('empty.' + suffix))
+	if empty == 'no byte':
+		open(p, 'wb').close()
+	elif suffix == 'tsv':
+		pytest.skip('an uncompressed file has no empty stream')
+	else:
+		_empty_stream(p)
+	assert TSVZ.readTabularFile(p, header='key\tval', strict=True, verbose=False) == {}
+	assert TSVZ.readTabularFile(p, header='key\tval', strict=True, lastLineOnly=True, verbose=False) in ({}, None, [])
+	t = TSVZ.TSVZed(p, header='key\tval', strict=True, rewrite_on_load=False, append_check_delay=0.001)
+	assert dict(t) == {} and t.correctColumnNum == 2
+	t['a'] = ['a', '1']
+	t.close()
+	assert TSVZ.readTabularFile(p, header='key\tval', strict=True, verbose=False) == {'a': ['a', '1']}
+	q = str(tmp_path / ('lite.' + suffix))
+	if empty == 'no byte':
+		open(q, 'wb').close()
+	else:
+		_empty_stream(q)
+	lite = TSVZ.TSVZedLite(q, header='key\tval', strict=True)
+	assert dict(lite) == {}
+	lite['b'] = ['b', '2']
+	lite.close()
+	assert TSVZ.readTabularFile(q, header='key\tval', strict=True, verbose=False) == {'b': ['b', '2']}
+
+
+def test_tsvzed_legacy_map_to_file_of_a_strict_store_writes_the_header_to_an_empty_file(tmp_path):
+	# mapToFile compared the empty file's first line with the header and, strict, refused it (a mismatch) before it
+	# fell back on hardMapToFile; the file holds nothing to mismatch: the header is written.
+	p = str(tmp_path / 'map.tsv')
+	t = _stopped(p, strict=True)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	open(p, 'wb').close()
+	t.externalFileUpdateTime = TSVZ.getFileUpdateTimeNs(p)
+	t.mapToFile()
+	assert _bytes(p) == b'key\tval\na\t1\n'
+	t.close()

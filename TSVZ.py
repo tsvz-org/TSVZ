@@ -1772,6 +1772,10 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger, delimiter = delimiter)
 	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter,errors = errors):
 		return taskDic
+	if _isCompressedFile(fileName) and _fileHoldsNothing(fileName):
+		# No byte, or only empty streams: an empty store, as an empty uncompressed file is (below), not a damaged
+		# stream (BZ2File and LZMAFile fail on a file with no byte).
+		return (-1 if storeOffset else []) if lastLineOnly else taskDic
 	reporter = _Reporter(fileName, teeLogger)
 	try:
 		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
@@ -1791,7 +1795,9 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 				except UnicodeDecodeError:
 					line = raw.decode(encoding=encoding,errors='replace')
 					reporter.note('decode', 'line 1', 'invalid {} replaced with U+FFFD'.format(encoding))
-				if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter) and correctColumnNum == -1:
+				# A file that holds nothing (no byte, or only empty compressed streams) is an empty store with this
+				# header, as an append to it takes it (it writes the header first): not a header mismatch.
+				if (not raw or _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter)) and correctColumnNum == -1:
 					correctColumnNum = len(header)
 					if verbose:
 						__teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
@@ -5596,7 +5602,7 @@ memoryOnly:{self.memoryOnly}
 		if headerBytes is not None:
 			line = file.readline().decode(self.encoding,errors='replace')
 			aftPos = file.tell()
-			if not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
+			if not line or not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
 				header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
 				file.seek(0)
 				file.write(headerBytes+b'\n')
