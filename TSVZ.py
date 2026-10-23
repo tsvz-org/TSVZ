@@ -319,14 +319,28 @@ def _rowHash(row):
 
 def _heldRow(store, key):
 	"""What the legacy ``store``'s memory holds for ``key``, the first cell of one of its queued rows: its defaults for
-	the defaults row, else its row; None when it holds none, or when ``key`` cannot be a key (a caller changed that cell
-	in place to a list)."""
+	the defaults row, else its row; None when it holds none, or when ``key`` cannot be a key. A caller that changes a
+	row's key cell in place (not supported: memory keeps the row under its old key) gets it looked up under the new
+	cell, so it is not found, rather than raising."""
 	if key == DEFAULTS_INDICATOR_KEY:
 		return store.defaults
 	try:
 		return dict.get(store, key)
 	except TypeError:
 		return None
+
+
+def _queuedKeys(queue):
+	"""The keys of the legacy ``queue``'s rows, their first cells, but for a cell a caller changed in place to one that
+	cannot be a key (a list), which is left out rather than raising."""
+	keys = set()
+	for row in queue:
+		if row:
+			try:
+				keys.add(row[0])
+			except TypeError:
+				pass
+	return keys
 
 
 def _queuedRowHashes(queue):
@@ -5382,7 +5396,7 @@ memoryOnly:{self.memoryOnly}
 		with self._memLock:
 			values = list(self.values())
 			defaults = list(self.defaults)
-			queued = _queuedRowHashes(self.appendQueue)  # memory holds the change of every one of them
+			queued = _queuedRowHashes(self.appendQueue)  # what each queued row holds now, see _releaseRewrite
 		first = []
 		if defaults and len(defaults) > 1:
 			# The defaults line comes right after the header, so it survives a
@@ -5563,7 +5577,7 @@ memoryOnly:{self.memoryOnly}
 			reporter.flush()
 		with self._memLock:
 			# No set or delete is half done: each holds _memLock from its change of memory to its queueing.
-			queued = set(row[0] for row in self.appendQueue if row)
+			queued = _queuedKeys(self.appendQueue)
 			for key, (row, readded) in changes.items():
 				if key in queued:
 					continue

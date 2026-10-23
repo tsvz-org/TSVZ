@@ -9721,6 +9721,31 @@ def test_tsvzed_legacy_rewrite_goes_through_when_a_queued_row_key_cell_was_chang
 	t.shutdownEvent.set()
 
 
+def test_tsvzed_legacy_merge_after_a_failed_rewrite_goes_through_when_a_queued_row_key_cell_was_changed_to_a_list(tmp_path, monkeypatch, capsys):
+	# The merge of another process's change into a damaged store took the set of the queued rows' first cells, and a
+	# caller that had changed one in place to a list made it raise TypeError: every rewrite after it failed, so the
+	# damage stayed for good. Such a cell is left out of the set, as it cannot be a key the file holds.
+	p = str(tmp_path / 'merge.tsv')
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	t['a'] = ['a', '2']
+	_failing_rewrite(monkeypatch, partial=b'key\tval\n')
+	t.hardMapToFile()  # fails partway: the file is damaged, memory is the good copy
+	monkeypatch.undo()
+	assert t._damage is not None
+	with open(p, 'ab') as g:  # another process appends
+		g.write(b'b\t1\n')
+	t['a'][0] = ['x']
+	capsys.readouterr()
+	t.hardMapToFile()  # merges the other process's change, then rewrites
+	captured = capsys.readouterr()
+	assert 'unhashable' not in captured.out + captured.err, captured
+	assert t._damage is None
+	assert dict.get(t, 'b') == ['b', '1']
+	t.shutdownEvent.set()
+
+
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 def test_tsvzed_legacy_same_size_rewrite_within_a_clock_tick_of_the_damage_is_not_taken_for_no_change(tmp_path, monkeypatch, capsys, suffix):
 	# ccc66b4 skipped reading the file when its size, mtime and ctime equalled the damage's stamp, though the comment
