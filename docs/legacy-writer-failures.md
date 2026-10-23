@@ -15,7 +15,7 @@ Each one has a script in `docs/legacy-writer-repros/`. Run it from an empty scra
 "main" is 1688d25 and "branch" is strict-utf8-writes-2 with its fixes. Both were run on
 Linux with Python 3.13. The review's finding numbers for items 1 to 15 are 1, 7, 6, 4, 10, 14,
 none (found while testing), 5, 8, what is left of 13, 11, a second opinion's, a second
-opinion's, 15 and 12.
+opinion's, 15 and 12. Item 16 was found later, while testing.
 
 ## Interrupts and failed writes
 
@@ -141,3 +141,15 @@ opinion's, 15 and 12.
     character. Clients never find a handler for such a store, which includes every plain `.tsv`.
     Script: `ptr_delim.py DIR`. Main and branch: a `.csv` handler is found, but for `.tsv` and NUL
     the pointer "has control characters in its x-delimiter".
+
+## Lifetime
+
+16. **A stopped store is never freed.** `TSVZed.__init__` calls
+    `atexit.register(self.stopAppendThread)` and nothing unregisters it, so the atexit list keeps
+    every store, with all its rows, until the interpreter exits. `TSVZedLite` does the same with
+    `atexit.register(self.close)`. A program that opens and closes many stores grows without bound.
+    A test repeated thousands of times, run on many xdist workers, helped exhaust a 60 GB host.
+    Suggested fix: register one module-level hook over a `weakref.WeakSet` of live stores (or
+    unregister in `stopAppendThread()`/`close()`).
+    Script: `atexit_keep.py DIR`. Main and branch: 50 of 50 stopped, unreferenced stores of 1000
+    rows are still alive, about 140 KB each.
