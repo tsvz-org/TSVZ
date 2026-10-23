@@ -149,7 +149,8 @@ opinion's, 15 and 12. Item 16 was found later, while testing.
     every store, with all its rows, until the interpreter exits. `TSVZedLite` does the same with
     `atexit.register(self.close)`. A program that opens and closes many stores grows without bound.
     A test repeated thousands of times, run on many xdist workers, helped exhaust a 60 GB host.
-    Suggested fix: register one module-level hook over a `weakref.WeakSet` of live stores (or
-    unregister in `stopAppendThread()`/`close()`).
+    Suggested fix: unregister in `stopAppendThread()`/`close()`, or register one module-level hook
+    over a `weakref.WeakValueDictionary` of live stores keyed by `id()` (a store is a dict, so it
+    cannot go in a `WeakSet`).
     Script: `atexit_keep.py DIR`. Main and branch: 50 of 50 stopped, unreferenced stores of 1000
-    rows are still alive, about 140 KB each.
+    rows are still alive, and RSS grows by about 15 MB for the 50 (about 290 KB each).
