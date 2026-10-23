@@ -1481,17 +1481,35 @@ def test_spec_reading_many_small_members_reads_the_part_once(tmp_path, monkeypat
 
 
 def _tear_first_append(monkeypatch, path):
-	"""Make the next append to ``path`` write half its bytes and then fail, as a full disk would (appends write
-	with os.write, on the descriptor of a file they open)."""
+	"""Make the next append to ``path`` write half its bytes and then fail, as a full disk would: through the
+	write() of a file opened to append to it, or os.write on its descriptor (what appends write with)."""
 	torn = []
 	fds = set()
 	real_open = open
 	real_write = os.write
 
+	class Tearing(object):
+		def __init__(self, f):
+			self._f = f
+		def write(self, data):
+			if not torn:
+				torn.append(len(data))
+				self._f.write(data[:len(data) // 2])
+				self._f.flush()
+				raise OSError(28, 'No space left on device')
+			return self._f.write(data)
+		def __getattr__(self, name):
+			return getattr(self._f, name)
+		def __enter__(self):
+			return self
+		def __exit__(self, *exc):
+			self._f.close()
+
 	def opener(name, mode='r', *args, **kwargs):
 		f = real_open(name, mode, *args, **kwargs)
 		if name == path and 'a' in mode:
 			fds.add(f.fileno())
+			return Tearing(f)
 		return f
 
 	def write(fd, data):
@@ -9431,3 +9449,58 @@ def test_append_lines_to_a_file_another_process_makes_empty_meanwhile_writes_the
 	monkeypatch.undo()
 	assert _text(p) == b'key\tval\na\t1\n'
 	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == {'a': ['a', '1']}
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
+@pytest.mark.parametrize('cut', [True, False])
+def test_tsvzed_legacy_append_cut_short_after_a_failed_rewrite_is_not_merged_over_memory(tmp_path, monkeypatch, suffix, cut):
+	# commitAppendToFile took the rows off the queue before it wrote them and never put them back. Its append to a
+	# file a failed rewrite damaged, cut short on the full disk that caused the damage, left a torn row there; the
+	# next rewrite's merge took it for another process's and it replaced memory's good row (rv8 r3: K became
+	# ['K', 'a-long'], where main kept the good value). The rows stay queued until they are on disk, so the merge
+	# keeps memory's row for their keys, and the torn bytes are cut off again (``cut``; else they stay, as when
+	# that fails too).
+	p = str(tmp_path / ('torn.' + suffix))
+	t, rows = _damaged_compressed(p, monkeypatch, suffix) if suffix != 'tsv' else (None, None)
+	if t is None:
+		t = _stopped(p)
+		rows = _many(t, 5)
+		_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
+		t.hardMapToFile()
+		monkeypatch.undo()
+	damaged = _bytes(p)
+	t['K'] = ['K', 'a-long-good-value']
+	torn = _tear_first_append(monkeypatch, p)
+	if not cut:
+		monkeypatch.setattr(TSVZ.os, 'ftruncate', lambda fd, size: (_ for _ in ()).throw(OSError(28, 'No space left on device')))
+	t.commitAppendToFile()
+	monkeypatch.undo()
+	assert torn and list(t.appendQueue)[-1] == ['K', 'a-long-good-value']
+	assert (_bytes(p) == damaged) == cut, _bytes(p)
+	t._worked('append')
+	t._worked('rewrite')
+	assert t.rewrite(force=True)
+	assert t['K'] == ['K', 'a-long-good-value'] and _back(p)['K'] == ['K', 'a-long-good-value']
+	assert not t.appendQueue and dict(t) == dict(rows, K=['K', 'a-long-good-value']) == _back(p)
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_append_whose_sync_fails_keeps_its_rows_queued(tmp_path, monkeypatch, capsys, suffix):
+	# release_file_obj swallowed a failed flush or sync: the append counted as done, its rows off the queue, though
+	# they may not be on disk. The sync is the append's own now, and its failure fails it: the rows stay queued.
+	p = str(tmp_path / ('sync.' + suffix))
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	t['b'] = ['b', '2']
+
+	def failing(fd):
+		raise OSError(errno.EIO, 'Input/output error')
+
+	monkeypatch.setattr(TSVZ, '_fsync', failing)
+	t.commitAppendToFile()
+	monkeypatch.undo()
+	assert 'Input/output error' in capsys.readouterr().out
+	assert list(t.appendQueue) == [['b', '2']] and t._failing('append') and not t.writeLock.locked()
+	t.close()
+	assert _back(p) == {'a': ['a', '1'], 'b': ['b', '2']}

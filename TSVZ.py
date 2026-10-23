@@ -5427,8 +5427,11 @@ memoryOnly:{self.memoryOnly}
 		change is not reloaded over memory (the rows the damage lost would go), nor erased. When the file still
 		begins with what the damage left (its size and digest), the rest is what other processes appended since
 		(appends, deletes, the file made again after it was removed): its rows are applied on top of memory, as a
-		read of the file would apply them, except for a key still queued (set or deleted since, the queue is
-		appended after the rewrite: memory holds its last change). Else (another process rewrote it, or what it
+		read of the file would apply them, except for a key still queued. A queued row is a change memory holds
+		that is not known to be in the file: set or deleted since the last append got through, or one whose append
+		failed (commitAppendToFile keeps a row queued until it is on disk; a write cut short is cut off again, where it
+		can be). What the file holds of such a key is older, or a row torn by that failed append, so memory's is kept:
+		the rewrite writes it, and once that is on disk the queued rows it wrote leave the queue (_releaseRewrite). Else (another process rewrote it, or what it
 		held is not known) memory is kept and the change is overwritten, with a warning. True when memory changed:
 		what the rewrite writes is encoded again.
 
@@ -5697,9 +5700,14 @@ memoryOnly:{self.memoryOnly}
 				file = self.get_file_obj('a+b')  # the file itself, compressed or not: _appendOpen compresses
 				if file is None:
 					return self  # get_file_obj reported why; the rows stay queued for the next try
+				# The rows stay queued until they are on disk: one whose write fails (a full disk) is written again later,
+				# and while it is queued a merge after a failed rewrite keeps memory's row for its key (_mergeChange), not
+				# what the file holds of it (an append cut short is cut off again, as far as it can be).
+				with self._memLock:  # a set or delete queues under it: not while the queue is listed
+					count = len(self.appendQueue)
+					rows = list(itertools.islice(self.appendQueue, count))
 				chunks = []
-				while self.appendQueue:
-					row = self.appendQueue.popleft()
+				for row in rows:
 					try:
 						chunks.append(_encodeRow(_sanitize(row,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,self.header)+b'\n')
 					except TSVZEncodeError as e:
@@ -5707,18 +5715,21 @@ memoryOnly:{self.memoryOnly}
 						# the good rows with it: those are written. A rewrite stores it once it can be.
 						self.dirty = True
 						self.__teePrintOrNot(f"Refused at commitAppendToFile() to {self._fileName}: {e}; the row is not appended, the others are",'error')
-				payload = b''.join(chunks)
-				if not payload:
-					self.release_file_obj(file)
+				if chunks:
+					# An existing empty file (a rewrite cut short, of this object's or another's) gets the header first,
+					# as creating it writes it; L1: a hand-edited last line is terminated instead of glued onto.
+					reporter = _Reporter(self._fileName, self.teeLogger)
+					try:
+						_appendOpen(file, b''.join(chunks), codec, self._headerLine if any(self.header) else None, 'newline', reporter)
+						_fsync(file.fileno())  # a sync that fails fails the append: the rows stay queued
+					finally:
+						reporter.flush()
+				with self._memLock:
+					for _ in range(count):
+						self.appendQueue.popleft()  # only those listed: rows queued since stay
+				self.release_file_obj(file, synced=True)
+				if not chunks:
 					return self
-				# An existing empty file (a rewrite cut short, of this object's or another's) gets the header first, as
-				# creating it writes it; L1: a hand-edited last line is terminated instead of glued onto.
-				reporter = _Reporter(self._fileName, self.teeLogger)
-				try:
-					_appendOpen(file, payload, codec, self._headerLine if any(self.header) else None, 'newline', reporter)
-				finally:
-					reporter.flush()
-				self.release_file_obj(file)
 				self._worked('append')
 				if self.verbose:
 					self.__teePrintOrNot(f"Records commited to {self._fileName}")
@@ -5805,8 +5816,11 @@ memoryOnly:{self.memoryOnly}
 				raise
 			return None
 
-	def release_file_obj(self,file):
-		"""Unlock and close ``file``, note the file's modification time as this object's own, and let go of writeLock."""
+	def release_file_obj(self,file,synced=False):
+		"""Unlock and close ``file``, note the file's modification time as this object's own, and let go of writeLock.
+
+		``file`` is flushed and synced first, unless ``synced``: the caller did that itself and learnt whether it
+		failed (an error here is reported, not raised)."""
 		# if write lock is already released, return
 		if not self.writeLock.locked():
 			return
@@ -5814,8 +5828,9 @@ memoryOnly:{self.memoryOnly}
 			return
 		noted = False
 		try:
-			file.flush()  # Ensure the file is flushed before unlocking
-			_fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
+			if not synced:
+				file.flush()  # Ensure the file is flushed before unlocking
+				_fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
 			if not file.closed:
 				if not self._keepFileTime and (not _isCompressedFile(self._fileName) or isinstance(file, (io.BufferedRandom, io.BufferedWriter))):
 					# Noted while the file is still locked: another writer appending right after the unlock
