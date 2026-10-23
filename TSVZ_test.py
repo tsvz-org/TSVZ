@@ -8092,9 +8092,14 @@ def test_tsvzed_legacy_rewrite_interrupted_again_in_its_release_lets_go_and_lose
 		hit = _interrupt_at(m, call, where='_releaseRewrite')
 		monkeypatch.undo()
 		t._snapshotForRewrite = real
+		# A Ctrl-C in the read of what the damage holds leaves it unknown (it is not read again): another process's
+		# row after it is then overwritten, with a warning, as the docstring of _releaseRewrite says.
+		unknown = t._damage == TSVZ._DAMAGE_UNKNOWN
 		late = {'late%d' % m: ['late%d' % m, 'L']}
 		_append_late(p, suffix, ('late%d\tL\n' % m).encode())  # another process, after it
 		_lets_go(t, fds)
+		if unknown:
+			late = {}
 		if first == 'defer':
 			assert dict(t) == dict(before, **dict({external: [external, 'B']}, **late)), (m, 'the change was erased')
 			del t[external]
@@ -8105,7 +8110,7 @@ def test_tsvzed_legacy_rewrite_interrupted_again_in_its_release_lets_go_and_lose
 		t.commitAppendToFile()
 		assert _back(p) == dict(t), m
 		assert not t._externalChange() and not t.deSynced, m
-		assert 'Overwriting external changes' not in capsys.readouterr().out, m
+		assert ('Overwriting external changes' in capsys.readouterr().out) == unknown, m
 		if not hit:
 			break
 		t['a'] = ['a', str(m)]  # dirty again, for the next try
@@ -9185,3 +9190,36 @@ def test_tsvzed_legacy_rewrite_that_keeps_failing_does_not_read_an_unchanged_dam
 	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', real_inplace)
 	assert t.rewrite()
 	assert dict(t) == dict(rows, ext=['ext', 'B']) and _back(p) == dict(t)
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_release_interrupted_reads_the_damage_once_at_most(tmp_path, monkeypatch, suffix):
+	# The release made again after a KeyboardInterrupt read and hashed the whole file again (_fileDigest, its slowest
+	# step), although nothing waits out a slow step after a Ctrl-C. The digest the first try took is kept; a read the
+	# Ctrl-C stopped is not made again: the damage is then unknown.
+	n = 0
+	while True:
+		n += 1
+		p = str(tmp_path / ('once%d.%s' % (n, suffix)))
+		t = _stopped(p)
+		rows = _many(t, 20)
+		reads = []
+		real = TSVZ._fileDigest
+
+		def digest(fd):
+			reads.append(1)
+			return real(fd)
+
+		monkeypatch.setattr(TSVZ, '_fileDigest', digest)
+		_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
+		hit = _interrupt_at(n, t.hardMapToFile, where='_releaseRewrite')
+		monkeypatch.undo()
+		assert len(reads) <= 1, (n, reads)
+		assert not t.writeLock.locked() and t.deSynced, n
+		sha = __import__('hashlib').sha256(_bytes(p)).digest()
+		assert t._damage in ((len(_bytes(p)), sha), TSVZ._DAMAGE_UNKNOWN), (n, t._damage)
+		assert t.rewrite() and dict(t) == rows and _back(p) == rows, n
+		t.close()
+		if not hit:
+			break
+	assert n > 10, n

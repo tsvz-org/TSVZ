@@ -285,7 +285,8 @@ def _discardWriter(writer):
 class _Rewrite(object):
 	"""How far a legacy rewrite (TSVZed._writeRewrite) has got: what _releaseRewrite lets go of, and what it did
 	already, so that a second call (after a KeyboardInterrupt stopped the first) goes on from there."""
-	__slots__ = ('raw', 'writer', 'started', 'written', 'failed', 'reached', 'noted', 'error', 'queued', 'kept')
+	__slots__ = ('raw', 'writer', 'started', 'written', 'failed', 'reached', 'noted', 'error', 'queued', 'kept',
+				 'hashing', 'damage')
 
 	def __init__(self):
 		self.raw = None  # the file, open and locked: None until get_file_obj hands it out
@@ -298,6 +299,8 @@ class _Rewrite(object):
 		self.error = None
 		self.queued = 0  # how many queued rows (the first ones) the rows written hold: dropped once on disk
 		self.kept = None  # the queue without them, once it is
+		self.hashing = False  # the read of what the file holds, to note the damage, has begun
+		self.damage = None  # (_damage, _damageAt) it noted, once it has
 
 	def fail(self, error):
 		self.failed = True
@@ -5813,7 +5816,10 @@ memoryOnly:{self.memoryOnly}
 		   the unlock (see _externalChange; a write that fails on a full disk changes it too). Once it reached the
 		   disk, ``dirty``, ``deSynced`` and ``_damage`` are cleared; else ``dirty`` and ``deSynced`` stay set
 		   (the next rewrite() makes it again from memory) and ``_damage`` is what the file now holds, read
-		   through its own descriptor, which another process's appends are merged after (_mergeChange);
+		   through its own descriptor, which another process's appends are merged after (_mergeChange). It is
+		   read once: made again after a KeyboardInterrupt, the release keeps what the first one read, and
+		   when the Ctrl-C stopped that read the damage is unknown (a change another process makes before the
+		   next rewrite is then overwritten, with a warning, instead of merged);
 		4. the file is unlocked and closed, unflushed unless it reached the disk: a buffer that could not be
 		   written is dropped, not written by a close after its time was noted.
 
@@ -5851,12 +5857,21 @@ memoryOnly:{self.memoryOnly}
 					self._damage, self._damageAt = _DAMAGE_EMPTY, None  # the file was missing, and could not be made again
 				else:
 					self._mergeBase = None
-					try:
-						# What it left, and which file it is: another process's appends to it are merged.
-						at = _fileStamp(os.fstat(raw.fileno()))
-						self._damage, self._damageAt = _fileDigest(raw.fileno()), at
-					except Exception:
-						self._damage = _DAMAGE_UNKNOWN
+					if rw.damage is None:
+						if rw.hashing:
+							# A KeyboardInterrupt stopped the read: it is not made again (after a Ctrl-C nothing waits
+							# out a slow step). The cost: the next merge cannot tell another process's appends from
+							# the damage, and overwrites a change made meanwhile, with a warning.
+							rw.damage = (_DAMAGE_UNKNOWN, None)
+						else:
+							rw.hashing = True
+							try:
+								# What it left, and which file it is: another process's appends to it are merged.
+								at = _fileStamp(os.fstat(raw.fileno()))
+								rw.damage = (_fileDigest(raw.fileno()), at)
+							except Exception:
+								rw.damage = (_DAMAGE_UNKNOWN, None)
+					self._damage, self._damageAt = rw.damage  # the same when made again
 			rw.noted = True
 		if rw.reached and rw.queued:
 			# The queued rows the rewrite wrote are dropped, not appended again after it (that undid another process's
