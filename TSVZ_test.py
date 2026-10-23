@@ -9694,6 +9694,31 @@ def test_tsvzed_legacy_rewrite_drops_a_queued_row_that_left_memory_and_was_chang
 	t.close()
 
 
+def test_tsvzed_legacy_rewrite_goes_through_when_a_queued_row_key_cell_was_changed_to_a_list(tmp_path, monkeypatch, capsys):
+	# 897f784 looked a changed queued row up in memory by its first cell, and a caller that had changed that cell in
+	# place to a list made the lookup raise TypeError: the rewrite that had written the file was reported failed.
+	# Such a row holds no key memory can hold it under, so it is dropped, as one that left memory is.
+	p = str(tmp_path / 'key.tsv')
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	row = t['a']
+	real = TSVZ._writeLines
+
+	def writing(*args, **kwargs):
+		result = real(*args, **kwargs)  # the snapshot is written
+		row[0] = ['x']
+		return result
+
+	monkeypatch.setattr(TSVZ, '_writeLines', writing)
+	assert t.hardMapToFile()
+	monkeypatch.undo()
+	captured = capsys.readouterr()
+	assert 'Failed' not in captured.out + captured.err, captured
+	assert not t.appendQueue
+	assert _back(p) == {'a': ['a', '1']}
+	t.shutdownEvent.set()
+
+
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 def test_tsvzed_legacy_same_size_rewrite_within_a_clock_tick_of_the_damage_is_not_taken_for_no_change(tmp_path, monkeypatch, capsys, suffix):
 	# ccc66b4 skipped reading the file when its size, mtime and ctime equalled the damage's stamp, though the comment

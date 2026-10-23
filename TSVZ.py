@@ -317,6 +317,18 @@ def _rowHash(row):
 		return -1
 
 
+def _heldRow(store, key):
+	"""What the legacy ``store``'s memory holds for ``key``, the first cell of one of its queued rows: its defaults for
+	the defaults row, else its row; None when it holds none, or when ``key`` cannot be a key (a caller changed that cell
+	in place to a list)."""
+	if key == DEFAULTS_INDICATOR_KEY:
+		return store.defaults
+	try:
+		return dict.get(store, key)
+	except TypeError:
+		return None
+
+
 def _queuedRowHashes(queue):
 	"""An array of _rowHash of each row of the legacy append ``queue``: what a rewrite's snapshot notes of the rows
 	queued when it is taken, 8 bytes a row."""
@@ -5994,8 +6006,7 @@ memoryOnly:{self.memoryOnly}
 				if self.appendQueue is not rw.kept:
 					count = len(rw.queued)
 					kept = deque(row for row, seen in zip(itertools.islice(self.appendQueue, count), rw.queued)
-								 if (seen == -1 or _rowHash(row) != seen) and row
-								 and (self.defaults if row[0] == DEFAULTS_INDICATOR_KEY else dict.get(self, row[0])) is row)
+								 if (seen == -1 or _rowHash(row) != seen) and row and _heldRow(self, row[0]) is row)
 					kept.extend(itertools.islice(self.appendQueue, count, None))
 					rw.kept = self.appendQueue = kept
 		if raw is not None and not raw.closed:
