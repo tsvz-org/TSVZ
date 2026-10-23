@@ -5986,13 +5986,16 @@ memoryOnly:{self.memoryOnly}
 			# The queued rows the rewrite wrote are dropped, not appended again after it (that undid another process's
 			# later change of their key, and a merge skipped such a key as still queued); only those that hold what
 			# they held at the snapshot: a row changed in place since (set() queues the list memory holds) was not
-			# written so, and stays queued. The queue is replaced whole, under _memLock: a second call after a
-			# KeyboardInterrupt drops them only once.
+			# written so, and stays queued, but only while memory still holds it for its key: a row that left memory
+			# (replaced or popped) and was changed after, by a caller that kept it, is dropped: appended, it would
+			# override the newer row or the tombstone on disk. The queue is replaced whole, under _memLock: a second
+			# call after a KeyboardInterrupt drops them only once.
 			with self._memLock:
 				if self.appendQueue is not rw.kept:
 					count = len(rw.queued)
 					kept = deque(row for row, seen in zip(itertools.islice(self.appendQueue, count), rw.queued)
-								 if seen == -1 or _rowHash(row) != seen)
+								 if (seen == -1 or _rowHash(row) != seen) and row
+								 and (self.defaults if row[0] == DEFAULTS_INDICATOR_KEY else dict.get(self, row[0])) is row)
 					kept.extend(itertools.islice(self.appendQueue, count, None))
 					rw.kept = self.appendQueue = kept
 		if raw is not None and not raw.closed:

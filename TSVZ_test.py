@@ -9660,6 +9660,39 @@ def test_tsvzed_legacy_rewrite_keeps_queued_a_row_changed_in_place_after_its_sna
 
 
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+@pytest.mark.parametrize('leaves', ['pop', 'replace'])
+def test_tsvzed_legacy_rewrite_drops_a_queued_row_that_left_memory_and_was_changed_in_place(tmp_path, monkeypatch, suffix, leaves):
+	# a31d3a1 kept every queued row whose cells changed after the snapshot. A row that had left memory (popped or
+	# replaced) but whose caller kept it and changed it in place while the rewrite wrote was then appended after
+	# the rewrite, and on disk it overrode the newer row or brought back the deleted key, as memory did not hold
+	# it. Only a changed row that memory still holds for its key stays queued.
+	p = str(tmp_path / ('left.' + suffix))
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '1']
+	old = t['a']  # the list memory holds, also the queued row
+	if leaves == 'pop':
+		assert t.pop('a') is old
+	else:
+		t['a'] = ['a', '2']
+	real = TSVZ._writeLines
+
+	def writing(*args, **kwargs):
+		result = real(*args, **kwargs)  # the snapshot is written
+		old[1] = 'reused'  # the caller reuses the list it got back, while the rewrite runs
+		return result
+
+	monkeypatch.setattr(TSVZ, '_writeLines', writing)
+	assert t.hardMapToFile()
+	monkeypatch.undo()
+	assert old not in list(t.appendQueue)
+	t.commitAppendToFile()
+	expected = {'b': ['b', '1']} if leaves == 'pop' else {'a': ['a', '2'], 'b': ['b', '1']}
+	assert dict(t) == expected == _back(p)
+	t.close()
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 def test_tsvzed_legacy_same_size_rewrite_within_a_clock_tick_of_the_damage_is_not_taken_for_no_change(tmp_path, monkeypatch, capsys, suffix):
 	# ccc66b4 skipped reading the file when its size, mtime and ctime equalled the damage's stamp, though the comment
 	# said the decision is by what the file holds: on a file system whose clock ticks once a second (here: times cut
