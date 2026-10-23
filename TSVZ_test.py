@@ -8672,9 +8672,11 @@ def test_tsvzed_legacy_damaged_store_whose_rewrite_is_refused_still_appends_its_
 	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv\n')
 	t.hardMapToFile()
 	monkeypatch.undo()
-	t._worked('rewrite')
-	assert t._damage is not None
-	_append_external(p, b'x\t\x81\n')  # a byte cp1252 cannot decode: merged as U+FFFD, which it cannot write
+	with open(p, 'ab') as g:  # another process appends under the file lock, which the background rewrite waits for
+		TSVZ._lockFile(g)
+		t._worked('rewrite')  # the rewrite is tried again now
+		assert t._damage is not None
+		g.write(b'x\t\x81\n')  # a byte cp1252 cannot decode: merged as U+FFFD, which it cannot write
 	assert _wait_for(lambda: 'x' in t, 5)
 	assert _wait_for(lambda: t._refusedAt is not None, 5)
 	out = capsys.readouterr().out
