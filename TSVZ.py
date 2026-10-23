@@ -4104,18 +4104,31 @@ class _TSVZedLoad(OrderedDict):
 
 class _TSVZedMerge(_TSVZedLoad):
 	"""What ``TSVZed._mergeChange`` reads the rows another process appended into, apart from the live store: the
-	last change of each key, its row shaped as a read shapes it or None for a delete, to apply to memory after."""
+	last change of each key, to apply to memory after, as ``(row, readded)``: its row shaped as a read shapes it
+	(None for a delete), and whether a delete came before that row. A read moves a key deleted and set again to
+	the end, and keeps the place of one only set: the keys are in the order such a read leaves the ones it adds.
+	"""
 
 	def __setitem__(self, key, value):
 		change = self._change(key, value)
 		if change is not None:
-			OrderedDict.__setitem__(self, *change)
+			self._note(*change)
+
+	def _note(self, key, row):
+		last = OrderedDict.get(self, key)
+		if row is None:
+			OrderedDict.__setitem__(self, key, (None, False))
+		elif last is not None and last[0] is None:  # set again after a delete: added again, at the end
+			OrderedDict.__delitem__(self, key)
+			OrderedDict.__setitem__(self, key, (row, True))
+		else:
+			OrderedDict.__setitem__(self, key, (row, last is not None and last[1]))
 
 	def __contains__(self, key):
 		return True  # a delete of a key memory holds: _processLine deletes only what it is told is there
 
 	def __delitem__(self, key):
-		OrderedDict.__setitem__(self, str(key).rstrip(), None)
+		self._note(str(key).rstrip(), None)
 
 
 class TSVZed(OrderedDict):
@@ -5409,7 +5422,7 @@ memoryOnly:{self.memoryOnly}
 		with self._memLock:
 			# No set or delete is half done: each holds _memLock from its change of memory to its queueing.
 			queued = set(row[0] for row in self.appendQueue if row)
-			for key, row in changes.items():
+			for key, (row, readded) in changes.items():
 				if key in queued:
 					continue
 				if row is None:
@@ -5417,6 +5430,8 @@ memoryOnly:{self.memoryOnly}
 						OrderedDict.__delitem__(self, key)  # not OrderedDict.pop: on 3.6 it calls TSVZed.__delitem__, which takes _memLock
 				else:
 					OrderedDict.__setitem__(self, key, row)
+					if readded:  # deleted and set again: a read of the file has it at the end, not in its old place
+						OrderedDict.move_to_end(self, key)  # not TSVZed.move_to_end: memory is not reordered by hand
 			if changes.defaults != defaults and DEFAULTS_INDICATOR_KEY not in queued:
 				self.defaults = changes.defaults
 			if self.correctColumnNum == -1 and self:

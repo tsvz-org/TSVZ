@@ -9044,3 +9044,21 @@ def test_tsvzed_legacy_rewrite_interrupted_in_its_release_drops_the_rows_it_wrot
 		if not hit:
 			break
 	assert n > 10, n
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_merge_orders_the_keys_as_a_read_of_the_file_does(tmp_path, monkeypatch, suffix):
+	# A merged delete and set again of a key memory held kept the key's old place (OrderedDict.__setitem__ on a key
+	# it has), where reading the file moves it to the end; a key only set keeps its place, as a read keeps it.
+	p = str(tmp_path / ('order.' + suffix))
+	t = _stopped(p)
+	_many(t, 5)
+	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
+	t.hardMapToFile()
+	monkeypatch.undo()
+	_append_external(p, _compressedAs(suffix, b'k1\t\nnew\tN\nk1\tagain\nk3\tset\nn2\tA\nn2\t\nn2\tB\n'))
+	assert t.rewrite()
+	t.commitAppendToFile()
+	assert list(t) == ['k0', 'k2', 'k3', 'k4', 'new', 'k1', 'n2'], list(t)
+	assert list(t) == list(_back(p)) and dict(t) == _back(p)
+	assert t['k1'] == ['k1', 'again'] and t['k3'] == ['k3', 'set'] and t['n2'] == ['n2', 'B']
