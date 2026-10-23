@@ -9411,3 +9411,23 @@ def test_tsvzed_legacy_commit_that_writes_nothing_leaves_nothing_in_a_compressed
 	t.commitAppendToFile()
 	assert _text(p) == b'key\tval\nb\t2\n'
 	t.close()
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
+def test_append_lines_to_a_file_another_process_makes_empty_meanwhile_writes_the_header_first(tmp_path, monkeypatch, suffix):
+	# appendLinesTabularFile(createIfNotExist=True) found the file missing, formatted the rows for a file it would
+	# create with the header, and passed no header to write; another process made the file, empty, before
+	# _verifyFileExistence looked, so the rows went into it with no header (haiku create-race): the first one was
+	# then read as the header.
+	p = str(tmp_path / ('race.' + suffix))
+	real = TSVZ._verifyFileExistence
+
+	def made(fileName, *args, **kwargs):
+		open(fileName, 'wb').close()  # another process makes the file, empty
+		return real(fileName, *args, **kwargs)
+
+	monkeypatch.setattr(TSVZ, '_verifyFileExistence', made)
+	TSVZ.appendLinesTabularFile(p, [['a', '1']], header='key\tval', createIfNotExist=True)
+	monkeypatch.undo()
+	assert _text(p) == b'key\tval\na\t1\n'
+	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == {'a': ['a', '1']}

@@ -1924,12 +1924,13 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter = delimiter,errors = errors):
 		return
 	headerLine = None
-	if formatted is None and any(header):
-		# An existing empty file gets the header first, as one created here does (_appendOpen, which encodes it only
-		# then: a header that cannot be encoded refuses only an append that writes it, before anything is written).
-		# Its rows are formatted as for a file that begins with it.
+	if any(header):
+		# An existing empty file gets the header first, as one created here does (_appendOpen, which looks under the
+		# file lock and encodes it only then: a header that cannot be encoded refuses only an append that writes it,
+		# before anything is written). Also when the file was missing above: another process may have made it, empty,
+		# before _verifyFileExistence looked. Its rows are formatted as for a file that begins with it.
 		headerLine = functools.partial(_encodeRow, _sanitize(header,delimiter=delimiter), delimiter, encoding, errors, what='header')
-		if _fileHoldsNothing(fileName):
+		if formatted is None and _fileHoldsNothing(fileName):
 			formatted = _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding,
 											 strict, delimiter, errors, rows, assume=header)
 	payload, count = formatted or _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose,
