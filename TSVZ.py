@@ -5404,6 +5404,11 @@ memoryOnly:{self.memoryOnly}
 			# Another file now: another process replaced it (renamed one over it, removed it and made it again), even
 			# if what it holds begins with the damage. Not appended to.
 			found = None
+		elif noted is not None and at == noted:
+			# The same file, as large and last changed when the damage was noted: nothing to read and hash again (a
+			# rewrite that keeps failing tried every time). Any change of its size or times reads it: the digest
+			# decides then.
+			found = (b'', self._damage)
 		else:
 			found = _bytesAfter(file, size, digest)
 		if found is None:

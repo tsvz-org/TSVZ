@@ -9162,3 +9162,26 @@ def test_tsvzed_legacy_rewrite_in_place_that_begins_with_the_damage_is_merged_as
 	assert t.rewrite()
 	assert 'Overwriting external changes' not in capsys.readouterr().out
 	assert dict(t) == dict(rows, other=['other', 'X']) and _back(p) == dict(t)
+
+
+def test_tsvzed_legacy_rewrite_that_keeps_failing_does_not_read_an_unchanged_damage_again(tmp_path, monkeypatch):
+	# Every rewrite tried while the file was damaged read and hashed the whole damaged prefix first, also when
+	# nothing had changed it since the damage was noted. Its size and times are compared first now.
+	p = str(tmp_path / 'again.tsv')
+	t = _stopped(p)
+	rows = _many(t, 50)
+	reads = []
+	real = TSVZ._bytesAfter
+	monkeypatch.setattr(TSVZ, '_bytesAfter', lambda *args: reads.append(1) or real(*args))
+	real_codec, real_inplace = TSVZ._codecWriter, TSVZ.TSVZed._writeInPlace
+	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
+	t.hardMapToFile()  # fails: the damage is noted
+	t.hardMapToFile()  # fails again: the file is as the damage left it
+	assert reads == [], 'an unchanged damage was read again'
+	_append_external(p, b'ext\tB\n')  # another process: the file changed
+	t.hardMapToFile()
+	assert reads == [1] and t['ext'] == ['ext', 'B']
+	monkeypatch.setattr(TSVZ, '_codecWriter', real_codec)
+	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', real_inplace)
+	assert t.rewrite()
+	assert dict(t) == dict(rows, ext=['ext', 'B']) and _back(p) == dict(t)
