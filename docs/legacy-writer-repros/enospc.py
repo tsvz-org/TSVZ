@@ -5,17 +5,18 @@ p = 'enospc.tsv'
 if os.path.exists(p): os.remove(p)
 t = TSVZ.TSVZed(p, header='key\tv', append_check_delay=0.01, rewrite_on_load=False)
 time.sleep(0.1)
-real = TSVZ._endsWithoutNewline
+hook = '_appendOpen' if hasattr(TSVZ, '_appendOpen') else '_endsWithoutNewline'  # the branch's append, or main's look at the file
+real = getattr(TSVZ, hook)
 n = [0]
-def full(f):
+def full(*args, **kwargs):
     if n[0] == 0:
         n[0] += 1
         raise OSError(errno.ENOSPC, 'No space left on device')  # the disk was full for a moment
-    return real(f)
-TSVZ._endsWithoutNewline = full
+    return real(*args, **kwargs)
+setattr(TSVZ, hook, full)
 t['new'] = ['new', '1']
 time.sleep(0.5)
-TSVZ._endsWithoutNewline = real
+setattr(TSVZ, hook, real)
 print('queue:', list(t.appendQueue), 'dirty:', t.dirty, 'deSynced:', t.deSynced, 'memory:', dict(t))
 t.close()
 print('file after close:', open(p,'rb').read())

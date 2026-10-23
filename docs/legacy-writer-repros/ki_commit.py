@@ -8,15 +8,16 @@ t = TSVZ.TSVZed(p, header='key\tv', append_check_delay=100, rewrite_on_load=Fals
 time.sleep(0.2)
 t['a'] = ['a', '1']
 if which == 'commit':
-    real = TSVZ._endsWithoutNewline
-    def boom(f):
+    hook = '_appendOpen' if hasattr(TSVZ, '_appendOpen') else '_endsWithoutNewline'  # the branch's append, or main's look at the file
+    real = getattr(TSVZ, hook)
+    def boom(*args, **kwargs):
         raise KeyboardInterrupt
-    TSVZ._endsWithoutNewline = boom
+    setattr(TSVZ, hook, boom)
     try:
         t.commitAppendToFile()
     except KeyboardInterrupt:
         print('KI out of commitAppendToFile')
-    TSVZ._endsWithoutNewline = real
+    setattr(TSVZ, hook, real)
 else:
     realfsync = os.fsync
     def fs(fd):

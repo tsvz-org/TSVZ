@@ -24,14 +24,19 @@ opinion's, 15 and 12.
    only `Exception`. A Ctrl-C between `get_file_obj` and the final release leaves `writeLock`
    held, and the rows already popped from the queue are lost. The next `close()` hangs.
    Script: `ki_commit.py DIR commit` (interrupt before the write) and `ki_commit.py DIR release`
-   (interrupt in the fsync). Main and branch: `writeLock held after KI: True | queue: []`,
-   `could take writeLock: False`.
+   (interrupt in the fsync). Main: `writeLock held after KI: True | queue: []`,
+   `could take writeLock: False`. Branch: the rows are no longer lost (they leave the queue only
+   once on disk, see item 2: `queue: [['a', '1']]`), but writeLock is still held for good.
 
 2. **A failed append loses the rows it popped.** `commitAppendToFile` pops rows before it writes
    and never puts them back when the write fails. Only a failed open keeps them. The .tsvz path
    (`_specCommitLocked`) puts them back with `extendleft(reversed(items))`.
-   Script: `enospc.py DIR` (one ENOSPC). Main and branch: `queue: []`, memory still has `new`,
+   Script: `enospc.py DIR` (one ENOSPC). Main: `queue: []`, memory still has `new`,
    and the file after close is only the header.
+   **Fixed on the branch** (the review of ee041a6 found that an append cut short on a file a
+   failed rewrite damaged was then merged back over memory): the rows leave the queue only once
+   written and synced, and a write that fails is cut off again. Branch: the background writer's
+   next try writes the row (`queue: []`), and the file after close is `b'key\tv\nnew\t1\n'`.
 
 3. **release_file_obj can release a writeLock that another thread acquired.** Its except path
    releases `writeLock`, then `if self.writeLock.locked(): release()` releases it again if
@@ -45,8 +50,11 @@ opinion's, 15 and 12.
    write nothing: a .bz2 or .xz append is written whole after the unlock (500 rows: 0 of 1047
    bytes on disk at the unlock for .bz2, 0 of 712 for .xz, 1698 of 1708 for .gz). Another
    writer that appends in that window corrupts the stream.
-   Script: `gzrace.py DIR`. Main and branch: `gzip read fails ... invalid block type`, and
+   Script: `gzrace.py DIR`. Main: `gzip read fails ... invalid block type`, and
    `readTabularFile: {}`.
+   **Fixed on the branch** for appends too: every legacy append writes its rows as whole members
+   (or frames) with os.write, under the file lock, before it unlocks (one helper, `_appendOpen`).
+   Branch: `decompressed: b'key\tv\na\t1\nother\tX\n'`.
    Rewrites had this too, and wider: every .bz2 or .xz rewrite (hardMapToFile, clear) was written
    after the unlock (2000 rows: 0 of 4700 bytes on disk at the unlock for .bz2, 0 of 1808 for
    .xz, 8052 of 8062 for .gz; the same on main). The branch now closes a rewrite's codec writer,
