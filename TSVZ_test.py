@@ -7197,11 +7197,15 @@ def _append_external(p, line=b'ext\tB\n'):
 
 
 def _append_late(p, suffix, line):
-	"""Another process appends ``line`` (one of its codec's members), with the header first to a file left empty, as a
-	file it makes again begins: rows a failed rewrite's empty damage is followed by begin with a header (_mergeChange)."""
-	if os.path.getsize(p) == 0:
-		line = b'key\tval\n' + line
-	_append_external(p, _compressedAs(suffix, line))
+	"""Another process, a TSVZed of the same store, sets the row ``line`` (b'key\\tvalue\\n') and appends it as a
+	TSVZed appends (commitAppendToFile): in its codec, and with the header first to a file a failed rewrite left
+	empty, as an append to an empty file writes it."""
+	key, _, value = line.rstrip(b'\n').decode().partition('\t')
+	other = _stopped(p, verbose=False)
+	other[key] = [key, value]
+	other.commitAppendToFile()
+	assert not other.appendQueue
+	other.close()
 
 
 def test_tsvzed_legacy_append_notes_the_time_before_it_unlocks_the_file(tmp_path, monkeypatch):
@@ -8773,3 +8777,86 @@ def test_tsvzed_legacy_row_changed_in_place_between_the_check_and_the_write_is_l
 	expected = dict(rows)
 	del expected['k2']
 	assert _back(p) == expected and t.dirty and not t.deSynced
+
+
+# --- seventh review round: an append to an empty file, the background writer, a flat snapshot ----------
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
+def test_tsvzed_legacy_append_to_an_empty_file_writes_the_header_first(tmp_path, suffix):
+	# A rewrite cut short before its first byte (a full disk, a Ctrl-C) leaves the file empty. Another process's
+	# TSVZed appended its rows there with no header: its own reload took the first one for the header (a mismatch,
+	# the row lost), and the store whose rewrite failed overwrote them, with a warning. Main 1688d25 appended the
+	# same. An append to an empty file now writes the header first, as creating the file does.
+	p = str(tmp_path / ('empty.' + suffix))
+	t = _stopped(p)
+	rows = _many(t, 5)
+	real = TSVZ._codecWriter
+
+	def full(*args, **kwargs):  # right after the truncate, before the first byte
+		import errno
+		raise OSError(errno.ENOSPC, 'No space left on device')
+
+	TSVZ._codecWriter = full
+	try:
+		t.hardMapToFile()
+	finally:
+		TSVZ._codecWriter = real
+	assert os.path.getsize(p) == 0 and t._damage[0] == 0
+	other = _stopped(p, verbose=False)  # another process's TSVZed on the store
+	other['fromB'] = ['fromB', 'B']
+	other.commitAppendToFile()
+	assert _back(p) == {'fromB': ['fromB', 'B']}  # the header first: the row is a row
+	other.reload()
+	assert dict(other) == {'fromB': ['fromB', 'B']}
+	other.close()
+	assert t.rewrite()
+	assert dict(t) == dict(rows, fromB=['fromB', 'B']) and _back(p) == dict(t)
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
+@pytest.mark.parametrize('strict', [True, False])
+def test_append_tabular_file_to_an_empty_file_writes_the_header_first(tmp_path, suffix, strict):
+	# appendTabularFile refused an empty file with a header (strict: 'Header mismatch'), or appended the row with
+	# no header (not strict), where a read then took it for the header, as on main 1688d25.
+	p = str(tmp_path / ('empty.' + suffix))
+	open(p, 'wb').close()
+	TSVZ.appendTabularFile(p, ['a', '1'], header='key\tval', strict=strict)
+	TSVZ.appendLinesTabularFile(p, [['b', '2']], header='key\tval', strict=strict)
+	assert TSVZ.readTabularFile(p, header='key\tval', strict=True, verbose=False) == {'a': ['a', '1'], 'b': ['b', '2']}
+	if suffix == 'tsv':
+		assert _bytes(p) == b'key\tval\na\t1\nb\t2\n'
+	q = str(tmp_path / ('none.' + suffix))
+	open(q, 'wb').close()
+	TSVZ.appendTabularFile(q, ['c', '3'], header='', strict=strict)  # no header to write
+	assert TSVZ.readTabularFile(q, header='', verbose=False) == {'c': ['c', '3']}
+
+
+def test_append_tabular_file_to_an_empty_file_refuses_a_header_it_cannot_write(tmp_path):
+	p = str(tmp_path / 'empty.tsv')
+	open(p, 'wb').close()
+	with pytest.raises(TSVZ.TSVZEncodeError):
+		TSVZ.appendTabularFile(p, ['a', '1'], header='key\tv\udcff', strict=False)
+	assert _bytes(p) == b''
+	q = str(tmp_path / 'full.tsv')
+	with open(q, 'wb') as g:
+		g.write(b'key\tv\xff\nx\t1\n')
+	TSVZ.appendTabularFile(q, ['a', '1'], header='key\tv\udcff', strict=False)  # the header is only compared here
+	assert _bytes(q).endswith(b'\na\t1\n')
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzedlite_append_to_an_empty_file_writes_the_header_first(tmp_path, suffix):
+	p = str(tmp_path / ('lite.' + suffix))
+	open(p, 'wb').close()
+	lite = TSVZ.TSVZedLite(p, header='key\tval', strict=False)
+	lite['a'] = ['a', '1']
+	assert lite['a'] == ['a', '1']
+	lite.close()
+	assert TSVZ.readTabularFile(p, header='key\tval', strict=True, verbose=False) == {'a': ['a', '1']}
+	lite = TSVZ.TSVZedLite(p, header='key\tval')
+	assert dict(lite) == {'a': ['a', '1']}
+	lite.clear_file()  # its own header once, as before
+	lite['b'] = ['b', '2']
+	lite.close()
+	assert TSVZ.readTabularFile(p, header='key\tval', strict=True, verbose=False) == {'b': ['b', '2']}
+	if suffix == 'tsv':
+		assert _bytes(p) == b'key\tval\nb\t2\n'
