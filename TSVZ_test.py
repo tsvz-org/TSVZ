@@ -1151,12 +1151,13 @@ GZ_CORRUPT = b'\x1f\x8b\x08\x00' + b'\xff' * 40  # a gzip header, then nothing t
 def test_spec_scrub_keeps_the_bytes_of_a_damaged_compressed_part(tmp_path, capsys):
 	# A scrub compacts what can be read; the damaged original is kept as <part>.damaged-<time>, as an append does.
 	p = str(tmp_path / 'm.tsvz.gz')
-	_touch(p, gzip.compress(b'a\t1\n') + GZ_CORRUPT)
+	original = gzip.compress(b'a\t1\n') + GZ_CORRUPT  # made once: a member's header holds the second it was made in
+	_touch(p, original)
 	TSVZ.scrubTabularFile(p)
 	backups = [name for name in os.listdir(str(tmp_path)) if name.startswith('m.tsvz.gz.damaged-')]
 	assert len(backups) == 1 and 'damaged' in capsys.readouterr().err
 	with open(str(tmp_path / backups[0]), 'rb') as f:
-		assert f.read() == gzip.compress(b'a\t1\n') + GZ_CORRUPT
+		assert f.read() == original
 	with open(p, 'rb') as f:
 		assert gzip.decompress(f.read()).splitlines()[-1] == b'a\t1'
 
