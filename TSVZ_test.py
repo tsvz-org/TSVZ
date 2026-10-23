@@ -1481,31 +1481,27 @@ def test_spec_reading_many_small_members_reads_the_part_once(tmp_path, monkeypat
 
 
 def _tear_first_append(monkeypatch, path):
-	"""Make the next append to ``path`` write half its bytes and then fail, as a full disk would."""
+	"""Make the next append to ``path`` write half its bytes and then fail, as a full disk would (appends write
+	with os.write, on the descriptor of a file they open)."""
 	torn = []
+	fds = set()
 	real_open = open
-
-	class Tearing(object):
-		def __init__(self, f):
-			self._f = f
-		def write(self, data):
-			if not torn:
-				torn.append(len(data))
-				self._f.write(data[:len(data) // 2])
-				self._f.flush()
-				raise OSError(28, 'No space left on device')
-			return self._f.write(data)
-		def __getattr__(self, name):
-			return getattr(self._f, name)
-		def __enter__(self):
-			return self
-		def __exit__(self, *exc):
-			self._f.close()
+	real_write = os.write
 
 	def opener(name, mode='r', *args, **kwargs):
 		f = real_open(name, mode, *args, **kwargs)
-		return Tearing(f) if name == path and 'a' in mode else f
+		if name == path and 'a' in mode:
+			fds.add(f.fileno())
+		return f
+
+	def write(fd, data):
+		if fd in fds and not torn:
+			torn.append(len(data))
+			real_write(fd, bytes(data)[:len(data) // 2])
+			raise OSError(28, 'No space left on device')
+		return real_write(fd, data)
 	monkeypatch.setattr(TSVZ, 'open', opener, raising=False)
+	monkeypatch.setattr(TSVZ.os, 'write', write)
 	return torn
 
 
@@ -6838,7 +6834,7 @@ def test_tsvzed_legacy_append_that_cannot_open_the_file_keeps_the_rows_queued(tm
 	p = str(tmp_path / 'q.tsv')
 	t = _stopped(p)
 	t['b'] = ['b', '1']
-	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', lambda *a, **k: (_ for _ in ()).throw(PermissionError(13, 'Permission denied')))
+	monkeypatch.setattr(TSVZ, 'open', lambda *a, **k: (_ for _ in ()).throw(PermissionError(13, 'Permission denied')), raising=False)
 	t.commitAppendToFile()
 	monkeypatch.undo()
 	out = capsys.readouterr().out
@@ -6866,16 +6862,16 @@ def test_tsvzed_legacy_append_that_keeps_failing_is_reported_once_and_retried_le
 	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001, teeLogger=log)
 	t['a'] = ['a', '1']
 	t.commitAppendToFile()
-	real = TSVZ.openFileAsCompressed
+	real = open
 	opens = []
 
-	def denying(fileName, mode='rb', *args, **kwargs):
-		if mode != 'rb':
+	def denying(fileName, mode='r', *args, **kwargs):  # the append opens the file itself ('a+b')
+		if 'a' in mode:
 			opens.append(mode)
 			raise PermissionError(13, 'Permission denied')
 		return real(fileName, mode, *args, **kwargs)
 
-	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', denying)
+	monkeypatch.setattr(TSVZ, 'open', denying, raising=False)
 	t['b'] = ['b', '1']
 	time.sleep(0.5)  # some 400 ticks of the background writer
 	monkeypatch.undo()
@@ -6884,7 +6880,7 @@ def test_tsvzed_legacy_append_that_keeps_failing_is_reported_once_and_retried_le
 	assert list(t.appendQueue) == [['b', '1']]
 	t.commitAppendToFile()  # an explicit call does not wait
 	assert _bytes(p) == b'key\tval\na\t1\nb\t1\n'
-	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', denying)
+	monkeypatch.setattr(TSVZ, 'open', denying, raising=False)
 	t['c'] = ['c', '1']
 	t.commitAppendToFile()
 	monkeypatch.undo()
@@ -9223,3 +9219,83 @@ def test_tsvzed_legacy_release_interrupted_reads_the_damage_once_at_most(tmp_pat
 		if not hit:
 			break
 	assert n > 10, n
+
+
+# --- eighth review round: one append helper, rows kept queued until written, member-by-member merge -------
+def _text(p):
+	"""What the file ``p`` holds, decoded through its codec."""
+	with TSVZ.openFileAsCompressed(p, mode='rb') as f:
+		return f.read()
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES[1:])
+def test_append_to_an_empty_compressed_file_looks_and_writes_under_the_file_lock(tmp_path, suffix):
+	# appendLinesTabularFile looked at a compressed file's size and wrote the header with no lock (main 1688d25
+	# took none either), so two writers could both find it empty and both write the header: the second one was
+	# read as a row. The look and the write now hold the path's lock and the file lock, as an uncompressed one did.
+	p = str(tmp_path / ('race.' + suffix))
+	open(p, 'wb').close()
+	name = '_holdsNothing' if hasattr(TSVZ, '_holdsNothing') else '_isEmptyFile'
+	real = getattr(TSVZ, name)
+	others = []
+
+	def looking(*args, **kwargs):
+		empty = real(*args, **kwargs)
+		if not others:  # another writer appends while this one has looked and not yet written
+			other = threading.Thread(target=TSVZ.appendTabularFile, args=(p, ['b', '2']), kwargs={'header': 'key\tval'})
+			others.append(other)
+			other.start()
+			other.join(0.5)
+		return empty
+
+	try:
+		setattr(TSVZ, name, looking)
+		TSVZ.appendTabularFile(p, ['a', '1'], header='key\tval')
+		others[0].join(5)
+	finally:
+		setattr(TSVZ, name, real)
+	assert _text(p).count(b'key\tval\n') == 1, _text(p)
+	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == {'a': ['a', '1'], 'b': ['b', '2']}
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
+def test_append_of_a_store_with_no_header_to_an_empty_file_writes_no_blank_line(tmp_path, suffix):
+	# TSVZed.commitAppendToFile and TSVZedLite tested self.header, which is [''] (true) for a store with no header,
+	# and wrote a blank first line to an empty file; appendLinesTabularFile tested any(header). One rule now.
+	p = str(tmp_path / ('bare.' + suffix))
+	open(p, 'wb').close()
+	t = _stopped(p, header='')
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	t.close()
+	assert _text(p) == b'a\t1\n'
+	q = str(tmp_path / ('lite.' + suffix))
+	open(q, 'wb').close()
+	lite = TSVZ.TSVZedLite(q, header='')
+	lite['a'] = ['a', '1']
+	lite.close()
+	assert _text(q) == b'a\t1\n'
+
+
+def test_tsvzedlite_encodes_its_header_only_to_write_it(tmp_path, monkeypatch):
+	# TSVZedLite sanitized and encoded its header at every write, although only an empty file is written one.
+	p = str(tmp_path / 'lite.tsv')
+	lite = TSVZ.TSVZedLite(p, header='key\tval')
+	real = TSVZ._encodeRow
+	headers = []
+
+	def encode(*args, **kwargs):
+		if kwargs.get('what') == 'header':
+			headers.append(args)
+		return real(*args, **kwargs)
+
+	monkeypatch.setattr(TSVZ, '_encodeRow', encode)
+	for i in range(20):
+		lite['k%d' % i] = ['k%d' % i, 'v']
+	del lite['k0']
+	assert headers == []
+	lite.fileObj.truncate(0)  # emptied by another hand: the next write puts the header first
+	lite['z'] = ['z', '1']
+	assert len(headers) == 1
+	lite.close()
+	assert _bytes(p) == b'key\tval\nz\t1\n'

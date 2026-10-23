@@ -1136,72 +1136,87 @@ def _lastNewlineEnd(f, size):
 	return 0
 
 
-def _isEmptyFile(f):
-	"""True when the open file ``f`` (or the file under a codec's writer over it) holds no byte on disk.
+def _holdsNothing(f, codec, size):
+	"""True when the open binary file ``f``, ``size`` bytes long, holds no line."""
+	return not size
 
-	A codec's writer may hold its stream's header in its buffer, never more than that before its first write:
-	what is on disk is what was there.
+
+def _appendOpen(f, payload, codec=None, header=None, tailPolicy='newline', reporter=None, fsync=False, memberSize=None):
+	"""Append ``payload`` (whole lines, each ending in b'\\n') to the open file ``f``: the one write of every append
+	to a legacy file (and of _lockedAppend's to a spec part). Returns the offset in ``f`` where the payload's first
+	line begins (for a compressed file, where what was written begins).
+
+	``f`` is binary, readable and seekable, opened at its raw level ('a+b' or 'r+b', never through a codec) and
+	held by the caller: locked (_lockedAppend, TSVZed.commitAppendToFile) or, for TSVZedLite, which never locks a
+	legacy file, owned alone. What is written depends on what the file holds:
+
+	- nothing (no byte): ``header`` first, when it is not None: a legacy store's header line without its newline,
+	  or a function that makes it, called only then (a header that cannot be encoded refuses only an append that
+	  would write it). An append to an empty file writes the header first, as creating the file does: a file a
+	  rewrite cut short (a full disk, a KeyboardInterrupt) or another process emptied is left empty, and rows
+	  there with no header would read with the first one taken for the header (a mismatch, the row lost);
+	- else, for a file that is not compressed, a last line with no b'\\n' is terminated first (``tailPolicy``
+	  'newline': to a legacy reader it is a record) or cut off ('truncate': spec, those bytes were never
+	  committed, spec §4.3), noted on ``reporter``; a compressed file's last line is not looked at.
+
+	For a ``codec`` the bytes are compressed as whole members (_compressBytes; ``memberSize``): no codec writer is
+	made, whose close would write a member of its own. They are written with os.write, past any buffer of ``f``
+	(nothing is left in one for a close to write later), and synced with ``fsync``. An error raises; one in the
+	write first cuts off again what it wrote of them, so an append cut short (a full disk) leaves no torn row for
+	a reader, or a merge, to take for a row (a failed sync leaves what was all written).
 	"""
-	try:
-		return os.fstat(f.fileno()).st_size == 0
-	except (AttributeError, OSError, ValueError):
-		name = getattr(f, 'name', None)
-		return isinstance(name, str) and os.path.getsize(name) == 0
-
-
-def _appendHeader(header, payload, empty):
-	"""``payload`` an append of a legacy store writes, with its ``header`` line (bytes, or None for none) first when
-	the file it goes to is ``empty``: an append to an empty file writes the header first, as creating the file does.
-
-	A file a rewrite cut short (a full disk, a KeyboardInterrupt) or another process emptied is left empty: rows
-	appended there with no header would read with the first one taken for the header (a mismatch, and the row
-	lost), and the store that left it so merges another process's rows there only after its header
-	(TSVZed._mergeChange). Readers of main 1688d25 read the header and the rows as they read a file created so.
-	"""
-	return header + b'\n' + payload if header is not None and empty else payload
-
-
-def _endsWithoutNewline(f):
-	"""True when the readable binary file ``f`` is non-empty and does not end in b'\\n'."""
+	f.flush()
 	size = f.seek(0, os.SEEK_END)
-	if not size:
-		return False
-	f.seek(size - 1)
-	return f.read(1) != b'\n'
+	prefix = b''
+	if header is not None and _holdsNothing(f, codec, size):
+		prefix = (header() if callable(header) else header) + b'\n'
+	elif size and not codec:
+		f.seek(size - 1)
+		if f.read(1) != b'\n':
+			if tailPolicy == 'newline':
+				prefix = b'\n'
+				if reporter is not None:
+					reporter.note('missing-newline', None, 'last line had no trailing newline; added one before appending')
+			else:
+				keep = _lastNewlineEnd(f, size)
+				f.seek(keep)
+				tail = f.read(size - keep)
+				f.truncate(keep)
+				if reporter is not None:
+					reporter.note('truncated-tail', None, 'removed uncommitted tail {!r} before appending'.format(tail[:80]))
+	data = prefix + payload
+	if codec:
+		data = _compressBytes(codec, data, memberSize=memberSize)
+	fd = f.fileno()
+	start = f.seek(0, os.SEEK_END)
+	try:
+		try:
+			view = memoryview(data)
+			while view:
+				view = view[os.write(fd, view):]
+		except BaseException:
+			try:
+				if os.fstat(fd).st_size <= start + len(data):  # only its own bytes: nothing written after them
+					os.ftruncate(fd, start)
+			except Exception:
+				pass  # the error raised says the append failed
+			raise
+		if fsync:
+			os.fsync(fd)  # all of it was written, and is read: a sync that fails leaves it
+	finally:
+		f.seek(0, os.SEEK_END)  # the offset ``f`` keeps is the file's again
+	return start if codec else start + len(prefix)
 
 
-def _lockedAppend(path, payload, tailPolicy, reporter, fsync=False, header=None):
-	"""Append ``payload`` (whole records ending in b'\\n') to an uncompressed file.
-
-	The file is opened ``O_APPEND`` and locked (``_pathLock`` + ``lockf``). An
-	unterminated last line is handled per ``tailPolicy``: ``'newline'`` writes
-	b'\\n' first (legacy dialect: that line is a record), ``'truncate'`` cuts it
-	off (spec dialect: those bytes were never committed, spec §4.3). Either
-	repair is noted on ``reporter``. A missing file is created. ``header`` (a
-	legacy store's header line, without its newline) is written first to a file
-	that is empty once locked, as creating it writes it (_appendHeader).
-	"""
+def _lockedAppend(path, payload, tailPolicy, reporter, fsync=False, header=None, codec=None, memberSize=None):
+	"""Append ``payload`` (whole records ending in b'\\n') to the file ``path`` (_appendOpen), compressed in
+	``codec`` when given, under its locks: ``_pathLock`` and the file lock (``_lockFile``), so that no other writer
+	that takes them writes between the look at what the file holds and the write. A missing file is created."""
 	with _pathLock(path):
 		with open(path, 'a+b') as f:
 			_lockFile(f)
 			try:
-				if header is not None and _isEmptyFile(f):
-					payload = _appendHeader(header, payload, True)
-				elif _endsWithoutNewline(f):
-					size = f.seek(0, os.SEEK_END)
-					if tailPolicy == 'newline':
-						payload = b'\n' + payload
-						reporter.note('missing-newline', None, 'last line had no trailing newline; added one before appending')
-					else:
-						keep = _lastNewlineEnd(f, size)
-						f.seek(keep)
-						tail = f.read(size - keep)
-						f.truncate(keep)
-						reporter.note('truncated-tail', None, 'removed uncommitted tail {!r} before appending'.format(tail[:80]))
-				f.write(payload)
-				f.flush()
-				if fsync:
-					os.fsync(f.fileno())
+				_appendOpen(f, payload, codec, header, tailPolicy, reporter, fsync, memberSize)
 			finally:
 				_unlockFile(f)
 
@@ -1861,39 +1876,35 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 										 strict, delimiter, errors, rows, assume=header)
 	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter = delimiter,errors = errors):
 		return
-	headerBytes = None
+	headerLine = None
 	if formatted is None and any(header):
-		# An existing empty file gets the header first, as one created here does (_appendHeader): its rows are
-		# formatted as for a file that begins with it.
-		empty = os.path.getsize(fileName) == 0
-		try:
-			headerBytes = _encodeRow(_sanitize(header,delimiter=delimiter), delimiter, encoding, errors, what='header')
-		except TSVZEncodeError:
-			if empty:
-				raise  # nothing is written
-		if empty:
+		# An existing empty file gets the header first, as one created here does (_appendOpen, which encodes it only
+		# then: a header that cannot be encoded refuses only an append that writes it, before anything is written).
+		# Its rows are formatted as for a file that begins with it.
+		headerLine = functools.partial(_encodeRow, _sanitize(header,delimiter=delimiter), delimiter, encoding, errors, what='header')
+		if os.path.getsize(fileName) == 0:
 			formatted = _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding,
 											 strict, delimiter, errors, rows, assume=header)
 	payload, count = formatted or _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose,
 													   encoding, strict, delimiter, errors, rows)
-	_legacyWritePayload(fileName, payload, count, teeLogger, verbose, encoding, headerBytes)
+	_legacyWritePayload(fileName, payload, count, teeLogger, verbose, encoding, headerLine)
 
 
 def _legacyWritePayload(fileName, payload, count, teeLogger, verbose, encoding, header=None):
 	"""Append the ``payload`` of ``count`` rows to the existing file (all of it, or nothing), after ``header`` (the
-	header line, None for none) when the file is empty (_appendHeader)."""
+	header line or a function that makes it, None for none) when the file is empty (_appendOpen)."""
 	if not count:
 		if verbose:
 			__teePrintOrNot(f"No lines to append to {fileName}",teeLogger=teeLogger)
 		return
-	if _isCompressedFile(fileName):
-		with openFileAsCompressed(fileName, mode ='ab',encoding=encoding,teeLogger=teeLogger) as file:
-			file.write(_appendHeader(header, payload, header is not None and _isEmptyFile(file)))
-	else:
-		# L1: a last line without '\n' is a record to the 3.39 reader; terminate it
-		# instead of gluing the new record onto it.
-		reporter = _Reporter(fileName, teeLogger)
-		_lockedAppend(fileName, payload, 'newline', reporter, header=header)
+	codec = _fileCodec(fileName)
+	_requireCodec(codec)
+	# L1: a last line without '\n' is a record to the 3.39 reader; terminate it
+	# instead of gluing the new record onto it. Compressed or not, under the file's locks.
+	reporter = _Reporter(fileName, teeLogger)
+	try:
+		_lockedAppend(fileName, payload, 'newline', reporter, header=header, codec=codec)
+	finally:
 		reporter.flush()
 	if verbose:
 		__teePrintOrNot(f"Appended {count} lines to {fileName}",teeLogger=teeLogger)
@@ -3487,20 +3498,8 @@ def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None):
 	member (spec §16.6). A missing part is created.
 	"""
 	codec = _parsePartName(path).codec
-	if not codec:
-		_lockedAppend(path, payload, 'truncate', reporter, fsync=fsync)
-		return
 	_requireCodec(codec)
-	with _pathLock(path):
-		with open(path, 'ab') as f:
-			_lockFile(f)
-			try:
-				f.write(_compressBytes(codec, payload, memberSize=memberSize))
-				f.flush()
-				if fsync:
-					os.fsync(f.fileno())
-			finally:
-				_unlockFile(f)
+	_lockedAppend(path, payload, 'truncate', reporter, fsync=fsync, codec=codec, memberSize=memberSize)
 
 
 #: Reads a scrub or clear makes before it gives up on a store that keeps changing.
@@ -5644,8 +5643,9 @@ memoryOnly:{self.memoryOnly}
 				if self.verbose:
 					self.__teePrintOrNot(f"Commiting {len(self.appendQueue)} records to {self._fileName}")
 					self.__teePrintOrNot(f"Before size of {self._fileName}: {os.path.getsize(self._fileName)}")
-				compressed = _isCompressedFile(self._fileName)
-				file = self.get_file_obj('ab' if compressed else 'a+b')
+				codec = _fileCodec(self._fileName)
+				_requireCodec(codec)
+				file = self.get_file_obj('a+b')  # the file itself, compressed or not: _appendOpen compresses
 				if file is None:
 					return self  # get_file_obj reported why; the rows stay queued for the next try
 				chunks = []
@@ -5662,15 +5662,13 @@ memoryOnly:{self.memoryOnly}
 				if not payload:
 					self.release_file_obj(file)
 					return self
-				if self.header and _isEmptyFile(file):
-					# An existing empty file (a rewrite cut short, of this object's or another's): the header first,
-					# as creating it writes it (_appendHeader).
-					payload = _appendHeader(self._headerLine(), payload, True)
-				elif not compressed and _endsWithoutNewline(file):
-					# L1: terminate a hand-edited last line instead of gluing onto it.
-					payload = b'\n' + payload
-					_warn(f'TSVZ warning: {self._fileName}: last line had no trailing newline; added one before appending', self.teeLogger)
-				file.write(payload)
+				# An existing empty file (a rewrite cut short, of this object's or another's) gets the header first, as
+				# creating it writes it; L1: a hand-edited last line is terminated instead of glued onto.
+				reporter = _Reporter(self._fileName, self.teeLogger)
+				try:
+					_appendOpen(file, payload, codec, self._headerLine if any(self.header) else None, 'newline', reporter)
+				finally:
+					reporter.flush()
 				self.release_file_obj(file)
 				self._worked('append')
 				if self.verbose:
@@ -5725,6 +5723,8 @@ memoryOnly:{self.memoryOnly}
 				# another writer that holds it, and for good when the lock then fails or is interrupted.
 				_requireCodec(_fileCodec(self._fileName))
 				file = _openUntruncated(self._fileName)
+			elif modes == 'a+b':
+				file = open(self._fileName, 'a+b')  # the file itself, also a compressed one (commitAppendToFile)
 			else:
 				file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding,teeLogger=self.teeLogger)
 			_lockFile(file)  # the whole file, on POSIX and Windows
@@ -5768,9 +5768,10 @@ memoryOnly:{self.memoryOnly}
 			file.flush()  # Ensure the file is flushed before unlocking
 			_fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
 			if not file.closed:
-				if not self._keepFileTime and not _isCompressedFile(self._fileName):
+				if not self._keepFileTime and (not _isCompressedFile(self._fileName) or isinstance(file, (io.BufferedRandom, io.BufferedWriter))):
 					# Noted while the file is still locked: another writer appending right after the unlock
-					# must not have its change taken for this one's (a compressed file is complete only once closed).
+					# must not have its change taken for this one's (written through a codec's writer, a compressed
+					# file is complete only once closed; commitAppendToFile writes whole members into the file itself).
 					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 					noted = True
 				_unlockFile(file)  # on POSIX and Windows
@@ -5915,7 +5916,8 @@ class TSVZedLite(MutableMapping):
 	- Does not support logging via teeLogger.
 	- Does not support move_to_end method.
 	- Does not support in-memory only mode. ( please just use a dict )
-	- Does not lock the file during operations (a .tsvz write takes the exclusive lock other writers take).
+	- Does not lock the file during operations (a .tsvz write takes the exclusive lock other writers take). Its
+	  appends to a legacy file, the header it writes first to an empty one among them, assume it is the only writer.
 	- Does not track last update times.
 	
 	However, it may be preferred in scenarios when:
@@ -6376,35 +6378,32 @@ class TSVZedLite(MutableMapping):
 
 	# Private methods for reading and writing values for TSVZedLite
 
+	def __headerLine(self):
+		"""The header line, encoded: made only when an append writes it to an empty file (_appendOpen); the
+		constructor checked it can be."""
+		return _encodeRow(_sanitize(self.header,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header')
+
 	def __writeValues(self,data,headerFirst=True):
 		# Encode first: a row that cannot be written must not even terminate the last line.
 		encoded = _encodeRow(_sanitize(data,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,self.header)
-		# An empty file gets the header first, as creating it writes it (_appendHeader); not for clear_file()'s own.
-		header = None
-		if headerFirst and self.header:
-			header = _encodeRow(_sanitize(self.header,delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header')
-		if self.fileObj is None:
-			with openFileAsCompressed(self._fileName, mode='ab', encoding=self.encoding) as f:
-				f.write(_appendHeader(header, encoded + b'\n', header is not None and _isEmptyFile(f)))
-			return list(data)
-		write_at = self.fileObj.seek(0, os.SEEK_END)
-		if not write_at and header is not None:
-			self.fileObj.write(header + b'\n')
-			write_at = self.fileObj.tell()
-		elif write_at:
-			self.fileObj.seek(write_at - 1)
-			if self.fileObj.read(1) != b'\n':
-				# L1: terminate a hand-edited last line instead of gluing onto it.
-				self.fileObj.seek(write_at)
-				self.fileObj.write(b'\n')
-				write_at += 1
-				_warn(f'TSVZ warning: {self._fileName}: last line had no trailing newline; added one before appending')
-			self.fileObj.seek(write_at)
+		# An empty file gets the header first, as creating it writes it; not for clear_file()'s own. L1: a
+		# hand-edited last line is terminated instead of glued onto. TSVZedLite does not lock a legacy file (see
+		# the class): it is the only writer, and another process's write between the look and the write is not
+		# excluded.
+		header = self.__headerLine if headerFirst and any(self.header) else None
+		reporter = _Reporter(self._fileName)
+		try:
+			if self.fileObj is None:
+				codec = _fileCodec(self._fileName)
+				_requireCodec(codec)
+				with open(self._fileName, 'a+b') as f:
+					_appendOpen(f, encoded + b'\n', codec, header, 'newline', reporter)
+				return list(data)
+			write_at = _appendOpen(self.fileObj, encoded + b'\n', None, header, 'newline', reporter)
+		finally:
+			reporter.flush()
 		if self.verbose:
-			eprint(f"Writing at position {write_at}")
-		bytes = self.fileObj.write(encoded + b'\n')
-		if self.verbose:
-			eprint(f"Wrote {bytes} bytes")
+			eprint(f"Wrote {len(encoded) + 1} bytes at position {write_at}")
 		return write_at
 
 	def _checkDelete(self, key):
@@ -7327,11 +7326,10 @@ class _ServeStore(object):
 			if self.spec:
 				_specAppendPayload(_storeParts(self.path)[1], payload, reporter, fsync=fsync,
 								   memberSize=getattr(getattr(self, 'state', None), 'memberSize', None))
-			elif _isCompressedFile(self.path):
-				with openFileAsCompressed(self.path, mode='ab', teeLogger=self.teeLogger) as f:
-					f.write(payload)
 			else:
-				_lockedAppend(self.path, payload, 'newline', reporter, fsync=fsync)
+				codec = _fileCodec(self.path)
+				_requireCodec(codec)
+				_lockedAppend(self.path, payload, 'newline', reporter, fsync=fsync, codec=codec)
 		finally:
 			reporter.flush()
 
