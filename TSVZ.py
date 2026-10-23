@@ -5397,32 +5397,33 @@ memoryOnly:{self.memoryOnly}
 			self._damage, self.externalFileUpdateTime = whole, seen
 			return False
 		reporter = _Reporter(self._fileName, self.teeLogger)
-		codec = _fileCodec(self._fileName)
-		if codec:
-			rest, error = _decompressedUpToDamage(codec, rest)
-			if error is not None:
-				reporter.note('damaged', None, 'compressed stream another process appended is damaged ({}: {}); merged up to '
-							  'the damage, and the rest is overwritten'.format(type(error).__name__, error))
-		if size == 0 and self.header and any(self.header) and self.verifyHeader:
-			# The damage left nothing (the file emptied, or removed): what another process wrote there begins with a
-			# header, as a read takes the first line of the file. Not after a damage that holds bytes: a row there
-			# that reads as the header is a row. A header that is not this store's: another store's file, not merged.
-			first, _, rest = rest.partition(b'\n')
-			line = first.decode(self.encoding or 'utf8', errors='replace')
-			if not _headerMatches(self.header, line, self.delimiter):
-				self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}: another process made it again "
-									 f"after a rewrite of this object's failed, with a first line that is not this store's "
-									 f"header ({line.rstrip()!r}); memory holds what the rewrite was writing",'warning')
-				return False
-		# What the rows are read with (the defaults that fill their empty cells, the column count) is what memory had
-		# when the first merge after this damage began: one stopped by a KeyboardInterrupt after it changed memory's
-		# defaults, and before it noted the damage, is made again from the same start, and ends the same.
-		base = self._mergeBase
-		if base is None or base[0] is not self._damage:
-			base = self._mergeBase = (self._damage, list(self.defaults), self.correctColumnNum)
-		defaults, columns = list(base[1]), base[2]
-		changes = _TSVZedMerge(self, columns, list(defaults))
-		try:
+		try:  # what it notes is reported however it ends (a refused header, an error, a KeyboardInterrupt)
+			codec = _fileCodec(self._fileName)
+			if codec:
+				rest, error = _decompressedUpToDamage(codec, rest)
+				if error is not None:
+					reporter.note('damaged', None, 'compressed stream another process appended is damaged ({}: {}); merged up to '
+								  'the damage, and the rest is overwritten'.format(type(error).__name__, error))
+			if size == 0 and self.header and any(self.header) and self.verifyHeader:
+				# The damage left nothing (the file emptied, or removed): what another process wrote there begins with a
+				# header, as a read takes the first line of the file. Not after a damage that holds bytes: a row there
+				# that reads as the header is a row. A header that is not this store's: another store's file, not merged.
+				first, _, rest = rest.partition(b'\n')
+				line = first.decode(self.encoding or 'utf8', errors='replace')
+				if not _headerMatches(self.header, line, self.delimiter):
+					reporter.flush()  # what was noted of the stream comes first
+					self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}: another process made it again "
+										 f"after a rewrite of this object's failed, with a first line that is not this store's "
+										 f"header ({line.rstrip()!r}); memory holds what the rewrite was writing",'warning')
+					return False
+			# What the rows are read with (the defaults that fill their empty cells, the column count) is what memory had
+			# when the first merge after this damage began: one stopped by a KeyboardInterrupt after it changed memory's
+			# defaults, and before it noted the damage, is made again from the same start, and ends the same.
+			base = self._mergeBase
+			if base is None or base[0] is not self._damage:
+				base = self._mergeBase = (self._damage, list(self.defaults), self.correctColumnNum)
+			defaults, columns = list(base[1]), base[2]
+			changes = _TSVZedMerge(self, columns, list(defaults))
 			_legacyReadLoop(io.BytesIO(rest), '', changes, columns, 0, self.strict, self.delimiter,
 							changes.defaults, False, self.encoding, reporter)
 		finally:

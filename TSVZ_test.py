@@ -9102,3 +9102,24 @@ def test_tsvzed_legacy_merge_interrupted_after_it_changed_the_defaults_fills_cel
 		if not hit:
 			break
 	assert n > 30, n
+
+
+def test_tsvzed_legacy_merge_refused_for_another_header_still_reports_a_damaged_stream(tmp_path, monkeypatch, capsys):
+	# The header check returned before the reporter was flushed: the 'compressed stream ... is damaged' note was lost.
+	p = str(tmp_path / 'noted.tsv.gz')
+	t = _stopped(p)
+	rows = _many(t, 5)
+	_failing_rewrite(monkeypatch)  # left empty
+	t.hardMapToFile()
+	monkeypatch.undo()
+	assert t._damage[0] == 0
+	import random
+	rng = random.Random(2)
+	theirs = b'id\tname\n' + b''.join(b'x%d\t%x\n' % (i, rng.getrandbits(64)) for i in range(20000))  # decoded in pieces
+	_append_external(p, TSVZ._compressBytes('gz', theirs) + b'\x1f\x8b\x08\x00 damaged member')
+	capsys.readouterr()
+	assert t.rewrite()
+	captured = capsys.readouterr()
+	assert 'compressed stream another process appended is damaged' in captured.err, captured
+	assert 'Overwriting external changes' in captured.out and "'id\\tname'" in captured.out, captured
+	assert dict(t) == rows and _back(p) == rows
