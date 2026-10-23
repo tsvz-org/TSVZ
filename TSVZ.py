@@ -12,6 +12,7 @@ extension) keep the exact TSVZ 3.39 format. ``.tsvz`` / ``.csvz`` / ``.nsvz``
 / ``.psvz`` files follow tsvz-spec-v1 (tsvz-spec-v1.md). Both use the same
 API: ``TSVZed``, ``TSVZedLite``, ``readTabularFile`` and friends.
 """
+import array
 import atexit
 import bisect
 import codecs
@@ -177,51 +178,78 @@ def _codecWriter(fileName, raw, compressLevel=1):
 	return _codecModule(codec).open(raw, 'wb', **_codecWriteOptions(codec, compressLevel))
 
 
-class _EncodedRows(object):
-	"""What a legacy rewrite writes after its header: the lines ``first`` (bytes), then each of ``rows`` (TSVZed's
-	rows, not copies) encoded as it is written, without its newline; '#'-prefixed keys are in-memory only
-	(comments / internal), never written.
+class _RewriteRows(object):
+	"""What a legacy rewrite writes after its header: the lines ``first`` (bytes), then the rows of a flat snapshot
+	of memory, each encoded as it is written, without its newline; '#'-prefixed keys are in-memory only (comments /
+	internal), never written.
 
-	check() encodes every row first, dropping each, and raises the TSVZEncodeError of one that cannot be written,
-	before anything is. It encodes the cells as they are, joined, and sanitizes (_sanitize) only a row that fails
-	so, for the error naming its cell: sanitizing replaces only characters every encoding has with ASCII tokens,
-	so it changes no row's fate, and the warnings it prints for a reserved token are printed once, by the write.
-	Under an ``errors`` handler that never raises, there is nothing to check. A row another thread changes in
-	place between the check and the write (a set replaces the row and queues it) so that it can no longer be
-	encoded is left out of the write and its error kept in ``refused``: the others are written, as an append
-	leaves such a row out (_writeRewrite reports it).
+	The snapshot is every row's cells in one list (``cells``) and each row's count in an array (``lengths``), made
+	from ``values`` (the rows, listed under _memLock; those of '#' keys left out) in one pass that takes each
+	row's cells once, so the two always agree: 8 bytes a cell and 4 a row, not the rows' bytes. check() encodes every row of it, dropping each,
+	and raises the TSVZEncodeError of one that cannot be written, before anything is: it encodes the cells as
+	they are, joined, and sanitizes (_sanitize) only a row that fails so, for the error naming its cell
+	(sanitizing replaces only characters every encoding has with ASCII tokens, so it changes no row's fate, and
+	the warnings it prints for a reserved token are printed once, by the write). Under an ``errors`` handler that
+	never raises, there is nothing to check.
+
+	The write encodes the same cells again, so it writes exactly what was checked: a row another thread changes
+	in place after the snapshot is written as it was then. It never meets a row it cannot encode and never leaves
+	one out (an in-place rewrite would write every later row a line early). Should it meet one all the same (an
+	``errors`` handler that changed its mind), it raises a RuntimeError: the rewrite fails, and is made again.
 	"""
 
-	def __init__(self, first, rows, delimiter, encoding, errors, header):
+	def __init__(self, first, values, delimiter, encoding, errors, header):
 		self.first = first
-		self.rows = rows
+		cells = []
+		lengths = array.array('I')
+		extend, append = cells.extend, lengths.append
+		for value in values:
+			if value and not str(value[0]).startswith('#'):
+				before = len(cells)
+				extend(value)
+				append(len(cells) - before)
+		self.cells = cells
+		self.lengths = lengths
 		self.encode = functools.partial(_encodeRow, delimiter=delimiter, encoding=encoding, errors=errors, header=header)
 		self.delimiter = delimiter
 		self.encoding = encoding or 'utf8'
 		self.errors = errors
-		self.refused = []
+
+	def _rows(self):
+		"""Each row of the snapshot, as a tuple or a list of its cells."""
+		cells, lengths = self.cells, self.lengths
+		if lengths and lengths.count(lengths[0]) == len(lengths):
+			return zip(*[iter(cells)] * lengths[0])  # every row as wide (the column count): cut in C
+		return self._slices()
+
+	def _slices(self):
+		cells = self.cells
+		start = 0
+		for count in self.lengths:
+			end = start + count
+			yield cells[start:end]
+			start = end
 
 	def check(self):
 		if not _mayRaise(self.errors):
 			return
 		encode, delimiter, encoding, errors = self.encode, self.delimiter, self.encoding, self.errors
-		for value in self.rows:
-			if value and not str(value[0]).startswith('#'):
-				try:
-					delimiter.join(value).encode(encoding, errors)
-				except (UnicodeEncodeError, TypeError):
-					encode(_sanitize(value,delimiter=delimiter))  # raises naming the cell, unless sanitizing it helped
+		for row in self._rows():
+			try:
+				delimiter.join(row).encode(encoding, errors)
+			except (UnicodeEncodeError, TypeError):
+				encode(_sanitize(row,delimiter=delimiter))  # raises naming the cell, unless sanitizing it helped
 
 	def __iter__(self):
 		for line in self.first:
 			yield line
 		encode, delimiter = self.encode, self.delimiter
-		for value in self.rows:
-			if value and not str(value[0]).startswith('#'):
-				try:
-					yield encode(_sanitize(value,delimiter=delimiter))
-				except TSVZEncodeError as e:
-					self.refused.append(e)
+		for row in self._rows():
+			try:
+				yield encode(_sanitize(row,delimiter=delimiter))
+			except TSVZEncodeError as e:
+				raise RuntimeError('a row the rewrite checked could not be encoded again ({}): the rewrite fails, '
+								   'and is made again'.format(e)) from None
 
 
 class _Discard(object):
@@ -5215,22 +5243,28 @@ memoryOnly:{self.memoryOnly}
 
 	def _snapshotForRewrite(self):
 		"""Check that all a rewrite writes can be written, and return ``(header, lines)``: the header line (None for
-		no header), and the defaults line and every row after it (_EncodedRows), as bytes without their newline.
+		no header), and the defaults line and every row after it (_RewriteRows), as bytes without their newline.
 
 		_writeRewrite calls it under ``writeLock``, before it opens the file: the background writer cannot append
 		a row after the rows were taken and before the file is cut (that row would be lost); a row set later is
-		appended after the rewrite. A ``TSVZEncodeError`` leaves the file untouched: every row is encoded here,
-		and dropped, and encoded again as it is written, a chunk at a time (_writeLines): what a rewrite holds
-		is the rows (references to them, not copies) and a chunk, not the whole store encoded.
+		appended after the rewrite. The rows and the defaults are listed under _memLock (no set or delete is half
+		done), and their cells copied into one flat snapshot, which is checked here and encoded again as it is
+		written, a chunk at a time (_writeLines): what a rewrite holds is the cells (references to them) and a
+		chunk, not the whole store encoded, and it writes exactly what it checked. A ``TSVZEncodeError`` leaves
+		the file untouched.
 		"""
 		delimiter, encoding, errors = self.delimiter, self.encoding, self.errors
 		header = self._headerLine()
+		with self._memLock:
+			values = list(self.values())
+			defaults = list(self.defaults)
 		first = []
-		if self.defaults and len(self.defaults) > 1:
+		if defaults and len(defaults) > 1:
 			# The defaults line comes right after the header, so it survives a
 			# full rewrite -- it is not a regular mapping key.
-			first.append(_encodeRow(_sanitize(list(self.defaults),delimiter=delimiter),delimiter,encoding,errors,what='defaults'))
-		rows = _EncodedRows(first, list(self.values()), delimiter, encoding, errors, self.header)
+			first.append(_encodeRow(_sanitize(defaults,delimiter=delimiter),delimiter,encoding,errors,what='defaults'))
+		rows = _RewriteRows(first, values, delimiter, encoding, errors, self.header)
+		del values  # the snapshot holds the cells
 		rows.check()
 		return header, rows
 
@@ -5260,7 +5294,6 @@ memoryOnly:{self.memoryOnly}
 		found nothing to keep (or the file was missing), never for a file another process's change was found in or
 		not yet looked at.
 		"""
-		lines = None
 		with self.writeLock:
 			rw = _Rewrite()
 			result = True
@@ -5304,11 +5337,6 @@ memoryOnly:{self.memoryOnly}
 					rw.written = False
 					self._releaseRewrite(rw)
 					raise
-		refused = getattr(lines, 'refused', None)
-		if refused and result:
-			self.dirty = True  # rewritten again once it can be
-			self.__teePrintOrNot(f"Refused at a rewrite of {self._fileName}: {refused[0]}; {len(refused)} row(s) changed in place since "
-								 f"the rewrite checked them are not written, the others are",'error')
 		return result
 
 	def _mergeChange(self, file):

@@ -5894,8 +5894,8 @@ class _FlipList(list):
 @pytest.mark.parametrize('method', ['hardMapToFile', 'mapToFile'])
 def test_tsvzed_legacy_rewrite_checks_everything_before_it_touches_the_file(tmp_path, capsys, method):
 	# A row that cannot be written refuses the rewrite before the file is touched; one that another thread changes
-	# in place after the check (it encodes each row again as it writes: a rewrite does not hold the whole store
-	# encoded) is left out of the write and reported, and the others are written: the file is never half written.
+	# in place after the rewrite took its snapshot of the cells is written as the snapshot has it: the cells are
+	# read once, checked, and encoded again from the snapshot as they are written.
 	p = str(tmp_path / 'r.tsv')
 	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=5, rewrite_on_load=False)
 	t['a'] = ['a', '1']
@@ -5910,8 +5910,8 @@ def test_tsvzed_legacy_rewrite_checks_everything_before_it_touches_the_file(tmp_
 	OrderedDict.__setitem__(t, 'a', _FlipList(['a', '1']))
 	capsys.readouterr()
 	getattr(t, method)()
-	assert 'Refused at a rewrite' in capsys.readouterr().out
-	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False) == {'b': ['b', '2']} and t.dirty
+	assert 'Refused' not in capsys.readouterr().out and _FlipList.reads == 1
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False) == {'a': ['a', '1'], 'b': ['b', '2']} and not t.dirty
 	_stop(t)
 
 
@@ -8786,8 +8786,8 @@ def test_tsvzed_legacy_compressed_rewrite_cut_short_by_a_really_full_disk_then_a
 def test_tsvzed_legacy_rewrite_memory_does_not_grow_with_the_store(tmp_path, suffix, method):
 	# A rewrite encoded the whole store before writing it (to refuse a row that cannot be written before anything
 	# is): its peak grew with the store, 159 MiB for 1,000,000 rows (47.6 MiB), where main 1688d25 took 64 MiB. It
-	# now checks every row, dropping each, then encodes them again a chunk at a time as it writes: what grows with
-	# the store is the list of its rows (8 bytes a row), not their bytes.
+	# now checks every row of a flat snapshot of the cells, dropping each, then encodes them again a chunk at a
+	# time as it writes: what grows with the store is the snapshot (8 bytes a cell, 4 a row), not the rows' bytes.
 	import tracemalloc
 	peaks = []
 	sizes = []
@@ -8805,15 +8805,26 @@ def test_tsvzed_legacy_rewrite_memory_does_not_grow_with_the_store(tmp_path, suf
 		finally:
 			tracemalloc.stop()
 		assert _back(p) == dict(t)
-	assert peaks[1] - peaks[0] < (sizes[1] - sizes[0]) / 4, (peaks, sizes)
+	rows = 100000 - 25000
+	# two cells: 20 bytes a row, and 8 more for the list of the rows while they are copied (159 on 50ea158)
+	assert peaks[1] - peaks[0] < 36 * rows, (peaks, sizes)
 
 
-def test_tsvzed_legacy_row_changed_in_place_between_the_check_and_the_write_is_left_out(tmp_path, capsys):
-	# The check and the write encode each row apart: a row changed in place in between (not a set, which replaces
-	# the row and queues it) so that it cannot be written is left out of the write, reported, and the others written.
-	p = str(tmp_path / 'inplace.tsv')
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
+def test_tsvzed_legacy_row_changed_in_place_between_the_check_and_the_write_is_written_as_checked(tmp_path, capsys, suffix, method):
+	# 87359a4 encoded each row again from memory as it wrote it: a row changed in place between the check and the
+	# write (not a set, which replaces the row and queues it) so that it could no longer be encoded was left out.
+	# In place (mapToFile on an uncompressed file) every later row was then written a line early and the tail cut
+	# off: each key after it held the next key's cells and the last row was gone. The write now encodes a flat
+	# snapshot of the cells taken with the check: it writes what it checked, every row in its place.
+	p = str(tmp_path / ('inplace.' + suffix))
 	t = _stopped(p)
-	rows = _many(t, 5)
+	for i in range(8):
+		t['k%d' % i] = ['k%d' % i, 'value%d' % i]
+	t.commitAppendToFile()
+	t['k1'] = ['k1', 'a longer value than it had']  # an in-place rewrite moves every row after it
+	rows = dict((key, list(row)) for key, row in t.items())
 	real = t.get_file_obj  # opened between the check and the write
 
 	def opening(*args, **kwargs):
@@ -8821,13 +8832,64 @@ def test_tsvzed_legacy_row_changed_in_place_between_the_check_and_the_write_is_l
 		return real(*args, **kwargs)
 
 	t.get_file_obj = opening
-	t.hardMapToFile()
+	getattr(t, method)()  # explicit: nothing to refuse, nothing raised
 	del t.get_file_obj
-	out = capsys.readouterr().out
-	assert 'Refused at a rewrite' in out and '1 row(s)' in out, out
-	expected = dict(rows)
-	del expected['k2']
-	assert _back(p) == expected and t.dirty and not t.deSynced
+	assert 'Refused' not in capsys.readouterr().out
+	assert _back(p) == rows, 'a row was left out, and the rows after it moved'
+	assert not t.dirty and not t.deSynced
+
+
+class _FlakyHandler(object):
+	"""An ``errors`` handler that writes '?' for what it is given, except at its ``fail``-th call, where it raises."""
+
+	def __init__(self, fail):
+		self.calls = 0
+		self.fail = fail
+
+	def __call__(self, error):
+		self.calls += 1
+		if self.calls == self.fail:
+			raise error
+		return '?', error.end
+
+
+@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
+def test_tsvzed_legacy_rewrite_that_cannot_encode_a_row_it_checked_fails_and_is_made_again(tmp_path, method):
+	# Should the write still meet a row it cannot encode (an errors handler that changes its mind), it must not
+	# leave the row out (in place, every later row would move up a line): the rewrite fails, and is made again.
+	import codecs
+	name = 'tsvz_flaky_%s' % method
+	handler = _FlakyHandler(fail=3)  # 1: the set, 2: the rewrite's check, 3: its write
+	codecs.register_error(name, handler)
+	p = str(tmp_path / 'flaky.tsv')
+	t = _stopped(p, errors=name)
+	for i in range(8):
+		t['k%d' % i] = ['k%d' % i, 'value%d' % i]
+	t.commitAppendToFile()
+	t['k1'] = ['k1', 'a longer value than it had']
+	t['k2'] = ['k2', 'bad\udcff']
+	assert handler.calls == 1
+	getattr(t, method)()
+	assert handler.calls >= 3
+	expected = dict((key, list(row)) for key, row in t.items())
+	expected['k2'] = ['k2', 'bad?']
+	if method == 'hardMapToFile':
+		assert t.deSynced and t.dirty  # it failed: made again by the next rewrite
+		assert t.rewrite()
+	assert _back(p) == expected and not t.deSynced  # mapToFile fell back on hardMapToFile
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
+def test_tsvzed_legacy_explicit_rewrite_raises_when_it_refuses_and_writes_nothing(tmp_path, suffix, method):
+	p = str(tmp_path / ('raise.' + suffix))
+	t = _stopped(p)
+	_many(t, 5)
+	before = _bytes(p)
+	t['k2'][1] = 'bad\udcff'  # changed in place: refused at the check, before anything is written
+	with pytest.raises(TSVZ.TSVZEncodeError):
+		getattr(t, method)()
+	assert _bytes(p) == before and t._damage is None and t.dirty and not t.deSynced
 
 
 # --- seventh review round: an append to an empty file, the background writer, a flat snapshot ----------
