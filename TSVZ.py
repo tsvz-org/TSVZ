@@ -4049,20 +4049,31 @@ class _TSVZedLoad(OrderedDict):
 		self.defaults = defaults
 		self.dirty = False
 
-	def __setitem__(self, key, value):
+	def _change(self, key, value):
+		"""``(key, row)``, the change a row read for ``key`` makes: its row as __setitem__ shapes it, None for a
+		delete; None when it changes no key (an empty key, a row strict refuses, the defaults line: applied here)."""
 		key = str(key).rstrip()
 		if not key:
-			return
+			return None
 		shaped = self.owner._shapeRow(key, value, self.columns, self.defaults)
 		if shaped is None:
-			return
+			return None
 		value, columns = shaped
 		if self.columns != 1 and len(value) == 1:
-			OrderedDict.pop(self, key, None)
-			return
+			return key, None
 		self.columns = columns
 		if key == DEFAULTS_INDICATOR_KEY:
 			self.defaults[:] = value
+			return None
+		return key, value
+
+	def __setitem__(self, key, value):
+		change = self._change(key, value)
+		if change is None:
+			return
+		key, value = change
+		if value is None:
+			OrderedDict.pop(self, key, None)
 			return
 		old = OrderedDict.get(self, key)
 		if old is not None:
@@ -4096,21 +4107,9 @@ class _TSVZedMerge(_TSVZedLoad):
 	last change of each key, its row shaped as a read shapes it or None for a delete, to apply to memory after."""
 
 	def __setitem__(self, key, value):
-		key = str(key).rstrip()
-		if not key:
-			return
-		shaped = self.owner._shapeRow(key, value, self.columns, self.defaults)
-		if shaped is None:
-			return
-		value, columns = shaped
-		if self.columns != 1 and len(value) == 1:
-			OrderedDict.__setitem__(self, key, None)
-			return
-		self.columns = columns
-		if key == DEFAULTS_INDICATOR_KEY:
-			self.defaults[:] = value
-			return
-		OrderedDict.__setitem__(self, key, value)
+		change = self._change(key, value)
+		if change is not None:
+			OrderedDict.__setitem__(self, *change)
 
 	def __contains__(self, key):
 		return True  # a delete of a key memory holds: _processLine deletes only what it is told is there
