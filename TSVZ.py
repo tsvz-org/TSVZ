@@ -312,18 +312,23 @@ _DAMAGE_UNKNOWN = (None, None)  # TSVZed._damage when what the file holds is not
 _DAMAGE_EMPTY = (0, hashlib.sha256(b'').digest())  # TSVZed._damage for a file that holds nothing
 
 
-def _fileDigest(fd):
-	"""``(size, sha256)`` of what the open file ``fd`` holds on disk, read through ``fd`` itself (a buffer over it is
-	left alone: closing the file another way still drops it)."""
+def _fileDigest(fd, limit):
+	"""``(size, sha256)`` of the first ``limit`` bytes the open file ``fd`` holds on disk (fewer when it is shorter),
+	read through ``fd`` itself (a buffer over it is left alone: closing the file another way still drops it).
+
+	``limit`` is the size noted with the file's stamp, just before: bytes another writer appends during the read
+	(one that takes no lock) are then in neither, and a merge reads them as appended after the damage, instead of
+	taking them for part of it (where the next rewrite overwrote them)."""
 	digest = hashlib.sha256()
 	size = 0
 	os.lseek(fd, 0, os.SEEK_SET)
-	while True:
-		chunk = os.read(fd, 1 << 20)
+	while size < limit:
+		chunk = os.read(fd, min(1 << 20, limit - size))
 		if not chunk:
-			return size, digest.digest()
+			break
 		digest.update(chunk)
 		size += len(chunk)
+	return size, digest.digest()
 
 
 def _fileStamp(st):
@@ -5942,7 +5947,7 @@ memoryOnly:{self.memoryOnly}
 							try:
 								# What it left, and which file it is: another process's appends to it are merged.
 								at = _fileStamp(os.fstat(raw.fileno()))
-								rw.damage = (_fileDigest(raw.fileno()), at)
+								rw.damage = (_fileDigest(raw.fileno(), at[2]), at)  # what it held at the stamp
 							except Exception:
 								rw.damage = (_DAMAGE_UNKNOWN, None)
 					self._damage, self._damageAt = rw.damage  # the same when made again

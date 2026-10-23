@@ -9235,9 +9235,9 @@ def test_tsvzed_legacy_release_interrupted_reads_the_damage_once_at_most(tmp_pat
 		reads = []
 		real = TSVZ._fileDigest
 
-		def digest(fd):
+		def digest(fd, *args):
 			reads.append(1)
-			return real(fd)
+			return real(fd, *args)
 
 		monkeypatch.setattr(TSVZ, '_fileDigest', digest)
 		_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
@@ -9598,3 +9598,30 @@ def test_tsvzed_legacy_merging_rewrite_holds_one_snapshot_at_a_time(tmp_path, mo
 	assert t['ext'] == ['ext', 'B'] and len(t) == 100001
 	assert merged < plain * 1.15, (plain, merged)
 	t.close()
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES)
+def test_tsvzed_legacy_append_landing_while_the_damage_is_read_is_merged_not_taken_for_damage(tmp_path, monkeypatch, capsys, suffix):
+	# The release noted the file's stamp (its size S among it) and then read and hashed the file to its end: bytes
+	# another writer (one that takes no lock) appended in between were counted in the damage. The merge then saw
+	# the file S+k long against a stamp of S, found the damage's digest whole and nothing after it, and the next
+	# rewrite overwrote those bytes without a warning (haiku toctou-during). The digest now covers the S bytes
+	# noted with the stamp: what lands after is merged.
+	p = str(tmp_path / ('during.' + suffix))
+	t = _stopped(p)
+	rows = _many(t, 5)
+	real = TSVZ._fileDigest
+
+	def digest(fd, *args):
+		_append_external(p, _compressedAs(suffix, b'late\tL\n'))  # lands while the damage is read
+		return real(fd, *args)
+
+	_failing_rewrite(monkeypatch, partial=_compressedAs(suffix, b'key\tval\nk0\tv0\n'))
+	monkeypatch.setattr(TSVZ, '_fileDigest', digest)
+	t.hardMapToFile()
+	monkeypatch.undo()
+	assert t._damage[0] == t._damageAt[2] < os.path.getsize(p)
+	capsys.readouterr()
+	assert t.rewrite()
+	assert t['late'] == ['late', 'L'] and dict(t) == dict(rows, late=['late', 'L']) and _back(p) == dict(t)
+	assert 'Overwriting external changes' not in capsys.readouterr().out
