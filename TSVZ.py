@@ -1160,9 +1160,32 @@ def _lastNewlineEnd(f, size):
 	return 0
 
 
+#: A compressed file at most this large is decoded to tell whether it holds anything (_holdsNothing): an empty
+#: stream is 9 to 40 bytes, and a file of only empty streams is never much larger.
+_EMPTY_STREAMS_MAX = 4096
+
+
 def _holdsNothing(f, codec, size):
-	"""True when the open binary file ``f``, ``size`` bytes long, holds no line."""
-	return not size
+	"""True when the open binary file ``f`` (read at its raw level), ``size`` bytes long, holds no line: it has no
+	byte, or, compressed in ``codec``, only complete empty streams, which a codec's writer closed with nothing
+	written leaves (gzip.open(p, 'wb').close(), a clear of a store with no header). A reader reads the same from
+	both: nothing. Only a file of at most _EMPTY_STREAMS_MAX bytes is decoded for it (``f`` is left at offset 0);
+	a damaged one holds something (bytes another writer left, not this store's empty file)."""
+	if not size:
+		return True
+	if not codec or size > _EMPTY_STREAMS_MAX or not _codecSupported(codec):
+		return False
+	f.seek(0)
+	data = f.read(size)
+	f.seek(0)  # where a rewrite that looked expects it
+	text, damage = _decodeMembers(codec, data)
+	return not text and not damage
+
+
+def _fileHoldsNothing(fileName):
+	"""_holdsNothing for the file ``fileName``, which exists."""
+	with open(fileName, 'rb') as f:
+		return _holdsNothing(f, _fileCodec(fileName), os.fstat(f.fileno()).st_size)
 
 
 def _appendOpen(f, payload, codec=None, header=None, tailPolicy='newline', reporter=None, fsync=False, memberSize=None):
@@ -1174,7 +1197,7 @@ def _appendOpen(f, payload, codec=None, header=None, tailPolicy='newline', repor
 	held by the caller: locked (_lockedAppend, TSVZed.commitAppendToFile) or, for TSVZedLite, which never locks a
 	legacy file, owned alone. What is written depends on what the file holds:
 
-	- nothing (no byte): ``header`` first, when it is not None: a legacy store's header line without its newline,
+	- nothing (_holdsNothing: no byte, or only empty compressed streams): ``header`` first, when it is not None: a legacy store's header line without its newline,
 	  or a function that makes it, called only then (a header that cannot be encoded refuses only an append that
 	  would write it). An append to an empty file writes the header first, as creating the file does: a file a
 	  rewrite cut short (a full disk, a KeyboardInterrupt) or another process emptied is left empty, and rows
@@ -1906,7 +1929,7 @@ def appendLinesTabularFile(fileName,linesToAppend,teeLogger = None,header = '',c
 		# then: a header that cannot be encoded refuses only an append that writes it, before anything is written).
 		# Its rows are formatted as for a file that begins with it.
 		headerLine = functools.partial(_encodeRow, _sanitize(header,delimiter=delimiter), delimiter, encoding, errors, what='header')
-		if os.path.getsize(fileName) == 0:
+		if _fileHoldsNothing(fileName):
 			formatted = _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding,
 											 strict, delimiter, errors, rows, assume=header)
 	payload, count = formatted or _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose,
@@ -5454,10 +5477,11 @@ memoryOnly:{self.memoryOnly}
 				if damage:
 					reporter.note('damaged', None, 'compressed stream another process appended is damaged ({}); the rest is '
 								  'merged, and the damaged bytes are overwritten'.format('; '.join(damage)))
-			if size == 0 and self.header and any(self.header) and self.verifyHeader:
-				# The damage left nothing (the file emptied, or removed): what another process wrote there begins with a
-				# header, as a read takes the first line of the file. Not after a damage that holds bytes: a row there
-				# that reads as the header is a row. A header that is not this store's: another store's file, not merged.
+			if any(self.header) and self.verifyHeader and _holdsNothing(file, codec, size):
+				# The damage left nothing (the file emptied, or removed; or only empty compressed streams, which an append
+				# takes for an empty file too): what another process wrote there begins with a header, as a read takes the
+				# first line of the file. Not after a damage that holds a line: a row there that reads as the header is a
+				# row. A header that is not this store's: another store's file, not merged.
 				first, _, rest = rest.partition(b'\n')
 				line = first.decode(self.encoding or 'utf8', errors='replace')
 				if not _headerMatches(self.header, line, self.delimiter):

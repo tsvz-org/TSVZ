@@ -9363,3 +9363,51 @@ def test_tsvzed_legacy_merge_reports_bytes_after_another_process_member_that_do_
 	err = capsys.readouterr().err
 	assert 'compressed stream another process appended is damaged' in err and 'do not decode' in err, err
 	assert dict(t) == dict(rows, B1=['B1', 'fromB']) and _back(p) == dict(t)
+
+
+def _empty_stream(p):
+	"""Make ``p`` a compressed file that holds only an empty stream, as a codec's writer closed with nothing
+	written leaves it."""
+	with TSVZ.openFileAsCompressed(p, mode='wb'):
+		pass
+	assert os.path.getsize(p) > 0 and _text(p) == b''
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES[1:])
+@pytest.mark.parametrize('writer', ['append', 'tsvzed', 'lite'])
+def test_append_to_a_compressed_file_holding_only_an_empty_stream_writes_the_header_first(tmp_path, suffix, writer):
+	# An append looked at the compressed file's size on disk: one holding only an empty stream (gzip.open(p,
+	# 'wb').close(), a commit that wrote nothing and closed its codec writer) was not empty, so no header was
+	# written, and a read took the first row for the header (a mismatch, the row lost).
+	p = str(tmp_path / ('stream.' + suffix))
+	_empty_stream(p)
+	if writer == 'append':
+		TSVZ.appendTabularFile(p, ['a', '1'], header='key\tval')
+	elif writer == 'tsvzed':
+		t = _stopped(p)
+		t['a'] = ['a', '1']
+		t.commitAppendToFile()
+		t.close()
+	else:
+		lite = TSVZ.TSVZedLite(p, header='key\tval', strict=False)
+		lite['a'] = ['a', '1']
+		lite.close()
+	assert _text(p) == b'key\tval\na\t1\n'
+	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == {'a': ['a', '1']}
+
+
+@pytest.mark.parametrize('suffix', ALL_SUFFIXES[1:])
+def test_tsvzed_legacy_commit_that_writes_nothing_leaves_nothing_in_a_compressed_file(tmp_path, suffix):
+	# A commit whose only row was refused (changed in place to text the encoding cannot hold) closed its codec
+	# writer with nothing written: an empty stream was left in the empty file, and the next append wrote no header.
+	p = str(tmp_path / ('nothing.' + suffix))
+	open(p, 'wb').close()
+	t = _stopped(p, encoding='ascii')
+	t['a'] = ['a', '1']
+	t['a'][1] = '\xe9'  # changed in place: the queued row cannot be written now
+	t.commitAppendToFile()
+	assert os.path.getsize(p) == 0
+	t['b'] = ['b', '2']
+	t.commitAppendToFile()
+	assert _text(p) == b'key\tval\nb\t2\n'
+	t.close()
