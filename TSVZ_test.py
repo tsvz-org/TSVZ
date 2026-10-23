@@ -8973,3 +8973,74 @@ def test_tsvzedlite_append_to_an_empty_file_writes_the_header_first(tmp_path, su
 	assert TSVZ.readTabularFile(p, header='key\tval', strict=True, verbose=False) == {'b': ['b', '2']}
 	if suffix == 'tsv':
 		assert _bytes(p) == b'key\tval\nb\t2\n'
+
+
+@pytest.mark.parametrize('change', [b'K\ttheirs\n', b'K\t\n'])
+def test_tsvzed_legacy_merge_takes_another_process_change_of_a_key_a_rewrite_wrote_from_the_queue(tmp_path, monkeypatch, change):
+	# A rewrite wrote the queued rows (memory holds them) but never dropped them from the queue: after a later failed
+	# rewrite, the merge skipped their keys as still queued, and another process's change of one was dropped without
+	# a warning; the stale row was then appended after the rewrite, over it.
+	p = str(tmp_path / 'stale.tsv')
+	t = _stopped(p)
+	rows = _many(t, 5)
+	t['K'] = ['K', 'mine']  # queued
+	t.hardMapToFile()  # writes it
+	assert not t.appendQueue, 'the rows the rewrite wrote are still queued'
+	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
+	t.hardMapToFile()
+	monkeypatch.undo()
+	_append_external(p, change)  # another process, after the damage: sets or deletes K
+	assert t.rewrite()
+	t.commitAppendToFile()
+	expected = dict(rows, K=['K', 'theirs'])
+	if change == b'K\t\n':
+		del expected['K']
+	assert dict(t) == expected and _back(p) == expected
+
+
+def test_tsvzed_legacy_stale_queued_tombstone_is_not_appended_over_another_process_row(tmp_path):
+	# A tombstone a rewrite already wrote stayed queued: rewrite() appended it before it reloaded another process's
+	# later row of that key, which was deleted from the file and memory.
+	p = str(tmp_path / 'tomb.tsv')
+	t = _stopped(p)
+	rows = _many(t, 5)
+	del t['k2']  # a tombstone, queued
+	t.mapToFile()  # writes memory without k2
+	assert not t.appendQueue
+	_append_external(p, b'k2\tback\n')  # another process sets it again
+	t.checkExternalChanges()  # the next tick
+	t.rewrite()
+	expected = dict(rows, k2=['k2', 'back'])
+	assert dict(t) == expected and _back(p) == expected
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_rewrite_interrupted_in_its_release_drops_the_rows_it_wrote_from_the_queue_once(tmp_path, suffix):
+	# The queued rows a rewrite wrote are dropped from the queue once it reached the disk; a KeyboardInterrupt in the
+	# release, which goes on from where it stopped, must drop them once: not a row set while it wrote, nor none.
+	p = str(tmp_path / ('trim.' + suffix))
+	t = _stopped(p)
+	_many(t, 5)
+	n = 0
+	while True:
+		n += 1
+		t['q%d' % n] = ['q%d' % n, 'Q']  # queued: the rewrite writes it
+		real = t.get_file_obj
+
+		def opening(*args, **kwargs):  # another thread sets a row while the rewrite writes: queued after the snapshot
+			t['late%d' % n] = ['late%d' % n, 'L']
+			return real(*args, **kwargs)
+
+		t.get_file_obj = opening
+		hit = _interrupt_at(n, t.hardMapToFile, where='_releaseRewrite')
+		del t.get_file_obj
+		queued = [row[0] for row in t.appendQueue]
+		if t._damage is None and not t.deSynced:  # it reached the disk
+			assert queued == ['late%d' % n], (n, queued)
+		else:
+			assert queued == ['q%d' % n, 'late%d' % n], (n, queued)
+		t.commitAppendToFile()
+		assert t.rewrite(force=True) and _back(p) == dict(t), n
+		if not hit:
+			break
+	assert n > 10, n

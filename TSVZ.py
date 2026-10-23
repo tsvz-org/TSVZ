@@ -21,6 +21,7 @@ import errno
 import functools
 import hashlib
 import io
+import itertools
 import os
 import re
 import shutil
@@ -284,7 +285,7 @@ def _discardWriter(writer):
 class _Rewrite(object):
 	"""How far a legacy rewrite (TSVZed._writeRewrite) has got: what _releaseRewrite lets go of, and what it did
 	already, so that a second call (after a KeyboardInterrupt stopped the first) goes on from there."""
-	__slots__ = ('raw', 'writer', 'started', 'written', 'failed', 'reached', 'noted', 'error')
+	__slots__ = ('raw', 'writer', 'started', 'written', 'failed', 'reached', 'noted', 'error', 'queued', 'kept')
 
 	def __init__(self):
 		self.raw = None  # the file, open and locked: None until get_file_obj hands it out
@@ -295,6 +296,8 @@ class _Rewrite(object):
 		self.reached = False  # all of it is on disk
 		self.noted = False  # the file's time and what it holds are noted
 		self.error = None
+		self.queued = 0  # how many queued rows (the first ones) the rows written hold: dropped once on disk
+		self.kept = None  # the queue without them, once it is
 
 	def fail(self, error):
 		self.failed = True
@@ -5258,12 +5261,14 @@ memoryOnly:{self.memoryOnly}
 		with self._memLock:
 			values = list(self.values())
 			defaults = list(self.defaults)
+			queued = len(self.appendQueue)  # memory holds the change of every one of them
 		first = []
 		if defaults and len(defaults) > 1:
 			# The defaults line comes right after the header, so it survives a
 			# full rewrite -- it is not a regular mapping key.
 			first.append(_encodeRow(_sanitize(defaults,delimiter=delimiter),delimiter,encoding,errors,what='defaults'))
 		rows = _RewriteRows(first, values, delimiter, encoding, errors, self.header)
+		rows.queued = queued
 		del values  # the snapshot holds the cells
 		rows.check()
 		return header, rows
@@ -5300,6 +5305,7 @@ memoryOnly:{self.memoryOnly}
 			# Nothing returns from inside the try: the line a return is on is outside its handlers.
 			try:
 				header, lines = (snapshot or self._snapshotForRewrite)()
+				rw.queued = getattr(lines, 'queued', 0)
 				missing = not os.path.isfile(self._fileName)  # under writeLock: this object does not remove it meanwhile
 				whole = whole or missing
 				if missing:
@@ -5315,6 +5321,7 @@ memoryOnly:{self.memoryOnly}
 				else:
 					if look and self._damage is not None and self._mergeChange(rw.raw):
 						header, lines = (snapshot or self._snapshotForRewrite)()  # with what was merged
+						rw.queued = getattr(lines, 'queued', 0)
 					# Until it is all written, the file does not hold memory: a rewrite that stops is made again,
 					# and the file is not reloaded over memory meanwhile. ``started`` first: a release that sees it
 					# notes what the file then holds as the damage, which another process's appends are merged after.
@@ -5800,6 +5807,14 @@ memoryOnly:{self.memoryOnly}
 					except Exception:
 						self._damage = _DAMAGE_UNKNOWN
 			rw.noted = True
+		if rw.reached and rw.queued:
+			# The queued rows the rewrite wrote are dropped, not appended again after it (that undid another process's
+			# later change of their key, and a merge skipped such a key as still queued). The queue is replaced whole,
+			# under _memLock: a second call after a KeyboardInterrupt drops them only once.
+			with self._memLock:
+				if self.appendQueue is not rw.kept:
+					rw.kept = deque(itertools.islice(self.appendQueue, rw.queued, None))
+					self.appendQueue = rw.kept
 		if raw is not None and not raw.closed:
 			_unlockFile(raw)  # never raises
 			try:

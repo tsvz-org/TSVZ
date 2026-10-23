@@ -76,8 +76,12 @@ opinion's, 15 and 12.
 8. **A rewrite appends the queued rows again.** The rewrite snapshot already contains the queued
    rows, but the queue is not trimmed, so they are appended again after the rewrite. That can
    undo a later delete or update by another process.
-   Script: `resurrect.py DIR`. Main and branch: the other process deletes `k`, the stale queued
+   Script: `resurrect.py DIR`. Main: the other process deletes `k`, the stale queued
    row is appended after the tombstone, and `k live on read: True`.
+   **Fixed on the branch** (the review of b28d917 found that the merge after a failed rewrite
+   skipped such a key as still queued, and dropped another process's change of it): a rewrite
+   that reached the disk drops from the queue the rows its snapshot held. Branch: `queue: []`
+   after the rewrite, and `k live on read: False`.
 
 9. **rewrite_on_load can overwrite a change made just after the load.** `load()` calls
    `rewrite(force=True, reloadInternalFromFile=False)`, so the rewrite_on_load rewrite overwrites
