@@ -217,14 +217,29 @@ the only good copy. Until a rewrite gets through, `TSVZed` does not reload the f
 over memory; its background writer still appends the rows set meanwhile (to a file left
 empty, after the header, as every append to an empty file does), and they are merged
 back as they are. The next rewrite (the background writer's, `rewrite()`, `close()`)
-makes the file again from memory. A change
-another process made to the file meanwhile is merged into memory first when the file
-still begins with exactly the bytes the failed rewrite left, so that the rest can only
-have been appended (a file left empty, or made again, must then begin with this store's
-header). Otherwise (another process rewrote the file, or it begins with another header)
-memory is kept, and that change is overwritten with the warning `Overwriting external
-changes`. An explicit `reload()` while the file is damaged is unsafe: it replaces memory
-with the damaged file, as asked, and warns that the rows only memory held are dropped.
+makes the file again from memory.
+
+A change another process made to the file meanwhile is merged into memory first, as a
+read of the file would apply it (each set or delete in turn, the last one of a key
+winning), when it can have been only appended: the file is still the one the failed
+rewrite left (the same device and inode; when the file was missing, any file) and still
+begins with exactly the bytes it left (their size and SHA-256). After a damage that left
+the file empty, what follows must also begin with this store's header, which every append
+to an empty file writes first. Otherwise memory is kept, and that change is overwritten
+with the warning `Overwriting external changes`: this catches another process that
+rewrote the file shorter or with other bytes where the damage was, replaced it with
+another file (renamed one over it, or removed it and made it again), or made it again
+with another header or with no header.
+
+What cannot be told from an append, and is merged as one: another process's rewrite of
+the same file in place (written over, or truncated and written again, as `TSVZed`'s own
+rewrites are) whose content begins with exactly the bytes the damage left; after a
+damage that left the file empty, any such rewrite that begins with this store's header;
+and, for a store with no header (or `verifyHeader=False`), anything written to a file
+the damage left empty. Its rows are then applied on top of memory: the keys it sets or
+deletes take its values, and keys it left out keep memory's. An explicit `reload()`
+while the file is damaged is unsafe: it replaces memory with the damaged file, as asked,
+and warns that the rows only memory held are dropped.
 
 ## Breaking changes from 3.39
 

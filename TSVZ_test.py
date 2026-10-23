@@ -9123,3 +9123,42 @@ def test_tsvzed_legacy_merge_refused_for_another_header_still_reports_a_damaged_
 	assert 'compressed stream another process appended is damaged' in captured.err, captured
 	assert 'Overwriting external changes' in captured.out and "'id\\tname'" in captured.out, captured
 	assert dict(t) == rows and _back(p) == rows
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+@pytest.mark.parametrize('partial', [b'', b'key\tval\nk0\tv0\n'])
+def test_tsvzed_legacy_file_replaced_after_a_failed_rewrite_is_not_merged_though_it_begins_with_the_damage(tmp_path, monkeypatch, capsys, suffix, partial):
+	# The merge took any file that begins with the bytes the damage left for that file appended to: a file another
+	# process wrote whole and renamed over it (or removed and made again), beginning with the same bytes (with an
+	# empty damage, any file with this store's header), was merged as appends. The damage now notes which file it is.
+	p = str(tmp_path / ('replaced.' + suffix))
+	t = _stopped(p)
+	rows = _many(t, 5)
+	_failing_rewrite(monkeypatch, partial=partial)
+	t.hardMapToFile()
+	monkeypatch.undo()
+	assert _bytes(p) == partial
+	content = partial + _compressedAs(suffix, (b'' if partial else b'key\tval\n') + b'other\tX\n')
+	with open(p + '.new', 'wb') as g:
+		g.write(content)
+	os.replace(p + '.new', p)  # another process's whole rewrite of the store
+	capsys.readouterr()
+	assert t.rewrite()
+	assert 'Overwriting external changes' in capsys.readouterr().out
+	assert dict(t) == rows and _back(p) == rows and t._damage is None
+
+
+def test_tsvzed_legacy_rewrite_in_place_that_begins_with_the_damage_is_merged_as_the_readme_says(tmp_path, monkeypatch, capsys):
+	# What cannot be told from an append (README): the same file, written again in place, beginning with the damage.
+	p = str(tmp_path / 'inplace.tsv')
+	t = _stopped(p)
+	rows = _many(t, 5)
+	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
+	t.hardMapToFile()
+	monkeypatch.undo()
+	with open(p, 'r+b') as g:  # another process's rewrite of the same file
+		g.truncate(0)
+		g.write(b'key\tval\nk0\tv0\nother\tX\n')
+	assert t.rewrite()
+	assert 'Overwriting external changes' not in capsys.readouterr().out
+	assert dict(t) == dict(rows, other=['other', 'X']) and _back(p) == dict(t)

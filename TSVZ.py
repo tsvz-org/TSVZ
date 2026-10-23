@@ -323,6 +323,13 @@ def _fileDigest(fd):
 		size += len(chunk)
 
 
+def _fileStamp(st):
+	"""``(st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns)`` of the os.stat_result ``st``: which file it is, and how
+	large and when last changed; the file's identity is None where the platform gives no inode number."""
+	identity = (st.st_dev, st.st_ino) if st.st_ino else (None, None)
+	return identity + (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
 def _bytesAfter(file, size, digest):
 	"""``(rest, (size, sha256))``: what the open ``file`` holds after its first ``size`` bytes, and the size and digest
 	of all of it; None when those first bytes are not the ones ``digest`` was taken of. ``file`` is left at offset 0."""
@@ -4240,10 +4247,12 @@ class TSVZed(OrderedDict):
 	  disk, a KeyboardInterrupt, an I/O error), or cannot make again a removed file, leaves the file
 	  damaged and memory the only good copy. Until a rewrite gets through, the file is not reloaded over
 	  memory (the background writer still appends the rows set meanwhile, merged back as they are); the
-	  next rewrite (the background writer's, rewrite(), close()) makes it again from memory. Another process's change made meanwhile is merged
-	  into memory first when the file still begins with exactly the bytes the failed rewrite left (all
-	  after them was appended; a file left empty must then begin with this store's header); otherwise
-	  memory is kept and that change is overwritten, with a warning. reload() is unsafe then: it replaces
+	  next rewrite (the background writer's, rewrite(), close()) makes it again from memory. Another
+	  process's change made meanwhile is merged into memory first when it can have been only appended:
+	  the file is the same one (device and inode) and still begins with exactly the bytes the failed
+	  rewrite left (a file left empty must then begin with this store's header); otherwise memory is kept
+	  and that change is overwritten, with a warning. A rewrite of the same file in place that begins with
+	  those bytes cannot be told from appends, and is merged (README). reload() is unsafe then: it replaces
 	  memory with the damaged file, as asked, and warns.
 	Examples
 	--------
@@ -5162,6 +5171,7 @@ memoryOnly:{self.memoryOnly}
 	# memory another process's change is not reloaded over it (_rewrite) but merged into it (_mergeChange). It is
 	# (size, sha256) of what the file held when this object let go of it, _DAMAGE_UNKNOWN when that is not known.
 	_damage = None
+	_damageAt = None  # _fileStamp of the file _damage is in, as it was noted; None when the file was missing
 	_mergeBase = None  # (_damage, defaults, column count) a merge after that damage reads the rows with: see _mergeChange
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
@@ -5325,7 +5335,7 @@ memoryOnly:{self.memoryOnly}
 					rw.started = True  # first: the release notes what the file holds from here on
 					self.dirty = True  # memory is the only copy left: made again until a rewrite gets through, and
 					self._mergeBase = None  # a new damage: what a merge after it starts from is taken again
-					self._damage = _DAMAGE_EMPTY  # what another process writes meanwhile is merged
+					self._damage, self._damageAt = _DAMAGE_EMPTY, None  # what another process writes meanwhile is merged
 				rw.raw = self.get_file_obj('wb' if whole else 'r+b', locked=True, empty=False)
 				if rw.raw is None:
 					self.deSynced = True  # tried again later
@@ -5383,8 +5393,17 @@ memoryOnly:{self.memoryOnly}
 		seen = getFileUpdateTimeNs(self._fileName)
 		# Decided by what the file holds, not by its time: on a file system with coarse timestamps, an append in the
 		# same tick as the failed rewrite leaves the time as it was. Only an unknown damage looks at the time.
+		try:
+			at = _fileStamp(os.fstat(file.fileno()))
+		except Exception:
+			at = None
+		noted = self._damageAt  # the file the damage is in: None when it was missing
 		if size is None:
 			found = None if self.externalFileUpdateTime < seen else (b'', self._damage)
+		elif noted is not None and at is not None and None not in at[:2] and at[:2] != noted[:2]:
+			# Another file now: another process replaced it (renamed one over it, removed it and made it again), even
+			# if what it holds begins with the damage. Not appended to.
+			found = None
 		else:
 			found = _bytesAfter(file, size, digest)
 		if found is None:
@@ -5394,7 +5413,7 @@ memoryOnly:{self.memoryOnly}
 			return False
 		rest, whole = found
 		if not rest:
-			self._damage, self.externalFileUpdateTime = whole, seen
+			self._damage, self._damageAt, self.externalFileUpdateTime = whole, at, seen
 			return False
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		try:  # what it notes is reported however it ends (a refused header, an error, a KeyboardInterrupt)
@@ -5445,7 +5464,7 @@ memoryOnly:{self.memoryOnly}
 				self.defaults = changes.defaults
 			if self.correctColumnNum == -1 and self:
 				self.correctColumnNum = len(self[next(iter(self))])
-		self._damage, self.externalFileUpdateTime = whole, seen  # a rewrite that does not start now merges only what comes next
+		self._damage, self._damageAt, self.externalFileUpdateTime = whole, at, seen  # a rewrite that does not start now merges only what comes next
 		if self.verbose:
 			self.__teePrintOrNot(f"Merged what another process wrote to {self._fileName} after a failed rewrite: {len(self)} records")
 		return True
@@ -5824,11 +5843,13 @@ memoryOnly:{self.memoryOnly}
 				self.dirty = self.deSynced = True
 				if raw is None:
 					self._mergeBase = None
-					self._damage = _DAMAGE_EMPTY  # the file was missing, and could not be made again
+					self._damage, self._damageAt = _DAMAGE_EMPTY, None  # the file was missing, and could not be made again
 				else:
 					self._mergeBase = None
 					try:
-						self._damage = _fileDigest(raw.fileno())  # what it left: another process's appends are merged
+						# What it left, and which file it is: another process's appends to it are merged.
+						at = _fileStamp(os.fstat(raw.fileno()))
+						self._damage, self._damageAt = _fileDigest(raw.fileno()), at
 					except Exception:
 						self._damage = _DAMAGE_UNKNOWN
 			rw.noted = True
