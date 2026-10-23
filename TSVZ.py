@@ -5162,6 +5162,7 @@ memoryOnly:{self.memoryOnly}
 	# memory another process's change is not reloaded over it (_rewrite) but merged into it (_mergeChange). It is
 	# (size, sha256) of what the file held when this object let go of it, _DAMAGE_UNKNOWN when that is not known.
 	_damage = None
+	_mergeBase = None  # (_damage, defaults, column count) a merge after that damage reads the rows with: see _mergeChange
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
 
@@ -5323,6 +5324,7 @@ memoryOnly:{self.memoryOnly}
 				if missing:
 					rw.started = True  # first: the release notes what the file holds from here on
 					self.dirty = True  # memory is the only copy left: made again until a rewrite gets through, and
+					self._mergeBase = None  # a new damage: what a merge after it starts from is taken again
 					self._damage = _DAMAGE_EMPTY  # what another process writes meanwhile is merged
 				rw.raw = self.get_file_obj('wb' if whole else 'r+b', locked=True, empty=False)
 				if rw.raw is None:
@@ -5412,10 +5414,16 @@ memoryOnly:{self.memoryOnly}
 									 f"after a rewrite of this object's failed, with a first line that is not this store's "
 									 f"header ({line.rstrip()!r}); memory holds what the rewrite was writing",'warning')
 				return False
-		defaults = list(self.defaults)
-		changes = _TSVZedMerge(self, self.correctColumnNum, list(defaults))
+		# What the rows are read with (the defaults that fill their empty cells, the column count) is what memory had
+		# when the first merge after this damage began: one stopped by a KeyboardInterrupt after it changed memory's
+		# defaults, and before it noted the damage, is made again from the same start, and ends the same.
+		base = self._mergeBase
+		if base is None or base[0] is not self._damage:
+			base = self._mergeBase = (self._damage, list(self.defaults), self.correctColumnNum)
+		defaults, columns = list(base[1]), base[2]
+		changes = _TSVZedMerge(self, columns, list(defaults))
 		try:
-			_legacyReadLoop(io.BytesIO(rest), '', changes, self.correctColumnNum, 0, self.strict, self.delimiter,
+			_legacyReadLoop(io.BytesIO(rest), '', changes, columns, 0, self.strict, self.delimiter,
 							changes.defaults, False, self.encoding, reporter)
 		finally:
 			reporter.flush()
@@ -5814,8 +5822,10 @@ memoryOnly:{self.memoryOnly}
 			else:
 				self.dirty = self.deSynced = True
 				if raw is None:
+					self._mergeBase = None
 					self._damage = _DAMAGE_EMPTY  # the file was missing, and could not be made again
 				else:
+					self._mergeBase = None
 					try:
 						self._damage = _fileDigest(raw.fileno())  # what it left: another process's appends are merged
 					except Exception:

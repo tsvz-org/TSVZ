@@ -9062,3 +9062,43 @@ def test_tsvzed_legacy_merge_orders_the_keys_as_a_read_of_the_file_does(tmp_path
 	assert list(t) == ['k0', 'k2', 'k3', 'k4', 'new', 'k1', 'n2'], list(t)
 	assert list(t) == list(_back(p)) and dict(t) == _back(p)
 	assert t['k1'] == ['k1', 'again'] and t['k3'] == ['k3', 'set'] and t['n2'] == ['n2', 'B']
+
+
+def _damaged_with_defaults(p, monkeypatch, suffix):
+	"""A three-column store with defaults whose rewrite failed part way, and another process's appends after the
+	damage: a row with an empty cell, new defaults, and another such row. Returns it and what to expect."""
+	t = _stopped(p, header='key\tval\tx', defaults=[TSVZ.DEFAULTS_INDICATOR_KEY, 'D0'])
+	for i in range(5):
+		t['k%d' % i] = ['k%d' % i, 'v', 'x']
+	t.commitAppendToFile()
+	t['k1'] = ['k1', 'upd', 'x']
+	t.commitAppendToFile()
+	rows = dict(t)
+	_failing_rewrite(monkeypatch, partial=b'key\tval\tx\nk0\tv\tx\n')
+	t.hardMapToFile()
+	monkeypatch.undo()
+	assert t._damage is not None
+	theirs = b'e1\t\tX\n' + TSVZ.DEFAULTS_INDICATOR_KEY.encode() + b'\tD1\t\ne2\t\tX\n'
+	_append_external(p, _compressedAs(suffix, theirs))
+	return t, dict(rows, e1=['e1', 'D0', 'X'], e2=['e2', 'D1', 'X'])
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_merge_interrupted_after_it_changed_the_defaults_fills_cells_as_before(tmp_path, monkeypatch, suffix):
+	# A KeyboardInterrupt after the merge replaced memory's defaults with the ones another process appended, and
+	# before it noted the damage, made the merge made again read the rows before those defaults with the new ones.
+	n = 0
+	while True:
+		n += 1
+		p = str(tmp_path / ('d%d.%s' % (n, suffix)))
+		t, expected = _damaged_with_defaults(p, monkeypatch, suffix)
+		hit = _interrupt_at(n, t.rewrite, where='_mergeChange')
+		assert not t.writeLock.locked(), n
+		assert t.rewrite() or not hit, n
+		assert dict(t) == expected, (n, dict(t))
+		assert t.defaults == [TSVZ.DEFAULTS_INDICATOR_KEY, 'D1', ''], (n, t.defaults)
+		assert TSVZ.readTabularFile(p, header='key\tval\tx', verbose=False) == expected, n
+		t.close()
+		if not hit:
+			break
+	assert n > 30, n
