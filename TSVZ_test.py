@@ -8670,8 +8670,9 @@ def test_tsvzed_legacy_damaged_store_whose_rewrite_is_refused_still_appends_its_
 	assert _wait_for(lambda: not t.appendQueue)
 	t['k1'] = ['k1', 'upd']
 	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv\n')
+	# the failed rewrite is tried again only at _worked() below, however long this thread stalls before it
+	monkeypatch.setattr(TSVZ, '_FAILURE_RETRY_FIRST', float('inf'))
 	t.hardMapToFile()
-	t._failures['rewrite'] = (TSVZ._FAILURE_RETRY_FIRST, float('inf'))  # not retried 0.1 s on, if this thread stalls
 	monkeypatch.undo()
 	with open(p, 'ab') as g:  # another process appends under the file lock, which the background rewrite waits for
 		TSVZ._lockFile(g)
