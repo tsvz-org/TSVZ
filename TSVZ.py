@@ -4196,8 +4196,8 @@ class TSVZed(OrderedDict):
 	- A rewrite of a legacy file (.tsv, .csv, .nsv, .psv, compressed or not) that fails part way (a full
 	  disk, a KeyboardInterrupt, an I/O error), or cannot make again a removed file, leaves the file
 	  damaged and memory the only good copy. Until a rewrite gets through, the file is not reloaded over
-	  memory and the background writer does not append to it; the next rewrite (the background writer's,
-	  rewrite(), close()) makes it again from memory. Another process's change made meanwhile is merged
+	  memory (the background writer still appends the rows set meanwhile, merged back as they are); the
+	  next rewrite (the background writer's, rewrite(), close()) makes it again from memory. Another process's change made meanwhile is merged
 	  into memory first when the file still begins with exactly the bytes the failed rewrite left (all
 	  after them was appended; a file left empty must then begin with this store's header); otherwise
 	  memory is kept and that change is overwritten, with a warning. reload() is unsafe then: it replaces
@@ -5141,8 +5141,10 @@ memoryOnly:{self.memoryOnly}
 		else:
 			retry = ("With rewrite_interval=0 none is tried again on its own, only one asked for (mapToFile(), "
 					 "rewrite(force=True), rewrite_on_exit) or one made after another process changes the file.")
+		damaged = (" A rewrite of this object's failed before this one and left the file damaged: until one gets through, "
+				   "memory holds the only good copy." if self._damage is not None else "")
 		self.__teePrintOrNot(f"Refused at {where} to {self._fileName}: {message}. The file is left as it is, and rows that can "
-							 f"be written are still appended. It is rewritten once every row can be written: set or delete the row; "
+							 f"be written are still appended.{damaged} It is rewritten once every row can be written: set or delete the row; "
 							 f"a key that cannot be written cannot be deleted either, so for one, edit the file, clear() the store "
 							 f"or open it with the encoding it was written in. {retry}",'error')
 
@@ -5531,10 +5533,10 @@ memoryOnly:{self.memoryOnly}
 					self._specSync()
 				elif not self._failing('sync'):
 					self._rewrite(background=True)  # it waits after a failed rewrite itself, but never to reload
-				# Not to a file a failed rewrite damaged (_damage): the rewrite that makes it again from memory, which
-				# holds the queued rows, comes first, and rows of this object's after the damage would be taken for
-				# another process's, merged after it (at close() they are appended all the same: nothing follows).
-				if self._spec or (not self._failing('append') and self._damage is None):
+				# Also to a file a failed rewrite damaged (_damage): the rows are on disk as soon as they are set, as
+				# ever, after the header to a file left empty; the rewrite that makes the file again merges them back
+				# as they are, in their order among another process's appends (the last writer wins, as on main).
+				if self._spec or not self._failing('append'):
 					self.commitAppendToFile()
 			time.sleep(self.append_check_delay)
 			# self.appendEvent.wait()

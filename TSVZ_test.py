@@ -8584,10 +8584,12 @@ def test_tsvzed_legacy_file_made_again_with_another_header_is_not_merged(tmp_pat
 	assert dict(t) == rows and _back(p) == rows and t._damage is None
 
 
-def test_tsvzed_legacy_background_writer_does_not_append_to_a_file_its_rewrite_emptied(tmp_path, monkeypatch, capsys):
-	# A failed rewrite that left the file empty: another process's file made there again begins with a header. Rows
-	# this object's background writer appended there first would have made it begin with a row (not merged, with a
-	# warning): it keeps them queued until the rewrite makes the file again.
+def test_tsvzed_legacy_background_writer_appends_to_a_file_its_rewrite_emptied(tmp_path, monkeypatch, capsys):
+	# cccd8c1 held the background writer's rows while a failed rewrite's damage was there, so that they did not make
+	# an emptied file begin with a row: they stayed in memory only until a rewrite got through (for good while it
+	# was refused), and another process's later row for the same key lost to them in the merge: the last writer no
+	# longer won (50ea158 kept it). They are appended as ever, after the header to the emptied file, and merged
+	# back as they are, in their order among another process's appends.
 	p = str(tmp_path / 'held.tsv')
 	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001)
 	for i in range(5):
@@ -8599,19 +8601,68 @@ def test_tsvzed_legacy_background_writer_does_not_append_to_a_file_its_rewrite_e
 	assert _wait_for(lambda: t._failing('rewrite'), 5)
 	for _ in range(10):
 		t._failed('rewrite', 'No space left on device', False)  # the next try is a minute away
-	assert _bytes(p) == b'' and t._damage is not None
-	t['mine'] = ['mine', 'M']
-	time.sleep(0.2)  # many ticks
-	assert _bytes(p) == b'' and t.appendQueue, 'the background writer appended to the damaged file'
-	with open(p, 'wb') as g:
-		g.write(b'key\tval\nnew\tN\n')  # another process makes the file again
+	assert t._damage is not None and b'k1' not in _bytes(p)
+	t['mine'] = ['mine', 'first']
+	assert _wait_for(lambda: not t.appendQueue and b'mine\tfirst' in _bytes(p)), 'the rows were held'
+	assert _bytes(p).startswith(b'key\tval\n')
+	_append_late(p, 'tsv', b'mine\tlater\n')  # another process, later: the last writer
+	_append_late(p, 'tsv', b'new\tN\n')
 	monkeypatch.undo()
 	t._worked('rewrite')
-	assert _wait_for(lambda: not t.deSynced, 5)
+	assert _wait_for(lambda: not t.deSynced and t._damage is None, 5)
 	t.close()
-	expected = dict((('k%d' % i, ['k%d' % i, 'v']) for i in range(1, 5)), k0=['k0', 'w'], mine=['mine', 'M'], new=['new', 'N'])
+	expected = dict((('k%d' % i, ['k%d' % i, 'v']) for i in range(1, 5)), k0=['k0', 'w'], mine=['mine', 'later'], new=['new', 'N'])
 	assert dict(t) == expected and _back(p) == expected
 	assert 'Overwriting external changes' not in capsys.readouterr().out
+
+
+def test_tsvzed_legacy_last_writer_wins_after_a_failed_rewrite(tmp_path, monkeypatch):
+	# This object sets K first, while its failed rewrite waits to be tried again; another process sets K later. The
+	# held row was queued until the rewrite and the merge skipped the other process's K: 'mine-first' won.
+	p = str(tmp_path / 'order.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001)
+	for i in range(5):
+		t['k%d' % i] = ['k%d' % i, 'v']
+	assert _wait_for(lambda: not t.appendQueue)
+	t['k0'] = ['k0', 'w']
+	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tw\n')
+	t.deSynced = True
+	assert _wait_for(lambda: t._failing('rewrite'), 5)
+	for _ in range(10):
+		t._failed('rewrite', 'No space left on device', False)
+	monkeypatch.undo()
+	t['K'] = ['K', 'mine-first']  # this process, first
+	assert _wait_for(lambda: not t.appendQueue)
+	_append_external(p, b'K\ttheirs-later\n')  # another process, later
+	t._worked('rewrite')
+	assert _wait_for(lambda: not t.deSynced and t._damage is None, 5)
+	t.close()
+	assert t['K'] == ['K', 'theirs-later'] and _back(p)['K'] == ['K', 'theirs-later']
+
+
+def test_tsvzed_legacy_damaged_store_whose_rewrite_is_refused_still_appends_its_rows(tmp_path, monkeypatch, capsys):
+	# The refusal said 'rows that can be written are still appended', but while a failed rewrite's damage was there
+	# the background writer held them, and a refused rewrite never gets through: they were held for good.
+	p = str(tmp_path / 'refused.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001, encoding='cp1252')
+	for i in range(5):
+		t['k%d' % i] = ['k%d' % i, 'v']
+	assert _wait_for(lambda: not t.appendQueue)
+	t['k1'] = ['k1', 'upd']
+	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv\n')
+	t.hardMapToFile()
+	monkeypatch.undo()
+	t._worked('rewrite')
+	assert t._damage is not None
+	_append_external(p, b'x\t\x81\n')  # a byte cp1252 cannot decode: merged as U+FFFD, which it cannot write
+	assert _wait_for(lambda: 'x' in t, 5)
+	assert _wait_for(lambda: t._refusedAt is not None, 5)
+	out = capsys.readouterr().out
+	assert 'Refused at' in out and 'still appended. A rewrite of this object\'s failed' in out, out
+	t['new'] = ['new', 'N']
+	assert _wait_for(lambda: not t.appendQueue and b'new\tN' in _bytes(p), 5), 'the row was held'
+	t.shutdownEvent.set()
+	t.appendThread.join()
 
 
 class _QuotaFileIO(io.FileIO):

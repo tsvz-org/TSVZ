@@ -214,8 +214,10 @@ A `TSVZed` rewrite of a `.tsv`, `.csv`, `.nsv` or `.psv` file (compressed or not
 that fails part way, on a full disk, a `KeyboardInterrupt` or an I/O error, or that
 cannot make again a file that was removed, leaves the file damaged: memory then holds
 the only good copy. Until a rewrite gets through, `TSVZed` does not reload the file
-over memory and its background writer does not append to it; the next rewrite (the
-background writer's, `rewrite()`, `close()`) makes the file again from memory. A change
+over memory; its background writer still appends the rows set meanwhile (to a file left
+empty, after the header, as every append to an empty file does), and they are merged
+back as they are. The next rewrite (the background writer's, `rewrite()`, `close()`)
+makes the file again from memory. A change
 another process made to the file meanwhile is merged into memory first when the file
 still begins with exactly the bytes the failed rewrite left, so that the rest can only
 have been appended (a file left empty, or made again, must then begin with this store's
