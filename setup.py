@@ -3,7 +3,7 @@ from TSVZ import version
 
 setup(
     name='TSVZ',
-    version=version,  
+    version=version,
     py_modules=['TSVZ'],
     description='Key-value store kept in a TSV / CSV / NSV / PSV file, with tsvz-spec-v1 support',
     author='Yufei Pan',
@@ -12,7 +12,7 @@ setup(
     entry_points={
         'console_scripts': [
             'TSVZ = TSVZ:__main__',
-			'tsvz = TSVZ:__main__',
+            'tsvz = TSVZ:__main__',
         ],
     },
     extras_require={
@@ -23,11 +23,14 @@ setup(
     classifiers=[
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.12',
+        'Programming Language :: Python :: 3.14',
         'License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)',
         'Operating System :: OS Independent',
     ],
     python_requires='>=3.6',
-	long_description=open('README.md', encoding='utf-8').read(),
-	long_description_content_type='text/markdown',
-	license='GPLv3+',
+    long_description=open('README.md', encoding='utf-8').read(),
+    long_description_content_type='text/markdown',
+    license='GPLv3+',
 )
