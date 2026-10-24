@@ -7732,6 +7732,8 @@ def _serveLookup(store):
 	address = fields['address']
 	if not address.startswith('unix:'):
 		return None, '{} names {}, which is not a Unix-domain socket'.format(path, address)
+	if 'x-delimiter' in fields:  # written with backslash escapes, so that a TAB or NUL is no control character
+		fields['x-delimiter'] = codecs.decode(fields['x-delimiter'], 'unicode_escape')
 	fields['owner'] = getattr(st, 'st_uid', None)
 	return fields, None
 
@@ -7981,7 +7983,7 @@ class _ServeHandle(object):
 		lines = ['tsvz-handler\t{}'.format(_SERVE_PROTOCOL_VERSION), 'address\t' + _serveEncode(self.address),
 				 'host\t' + _serveEncode(socket.gethostname()), 'pid\t{}'.format(os.getpid())]
 		if not store.spec:
-			lines.append('x-delimiter\t' + _serveEncode(store.delimiter))
+			lines.append('x-delimiter\t' + _serveEncode(store.delimiter.encode('unicode_escape').decode('ascii')))
 		f = self.pointerFile
 		if hasattr(os, 'fchmod'):
 			os.fchmod(f.fileno(), 0o644)  # readable by all, writable by its owner only

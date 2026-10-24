@@ -4896,6 +4896,24 @@ def test_tsvz_serve_and_stop(tmp_path):
 	assert r.returncode == 1 and 'no handler is running' in r.stderr
 
 
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_tsvz_serve_of_a_tab_or_nul_delimited_file_is_found_and_stopped(tmp_path):
+	"""The pointer of a TAB- or NUL-delimited store holds its x-delimiter escaped, and clients use it."""
+	for name, delimiter in (('t.tsv', b'\t'), ('n.nsv', b'\0')):
+		p = str(tmp_path / name)
+		proc = _serve_process(p)  # returns once a client finds the pointer
+		try:
+			r = _cli('set', p, 'k', 'v')
+			assert (r.returncode, r.stderr) == (0, ''), r.stderr  # through the handler: the pointer is not ignored
+			r = _cli('stop', p)
+			assert r.returncode == 0, r.stderr
+			assert proc.wait(10) == 0
+		finally:
+			if proc.poll() is None:
+				proc.kill()
+		assert open(p, 'rb').read().endswith(b'k' + delimiter + b'v\n') and not os.path.exists(p + '.serve')
+
+
 @pytest.mark.skipif(os.name != 'posix', reason='signals')
 def test_tsvz_serve_stops_on_sigterm_and_when_idle(tmp_path):
 	import signal
