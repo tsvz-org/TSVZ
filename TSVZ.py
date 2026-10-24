@@ -6361,39 +6361,14 @@ class TSVZedLite(MutableMapping):
 	def _specWrite(self, line):
 		"""Append one record (or lines written together) to the active part; return its offset, or None for a compressed part."""
 		data = _encodeText(line + '\n', 'utf-8', self.errors)
-		if self.fileObj is None:
-			reporter = _Reporter(self._activePath)
-			try:
+		reporter = _Reporter(self._activePath)
+		try:
+			if self.fileObj is None:
 				_specAppendPayload(self._activePath, data, reporter, memberSize=self._specState.memberSize)
-			finally:
-				reporter.flush()
-			return None
-		f = self.fileObj
-		with _pathLock(self._activePath):
-			# The 3.39 exclusive lockf, as every other writer takes: under it an
-			# unterminated tail really is uncommitted, and the end cannot move.
-			_seekRawStart(f)  # msvcrt locks from the raw position: lock and unlock the same range
-			_lockFile(f)
-			try:
-				size = f.seek(0, os.SEEK_END)
-				if size:
-					f.seek(size - 1)
-					if f.read(1) != b'\n':
-						keep = _lastNewlineEnd(f, size)
-						f.seek(keep)
-						tail = f.read(size - keep)
-						f.truncate(keep)
-						size = keep
-						_warn(f'TSVZ warning: {self._activePath}: removed uncommitted tail {tail[:80]!r} before appending')
-				f.seek(size)
-				f.write(data)
-				f.flush()
-			finally:
-				try:
-					_seekRawStart(f)
-				except Exception:
-					pass  # a failed write is already propagating; the lock must still be released
-				_unlockFile(f)
+				return None
+			size = _specAppendTo(self.fileObj, self._activePath, data, reporter)[0]
+		finally:
+			reporter.flush()
 		if not self._transStates or self._specState.rowState is not self._transStates[-1]:
 			self._transOffsets.append(size)
 			self._transStates.append(self._specState.rowState)
