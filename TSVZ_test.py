@@ -4434,26 +4434,6 @@ def test_part_info_counts_committed_bytes(tmp_path):
 	assert TSVZ._specLoad(p, '\t', reporter=TSVZ._Reporter(p)).infos[0].lines == 2
 
 
-def test_spec_replay_line_matches_spec_replay(tmp_path):
-	p = str(tmp_path / 'r.tsvz')
-	good = '%08x' % (__import__('zlib').crc32(b'a\t1\n') & 0xffffffff)
-	_touch(p, ('\ufeff#_defaults_#\t\tD\n#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\t' + good + '\n'
-			   '<#>h\tx<sep>y\nb\n#c\n\xe9\t2\n').encode('utf-8') + b'bad\xff\t3\n')
-	whole = TSVZ._SpecState()
-	expected = [(text, record) for _, _, text, record in
-				TSVZ._specReplay([p], '\t', whole, TSVZ._Reporter(p), [])]
-	single = TSVZ._SpecState()
-	reporter = TSVZ._Reporter(p)
-	got = []
-	for lineNo, (raw, _) in enumerate(TSVZ._iterPartLines(TSVZ._PartInfo(p), reporter), 1):
-		replayed = TSVZ._specReplayLine(raw, lineNo, '', p, single, '\t', reporter)
-		if replayed is not None:
-			got.append(replayed)
-	assert got == expected
-	assert single.defaults == whole.defaults == ['#_defaults_#', '', 'D']
-	assert single.mismatches == whole.mismatches == []
-
-
 def test_spec_pad_row():
 	state = TSVZ._SpecState(['#_defaults_#', 'x', 'y'])
 	row = ['k', '1']

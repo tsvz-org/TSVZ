@@ -2595,9 +2595,9 @@ def _cellText(item):
 class _PartInfo(object):
 	"""What reading one part found: its codec, uncommitted tail and damage."""
 
-	def __init__(self, path):
+	def __init__(self, path, codec=None):
 		self.path = path
-		self.codec = _parsePartName(path).codec
+		self.codec = _parsePartName(path).codec if codec is None else codec
 		self.tail = b''
 		self.damaged = []  # what was wrong with a compressed part's members, for the warning
 		self.lost = False  # damaged data was recovered, skipped or stopped at (spec §4.10): a rewrite keeps a copy
@@ -3020,11 +3020,10 @@ def _specReplay(parts, delimiter, state, reporter, infos, start=0):
 	"""Replay ``parts`` as one stream (spec §7, §17.4).
 
 	Yields ``(partIndex, offset, text, record)`` for every committed line except
-	checksum markers of supported algorithms, where ``record`` is what
-	``_specProcessRecord`` returned. Marker state and checksum accumulators in
-	``state`` carry across parts. One ``_PartInfo`` per part is appended to
-	``infos``. The parts before ``start`` (a snapshot part, spec §19.10.3) are not
-	read: their infos are marked ``skipped``.
+	checksum markers of supported algorithms (``_specReplayLines``). Marker state
+	and checksum accumulators in ``state`` carry across parts. One ``_PartInfo``
+	per part is appended to ``infos``. The parts before ``start`` (a snapshot part,
+	spec §19.10.3) are not read: their infos are marked ``skipped``.
 	"""
 	multi = len(parts) > 1
 	for partIndex, path in enumerate(parts):
@@ -3035,39 +3034,53 @@ def _specReplay(parts, delimiter, state, reporter, infos, start=0):
 			info.skipped = True
 			continue
 		label = os.path.basename(path) + ' ' if multi else ''
-		lineNo = 0
-		for raw, offset in _iterPartLines(info, reporter, label):
-			lineNo += 1
-			where = '{}line {}'.format(label, lineNo)
-			whole = raw  # digests cover the line as written, zero bytes included (spec §4.9)
-			fill = _specZeroFill(raw, delimiter, state, reporter, where)
-			if fill is not raw:
-				info.lost = True
-				if fill is _STOP:
-					_reportPartDamage(info, reporter)  # the part reader stops here too, before its own report
-					info.stopped = True
-					info.lines = lineNo
-					info.committed = offset  # where reading stopped: a follower checks the bytes before it
-					return
-				if fill is None:
-					for digest in state.digests.values():
-						digest.update(whole)
-					continue
-				offset += len(raw) - len(fill)
-				raw = fill
-			text = _decodeLine(raw, reporter, where)
-			check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
-			algo = check.group(1).lower() if check and _digestSupported(check.group(1).lower()) else None
-			for name, digest in state.digests.items():
-				if name != algo:
-					digest.update(whole)
-			if algo:
-				_specChecksum(state, algo, text, delimiter, reporter, where, (path, lineNo))
-				continue
-			yield partIndex, offset, text, _specProcessRecord(text, state, delimiter, reporter, where)
-		info.lines = lineNo
+		yield from _specReplayLines(_iterPartLines(info, reporter, label), info, label, state, delimiter, reporter,
+									partIndex=partIndex)
 		if info.stopped:  # a stop policy ends the read of the whole store (spec §4.10)
 			return
+
+
+def _specReplayLines(lines, info, label, state, delimiter, reporter, lineNo=0, partIndex=0):
+	"""Replay committed lines of the part ``info`` describes (spec §4.9, §7, §15).
+
+	``lines`` yields ``(raw, offset)``: each line with its b'\\n' (a byte order
+	mark already removed) and where it begins in the part; ``lineNo`` lines of the
+	part come before them. Yields ``(partIndex, offset, text, record)`` for each
+	line except checksum markers of supported algorithms, where ``record`` is what
+	``_specProcessRecord`` returned; ``offset`` is past any zero fill. Sets
+	``info.lines``, and ``info.lost`` and ``info.stopped`` for damaged data.
+	"""
+	path = info.path
+	for raw, offset in lines:
+		lineNo += 1
+		where = '{}line {}'.format(label, lineNo)
+		whole = raw  # digests cover the line as written, zero bytes included (spec §4.9)
+		fill = _specZeroFill(raw, delimiter, state, reporter, where)
+		if fill is not raw:
+			info.lost = True
+			if fill is _STOP:
+				_reportPartDamage(info, reporter)  # the part reader stops here too, before its own report
+				info.stopped = True
+				info.lines = lineNo
+				info.committed = offset  # where reading stopped: a follower checks the bytes before it
+				return
+			if fill is None:
+				for digest in state.digests.values():
+					digest.update(whole)
+				continue
+			offset += len(raw) - len(fill)
+			raw = fill
+		text = _decodeLine(raw, reporter, where)
+		check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
+		algo = check.group(1).lower() if check and _digestSupported(check.group(1).lower()) else None
+		for name, digest in state.digests.items():
+			if name != algo:
+				digest.update(whole)
+		if algo:
+			_specChecksum(state, algo, text, delimiter, reporter, where, (path, lineNo))
+			continue
+		yield partIndex, offset, text, _specProcessRecord(text, state, delimiter, reporter, where)
+	info.lines = lineNo
 
 
 SNAPSHOT_KEY = '#_snapshot_#'
@@ -3122,38 +3135,19 @@ def _specSnapshotStart(parts, delimiter):
 
 
 def _specReplayLine(raw, lineNo, label, path, state, delimiter, reporter, atStart=False):
-	"""Replay one committed line of the part ``path``, as ``_specReplay`` does for each line.
+	"""``_specReplayLines`` for the one committed line ``raw`` (with its b'\\n'), line ``lineNo`` of the part ``path``.
 
-	``raw`` is the line with its b'\\n'; ``lineNo`` counts from 1 within the
-	part and ``label`` prefixes locations in reports; ``atStart`` says the line
-	begins the part, the one place a byte order mark is removed (spec §4.7). Returns ``(text,
-	record)`` as ``_specProcessRecord`` sees it, None for the checksum marker
-	of a supported algorithm or an ignored zero-filled line, or ``_STOP``.
-	(``_specReplay`` keeps this logic inline for speed; the two must stay in
-	step.)
+	``atStart`` says it begins the part, the one place a byte order mark is removed
+	(spec §4.7). Returns ``(text, record)``, None for a line that gives no record (the
+	checksum marker of a supported algorithm, an ignored zero-filled line), or ``_STOP``.
 	"""
-	where = '{}line {}'.format(label, lineNo)
 	if atStart and raw.startswith(b'\xef\xbb\xbf'):
 		raw = raw[3:]
-		reporter.note('bom', where, 'stripped a UTF-8 byte order mark')
-	whole = raw  # digests cover the line as written, zero bytes included (spec §4.9)
-	raw = _specZeroFill(raw, delimiter, state, reporter, where)
-	if raw is _STOP:
-		return raw
-	if raw is None:
-		for digest in state.digests.values():
-			digest.update(whole)
-		return None
-	text = _decodeLine(raw, reporter, where)
-	check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
-	algo = check.group(1).lower() if check and _digestSupported(check.group(1).lower()) else None
-	for name, digest in state.digests.items():
-		if name != algo:
-			digest.update(whole)
-	if algo:
-		_specChecksum(state, algo, text, delimiter, reporter, where, (path, lineNo))
-		return None
-	return text, _specProcessRecord(text, state, delimiter, reporter, where)
+		reporter.note('bom', '{}line {}'.format(label, lineNo), 'stripped a UTF-8 byte order mark')
+	info = _PartInfo(path, '')  # a follower follows plain parts only
+	for _, _, text, record in _specReplayLines(((raw, 0),), info, label, state, delimiter, reporter, lineNo - 1):
+		return text, record
+	return _STOP if info.stopped else None
 
 
 def _storeParts(path, reporter=None):
