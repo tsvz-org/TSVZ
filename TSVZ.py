@@ -3419,6 +3419,22 @@ def _specReplayQueued(load, records, delimiter):
 				load.data[key] = row
 
 
+def _specCells(key, value, delimiter):
+	"""``(key, cells)`` as a .tsvz set takes them (as 3.39 did): the key and every cell right-stripped, the key first."""
+	key = str(key).rstrip()
+	if isinstance(value, str):
+		value = value.split(delimiter)
+	cells = [str(s).rstrip() if s else '' for s in value]
+	return key, (cells if cells and cells[0] == key else [key] + cells)
+
+
+def _specFill(cells, defaults):
+	"""Fill a set row's empty cells with ``defaults`` in place, as it is written (design §5.2)."""
+	for i in range(1, min(len(cells), len(defaults))):
+		if not cells[i] and defaults[i]:
+			cells[i] = defaults[i]
+
+
 def _specPadRow(row, state, width):
 	"""Pad a data row in place to the store width with its row-bound defaults (design §4.7).
 
@@ -4471,22 +4487,7 @@ class TSVZed(OrderedDict):
 		self._constructed = True
 
 	def setDefaults(self,defaults):
-		if not defaults:
-			defaults = []
-		if isinstance(defaults,str):
-			defaults = defaults.split(self.delimiter)
-		elif not isinstance(defaults,list):
-			try:
-				defaults = list(defaults)
-			except Exception:
-				if self.verbose:
-					self.__teePrintOrNot('Invalid defaults, setting defaults to empty.','error')
-				defaults = []
-		defaults = [str(s).rstrip() if s else '' for s in defaults]
-		if not any(defaults):
-			defaults = []
-		if not defaults or defaults[0] != DEFAULTS_INDICATOR_KEY:
-			defaults = [DEFAULTS_INDICATOR_KEY]+defaults
+		defaults = _normalizeDefaults(defaults, self.delimiter)
 		_checkRow(defaults, self.delimiter, self.encoding, self.errors, what='defaults')
 		if self._spec and self._constructed:
 			# Spec rows are written sparse and read back under the file's
@@ -4887,15 +4888,10 @@ class TSVZed(OrderedDict):
 
 	def _specSetItem(self, key, value):
 		"""__setitem__ for .tsvz (design §5.2): write the given cells, keep the padded row in memory."""
-		key = str(key).rstrip()
+		key, value = _specCells(key, value, self.delimiter)
 		if not key:
 			self.__teePrintOrNot('Key cannot be empty','error')
 			return
-		if isinstance(value,str):
-			value = value.split(self.delimiter)
-		value = [str(s).rstrip() if s else '' for s in value]
-		if not value or value[0] != key:
-			value = [key]+value
 		if _MARKER_RE.match(key):
 			self._specSetMarker(key, value)
 			return
@@ -4907,16 +4903,9 @@ class TSVZed(OrderedDict):
 			if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
 				self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
 				return
-			defaults = self.defaults
-			for i in range(1, min(len(value), len(defaults))):
-				if not value[i] and defaults[i]:
-					value[i] = defaults[i]
-			written = list(value)
-			if self.correctColumnNum <= 0:
-				self.correctColumnNum = len(defaults) if len(defaults) > 1 else len(value)
-			target = max(self.correctColumnNum, len(defaults))
-			if len(value) < target:
-				value += [defaults[j] if j < len(defaults) else '' for j in range(len(value), target)]
+			_specFill(value, self.defaults)
+			record = _specFormatRecord(value, self.delimiter)
+			self.correctColumnNum = _specPadRow(value, self._specState, self.correctColumnNum if self.correctColumnNum > 0 else -1)
 			if key in self:
 				if OrderedDict.__getitem__(self, key) == value:
 					return
@@ -4924,7 +4913,7 @@ class TSVZed(OrderedDict):
 			OrderedDict.__setitem__(self, key, value)
 			if self.memoryOnly:
 				return
-			self.appendQueue.append(_specFormatRecord(written, self.delimiter))
+			self.appendQueue.append(record)
 			self.lastUpdateTime = get_time_ns()
 
 	def _specSetMarker(self, key, value):
@@ -6336,16 +6325,11 @@ class TSVZedLite(MutableMapping):
 		return segments
 
 	def _specSetItem(self, key, value):
-		"""__setitem__ for .tsvz: same normalisation as TSVZed, written immediately."""
-		key = str(key).rstrip()
+		"""__setitem__ for .tsvz: as TSVZed's, written immediately."""
+		key, value = _specCells(key, value, self.delimiter)
 		if not key:
 			eprint('Error: Key cannot be empty')
 			return
-		if isinstance(value,str):
-			value = value.split(self.delimiter)
-		value = [str(s).rstrip() if s else '' for s in value]
-		if not value or value[0] != key:
-			value = [key]+value
 		if _MARKER_RE.match(key):
 			self._specWriteMarker(key, value)
 			return
@@ -6356,20 +6340,10 @@ class TSVZedLite(MutableMapping):
 		if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
 			eprint(f"Error: Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...")
 			return
-		defaults = self.defaults
-		for i in range(1, min(len(value), len(defaults))):
-			if not value[i] and defaults[i]:
-				value[i] = defaults[i]
-		if self.correctColumnNum <= 0:
-			# Mirror _specLoad's width rule so memory and reads equal a reload.
-			self.correctColumnNum = len(defaults) if len(defaults) > 1 else len(value)
+		_specFill(value, self.defaults)
 		offset = self._specWrite(_specFormatRecord(value, self.delimiter))
-		if offset is None:
-			target = max(self.correctColumnNum, len(defaults))
-			value += [defaults[j] if j < len(defaults) else '' for j in range(len(value), target)]
-			self.indexes[key] = value
-		else:
-			self.indexes[key] = offset
+		self.correctColumnNum = _specPadRow(value, self._specState, self.correctColumnNum if self.correctColumnNum > 0 else -1)
+		self.indexes[key] = value if offset is None else offset  # a row of a compressed part is held, as a read holds it
 
 	def _specWriteMarker(self, key, value):
 		_checkRow(value, self.delimiter, self.encoding, self.errors, self.header,
@@ -6426,22 +6400,7 @@ class TSVZedLite(MutableMapping):
 		return size
 
 	def setDefaults(self,defaults):
-		if not defaults:
-			defaults = []
-		if isinstance(defaults,str):
-			defaults = defaults.split(self.delimiter)
-		elif not isinstance(defaults,list):
-			try:
-				defaults = list(defaults)
-			except Exception:
-				if self.verbose:
-					eprint('Error: Invalid defaults, setting defaults to empty.')
-				defaults = []
-		defaults = [str(s).rstrip() if s else '' for s in defaults]
-		if not any(defaults):
-			defaults = []
-		if not defaults or defaults[0] != DEFAULTS_INDICATOR_KEY:
-			defaults = [DEFAULTS_INDICATOR_KEY]+defaults
+		defaults = _normalizeDefaults(defaults, self.delimiter)
 		_checkRow(defaults, self.delimiter, self.encoding, self.errors, what='defaults')
 		if self._spec and self._constructed:
 			# Spec rows are written sparse and read back under the file's
