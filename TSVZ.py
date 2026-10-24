@@ -2738,7 +2738,7 @@ def _gzipHeaderLength(data):
 	"""The length of the gzip member header at the start of ``data`` (RFC 1952), or None when it is not all there."""
 	if len(data) < 10 or data[:3] != b'\x1f\x8b\x08':
 		return None
-	flags = data[3] if not isinstance(data[3], str) else ord(data[3])
+	flags = data[3]
 	pos = 10
 	if flags & 4:  # FEXTRA
 		if len(data) < pos + 2:
@@ -2862,7 +2862,6 @@ def _decompressMembers(f, info, src):
 			stop = following
 		f.seek(start)
 		raw = f.read(stop - start)
-		# Where the read ends now, and the bytes before it: those read up to the damage, then these.
 		if _CODEC_NAMES[info.codec] == 'gzip':
 			raw = _gzipUnpad(raw)  # zero padding before the next member (spec §16.6)
 		cutShort, out, error = _decodeAlone(raw, info.codec)
@@ -2978,7 +2977,7 @@ def _decodeLine(raw, reporter, where):
 	return text
 
 
-def _specChecksum(state, algo, text, delimiter, reporter, where, position=None):
+def _specChecksum(state, algo, text, delimiter, reporter, where, position):
 	"""Arm or verify-and-reset the ``algo`` accumulator (spec §15.3).
 
 	A mismatch is noted on ``reporter`` and appended to ``state.mismatches`` as
@@ -2991,7 +2990,7 @@ def _specChecksum(state, algo, text, delimiter, reporter, where, position=None):
 			actual = state.digests[algo].hexdigest()
 			if actual != expected:
 				reporter.note('checksum', where, '#_checksum_{}_# mismatch: expected {}, computed {}; data kept'.format(algo, expected, actual))
-				state.mismatches.append(tuple(position or (None, None)) + (algo, expected, actual))
+				state.mismatches.append(tuple(position) + (algo, expected, actual))
 	state.digests[algo] = _newDigest(algo)
 
 
