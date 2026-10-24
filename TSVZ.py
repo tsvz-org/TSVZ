@@ -2399,7 +2399,6 @@ class _SpecState(object):
 	"""Reader state of spec §12, carried across records and parts."""
 
 	def __init__(self, defaults=None):
-		self.version = 1
 		self.newestVersion = 1  # the highest version a #_version_# line declared (spec §19.4, §19.8)
 		self.defaults = list(defaults) if defaults and len(defaults) > 1 else [DEFAULTS_INDICATOR_KEY]
 		self.strip = True
@@ -2433,6 +2432,15 @@ def _asciiLower(text):
 	return ''.join(c.lower() if c < '\x80' else c for c in text)
 
 
+def _asciiInt(value):
+	"""The number the ASCII digits ``value`` spell, else 0. A value of more than 64 significant digits, which int()
+	refuses from Python 3.11 when it is very long, counts as 10 ** 64: more than any version or member size."""
+	if not _ASCII_DIGITS_RE.match(value):
+		return 0
+	digits = value.lstrip('0') or '0'
+	return int(digits) if len(digits) <= 64 else 10 ** 64
+
+
 def _specApplyMarker(state, keyLower, values, reporter, where):
 	"""Apply an official marker (spec §12.4). Returns False when its value was rejected."""
 	value = values[0] if values else ''  # marker lines are not stripped (spec §10.4)
@@ -2440,21 +2448,14 @@ def _specApplyMarker(state, keyLower, values, reporter, where):
 		state.defaults = [DEFAULTS_INDICATOR_KEY] + list(values)
 		state.sawDefaults = True
 	elif keyLower == '#_version_#':
-		if not value:
-			state.version = 1
-		else:
-			number = 0
-			if _ASCII_DIGITS_RE.match(value):
-				digits = value.lstrip('0') or '0'
-				# int() refuses very long values (Python 3.11+); any such value is above every implemented version.
-				number = int(digits) if len(digits) <= 64 else MAX_SPEC_VERSION + 1
+		if value:  # an empty value resets to version 1, which changes nothing that is read
+			number = _asciiInt(value)
 			if number < 1:
 				reporter.note('bad-marker', where, 'ignored #_version_# with invalid value {!r}'.format(value))
 				return False
 			if number > MAX_SPEC_VERSION:
 				shown = value if len(value) <= 20 else '{}… ({} digits)'.format(value[:20], len(value))
 				reporter.note('newer-version', where, 'declares spec version {}; read as version {}'.format(shown, MAX_SPEC_VERSION))
-			state.version = number
 			state.newestVersion = max(state.newestVersion, number)
 	elif keyLower in _BOOL_MARKERS:
 		attr, default = _BOOL_MARKERS[keyLower]
@@ -2466,12 +2467,7 @@ def _specApplyMarker(state, keyLower, values, reporter, where):
 			reporter.note('bad-marker', where, 'ignored {} with invalid value {!r}'.format(keyLower, value))
 			return False
 	elif keyLower == MEMBER_SIZE_KEY:
-		size = 0
-		if _ASCII_DIGITS_RE.match(value):
-			try:
-				size = int(value)
-			except ValueError:  # more digits than int() converts (Python 3.11+ limit)
-				pass
+		size = _asciiInt(value)
 		if not value:
 			state.memberSize = _DEFAULT_MEMBER_SIZE
 		elif size >= 1:
@@ -3916,17 +3912,29 @@ def _specAppendRecords(fileName, records, reporter, teeLogger=None, header=(), c
 	return True
 
 
+def _specKeptHeader(load, header, delimiter, errors):
+	"""The header line a clear or scrub writes, as a list of 0 or 1 lines: the store's own, else ``header``
+	(checked, as it is written only then)."""
+	if load.headerLine:
+		return [load.headerLine]
+	if not any(header):
+		return []
+	_checkRow(header, delimiter, 'utf-8', errors, what='header')
+	return [_specHeaderComment(header, delimiter)]
+
+
 def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=False, verbose=False,
 						  encoding='utf8', strict=False, delimiter=..., errors='strict'):
 	"""``clearTabularFile`` for spec paths (design §5.5, §5.8). Returns True when the store was cleared.
 
 	A single file is read without a lock and rewritten in place only if no
 	other writer changed it since the read (else it is read again, up to
-	``_SPEC_REWRITE_ATTEMPTS`` times), as is a store whose read may be torn,
-	so a multi-part store never gets tombstones for the keys of a torn view.
-	A path naming one part of a multi-part store is refused, and so is a
+	``_SPEC_REWRITE_ATTEMPTS`` times). A store whose read may be torn is left
+	alone, so a multi-part store never gets tombstones for the keys of a torn
+	view. A path naming one part of a multi-part store is refused, and so is a
 	single file declaring a spec version newer than ``MAX_SPEC_VERSION``.
 	"""
+	changing = 'clear skipped: the store kept changing while it was being cleared; nothing was written'
 	reporter = _Reporter(fileName, teeLogger)
 	attempt = None
 	cleared = False
@@ -3945,8 +3953,9 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			parts, stamp = _specSnapshot(fileName)
 			load = _specLoad(fileName, delimiter, header=header, verifyHeader=False, strict=False,
 							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
-			if attempt.has('torn'):
-				continue  # the store kept changing under its reads: never clear the keys of a torn view
+			if attempt.has('torn'):  # read again already: never clear the keys of a torn view
+				attempt.note('changing', None, changing)
+				return False
 			if attempt.incomplete():
 				if _storeParts(fileName)[0] != parts:
 					continue  # a part went away during the read (a rotation): read again
@@ -3969,19 +3978,13 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 				headerChecked = True
 				if not _lineContainHeader(header, load.headerLine[1:], verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter):
 					__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
-			lines = []
-			headerLine = load.headerLine or (_specHeaderComment(header, delimiter) if any(header) else None)
-			if headerLine:
-				if not load.headerLine:
-					_checkRow(header, delimiter, 'utf-8', errors, what='header')  # the header is written only when the store has none
-				lines.append(headerLine)
-			lines += _specPreamble(load.state, delimiter, version=False)
+			lines = _specKeptHeader(load, header, delimiter, errors) + _specPreamble(load.state, delimiter, version=False)
 			if _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors), expect=stamp,
 								   memberSize=load.state.memberSize) is not None:
 				cleared = True
 				break
 		else:
-			attempt.note('changing', None, 'clear skipped: the store kept changing while it was being cleared; nothing was written')
+			attempt.note('changing', None, changing)
 	finally:
 		reporter.flush()
 		if attempt is not None:
@@ -4086,8 +4089,10 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 			if len(load.parts) != 1 or name.ordinal is not None or name.rotated:
 				attempt.note('multipart', None, 'scrub skipped: TSVZ does not compact multi-part stores or single parts of them; nothing was written')
 				return taskDic, False
-			if stamp is None or load.parts != parts or attempt.has('torn'):
-				continue  # the set of parts changed under the read, or the part kept changing while it was read
+			if attempt.has('torn'):
+				break  # the part kept changing while it was read, which was done again already
+			if stamp is None or load.parts != parts:
+				continue  # the set of parts changed under the read
 			if load.state.newestVersion > MAX_SPEC_VERSION:
 				attempt.note('refused', None, 'scrub skipped: the store declares a spec version newer than {0} (#_version_#), which '
 							 'this TSVZ reads as version {0} only (spec §6.3); a rewrite would make that reading permanent; '
@@ -4097,14 +4102,8 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 			state = load.state
 			rows = [_specScrubCells(row, state) for row in taskDic.values()]
 			compensate = not all(_specRoundTrips(cells, state) for cells in rows)
-			lines = []
-			headerLine = load.headerLine or (_specHeaderComment(header, delimiter) if any(header) else None)
-			if headerLine:
-				if not load.headerLine:
-					_checkRow(header, delimiter, 'utf-8', errors, what='header')  # the header is written only when the store has none
-				lines.append(headerLine)
 			preamble = _specPreamble(state, delimiter, compensate=compensate)
-			lines += preamble
+			lines = _specKeptHeader(load, header, delimiter, errors) + preamble
 			# Everything that is to be written is looked at before a copy of a damaged part is kept or the part is
 			# touched, and a refused cell is named (its key and column), not the file.
 			for line in preamble:

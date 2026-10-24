@@ -896,7 +896,7 @@ def test_spec_bad_marker_values_keep_state(capsys):
 								   '#_return_defaults_when_missing_#\tno', '#_version_#\t3',
 								   '#__custom__#\tanything', '#_unknown_#\t1', '#_rotate_#\tRENAME'])
 	reporter.flush()
-	assert state.fillEmpty is False and state.returnDefaults is False and state.version == 3
+	assert state.fillEmpty is False and state.returnDefaults is False and state.newestVersion == 3
 	assert state.rotate == 'rename'
 	warnings = _tsvz_warnings(capsys)
 	assert len(warnings) == 2
@@ -939,7 +939,7 @@ def test_normalize_defaults():
 
 def test_spec_version_marker_with_unicode_digits_is_rejected(capsys):
 	_, state, reporter = _process(['#_version_#\t²', '#_version_#\t٣'])
-	assert state.version == 1
+	assert state.newestVersion == 1
 	reporter.flush()
 	warnings = _tsvz_warnings(capsys)
 	assert len(warnings) == 1
@@ -3779,7 +3779,7 @@ def test_spec_version_marker_with_too_many_digits_does_not_crash(tmp_path, capsy
 	reporter.flush()
 	warnings = [w for w in _tsvz_warnings(capsys) if w.startswith(('TSVZ warning: t:', 'TSVZ warning: ' + p))]
 	# On every Python, int()'s digit limit (3.11+) included: a version above every implemented one.
-	assert state.version > TSVZ.MAX_SPEC_VERSION and state.newestVersion > TSVZ.MAX_SPEC_VERSION
+	assert state.newestVersion > TSVZ.MAX_SPEC_VERSION
 	assert len(warnings) == 2 and all('declares spec version' in w for w in warnings)
 	assert all(len(w) < 300 for w in warnings)  # the value is shortened, not printed whole
 
@@ -3788,7 +3788,7 @@ def test_spec_integer_marker_values_are_digits_only_with_no_trailing_newline(tmp
 	# '<LF>' decodes to a newline, which is not a digit (spec §12.4.1): the marker is ignored, never a crash.
 	for value in ('0<LF>', '2<LF>'):
 		_, state, reporter = _process(['#_version_#\t' + value])
-		assert (state.version, state.newestVersion) == (1, 1), value
+		assert state.newestVersion == 1, value
 		assert reporter.has('bad-marker'), value
 	_, state, reporter = _process(['#_member_size_#\t5<LF>'])
 	assert state.memberSize == TSVZ._DEFAULT_MEMBER_SIZE and reporter.has('bad-marker')
