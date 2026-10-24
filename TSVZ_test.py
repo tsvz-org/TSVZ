@@ -3588,6 +3588,38 @@ def test_spec_tsvzed_reads_a_torn_store_again(tmp_path, monkeypatch, capsys):
 		t.close()
 
 
+def test_spec_tsvzed_sees_an_append_made_after_its_load_read_the_part(tmp_path, monkeypatch):
+	# Another writer appends once the load has read the part, before the load is done: the next check
+	# reads that row.
+	p = str(tmp_path / 's.tsvz')
+	_touch(p, b'a\t1\n')
+	real = TSVZ._iterPartLines
+
+	def lines(info, reporter, label=''):
+		for item in real(info, reporter, label):
+			yield item
+		monkeypatch.undo()
+		TSVZ.appendLinesTabularFile(p, [['b', '2']])
+	monkeypatch.setattr(TSVZ, '_iterPartLines', lines)
+	t = TSVZ.TSVZed(p, append_check_delay=0.01)
+	try:
+		assert _wait_for(lambda: 'b' in t)
+	finally:
+		t.close()
+
+
+def test_spec_tsvzed_commit_does_not_hide_an_append_made_before_it(tmp_path):
+	p = str(tmp_path / 's.tsvz')
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	TSVZ.appendLinesTabularFile(p, [['ext', 'X']])  # another writer, before this object's commit
+	t.commitAppendToFile()
+	t.checkExternalChanges()
+	assert t.deSynced
+	t._specSync()
+	assert t['ext'] == ['ext', 'X'] and t['a'] == ['a', '1']
+
+
 @pytest.mark.parametrize('name, new', [
 	('s.tsvz', b'x\t9\n'),  # shorter: the read ends early, with a and b but not c
 	('s.tsvz', b'c\t3\nd\t4\ne\t5\nf\t6\n'),  # longer: the read takes a and b, then e and f

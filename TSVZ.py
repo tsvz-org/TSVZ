@@ -3605,17 +3605,36 @@ def _specBackupPart(path, reporter):
 	return backup
 
 
-def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None):
-	"""Append whole records to a spec part (design §5.4).
+def _specAppendTo(f, path, payload, reporter, fsync=False, memberSize=None):
+	"""Append whole records to the open part ``f`` (``path``) under its locks (design §5.4).
 
 	Uncompressed: an uncommitted tail is truncated first. Compressed: the
 	payload becomes new members of at most ``memberSize`` bytes (spec §16.7);
 	the part is not read or checked for damage, since readers handle a damaged
-	member (spec §16.6). A missing part is created.
+	member (spec §16.6). Returns ``(offset, before, after)``: where the payload
+	begins, and the part's ``_specStamp`` just before and after it is written,
+	both taken under the lock, so no other locked writer's append falls between.
 	"""
-	codec = _parsePartName(path).codec
-	_requireCodec(codec)
-	_lockedAppend(path, payload, 'truncate', reporter, fsync=fsync, codec=codec, memberSize=memberSize)
+	with _pathLock(path):
+		_seekRawStart(f)  # msvcrt locks from the raw position: lock and unlock the same range
+		_lockFile(f)
+		try:
+			before = _specStamp(os.fstat(f.fileno()))
+			offset = _appendOpen(f, payload, _parsePartName(path).codec, None, 'truncate', reporter, fsync, memberSize)
+			return offset, before, _specStamp(os.fstat(f.fileno()))
+		finally:
+			try:
+				_seekRawStart(f)
+			except OSError:
+				pass  # a failed write is already propagating; the lock must still be released
+			_unlockFile(f)
+
+
+def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None):
+	"""``_specAppendTo`` the part ``path``; a missing part is created."""
+	_requireCodec(_parsePartName(path).codec)
+	with open(path, 'a+b') as f:
+		return _specAppendTo(f, path, payload, reporter, fsync, memberSize)
 
 
 #: Reads a scrub or clear makes before it gives up on a store that keeps changing.
@@ -3629,15 +3648,18 @@ def _specStamp(st):
 	return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
+def _specFileStamp(path):
+	"""The ``_specStamp`` of the file ``path``, or None when it cannot be looked at."""
+	try:
+		return _specStamp(os.stat(path))
+	except OSError:
+		return None
+
+
 def _specSnapshot(fileName):
 	"""Return ``(parts, stamp)`` before a read: ``stamp`` is the single part's ``_specStamp``, else None."""
 	parts, _ = _storeParts(fileName)
-	if len(parts) != 1:
-		return parts, None
-	try:
-		return parts, _specStamp(os.stat(parts[0]))
-	except OSError:
-		return parts, None
+	return parts, (_specFileStamp(parts[0]) if len(parts) == 1 else None)
 
 
 def _matchOwner(fd, st):
@@ -4567,6 +4589,7 @@ class TSVZed(OrderedDict):
 			self.__teePrintOrNot(f"Loading {self._fileName}")
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		load = None
+		dirMtime = _dirMtimeNs(self._fileName)  # before the read: a part created during it is a change
 		try:
 			if _specEnsureStore(self._fileName, self.createIfNotExist, self.header, self._constructorDefaults,
 								self.strict, self.teeLogger, self.delimiter, self.errors):
@@ -4592,14 +4615,17 @@ class TSVZed(OrderedDict):
 			self.correctColumnNum = width
 		if self.verbose:
 			self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
-		self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
+		# The active part as it was just before it was read (else as it is now): whatever is appended
+		# after that, even before the read ends, is a change the next check sees.
+		info = load.infos[-1] if load is not None and load.infos else None
+		self._specNoteSeen(info.stamp if info is not None and info.stamp is not None else _specFileStamp(self._activePath))
 		self.lastUpdateTime = self.externalFileUpdateTime
 		# The store kept changing under every read: no part watched need change again for the next
 		# check to read it again (spec §19.8).
 		self._specTorn = torn
 		self._specTornAt = 0.0
 		self._specTornWait = 0.0  # a load that worked starts the waits over
-		self._dirMtimeNs = _dirMtimeNs(self._fileName)
+		self._dirMtimeNs = dirMtime
 		if (load is not None and not load.state.sawDefaults and any(self._constructorDefaults[1:])
 				and not self.memoryOnly and not unreadable):  # the store's own defaults may be in the unread part
 			# Design §5.3: persist constructor defaults by appending, as 3.39 did by rewriting.
@@ -4624,6 +4650,11 @@ class TSVZed(OrderedDict):
 		"""'tsvz' for tsvz-spec-v1 files (.tsvz/.csvz/.nsvz/.psvz), 'tsv' for 3.39-format files."""
 		return 'tsvz' if self._spec else 'tsv'
 
+	def _specNoteSeen(self, stamp):
+		"""Note ``stamp`` (``_specStamp``, or None) as the active part's that memory and the queue account for."""
+		self._specSeen = stamp
+		self.externalFileUpdateTime = stamp[2] if stamp else 0
+
 	def _specSync(self, reloadInternalFromFile=None):
 		"""The part of 3.39's rewrite() that .tsvz keeps: reload after an external change."""
 		if not self.deSynced:
@@ -4640,15 +4671,12 @@ class TSVZed(OrderedDict):
 				self.__teePrintOrNot(f"Failed to reload {self._fileName} after an external change: {e}; keeping the in-memory state",'error')
 				# Mark the change as seen so the failure is reported once, not every tick. A torn view is
 				# read again after a while (1 s, doubling to a minute), not at every tick.
-				if getattr(self, '_specTorn', False):
-					self._specTornWait = min(max(1.0, getattr(self, '_specTornWait', 0.0) * 2), 60.0)
+				if self._specTorn:
+					self._specTornWait = min(max(1.0, self._specTornWait * 2), 60.0)
 					self._specTornAt = _specClock() + self._specTornWait
-				try:
-					self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
-					self._dirMtimeNs = _dirMtimeNs(self._fileName)
-					self._parts = _storeParts(self._fileName)[0]
-				except Exception:
-					pass
+				self._specNoteSeen(_specFileStamp(self._activePath))
+				self._dirMtimeNs = _dirMtimeNs(self._fileName)
+				self._parts = _storeParts(self._fileName)[0]
 				self.deSynced = False
 				return False
 		self.deSynced = False
@@ -4656,9 +4684,9 @@ class TSVZed(OrderedDict):
 
 	def _specExternalChanged(self):
 		"""True when another writer changed the active part or the set of parts, or the last load was torn."""
-		if getattr(self, '_specTorn', False) and _specClock() >= getattr(self, '_specTornAt', 0.0):
+		if self._specTorn and _specClock() >= self._specTornAt:
 			return True
-		if getFileUpdateTimeNs(self._activePath) > self.externalFileUpdateTime:
+		if _specFileStamp(self._activePath) != self._specSeen:
 			return True
 		dirMtime = _dirMtimeNs(self._fileName)
 		if dirMtime != self._dirMtimeNs:
@@ -4979,8 +5007,10 @@ class TSVZed(OrderedDict):
 			if not chunks:
 				return self
 			payload = b''.join(chunks)
-			_specAppendPayload(self._activePath, payload, reporter, fsync=True, memberSize=self._specState.memberSize)
-			self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
+			_, before, after = _specAppendPayload(self._activePath, payload, reporter, fsync=True,
+												  memberSize=self._specState.memberSize)
+			if before == self._specSeen:
+				self._specNoteSeen(after)  # else another writer changed the part first: the next check reloads
 			if self._writeFailing:
 				self._writeFailing = False
 				_warn(f'TSVZ warning: {self._fileName}: writes recovered', self.teeLogger)
@@ -5005,7 +5035,7 @@ class TSVZed(OrderedDict):
 					return self
 				cleared = _specClearTabularFile(self._fileName, teeLogger=self.teeLogger, header=self.header,
 												verbose=self.verbose, delimiter=self.delimiter, errors=self.errors)
-				self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
+				self._specNoteSeen(_specFileStamp(self._activePath))
 			self.dirty = False
 			# A skipped clear (reported) left the store as it was: reload it into memory.
 			self.deSynced = not cleared
