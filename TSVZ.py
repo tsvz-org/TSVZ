@@ -6923,6 +6923,7 @@ class _ServeWriter(object):
 			self.cond.notify_all()
 		self.thread.join()
 		_SERVE_OPEN_WRITERS.discard(self)
+		self.store = None  # no cycle: a closed store's rows are freed now, not by the collector at exit
 
 	def _run(self):
 		while True:
