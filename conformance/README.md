@@ -15,7 +15,7 @@ python3 tsvzconform.py --impl ./tsvz --class reader --only 13      # §13 reader
 python3 tsvzconform.py --list --only 9                             # what would run
 ```
 
-Python 3.8 or later on Linux or macOS; standard library only. Run it from
+Python 3.6 or later on Linux or macOS; standard library only. Run it from
 the `TSVZ/` directory, or anywhere: it finds `conformance/cases/` beside itself.
 
 | Option | Meaning |
