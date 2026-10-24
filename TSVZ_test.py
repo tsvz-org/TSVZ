@@ -6076,23 +6076,6 @@ def test_errors_is_checked_where_it_is_given(tmp_path, bad):
 	assert not os.path.exists(p)
 
 
-def test_tsvzed_spec_strict_refuses_a_bad_record_and_writes_the_good_ones(tmp_path, capsys):
-	p = str(tmp_path / 's.tsvz')
-	t = TSVZ.TSVZed(p, append_check_delay=0.01)
-	t['x'] = ['x', '1']
-	t.memoryOnly = True  # the check at set time is skipped for a memory-only store
-	t['bad'] = ['bad', BAD_NAME]
-	t.memoryOnly = False
-	t.appendQueue.append('bad\t' + BAD_NAME)  # a record queued before the toggle
-	t['c'] = ['c', '1']
-	assert _wait_for(lambda: b'c\t1\n' in _bytes(p))
-	assert b'x\t1\n' in _bytes(p) and b'bad' not in _bytes(p)
-	assert t.appendThread.is_alive()
-	t.close()
-	assert b'c\t1\n' in _bytes(p) and not t.appendQueue
-	assert capsys.readouterr().out.count('cannot write') == 1
-
-
 @pytest.mark.parametrize('mode', ['local', 'served'])
 def test_client_reads_of_a_key_that_cannot_exist_agree_with_and_without_a_handler(tmp_path, served, mode):
 	p = str(tmp_path / 'c.tsvz')

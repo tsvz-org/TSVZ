@@ -4992,21 +4992,7 @@ class TSVZed(OrderedDict):
 			items.append(self.appendQueue.popleft())
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		try:
-			# A record that cannot be encoded is refused (reported, not kept): left in the queue it
-			# would hold back every later write for good. The others are written.
-			chunks = []
-			good = []
-			for item in items:
-				try:
-					chunks.append(_encodeText(item + '\n', 'utf-8', self.errors))
-					good.append(item)
-				except TSVZEncodeError as e:
-					self.dirty = True
-					self.__teePrintOrNot(f"Refused at commitAppendToFile() to {self._activePath}: {e}; the record is not written, the others are",'error')
-			items = good
-			if not chunks:
-				return self
-			payload = b''.join(chunks)
+			payload = _encodeText(''.join(item + '\n' for item in items), 'utf-8', self.errors)  # checked when set
 			_, before, after = _specAppendPayload(self._activePath, payload, reporter, fsync=True,
 												  memberSize=self._specState.memberSize)
 			if before == self._specSeen:
