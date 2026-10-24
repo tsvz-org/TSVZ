@@ -2837,55 +2837,45 @@ def _decompressChunks(f, info):
 	"""
 	src = _PartBytes(f)
 	try:
-		for piece in _decompressMembers(f, info, src):
-			yield piece
+		while True:
+			status, out, start, end, error = _readMember(src, info.codec)
+			if status == 'none':
+				break
+			if status == 'complete':
+				if out:
+					yield out
+				continue
+			following = _nextMemberStart(f, info.codec, start + 1)
+			stop = f.seek(0, os.SEEK_END) if following is None else following
+			f.seek(start)
+			raw = f.read(stop - start)
+			if _CODEC_NAMES[info.codec] == 'gzip':
+				raw = _gzipUnpad(raw)  # zero padding before the next member (spec §16.6)
+			cutShort, out, error = _decodeAlone(raw, info.codec)
+			if cutShort:
+				info.damaged.append('the member at byte {} is cut short; its whole lines are read'.format(start))
+				if out:
+					yield out
+			else:
+				info.lost = True
+				policy = info.state.onCorruption if info.state is not None else 'recover'
+				if policy == 'stop':
+					info.damaged.append('the member at byte {} is corrupt ({}); reading stopped there (#_on_corruption_# stop)'.format(start, error))
+					yield _STOP
+					return
+				if policy == 'skip':
+					info.damaged.append('skipped the corrupt member at byte {} ({})'.format(start, error))
+				else:
+					info.damaged.append('used {} bytes the corrupt member at byte {} decoded before it failed ({}); they are not verified'.format(len(out), start, error))
+					if out:
+						yield out
+			if following is None:
+				break
+			yield None
+			src.seek(following)  # the next member, damaged or not; the search moved the file
 	finally:
 		info.rawHead = src.head or b''
 		info.rawEnd, info.rawCheck = src.offset(), src.tail()
-
-
-def _decompressMembers(f, info, src):
-	"""The loop of ``_decompressChunks``."""
-	while True:
-		status, out, start, end, error = _readMember(src, info.codec)
-		if status == 'none':
-			break
-		if status == 'complete':
-			if out:
-				yield out
-			continue
-		following = _nextMemberStart(f, info.codec, start + 1)
-		if following is None:
-			f.seek(0, os.SEEK_END)
-			stop = f.tell()
-		else:
-			stop = following
-		f.seek(start)
-		raw = f.read(stop - start)
-		if _CODEC_NAMES[info.codec] == 'gzip':
-			raw = _gzipUnpad(raw)  # zero padding before the next member (spec §16.6)
-		cutShort, out, error = _decodeAlone(raw, info.codec)
-		if cutShort:
-			info.damaged.append('the member at byte {} is cut short; its whole lines are read'.format(start))
-			if out:
-				yield out
-		else:
-			info.lost = True
-			policy = info.state.onCorruption if info.state is not None else 'recover'
-			if policy == 'stop':
-				info.damaged.append('the member at byte {} is corrupt ({}); reading stopped there (#_on_corruption_# stop)'.format(start, error))
-				yield _STOP
-				return
-			if policy == 'skip':
-				info.damaged.append('skipped the corrupt member at byte {} ({})'.format(start, error))
-			else:
-				info.damaged.append('used {} bytes the corrupt member at byte {} decoded before it failed ({}); they are not verified'.format(len(out), start, error))
-				if out:
-					yield out
-		if following is None:
-			break
-		yield None
-		src.seek(following)  # the next member, damaged or not; the search moved the file
 
 
 def _iterPartLines(info, reporter, label=''):
@@ -3213,28 +3203,21 @@ def _specUnsteady(parts, infos):
 	for i, info in enumerate(infos):
 		if info.stamp is None:
 			continue
-		try:
-			stamp = _specStamp(os.stat(info.path))
-		except OSError:
-			stamp = None
+		stamp = _specFileStamp(info.path)
 		if stamp == info.stamp:
 			continue
 		if i != last:
 			return 'the parts before the last kept changing while they were read'
 		appended = stamp is not None and not info.stopped and stamp[0] == info.stamp[0] and stamp[1] > info.stamp[1]
-		if appended and info.codec:
+		if appended:
+			# Where the read ended, in raw bytes, and the bytes it saw before that (committed counts raw
+			# bytes only in a plain part, whose rawHead is empty).
+			end, check = (info.rawEnd, info.rawCheck) if info.codec else (info.committed, info.check)
 			try:
 				with open(info.path, 'rb') as f:
-					appended = stamp[1] >= info.rawEnd and f.read(len(info.rawHead)) == info.rawHead
-					f.seek(info.rawEnd - len(info.rawCheck))
-					appended = appended and f.read(len(info.rawCheck)) == info.rawCheck
-			except OSError:
-				appended = False
-		elif appended:  # committed counts raw bytes only in a plain part
-			try:
-				with open(info.path, 'rb') as f:
-					f.seek(info.committed - len(info.check))
-					appended = stamp[1] >= info.committed and f.read(len(info.check)) == info.check
+					appended = stamp[1] >= end and f.read(len(info.rawHead)) == info.rawHead
+					f.seek(end - len(check))
+					appended = appended and f.read(len(check)) == check
 			except OSError:
 				appended = False
 		if not appended:
