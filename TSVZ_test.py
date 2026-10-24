@@ -5214,6 +5214,21 @@ def test_tsvz_client_reconnects_or_falls_back(tmp_path, served):
 		client.close()
 
 
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_tsvz_client_splits_values_on_the_delimiter_of_its_handler(tmp_path):
+	p = str(tmp_path / 'c.txt')  # the name implies TAB; the handler was given a comma
+	proc = _serve_process(p, '-d', 'comma')
+	try:
+		with TSVZ.TSVZClient(p) as c:
+			c['k'] = 'k,a,b'
+			assert c['k'] == ['k', 'a', 'b'] and repr(c).endswith('served)')
+		assert _cli('stop', p).returncode == 0 and proc.wait(10) == 0
+	finally:
+		if proc.poll() is None:
+			proc.kill()
+	assert open(p, 'rb').read().endswith(b'\nk,a,b\n')
+
+
 # ==========================================================================
 # Write handler: final-review fixes
 # ==========================================================================

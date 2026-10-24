@@ -8174,6 +8174,7 @@ class TSVZClient(MutableMapping):
 		if info is not None:
 			try:
 				self._backend = _ServeConnection(info, self._timeout)
+				self.delimiter = info.get('x-delimiter', self.delimiter)  # a loose store's, as its handler splits it
 				return
 			except _ServeUnreachable as e:
 				reason = 'its handler cannot be used ({})'.format(e)
