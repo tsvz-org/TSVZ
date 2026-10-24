@@ -3620,6 +3620,27 @@ def test_spec_tsvzed_commit_does_not_hide_an_append_made_before_it(tmp_path):
 	assert t['ext'] == ['ext', 'X'] and t['a'] == ['a', '1']
 
 
+def test_spec_tsvzed_reload_keeps_what_is_set_and_deleted_during_its_read(tmp_path, monkeypatch):
+	p = str(tmp_path / 's.tsvz')
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '1']
+	t.commitAppendToFile()
+	real = TSVZ._specLoad
+
+	def load(*args, **kwargs):
+		result = real(*args, **kwargs)
+		t['late'] = ['late', '2']  # another thread, while the reload reads: queued, not yet in the file
+		del t['a']
+		return result
+	monkeypatch.setattr(TSVZ, '_specLoad', load)
+	t.reload()
+	monkeypatch.undo()
+	assert dict(t) == {'b': ['b', '1'], 'late': ['late', '2']}
+	t.commitAppendToFile()
+	assert TSVZ.readTabularFile(p, header='key\tval') == dict(t)
+
+
 @pytest.mark.parametrize('name, new', [
 	('s.tsvz', b'x\t9\n'),  # shorter: the read ends early, with a and b but not c
 	('s.tsvz', b'c\t3\nd\t4\ne\t5\nf\t6\n'),  # longer: the read takes a and b, then e and f

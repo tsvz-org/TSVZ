@@ -3436,6 +3436,22 @@ def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, c
 	return result
 
 
+def _specReplayQueued(load, records, delimiter):
+	"""Replay formatted ``records`` not yet committed on ``load`` (a ``_SpecLoad``), as a read after their commit would."""
+	quiet = _Reporter('')  # never flushed: they were checked when they were queued
+	for record in list(records):
+		for line in record.split('\n'):
+			replayed = _specProcessRecord(line, load.state, delimiter, quiet, None)
+			if replayed is None:
+				continue
+			key, row = replayed
+			if row is None:
+				load.data.pop(key, None)
+			else:
+				load.correctColumnNum = _specPadRow(row, load.state, load.correctColumnNum)
+				load.data[key] = row
+
+
 def _specPadRow(row, state, width):
 	"""Pad a data row in place to the store width with its row-bound defaults (design §4.7).
 
@@ -4584,41 +4600,53 @@ class TSVZed(OrderedDict):
 		return True
 
 	def _specReload(self):
-		"""Load a spec store into memory (design §4); rows bypass __setitem__ so nothing is re-normalised."""
+		"""Load a spec store into memory (design §4); rows bypass __setitem__ so nothing is re-normalised.
+
+		What is still queued is replayed on what was read, as a read once it is committed sees it: under
+		writeLock no commit of this object's runs meanwhile, and under _memLock no set is half done.
+		"""
 		if self.verbose:
 			self.__teePrintOrNot(f"Loading {self._fileName}")
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		load = None
-		dirMtime = _dirMtimeNs(self._fileName)  # before the read: a part created during it is a change
-		try:
-			if _specEnsureStore(self._fileName, self.createIfNotExist, self.header, self._constructorDefaults,
-								self.strict, self.teeLogger, self.delimiter, self.errors):
-				load = _specLoad(self._fileName, self.delimiter, header=self.header, verifyHeader=self.verifyHeader,
-								 strict=self.strict, defaults=self._constructorDefaults, taskDic=OrderedDict(),
-								 reporter=reporter, teeLogger=self.teeLogger, verbose=self.verbose)
-			unreadable = reporter.incomplete()
-			torn = reporter.has('torn')
-		finally:
-			reporter.flush()
-		OrderedDict.clear(self)
-		width = -1
-		if load is not None:
-			for key, row in load.data.items():
-				OrderedDict.__setitem__(self, key, row)
-			self._specState = load.state
-			self.defaults = list(load.state.defaults)
-			self._parts, self._activePath = load.parts, load.active
-			width = load.correctColumnNum
-		if self.header and any(self.header) and self.verifyHeader:
-			self.correctColumnNum = len(self.header)
-		else:
-			self.correctColumnNum = width
+		with self.writeLock:
+			dirMtime = _dirMtimeNs(self._fileName)  # before the read: a part created during it is a change
+			try:
+				if _specEnsureStore(self._fileName, self.createIfNotExist, self.header, self._constructorDefaults,
+									self.strict, self.teeLogger, self.delimiter, self.errors):
+					load = _specLoad(self._fileName, self.delimiter, header=self.header, verifyHeader=self.verifyHeader,
+									 strict=self.strict, defaults=self._constructorDefaults, taskDic=OrderedDict(),
+									 reporter=reporter, teeLogger=self.teeLogger, verbose=self.verbose)
+				unreadable = reporter.incomplete()
+				torn = reporter.has('torn')
+			finally:
+				reporter.flush()
+			with self._memLock:
+				OrderedDict.clear(self)
+				width = -1
+				if load is not None:
+					_specReplayQueued(load, self.appendQueue, self.delimiter)
+					for key, row in load.data.items():
+						OrderedDict.__setitem__(self, key, row)
+					self._specState = load.state
+					self.defaults = list(load.state.defaults)
+					self._parts, self._activePath = load.parts, load.active
+					width = load.correctColumnNum
+				if self.header and any(self.header) and self.verifyHeader:
+					self.correctColumnNum = len(self.header)
+				else:
+					self.correctColumnNum = width
+				if (load is not None and not load.state.sawDefaults and any(self._constructorDefaults[1:])
+						and not self.memoryOnly and not unreadable):  # the store's own defaults may be in the unread part
+					# Design §5.3: persist constructor defaults by appending, as 3.39 did by rewriting.
+					self.appendQueue.append(_specFormatRecord(self._constructorDefaults, self.delimiter, marker=True))
+					self._specState.sawDefaults = True
+			# The active part as it was just before it was read (else as it is now): whatever is appended
+			# after that, even before the read ends, is a change the next check sees.
+			info = load.infos[-1] if load is not None and load.infos else None
+			self._specNoteSeen(info.stamp if info is not None and info.stamp is not None else _specFileStamp(self._activePath))
 		if self.verbose:
 			self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
-		# The active part as it was just before it was read (else as it is now): whatever is appended
-		# after that, even before the read ends, is a change the next check sees.
-		info = load.infos[-1] if load is not None and load.infos else None
-		self._specNoteSeen(info.stamp if info is not None and info.stamp is not None else _specFileStamp(self._activePath))
 		self.lastUpdateTime = self.externalFileUpdateTime
 		# The store kept changing under every read: no part watched need change again for the next
 		# check to read it again (spec §19.8).
@@ -4626,11 +4654,6 @@ class TSVZed(OrderedDict):
 		self._specTornAt = 0.0
 		self._specTornWait = 0.0  # a load that worked starts the waits over
 		self._dirMtimeNs = dirMtime
-		if (load is not None and not load.state.sawDefaults and any(self._constructorDefaults[1:])
-				and not self.memoryOnly and not unreadable):  # the store's own defaults may be in the unread part
-			# Design §5.3: persist constructor defaults by appending, as 3.39 did by rewriting.
-			self.appendQueue.append(_specFormatRecord(self._constructorDefaults, self.delimiter, marker=True))
-			self._specState.sawDefaults = True
 		self._specLoaded = True
 		return self
 
@@ -4913,46 +4936,48 @@ class TSVZed(OrderedDict):
 			del self[key]
 			return
 		self._checkWritable(value)
-		if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
-			self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
-			return
-		defaults = self.defaults
-		for i in range(1, min(len(value), len(defaults))):
-			if not value[i] and defaults[i]:
-				value[i] = defaults[i]
-		written = list(value)
-		if self.correctColumnNum <= 0:
-			self.correctColumnNum = len(defaults) if len(defaults) > 1 else len(value)
-		target = max(self.correctColumnNum, len(defaults))
-		if len(value) < target:
-			value += [defaults[j] if j < len(defaults) else '' for j in range(len(value), target)]
-		if key in self:
-			if OrderedDict.__getitem__(self, key) == value:
+		with self._memLock:  # memory and the queue change together: see _specReload
+			if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
+				self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
 				return
-			self.dirty = True
-		OrderedDict.__setitem__(self, key, value)
-		if self.memoryOnly:
-			return
-		self.appendQueue.append(_specFormatRecord(written, self.delimiter))
-		self.lastUpdateTime = get_time_ns()
+			defaults = self.defaults
+			for i in range(1, min(len(value), len(defaults))):
+				if not value[i] and defaults[i]:
+					value[i] = defaults[i]
+			written = list(value)
+			if self.correctColumnNum <= 0:
+				self.correctColumnNum = len(defaults) if len(defaults) > 1 else len(value)
+			target = max(self.correctColumnNum, len(defaults))
+			if len(value) < target:
+				value += [defaults[j] if j < len(defaults) else '' for j in range(len(value), target)]
+			if key in self:
+				if OrderedDict.__getitem__(self, key) == value:
+					return
+				self.dirty = True
+			OrderedDict.__setitem__(self, key, value)
+			if self.memoryOnly:
+				return
+			self.appendQueue.append(_specFormatRecord(written, self.delimiter))
+			self.lastUpdateTime = get_time_ns()
 
 	def _specSetMarker(self, key, value):
 		"""Write a reserved-key marker (design §5.2 e); official markers also update the reader state."""
 		self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
 		keyLower = key.lower()
-		if keyLower in _SPEC_MARKER_KEYS:
-			reporter = _Reporter(self._fileName, self.teeLogger)
-			applied = _specApplyMarker(self._specState, keyLower, value[1:], reporter, None)
-			reporter.flush()
-			if not applied:
+		with self._memLock:  # the reader state and the queue change together: see _specReload
+			if keyLower in _SPEC_MARKER_KEYS:
+				reporter = _Reporter(self._fileName, self.teeLogger)
+				applied = _specApplyMarker(self._specState, keyLower, value[1:], reporter, None)
+				reporter.flush()
+				if not applied:
+					return
+				self.defaults = list(self._specState.defaults)
+			if self.verbose:
+				self.__teePrintOrNot(f"Marker {key} set to {value[1:]}")
+			if self.memoryOnly:
 				return
-			self.defaults = list(self._specState.defaults)
-		if self.verbose:
-			self.__teePrintOrNot(f"Marker {key} set to {value[1:]}")
-		if self.memoryOnly:
-			return
-		self.appendQueue.append(_specFormatRecord(value, self.delimiter, marker=True))
-		self.lastUpdateTime = get_time_ns()
+			self.appendQueue.append(_specFormatRecord(value, self.delimiter, marker=True))
+			self.lastUpdateTime = get_time_ns()
 
 	def _specDelItem(self, key):
 		key = self._nameKey(key)
@@ -4960,16 +4985,17 @@ class TSVZed(OrderedDict):
 			# A lone marker key resets that marker (spec §12.1).
 			self._specSetMarker(key, [key])
 			return
-		if key not in self:
-			if self.verbose:
-				self.__teePrintOrNot(f"Key {key} not found")
-			return
-		self._checkDelete(key)
-		OrderedDict.__delitem__(self, key)
-		if self.memoryOnly:
-			return
-		self.__appendEmptyLine(key)
-		self.lastUpdateTime = get_time_ns()
+		with self._memLock:  # memory and the queue change together: see _specReload
+			if key not in self:
+				if self.verbose:
+					self.__teePrintOrNot(f"Key {key} not found")
+				return
+			self._checkDelete(key)
+			OrderedDict.__delitem__(self, key)
+			if self.memoryOnly:
+				return
+			self.__appendEmptyLine(key)
+			self.lastUpdateTime = get_time_ns()
 
 	def _specCommit(self):
 		"""Append the queued records to the active part (design §5.4).
