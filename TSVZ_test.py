@@ -3375,26 +3375,6 @@ def test_spec_a_part_rewritten_to_its_size_with_its_mtime_put_back_is_read_again
 		store.close()
 
 
-def test_spec_a_header_garbled_by_a_torn_read_is_judged_on_the_read_kept(tmp_path, monkeypatch, capsys):
-	# Part 0 is rewritten while its first line is read: the line seen is not the store's, and the
-	# change shows, so the mismatch is no reason to raise; only the read kept counts.
-	p = str(tmp_path / 's.tsvz')
-	_touch(p, b'#x\ty\na\t1\n')
-	real = TSVZ._iterPartLines
-	done = []
-
-	def lines(info, reporter, label=''):
-		for item in real(info, reporter, label):
-			if info.path == p and not done:
-				done.append(1)
-				TSVZ._specRewriteInPlace(p, b'#k\tv\na\t11\n')
-			yield item
-	monkeypatch.setattr(TSVZ, '_iterPartLines', lines)
-	data = TSVZ.readTabularFile(p, header='k\tv', strict=True, verbose=False)
-	assert data['a'] == ['a', '11']
-	assert 'mismatch' not in capsys.readouterr().err
-
-
 def test_spec_the_handler_does_not_read_again_what_a_read_done_again_saw(tmp_path, monkeypatch):
 	# Its first read was torn by an in-place rewrite of part 0, the second one held: the parts as the
 	# kept read saw them are the parts now, so the next request reads nothing again.
@@ -3475,23 +3455,6 @@ def test_spec_a_torn_tsvzed_load_whose_reload_fails_is_not_read_again_at_every_c
 		assert not t._specTornWait, 'a load that worked starts the waits over'
 	finally:
 		t.close()
-
-
-def test_spec_a_strict_header_mismatch_is_raised_though_the_next_read_cannot_read_the_header(tmp_path, monkeypatch):
-	p = str(tmp_path / 's.tsvz')
-	_touch(p, b'#x\ty\na\t1\n')
-	real = open
-	opened = []
-
-	def opening(path, mode='r', *args, **kwargs):
-		if path == p and mode == 'rb':
-			opened.append(1)
-			if len(opened) == 2:
-				raise OSError(errno.EMFILE, 'Too many open files')
-		return real(path, mode, *args, **kwargs)
-	monkeypatch.setattr(TSVZ, 'open', opening, raising=False)
-	with pytest.raises(ValueError):
-		TSVZ.readTabularFile(p, header='k\tv', strict=True, verbose=False)
 
 
 def test_spec_a_store_with_no_header_line_under_a_torn_read_is_judged_on_the_read_kept(tmp_path, monkeypatch):

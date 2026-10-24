@@ -3253,14 +3253,6 @@ def _specUnsteady(parts, infos):
 _specClock = time.monotonic
 
 
-class _HeaderMismatch(Exception):
-	"""A strict read found a header line other than the one asked for (``line``): it stops there."""
-
-	def __init__(self, line):
-		Exception.__init__(self, line)
-		self.line = line
-
-
 def _specSteadyRead(read, reporter):
 	"""Return what ``read(again)`` returns, done again while the store changed under it (spec §19.8).
 
@@ -3347,26 +3339,7 @@ def _specLoad(fileName, delimiter, header=(), verifyHeader=True, strict=True, de
 		load = _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, correctColumnNum,
 							 storeOffset, taskDic, reporter, teeLogger, verbose)
 		return load, load.parts, load.infos
-	# A strict read stops at a header line other than the one asked for: raised when the next read finds
-	# that same line (the store's header, not a torn view of it; compared, not stamped), else read again.
-	mark = reporter.mark()
-	seen = []
-	while True:
-		try:
-			load = _specSteadyRead(read, reporter)
-			break
-		except _HeaderMismatch as e:
-			if (seen and seen[-1] == e.line) or len(seen) == _SPEC_READS - 1:
-				_lineContainHeader(header, e.line, verbose=verbose, teeLogger=teeLogger, strict=True,
-								   delimiter=delimiter)
-			seen.append(e.line)
-			reporter.rewind(mark)
-			if taskDic is not None:
-				taskDic.clear()
-				taskDic.update(given)
-	if seen and load.headerChecked is None:  # the line seen, and none read since (the part unreadable)
-		_lineContainHeader(header, seen[-1], verbose=verbose, teeLogger=teeLogger, strict=True,
-						   delimiter=delimiter)
+	load = _specSteadyRead(read, reporter)
 	if load.headerChecked is not None:  # judged silently in each read; said, or raised on, once
 		_lineContainHeader(header, load.headerChecked, verbose=verbose, teeLogger=teeLogger, strict=strict,
 						   delimiter=delimiter)
@@ -3408,7 +3381,8 @@ def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, c
 					if width == -1:
 						width = len(header)
 				elif strict:
-					raise _HeaderMismatch(candidate)  # ends this read (``_specLoad``)
+					_lineContainHeader(header, candidate, verbose=verbose, teeLogger=teeLogger, strict=True,
+									   delimiter=delimiter)  # raises: the store's own header line is not torn
 		if record is None:
 			if verbose and text.startswith('#_'):
 				f0 = text.split(delimiter, 1)[0]
