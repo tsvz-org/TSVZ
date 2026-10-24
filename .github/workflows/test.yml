@@ -1,0 +1,33 @@
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  # ubuntu-latest is moving to 26.04, which has no setup-python 3.9 build
+  pytest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install "pytest<9"
+      - run: python -m pytest -q TSVZ_test.py tsvzconform_test.py tsvzbench_test.py
+  # setup-python no longer ships 3.6, the oldest Python TSVZ supports: it runs in a container
+  pytest-py36:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    # python:3.6 manifest list, pinned by digest
+    container: python:3.6@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python -m pip install "pytest<7.1"
+      - run: python -m pytest -q -p no:cacheprovider TSVZ_test.py tsvzconform_test.py tsvzbench_test.py
