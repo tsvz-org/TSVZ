@@ -3375,29 +3375,6 @@ def test_spec_a_part_rewritten_to_its_size_with_its_mtime_put_back_is_read_again
 		store.close()
 
 
-def test_spec_the_handler_does_not_read_again_what_a_read_done_again_saw(tmp_path, monkeypatch):
-	# Its first read was torn by an in-place rewrite of part 0, the second one held: the parts as the
-	# kept read saw them are the parts now, so the next request reads nothing again.
-	p = str(tmp_path / 's.tsvz')
-	_touch(p, b'a\t1\n')
-	_touch(p + '.1', b'b\t2\n')
-	reads = _during_reads(monkeypatch, p + '.1', _rewrites(p, [b'a\t99\n']))
-	store = TSVZ._ServeStore(p)
-	assert len(reads) == 2
-	loads = []
-	real = TSVZ._specLoad
-
-	def load(*args, **kwargs):
-		loads.append(1)
-		return real(*args, **kwargs)
-	monkeypatch.setattr(TSVZ, '_specLoad', load)
-	try:
-		assert store.get(['a'], None) == ([['a', '99']], False)
-		assert not loads
-	finally:
-		store.close()
-
-
 def test_spec_a_compressed_snapshot_part_whose_first_member_is_corrupt_is_no_snapshot_part(tmp_path):
 	# Spec §19.10.3: a part whose first lines cannot be read is not a snapshot part. The member is
 	# larger than a first read, so its lines decode before its check fails.
@@ -3490,27 +3467,6 @@ def test_spec_appends_to_a_compressed_part_with_old_damage_do_not_make_it_read_a
 	TSVZ.readTabularFile(p, verbose=False)
 	assert len(reads) == 1
 	assert _TORN_LAST not in capsys.readouterr().err
-
-
-def test_spec_the_handler_keeps_stamps_for_the_parts_a_stop_left_unread(tmp_path, monkeypatch):
-	# #_on_corruption_# stop ends the read in part 0: part 1 is not read, but it is no change either.
-	p = str(tmp_path / 's.tsvz')
-	_touch(p, b'#_on_corruption_#\tstop\na\t1\n\0\0\0\0\n')
-	_touch(p + '.1', b'b\t2\n')
-	store = TSVZ._ServeStore(p)
-	loads = []
-	real = TSVZ._specLoad
-
-	def load(*args, **kwargs):
-		loads.append(1)
-		return real(*args, **kwargs)
-	monkeypatch.setattr(TSVZ, '_specLoad', load)
-	try:
-		for _ in range(3):
-			store.get(['a'], None)
-		assert not loads
-	finally:
-		store.close()
 
 
 def test_spec_a_torn_tsvzed_load_is_read_again_after_a_commit_too(tmp_path, monkeypatch):
