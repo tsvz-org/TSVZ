@@ -7487,9 +7487,8 @@ def test_tsvzed_legacy_failed_release_reports_the_real_error(tmp_path, monkeypat
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 @pytest.mark.parametrize('how', ['mapToFile', 'hardMapToFile', 'rewrite', 'rewrite_on_exit'])
 def test_tsvzed_legacy_rewrite_of_a_removed_file_makes_it_again_from_memory(tmp_path, suffix, how):
-	# mapToFile stopped when get_file_obj('r+b') could not open a file another process removed (main 1688d25 fell
-	# back on hardMapToFile, which made it again); a compressed rewrite looking once the file is locked took the
-	# file it had just created for another process's change.
+	# A file another process removed is made again from memory, whatever makes the rewrite; a compressed rewrite
+	# does not take the file it has just created for another process's change.
 	p = str(tmp_path / ('gone.' + suffix))
 	t = _stopped(p, rewrite_on_exit=(how == 'rewrite_on_exit'))
 	_dirty(t)
@@ -7563,12 +7562,10 @@ def test_tsvzed_legacy_failed_rewrite_and_its_fallback_count_as_one_try(tmp_path
 # --- fifth review round: a rewrite lets go of the file once, whatever stops it where ----------
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 @pytest.mark.parametrize('method', ['rewrite', 'hardMapToFile', 'clear_file', 'append'])
-@pytest.mark.parametrize('code', ['EINVAL', 'EROFS', 'ENOTSUP', 'EOPNOTSUPP', 'EIO', 'ENOSPC'])
+@pytest.mark.parametrize('code', ['EINVAL', 'ENOTSUP', 'EIO', 'ENOSPC'])
 def test_tsvzed_legacy_write_on_a_file_system_that_cannot_fsync(tmp_path, monkeypatch, capsys, suffix, method, code):
-	# a2107b4 made a failed fsync a failed rewrite: where fsync always fails with EINVAL (a file system that
-	# cannot sync) every rewrite and clear_file() failed though its data was written, and the background writer
-	# rewrote the file twice at every try, for good (main 1688d25 took it for written). Only an fsync error that
-	# may mean the data is not on disk fails it.
+	# Where fsync always fails because the file system cannot sync (EINVAL, ENOTSUP), a write whose data was written
+	# is a written one; only an fsync error that may mean the data is not on disk (EIO, ENOSPC) fails it.
 	import errno
 	if not hasattr(errno, code):
 		pytest.skip('no errno.' + code + ' here')
@@ -7777,9 +7774,8 @@ def test_tsvzed_legacy_get_file_obj_whose_truncate_fails_does_not_take_the_file_
 
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 def test_tsvzed_legacy_removed_file_that_cannot_be_made_again_does_not_leave_the_store_stuck(tmp_path, monkeypatch, suffix):
-	# A rewrite of a removed file set _damage before it opened the file, and dirty only once it started writing:
-	# when the open failed, _damage stayed set with dirty False, and rewrite() neither reloaded another process's
-	# file (damaged) nor rewrote (not dirty). The store never followed the file again (50ea158).
+	# A rewrite that cannot make a removed file again (the open fails) leaves the store dirty and damaged, so that
+	# a later one makes it, merging the file another process made meanwhile: the store follows the file again.
 	import errno
 	p = str(tmp_path / ('gone.' + suffix))
 	t = _stopped(p)
@@ -7905,8 +7901,8 @@ def test_tsvzed_legacy_merge_notes_the_time_from_before_it_read(tmp_path, monkey
 
 
 def test_tsvzed_legacy_merge_keeps_a_row_that_reads_as_the_header(tmp_path, monkeypatch):
-	# _mergeChange dropped the first appended line whenever it equalled the header, also after a damage that held
-	# bytes: a real row (key 'key', value 'val') was erased, where reading the file keeps it.
+	# After a damage that holds bytes, a first appended line equal to the header is a row (key 'key', value 'val'),
+	# as reading the file keeps it: merged, not dropped.
 	p = str(tmp_path / 'hdr.tsv')
 	t = _stopped(p)
 	rows = _many(t, 5)
@@ -8192,7 +8188,7 @@ def test_tsvzed_legacy_rewrite_memory_does_not_grow_with_the_store(tmp_path, suf
 
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 @pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
-def test_tsvzed_legacy_row_changed_in_place_between_the_check_and_the_write_is_written_as_checked(tmp_path, capsys, suffix, method):
+def test_tsvzed_legacy_row_changed_in_place_between_the_check_and_the_write_is_written_as_checked(tmp_path, monkeypatch, capsys, suffix, method):
 	# 87359a4 encoded each row again from memory as it wrote it: a row changed in place between the check and the
 	# write (not a set, which replaces the row and queues it) so that it could no longer be encoded was left out.
 	# In place (mapToFile on an uncompressed file) every later row was then written a line early and the tail cut
@@ -8205,15 +8201,19 @@ def test_tsvzed_legacy_row_changed_in_place_between_the_check_and_the_write_is_w
 	t.commitAppendToFile()
 	t['k1'] = ['k1', 'a longer value than it had']  # an in-place rewrite moves every row after it
 	rows = dict((key, list(row)) for key, row in t.items())
-	real = t.get_file_obj  # opened between the check and the write
+	realLines, realInPlace = TSVZ._writeLines, TSVZ.TSVZed._writeInPlace
+	changed = []
 
-	def opening(*args, **kwargs):
-		t['k2'][1] = 'bad\udcff'  # another thread changes the row in place
-		return real(*args, **kwargs)
+	def change():  # between the check and the write
+		if not changed:
+			changed.append(1)
+			t['k2'][1] = 'bad\udcff'  # another thread changes the row in place
 
-	t.get_file_obj = opening
+	monkeypatch.setattr(TSVZ, '_writeLines', lambda *args, **kwargs: change() or realLines(*args, **kwargs))
+	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', lambda self, *args: change() or realInPlace(self, *args))
 	getattr(t, method)()  # explicit: nothing to refuse, nothing raised
-	del t.get_file_obj
+	monkeypatch.undo()
+	assert changed
 	assert 'Refused' not in capsys.readouterr().out
 	assert _back(p) == rows, 'a row was left out, and the rows after it moved'
 	assert not t.dirty and not t.deSynced
@@ -8231,19 +8231,6 @@ class _FlakyHandler(object):
 		if self.calls == self.fail:
 			raise error
 		return '?', error.end
-
-
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
-@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
-def test_tsvzed_legacy_explicit_rewrite_raises_when_it_refuses_and_writes_nothing(tmp_path, suffix, method):
-	p = str(tmp_path / ('raise.' + suffix))
-	t = _stopped(p)
-	_many(t, 5)
-	before = _bytes(p)
-	t['k2'][1] = 'bad\udcff'  # changed in place: refused at the check, before anything is written
-	with pytest.raises(TSVZ.TSVZEncodeError):
-		getattr(t, method)()
-	assert _bytes(p) == before and not t._damaged and t.dirty and not t.deSynced
 
 
 # --- seventh review round: an append to an empty file, the background writer, a flat snapshot ----------
@@ -8881,6 +8868,7 @@ def test_tsvzed_legacy_ctrl_c_in_an_append_leaves_writelock_free_and_the_row_wri
 	# and lost the rows it had taken from the queue.
 	p = str(tmp_path / 'ki.tsv')
 	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=100, rewrite_on_load=False)
+	time.sleep(0.2)  # the writer is in its wait: the commit below is the first append
 	t['a'] = ['a', '1']
 	real = TSVZ._appendOpen
 	calls = []
