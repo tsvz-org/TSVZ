@@ -5780,9 +5780,10 @@ def test_tsvzed_refuses_an_unencodable_header_before_it_starts(tmp_path, suffix)
 
 
 @pytest.mark.parametrize('suffix', BAD_SUFFIXES)
-def test_tsvzed_errors_replace_writes_a_question_mark(tmp_path, suffix):
-	p = str(tmp_path / ('zr' + suffix))
-	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.01, errors='replace')
+@pytest.mark.parametrize('cls', ['TSVZed', 'TSVZedLite'])
+def test_tsvzed_and_lite_errors_replace_write_a_question_mark(tmp_path, suffix, cls):
+	p = str(tmp_path / ('r' + suffix))
+	t = getattr(TSVZ, cls)(p, header='id\tv', errors='replace')
 	t[BAD_NAME] = [BAD_NAME, 'x']
 	t.close()
 	assert _bytes(p) == _hash(suffix) + b'id\tv\nbad?.txt\tx\n'
@@ -5821,15 +5822,6 @@ def test_tsvzedlite_refuses_an_unencodable_header_and_creates_nothing(tmp_path, 
 		TSVZ.TSVZedLite(p, header=['id', BAD_NAME])
 	_expect_unencodable(e, 'the header')
 	assert not os.path.exists(p)
-
-
-@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
-def test_tsvzedlite_errors_replace_writes_a_question_mark(tmp_path, suffix):
-	p = str(tmp_path / ('lr' + suffix))
-	lite = TSVZ.TSVZedLite(p, header='id\tv', errors='replace')
-	lite[BAD_NAME] = [BAD_NAME, 'x']
-	lite.close()
-	assert _bytes(p) == _hash(suffix) + b'id\tv\nbad?.txt\tx\n'
 
 
 @pytest.mark.parametrize('suffix', BAD_SUFFIXES)
