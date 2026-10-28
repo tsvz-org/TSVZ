@@ -567,8 +567,6 @@ def pretty_format_table(data, delimiter="\t", header=None, full=False):
 	color code none.
 	"""
 	import unicodedata
-	version = 1.13
-	_ = version
 	ansi = re.compile(r"(\x1b\[[0-?]*[ -/]*[@-~])")
 	def char_width(ch):
 		if ch < "\u0300":  # ASCII and Latin-1
@@ -7865,8 +7863,7 @@ def _serveClasses():
 
 def _serveSupported():
 	"""True when this Python can serve: it has Unix-domain sockets (spec §21.3)."""
-	import socket
-	return hasattr(socket, 'AF_UNIX') and 'unix' in _serveClasses()
+	return 'unix' in _serveClasses()
 
 
 def _serveGroup(group):
@@ -7981,8 +7978,6 @@ class _ServeHandle(object):
 		gid = _serveGroup(self.group)
 		mode = self.mode if self.mode is not None else (0o660 if gid is not None else 0o600)
 		shared = self.group is not None or self.mode is not None
-		if 'unix' not in classes:
-			raise OSError('tsvz serve needs Unix-domain sockets, which Python does not provide on this platform')
 		base = os.environ.get('XDG_RUNTIME_DIR', '')
 		if shared or not base or not os.path.isdir(base) or not os.access(base, os.W_OK):
 			base = tempfile.gettempdir()  # others cannot enter a private runtime directory
@@ -8176,10 +8171,7 @@ class TSVZClient(MutableMapping):
 		self._timeout = timeout
 		self.teeLogger = teeLogger
 		self._spec = _isSpecPath(fileName)
-		if self._spec:
-			self.delimiter = _EXTENSION_DELIMITERS[_parsePartName(fileName).ext]
-		else:
-			self.delimiter = get_delimiter(..., file_name=fileName)
+		self.delimiter = get_delimiter(..., file_name=fileName)
 		self._backend = None
 		self._lock = threading.RLock()
 		self._connect()
