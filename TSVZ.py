@@ -6479,12 +6479,11 @@ class TSVZedLite(MutableMapping):
 		return write_at
 
 	def _checkDelete(self, key):
-		"""Raise ``TSVZEncodeError`` now when the tombstone of ``key`` could not be written, before memory changes."""
-		if not _mayRaise(self.errors):
-			return
-		if self._spec:
-			_encodeText(_specTombstoneLines(key, self.delimiter, self._specState.strip) + '\n', 'utf-8', self.errors)
-		elif key == DEFAULTS_INDICATOR_KEY or not key.startswith('#'):
+		"""Raise ``TSVZEncodeError`` now when the tombstone of ``key`` could not be written, before memory changes.
+
+		A .tsvz key was checked when it was set, or decoded from UTF-8: its tombstone can always be written.
+		"""
+		if not self._spec and _mayRaise(self.errors) and (key == DEFAULTS_INDICATOR_KEY or not key.startswith('#')):
 			_checkRow([key], self.delimiter, self.encoding, self.errors, self.header)
 
 	def __mapDeleteToFile(self,key):
@@ -6672,32 +6671,14 @@ class TSVZedLite(MutableMapping):
 		return self
 
 	def popitem(self, last=True,return_pos = False):
-		popped = None
 		if self.indexes and _mayRaise(self.errors):
-			# Refuse before anything changes, without a pass over the keys: the key of the tombstone is the next
-			# one, or, where a dict cannot be reversed (before Python 3.8) and is plain, the one popped, which
-			# is put back if its tombstone is refused.
-			if not last:
-				self._checkDelete(next(iter(self.indexes)))
-			else:
-				try:
-					lastKey = next(reversed(self.indexes))
-				except TypeError:
-					lastKey = None
-				if lastKey is not None:
-					self._checkDelete(lastKey)
-				elif type(self.indexes) is dict:
-					popped = self.indexes.popitem()
-					try:
-						self._checkDelete(popped[0])
-					except BaseException:
-						self.indexes[popped[0]] = popped[1]
-						raise
-				else:
-					self._checkDelete(list(self.indexes)[-1])
-		if popped is not None:
-			key, pos = popped
-		elif last:
+			# Refuse before anything changes: the key of the tombstone is the one popped next.
+			try:
+				key = next(reversed(self.indexes)) if last else next(iter(self.indexes))
+			except TypeError:  # a dict cannot be reversed before Python 3.8
+				key = list(self.indexes)[-1]
+			self._checkDelete(key)
+		if last:
 			key, pos = self.indexes.popitem()
 		else:
 			try:

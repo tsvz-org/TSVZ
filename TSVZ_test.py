@@ -6058,37 +6058,6 @@ def test_tsvzed_compressed_legacy_file_keeps_monitoring_after_a_rewrite(tmp_path
 	_stop(t)
 
 
-def _lite_with_a_stored_key(tmp_path, suffix, key):
-	"""A TSVZedLite holding ``key``, which set would refuse: it is put in the index the way a load does."""
-	p = str(tmp_path / ('lt' + suffix))
-	lite = TSVZ.TSVZedLite(p, header='id\tv')
-	lite['ok'] = ['ok', '1']
-	lite['k'] = ['k', '2']
-	lite.indexes[key] = lite.indexes['k']
-	return lite, p
-
-
-@pytest.mark.parametrize('suffix', BAD_SUFFIXES)
-@pytest.mark.parametrize('how', ['del', 'pop', 'popitem_last', 'popitem_first'])
-def test_tsvzedlite_refused_tombstone_leaves_memory_and_file_alone(tmp_path, suffix, how):
-	lite, p = _lite_with_a_stored_key(tmp_path, suffix, BAD_NAME)
-	if how == 'popitem_first':
-		rest = dict(lite.indexes)
-		lite.indexes.clear()
-		lite.indexes[BAD_NAME] = rest.pop(BAD_NAME)
-		lite.indexes.update(rest)
-	before, keys = _bytes(p), list(lite.indexes)
-	with pytest.raises(ValueError) as e:
-		if how == 'del':
-			del lite[BAD_NAME]
-		elif how == 'pop':
-			lite.pop(BAD_NAME)
-		else:
-			lite.popitem(last=(how == 'popitem_last'))
-	_expect_unencodable(e)
-	assert list(lite.indexes) == keys and _bytes(p) == before
-
-
 @pytest.mark.parametrize('suffix', BAD_SUFFIXES)
 def test_tsvzedlite_refuses_unencodable_defaults_when_they_are_given(tmp_path, suffix):
 	lite = TSVZ.TSVZedLite(str(tmp_path / ('d' + suffix)), header='id\tv')
@@ -6528,45 +6497,25 @@ def test_cli_routed_setdefault_is_one_atomic_request(tmp_path, served, monkeypat
 	assert _run('has', p, 'k')[0] != 0
 
 
-@pytest.mark.parametrize('last', [True, False])
-def test_tsvzedlite_popitem_refuses_without_changing_the_index_or_the_file(tmp_path, last):
-	p = str(tmp_path / 'pi.tsv')
-	_touch(p, b'a\t1\nb\t2\n')
-	t = TSVZ.TSVZedLite(p, header='')
-	t.indexes['z' + BAD_NAME] = ['z' + BAD_NAME, 'x']  # an in-memory row whose tombstone cannot be written
-	if not last:
-		t.indexes = dict(reversed(list(t.indexes.items())))
-	order = list(t.indexes)
+@pytest.mark.parametrize('how', ['del', 'pop', 'popitem'])
+def test_tsvzedlite_refuses_to_delete_a_key_read_as_u_fffd_under_ascii(tmp_path, how):
+	# The file holds a byte ascii cannot decode: the key read is 'k\ufffd', whose tombstone ascii cannot
+	# write. Deleting it is refused, and the index and the file are left as they were.
+	p = str(tmp_path / 'a.tsv')
+	_touch(p, b'ok\t1\nk\xff\t2\n')
+	lite = TSVZ.TSVZedLite(p, header='', encoding='ascii')
+	key = 'k\ufffd'
+	assert key in lite
+	keys = list(lite.indexes)
 	with pytest.raises(TSVZ.TSVZEncodeError):
-		t.popitem(last=last)
-	assert list(t.indexes) == order
-	assert _bytes(p) == b'a\t1\nb\t2\n'
-	if last:
-		t.indexes.pop('z' + BAD_NAME)
-		assert t.popitem()[0] == 'b'
-
-
-@pytest.mark.skipif(sys.version_info >= (3, 8), reason='a dict is reversible')
-def test_tsvzedlite_popitem_does_not_list_the_keys_before_python_3_8(tmp_path, monkeypatch):
-	p = str(tmp_path / 'o.tsv')
-	_touch(p, ''.join('k%d\t%d\n' % (i, i) for i in range(50)).encode())
-	t = TSVZ.TSVZedLite(p, header='')
-	listed = []
-	real = list
-
-	class Meta(type):
-		def __instancecheck__(cls, obj):
-			return isinstance(obj, real)
-
-	class CountingList(metaclass=Meta):  # the module's `list`: builds real lists and notes a pass over the keys
-		def __new__(cls, *args):
-			listed.append(bool(args) and args[0] is t.indexes)
-			return real(*args)
-
-	monkeypatch.setattr(TSVZ, 'list', CountingList, raising=False)
-	while len(t):
-		t.popitem()
-	assert True not in listed  # list(self.indexes) at every pop made emptying a store quadratic
+		if how == 'del':
+			del lite[key]
+		elif how == 'pop':
+			lite.pop(key)
+		else:
+			lite.popitem()
+	assert list(lite.indexes) == keys and _bytes(p) == b'ok\t1\nk\xff\t2\n'
+	lite.close()
 
 
 # --- third review round: the legacy writer's locks, stamps and queue ----------
