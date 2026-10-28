@@ -1414,10 +1414,6 @@ def test_lock_survives_another_descriptor_of_the_part_closing(tmp_path):
 	assert code == 3
 
 
-_LOCK_PROBE = ('import fcntl, sys\nf = open(sys.argv[1], "r+b")\n'
-			   'try:\n    fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept OSError:\n    sys.exit(3)\nsys.exit(0)\n')
-
-
 @pytest.mark.skipif(not hasattr(os, 'register_at_fork'), reason='os.register_at_fork (Python 3.7+)')
 @pytest.mark.filterwarnings('ignore::DeprecationWarning')  # fork() in a process with threads: here on purpose
 def test_a_forked_child_does_not_wait_for_a_path_lock_its_parent_held(tmp_path, monkeypatch):
