@@ -7858,14 +7858,13 @@ def _damaged_with_appends(p, monkeypatch, suffix='tsv'):
 
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 def test_tsvzed_legacy_change_after_a_failed_rewrite_in_the_same_tick_is_merged(tmp_path, monkeypatch, capsys, suffix):
-	# The merge was made only when the file's time had moved past the one noted: on a file system with coarse
-	# timestamps (or within one tick) another process's append after the failed rewrite kept the time, and the next
-	# rewrite overwrote it without a warning though the file held more bytes than the damage. It is decided by them.
+	# On a file system with coarse timestamps (or within one tick) another process's append after the failed rewrite
+	# keeps the file's time: the file holds more bytes than the damage all the same, and the next rewrite merges them.
 	p = str(tmp_path / ('tick.' + suffix))
 	t, expected = _damaged_with_appends(p, monkeypatch, suffix)
 	noted = t.externalFileUpdateTime
 	os.utime(p, ns=(noted, noted))  # the append left the time as the failed rewrite noted it
-	assert not t._externalChange()
+	assert t._externalChange()  # told by the size
 	assert t.rewrite()
 	assert dict(t) == expected and _back(p) == expected
 	assert 'Overwriting external changes' not in capsys.readouterr().out
@@ -9058,3 +9057,33 @@ def test_tsvzed_legacy_rewrite_after_a_header_with_no_newline_starts_a_line(tmp_
 	t['a'] = ['a', '1']
 	t.mapToFile()
 	assert _bytes(p) == b'key\tval\na\t1\n'
+
+
+@pytest.mark.parametrize('how', ['append', 'rewrite'])
+def test_tsvzed_legacy_append_landing_right_after_the_store_s_own_write_is_still_taken_in(tmp_path, monkeypatch, how):
+	# A writer that takes no lock appends right after this store's own write, before the store notes what it wrote:
+	# what the store knows is the bytes it wrote, not all the file then holds, so the other row is still read.
+	p = str(tmp_path / 'after.tsv')
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	real = TSVZ._fsync
+	landed = []
+
+	def syncing(fd):
+		real(fd)
+		if not landed:
+			landed.append(1)
+			_append_external(p, b'ext\tB\n')
+
+	monkeypatch.setattr(TSVZ, '_fsync', syncing)
+	t['b'] = ['b', '1']
+	if how == 'append':
+		t.commitAppendToFile()
+	else:
+		t.mapToFile()
+	monkeypatch.undo()
+	assert landed
+	t.checkExternalChanges()
+	t.rewrite()
+	assert dict(t) == {'a': ['a', '1'], 'b': ['b', '1'], 'ext': ['ext', 'B']} == _back(p)

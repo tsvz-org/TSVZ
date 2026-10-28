@@ -281,15 +281,17 @@ class _HashingReader(object):
 		return self.f.tell()
 
 
-def _fileKnown(fd):
-	"""``(identity, size, sha256)`` of what the open file descriptor ``fd`` holds, read through it: a buffer over it,
-	which a failed write may have left holding bytes, is not flushed (the file is closed right after)."""
+def _fileKnown(fd, end=None):
+	"""``(identity, size, sha256)`` of the first ``end`` bytes (default: all) the open file descriptor ``fd`` holds,
+	read through it: a buffer over it, which a failed write may have left holding bytes, is not flushed (the file is
+	closed right after)."""
 	st = os.fstat(fd)
+	end = st.st_size if end is None else end
 	digest = hashlib.sha256()
 	size = 0
 	os.lseek(fd, 0, os.SEEK_SET)
-	while size < st.st_size:
-		chunk = os.read(fd, min(1 << 20, st.st_size - size))
+	while size < end:
+		chunk = os.read(fd, min(1 << 20, end - size))
 		if not chunk:
 			break
 		digest.update(chunk)
@@ -1143,7 +1145,8 @@ def _fileHoldsNothing(fileName):
 		return _holdsNothing(f, _fileCodec(fileName), os.fstat(f.fileno()).st_size)
 
 
-def _appendOpen(f, payload, codec=None, header=None, tailPolicy='newline', reporter=None, fsync=False, memberSize=None):
+def _appendOpen(f, payload, codec=None, header=None, tailPolicy='newline', reporter=None, fsync=False, memberSize=None,
+				written=None):
 	"""Append ``payload`` (whole lines, each ending in b'\\n') to the open file ``f``: the one write of every append
 	to a legacy file (and of _lockedAppend's to a spec part). Returns the offset in ``f`` where the payload's first
 	line begins (for a compressed file, where what was written begins).
@@ -1165,7 +1168,8 @@ def _appendOpen(f, payload, codec=None, header=None, tailPolicy='newline', repor
 	made, whose close would write a member of its own. They are written with os.write, past any buffer of ``f``
 	(nothing is left in one for a close to write later), and synced with ``fsync``. An error raises; one in the
 	write first cuts off again what it wrote of them, so an append cut short (a full disk) leaves no torn row for
-	a reader, or a merge, to take for a row (a failed sync leaves what was all written).
+	a reader, or a merge, to take for a row (a failed sync leaves what was all written). ``written``, a list, gets
+	the bytes written once they all are, as they are on disk.
 	"""
 	f.flush()
 	size = f.seek(0, os.SEEK_END)
@@ -1203,6 +1207,8 @@ def _appendOpen(f, payload, codec=None, header=None, tailPolicy='newline', repor
 			except Exception:
 				pass  # the error raised says the append failed
 			raise
+		if written is not None:
+			written.append(data)
 		if fsync:
 			os.fsync(fd)  # all of it was written, and is read: a sync that fails leaves it
 	finally:
@@ -5117,8 +5123,13 @@ memoryOnly:{self.memoryOnly}
 			return False
 
 	def _externalChange(self):
-		"""True when the file changed since this object last wrote or read it, by its modification time."""
-		return self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName)
+		"""True when the file changed since this object last wrote or read it: a later modification time, or another
+		size than the bytes it knows (an append that landed right after its own, in the same tick)."""
+		try:
+			st = os.stat(self._fileName)
+		except OSError:
+			return False
+		return self.externalFileUpdateTime < st.st_mtime_ns or (self._known is not None and st.st_size != self._known[1])
 
 	# ``(identity, size, sha256)`` of the bytes this store last read or wrote in its legacy file; None when not known.
 	_known = None
@@ -5267,6 +5278,7 @@ memoryOnly:{self.memoryOnly}
 				self.deSynced = True
 				return False
 			started = False
+			end = None
 			try:
 				for attempt in range(3):
 					if sync is not None and (self._damaged or (sync and self._changedSince(f))):
@@ -5290,6 +5302,7 @@ memoryOnly:{self.memoryOnly}
 					self._writeInPlace(f, header, lines)
 				f.flush()
 				_fsync(f.fileno())
+				end = f.tell()  # its own bytes end here: a writer that takes no lock may append after them
 				self._damaged = False
 				self.dirty = self.deSynced = False
 			except BaseException:
@@ -5303,7 +5316,7 @@ memoryOnly:{self.memoryOnly}
 					if started:
 						# What it wrote, or what stopping it left (the damage): read through the descriptor, before the
 						# file is let go of. Its time is noted as this object's own.
-						self._known = _fileKnown(f.fileno())
+						self._known = _fileKnown(f.fileno(), None if self._damaged else end)
 						self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 				except Exception:
 					self._known = None
@@ -5428,11 +5441,7 @@ memoryOnly:{self.memoryOnly}
 			# queued is not in the file (appends take writeLock, held here): replayed on what was read, as reading it
 			# once appended will, so memory stays what the file will hold.
 			loaded.replay(list(self.appendQueue))
-			for key in [key for key in OrderedDict.__iter__(self) if not OrderedDict.__contains__(loaded, key)]:
-				OrderedDict.__delitem__(self, key)
-			for key, row in loaded.items():
-				OrderedDict.__setitem__(self, key, row)
-				OrderedDict.move_to_end(self, key)
+			self._replaceRows(loaded)
 			self.defaults = loaded.defaults
 			if loaded.dirty:
 				self.dirty = True  # a key the file holds twice
@@ -5446,6 +5455,17 @@ memoryOnly:{self.memoryOnly}
 		self._damaged = False  # memory is what the file holds, damaged or not
 		self.externalFileUpdateTime = self.lastUpdateTime = seen
 		self.deSynced = False  # memory is the file again: a change seen before needs no rewrite
+
+	def _replaceRows(self, rows):
+		"""Make memory hold the mapping ``rows`` in its order, changed in place, never emptied: a key both hold is never
+		missing for another thread meanwhile (a reload). The caller holds _memLock."""
+		for key in [key for key in OrderedDict.__iter__(self) if not dict.__contains__(rows, key)]:
+			OrderedDict.__delitem__(self, key)
+		for key, row in rows.items():
+			OrderedDict.__setitem__(self, key, row)
+		if list(OrderedDict.__iter__(self)) != list(rows):  # another order: the keys take it, one at a time
+			for key in rows:
+				OrderedDict.move_to_end(self, key)
 
 	def _rewritten(self):
 		"""What mapToFile and hardMapToFile do once _writeFile wrote every row; True."""
@@ -5563,7 +5583,7 @@ memoryOnly:{self.memoryOnly}
 	def _checkExternalChanges(self):
 		"""checkExternalChanges() for a legacy file, on the writer thread: never in the middle of this object's own write."""
 		realExternalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
-		if self.externalFileUpdateTime < realExternalFileUpdateTime:
+		if self._externalChange():
 			self.deSynced = True
 			self.__teePrintOrNot(f"External changes detected in {self._fileName}")
 		elif self.externalFileUpdateTime > realExternalFileUpdateTime:
@@ -5671,17 +5691,19 @@ memoryOnly:{self.memoryOnly}
 					# An existing empty file (a rewrite cut short, of this object's or another's) gets the header first,
 					# as creating it writes it; L1: a hand-edited last line is terminated instead of glued onto.
 					reporter = _Reporter(self._fileName, self.teeLogger)
+					written = []
 					try:
-						_appendOpen(f, b''.join(chunks), codec, self._headerLine if any(self.header) else None, 'newline', reporter)
+						_appendOpen(f, b''.join(chunks), codec, self._headerLine if any(self.header) else None, 'newline',
+									reporter, written=written)
 						_fsync(f.fileno())  # a sync that fails fails the append: the rows stay queued
 					finally:
 						reporter.flush()
 					if known is not None:
-						f.seek(known[1])
-						written = f.read()
+						# What it wrote, not what the file now holds: another writer's append that lands meanwhile
+						# (one that takes no lock) is still to be read, and one that landed first fails the next look.
 						digest = known[2].copy()
-						digest.update(written)
-						self._known = (_fileIdentity(os.fstat(f.fileno())), known[1] + len(written), digest)
+						digest.update(written[0])
+						self._known = (_fileIdentity(os.fstat(f.fileno())), known[1] + len(written[0]), digest)
 						self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 				with self._memLock:
 					for _ in range(len(rows)):
