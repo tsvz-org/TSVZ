@@ -6682,21 +6682,20 @@ class TSVZedLite(MutableMapping):
 		return self
 
 	def popitem(self, last=True,return_pos = False):
-		if self.indexes and _mayRaise(self.errors):
-			# Refuse before anything changes: the key of the tombstone is the one popped next.
-			try:
-				key = next(reversed(self.indexes)) if last else next(iter(self.indexes))
-			except TypeError:  # a dict cannot be reversed before Python 3.8
-				key = list(self.indexes)[-1]
-			self._checkDelete(key)
 		if last:
 			key, pos = self.indexes.popitem()
+			try:
+				self._checkDelete(key)
+			except BaseException:
+				self.indexes[key] = pos  # back at the end, where it was
+				raise
 		else:
 			try:
 				key = next(iter(self.indexes))
-				pos = self.indexes.pop(key)
 			except StopIteration:
 				raise KeyError("popitem(): dictionary is empty")
+			self._checkDelete(key)
+			pos = self.indexes.pop(key)
 		if return_pos or isinstance(pos, list):
 			value = pos
 		else:

@@ -6518,12 +6518,13 @@ def test_cli_routed_setdefault_is_one_atomic_request(tmp_path, served, monkeypat
 	assert _run('has', p, 'k')[0] != 0
 
 
-@pytest.mark.parametrize('how', ['del', 'pop', 'popitem'])
+@pytest.mark.parametrize('how', ['del', 'pop', 'popitem_last', 'popitem_first'])
 def test_tsvzedlite_refuses_to_delete_a_key_read_as_u_fffd_under_ascii(tmp_path, how):
 	# The file holds a byte ascii cannot decode: the key read is 'k\ufffd', whose tombstone ascii cannot
-	# write. Deleting it is refused, and the index and the file are left as they were.
+	# write. Deleting it is refused, and the index (its keys and their order) and the file are left as they were.
 	p = str(tmp_path / 'a.tsv')
-	_touch(p, b'ok\t1\nk\xff\t2\n')
+	content = b'k\xff\t2\nok\t1\nz\t3\n' if how == 'popitem_first' else b'ok\t1\nz\t3\nk\xff\t2\n'
+	_touch(p, content)
 	lite = TSVZ.TSVZedLite(p, header='', encoding='ascii')
 	key = 'k\ufffd'
 	assert key in lite
@@ -6534,8 +6535,9 @@ def test_tsvzedlite_refuses_to_delete_a_key_read_as_u_fffd_under_ascii(tmp_path,
 		elif how == 'pop':
 			lite.pop(key)
 		else:
-			lite.popitem()
-	assert list(lite.indexes) == keys and _bytes(p) == b'ok\t1\nk\xff\t2\n'
+			lite.popitem(last=(how == 'popitem_last'))
+	assert list(lite.indexes) == keys and _bytes(p) == content
+	assert lite.popitem(last=(how == 'popitem_first'))[0] == ('z' if how == 'popitem_first' else 'ok')  # the other end
 	lite.close()
 
 
