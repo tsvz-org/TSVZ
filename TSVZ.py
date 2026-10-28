@@ -6970,10 +6970,14 @@ class _ServeStore(object):
 	writer's. ``sync()`` replays the newly committed bytes of the active part
 	and reloads everything when anything else changed. Every public method
 	takes ``self.lock``; ``log`` is the teeLogger its messages go to.
+
+	``header`` and ``createDefaults`` (default ``defaults``) are what a missing store is created with
+	(``create``). ``checkHeader``: writes and ``clear`` also check ``header`` as 3.39 did (the CLI's
+	``--x-header``). ``lazy``: the store is read at the first request that needs it, not here.
 	"""
 
 	def __init__(self, fileName, delimiter=..., header='', defaults=None, strict=False, teeLogger=None,
-				 verbose=False, create=False, createDefaults=None):
+				 verbose=False, create=False, createDefaults=None, checkHeader=False, lazy=False):
 		self.path = fileName
 		self.spec = _isSpecPath(fileName)
 		if self.spec:
@@ -6985,12 +6989,16 @@ class _ServeStore(object):
 		self.teeLogger = teeLogger
 		self.verbose = verbose
 		self.lock = threading.RLock()
-		self.data = OrderedDict()
+		self.mapping = dict if lazy else OrderedDict  # a one-shot read fills a dict faster; popitem reverses either
+		self.data = self.mapping()
 		self.unreadable = False
 		self.stopped = False
+		self.parts = self.state = None  # not read yet
+		self.header = _formatHeader(header, teeLogger=teeLogger, delimiter=self.delimiter) if checkHeader else ['']
 		if create:
 			self._create(header, self.defaults if createDefaults is None else createDefaults)
-		self.reload(teeLogger)
+		if not lazy:
+			self.reload(teeLogger)
 		self.writer = _ServeWriter(self)
 
 	def _create(self, header, defaults):
@@ -7035,7 +7043,7 @@ class _ServeStore(object):
 		self.parts = _storeParts(self.path)[0]
 		before = self._stamps(self.parts)
 		load = _specLoad(self.path, self.delimiter, defaults=_normalizeDefaults(self.defaults, self.delimiter),
-						 strict=self.strict, taskDic=OrderedDict(), reporter=reporter, teeLogger=log,
+						 strict=self.strict, taskDic=self.mapping(), reporter=reporter, teeLogger=log,
 						 verbose=self.verbose)
 		self.data, self.state, self.width = load.data, load.state, load.correctColumnNum
 		if load.parts != self.parts or reporter.has('torn'):
@@ -7058,10 +7066,11 @@ class _ServeStore(object):
 	def _loadLegacy(self, reporter):
 		self.parts = [self.path] if os.path.isfile(self.path) else []
 		self.stamps = self._stamps(self.parts)
-		self.data = OrderedDict()
+		self.data = self.mapping()
 		self.legacyDefaults = list(self.defaults)
 		self.width, self.offset, self.lineNo, self.tailSeen = -1, 0, 0, b''
-		if self.parts:
+		# A compressed file with no byte, or only empty streams, is an empty store, as readTabularFile reads it.
+		if self.parts and not (_isCompressedFile(self.path) and _fileHoldsNothing(self.path)):
 			try:
 				with openFileAsCompressed(self.path, mode='rb', teeLogger=self.teeLogger) as f:
 					self.width, self.offset, self.lineNo = _legacyReadLoop(
@@ -7087,6 +7096,8 @@ class _ServeStore(object):
 	def sync(self, log):
 		"""Bring the view up to date with the files: follow appends, reload on anything else."""
 		with self.lock:
+			if self.parts is None:
+				return self.reload(log)
 			dirMtime = _dirMtimeNs(self.path)
 			if dirMtime != self.dirMtime or self.dirRacy:
 				parts = _storeParts(self.path)[0] if self.spec else ([self.path] if os.path.isfile(self.path) else [])
@@ -7171,10 +7182,10 @@ class _ServeStore(object):
 
 	# -- reads ----------------------------------------------------------------
 	def missing(self, log):
-		"""True when the store has no part (spec §20.2.2)."""
+		"""True when the store has no part (spec §20.2.2); the store is not read for it."""
 		with self.lock:
-			self._fresh(log)
-			return not self.parts
+			self.writer.barrier()
+			return not (_storeParts(self.path)[0] if self.spec else os.path.isfile(self.path))
 
 	def resolve(self, key):
 		"""The key a requested key names (spec §20.2.7; 3.39 rstrip for loose files)."""
@@ -7185,7 +7196,7 @@ class _ServeStore(object):
 	def read(self, log):
 		with self.lock:
 			self._fresh(log)
-			return [list(row) for row in self.data.values()]
+			return list(self.data.values())  # a row is replaced, never changed, once it is in ``data``
 
 	def get(self, keys, log):
 		"""Rows for ``keys`` and whether one was missing (spec §20.2 ``get``, §14.5)."""
@@ -7246,16 +7257,20 @@ class _ServeStore(object):
 	def _payload(self, rows, log):
 		"""Bytes for ``rows`` (``[(cells, marker), ...]``), formatted as the direct writers format them."""
 		if self.spec:
+			if rows and any(self.header):
+				_specCheckHeader(self.path, self.header, self.delimiter, self.strict, self.verbose, log)
 			return _specFormatRecords(rows, self.delimiter).encode('utf-8')
-		return _legacyFormatPayload(self.path, [cells for cells, marker in rows], log, [''], True, self.verbose,
-									'utf8', self.strict, self.delimiter)[0]
+		# Rows for a file that holds nothing yet are fitted to the header it is about to begin with.
+		assume = self.header if any(self.header) and _fileHoldsNothing(self.path) else None
+		return _legacyFormatPayload(self.path, [cells for cells, marker in rows], log, self.header, True, self.verbose,
+									'utf8', self.strict, self.delimiter, assume=assume)[0]
 
 	def _tombstone(self, key):
 		"""Rows that delete ``key``: written with stripping off when it would strip ``key`` (spec §9.6)."""
 		return _specTombstones([key], self.delimiter, self.state.strip) if self.spec else [([key], False)]
 
 	def _durable(self, sync):
-		return sync or (self.spec and self.state.writeAck == 'disk')
+		return sync or (self.spec and self.state is not None and self.state.writeAck == 'disk')
 
 	def _submit(self, rows, sync, log):
 		"""Queue ``rows`` (caller holds the lock); return ``(seq, durable)`` or None when there is nothing to write."""
@@ -7279,6 +7294,11 @@ class _ServeStore(object):
 		with self.lock:
 			queued = self._submit(rows, sync, log)
 		self._ack(queued, written)
+		self._wrote(rows, log)
+
+	def _wrote(self, rows, log):
+		if self.verbose and log is not None:  # as the direct writers report it
+			log.teelog('Appended {} lines to {}'.format(len(rows), self.path) if rows else 'No lines to append to ' + self.path)
 
 	def delete(self, rows, sync, log, written=False):
 		"""Append the tombstones of ``delete`` (``[(cells, marker), ...]``) as one batch (spec §20.2.7).
@@ -7295,6 +7315,7 @@ class _ServeStore(object):
 				rows = _specDeleteRows(rows, self.delimiter, self.state.strip, self.data)
 			queued = self._submit(rows, sync, log)
 		self._ack(queued, written)
+		self._wrote(rows, log)
 		return True
 
 	def pop(self, key, sync, log):
@@ -7320,7 +7341,10 @@ class _ServeStore(object):
 				return _SERVE_PARTIAL
 			if not self.data:
 				return None
-			key = next(reversed(self.data)) if last else next(iter(self.data))
+			if not last:
+				key = next(iter(self.data))
+			else:  # a dict is reversible from Python 3.8
+				key = next(reversed(self.data)) if hasattr(self.data, '__reversed__') else list(self.data)[-1]
 			row = list(self.data[key])
 			queued = self._submit(self._tombstone(key), sync, log)
 		self._ack(queued, written=True)
@@ -7350,13 +7374,11 @@ class _ServeStore(object):
 		with self.lock:
 			self.writer.barrier()
 			try:
-				if self.spec:
-					return _specClearTabularFile(self.path, teeLogger=log, verbose=self.verbose,
-												 delimiter=self.delimiter)
-				clearTabularFile(self.path, teeLogger=log, verbose=self.verbose, delimiter=self.delimiter)
-				return True
+				clear = _specClearTabularFile if self.spec else clearTabularFile
+				return clear(self.path, teeLogger=log, header=self.header, verifyHeader=self.strict,
+							 verbose=self.verbose, delimiter=self.delimiter) is not False
 			finally:
-				self.reload(log)
+				self.parts = None  # read again at the next request
 
 	def scrub(self, log):
 		"""``scrub`` (spec §20.2) through the library; True when done, False when refused, None when the read
@@ -7371,7 +7393,7 @@ class _ServeStore(object):
 								 strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)
 				return True
 			finally:
-				self.reload(log)
+				self.parts = None  # read again at the next request
 
 	def flush(self):
 		"""Write and fsync everything submitted so far (``stop``, spec §21.9)."""
@@ -7389,11 +7411,15 @@ class _ServeStore(object):
 		try:
 			if self.spec:
 				_specAppendPayload(_storeParts(self.path)[1], payload, reporter, fsync=fsync,
-								   memberSize=getattr(getattr(self, 'state', None), 'memberSize', None))
+								   memberSize=getattr(self.state, 'memberSize', None))
 			else:
 				codec = _fileCodec(self.path)
 				_requireCodec(codec)
-				_lockedAppend(self.path, payload, 'newline', reporter, fsync=fsync, codec=codec)
+				header = None  # a file that holds nothing gets the header first (_appendOpen)
+				if any(self.header):
+					header = functools.partial(_encodeRow, _sanitize(self.header, delimiter=self.delimiter),
+											   self.delimiter, 'utf8', 'strict', what='header')
+				_lockedAppend(self.path, payload, 'newline', reporter, fsync=fsync, header=header, codec=codec)
 		finally:
 			reporter.flush()
 
@@ -7441,11 +7467,6 @@ def _serveRecordLine(cells, marker):
 	return _specFormatRecord(cells, '\t')
 
 
-def _serveFieldsLine(fields):
-	"""An output line of plain fields (``verify``, ``parts``): §13 with TAB, a leading '#' as ``<#>``."""
-	return '\t'.join([_specEncodeField(str(fields[0]), '\t', isKey=True)] + [_serveEncode(str(field)) for field in fields[1:]])
-
-
 def _serveDecodeLine(line):
 	"""The fields of a protocol record line, decoded per §13."""
 	return [_specDecodeField(field, '\t') for field in line.split('\t')]
@@ -7486,7 +7507,10 @@ class _ServeLog(object):
 
 
 def _serveDispatch(store, line, bulk, log):
-	"""Run one request against ``store`` (spec §21.7); return ``(status, lines, message)``."""
+	"""Run one request against ``store`` (spec §21.7); return ``(status, rows, message)``.
+
+	``rows`` hold the output's fields: each is one output line, as ``_specFormatRecord`` with TAB writes it.
+	"""
 	options, operation, args, raw = _serveParseRequest(line)
 	for option in options:
 		if option not in ('--sync', '--x-written'):
@@ -7505,33 +7529,24 @@ def _serveDispatch(store, line, bulk, log):
 		raise _ServeUsage('a KEY must not be empty')
 	if operation in _SERVE_NEED_STORE and store.missing(log):
 		return 1, [], 'no such store'  # spec §20.2.2
-	unreadable = (1, _SERVE_UNREADABLE)
-	# Each read takes its status under the store lock it read under: another request's reload may
-	# change ``unreadable`` once the lock is free.
-	if operation == 'read':
+	if operation in ('read', 'get', 'has', 'len', 'keys'):
+		# The status is taken under the store lock the read ran under: another request's reload may change
+		# ``unreadable`` once the lock is free.
 		with store.lock:
-			rows = store.read(log)
-			status = unreadable if store.unreadable else (0, '')
-		return status[0], [_specFormatRecord(row, '\t') for row in rows], status[1]
-	if operation == 'get':
-		with store.lock:
-			rows, missing = store.get(args, log)
-			status = unreadable if store.unreadable else (3 if missing else 0, '')
-		return status[0], [_specFormatRecord(row, '\t') for row in rows], status[1]
-	if operation == 'has':
-		with store.lock:
-			found = store.has(args[0], log)
-			return (1, [], _SERVE_UNREADABLE) if store.unreadable else (0 if found else 3, [], '')
-	if operation == 'len':
-		with store.lock:
-			count = store.length(log)
-			status = unreadable if store.unreadable else (0, '')  # spec §4.10, §20.6: a stopped read failed
-		return status[0], [str(count)], status[1]
-	if operation == 'keys':
-		with store.lock:
-			keys = store.keys(log)
-			status = unreadable if store.unreadable else (0, '')
-		return status[0], [_specEncodeField(key, '\t', isKey=True) for key in keys], status[1]
+			missing = False
+			if operation == 'read':
+				rows = store.read(log)
+			elif operation == 'get':
+				rows, missing = store.get(args, log)
+			elif operation == 'has':
+				rows, missing = [], not store.has(args[0], log)
+			elif operation == 'len':
+				rows = [[str(store.length(log))]]
+			else:
+				rows = [[key] for key in store.keys(log)]
+			if store.unreadable:  # what could be read, and status 1 (spec §4.10, §21.8.5)
+				return 1, rows, _SERVE_UNREADABLE
+		return (3 if missing else 0), rows, ''
 	if operation in ('set', 'append', 'delete'):
 		keysOnly = operation == 'delete'
 		if isBulk:
@@ -7558,25 +7573,26 @@ def _serveDispatch(store, line, bulk, log):
 			row = store.popitem(not args or args[0] == 'last', sync, log)
 		if row is _SERVE_PARTIAL:
 			return 1, [], _SERVE_UNREADABLE
-		return (3, [], '') if row is None else (0, [_specFormatRecord(row, '\t')], '')
+		return (3, [], '') if row is None else (0, [row], '')
 	if operation == 'setdefault':
 		if _MARKER_RE.match(raw[0]):
 			raise _ServeUsage('setdefault takes a data KEY, not a marker')
 		row = store.setdefault(args, sync, log)
 		if row is _SERVE_PARTIAL:
 			return 1, [], _SERVE_UNREADABLE
-		return (3, [], '') if row is None else (0, [_specFormatRecord(row, '\t')], '')
+		return (3, [], '') if row is None else (0, [row], '')
 	if operation in ('clear', 'scrub'):
 		done = store.clear(log) if operation == 'clear' else store.scrub(log)
 		if done is None:  # spec §4.10: rewritten from a read that stopped at damaged data
-			return 1, [], 'the read stopped at damaged data; the store was rewritten from what was read, the original kept'
+			return 1, [], ('the read stopped at damaged data (#_on_corruption_# stop); the store was rewritten from what '
+						   'was read, and the original part was kept as a .damaged- copy')
 		return (0, [], '') if done else (1, [], '{} refused; nothing was written'.format(operation))
 	if operation == 'verify':
 		mismatches, readable = store.verify(log)
-		lines = [_serveFieldsLine(entry) for entry in mismatches]
-		return (1 if not readable else 4 if lines else 0), lines, '' if readable else _SERVE_UNREADABLE
+		rows = [[str(field) for field in entry] for entry in mismatches]
+		return (1 if not readable else 4 if rows else 0), rows, '' if readable else _SERVE_UNREADABLE
 	if operation == 'parts':
-		return 0, [_serveFieldsLine(row) for row in store.partRows(log)], ''
+		return 0, store.partRows(log), ''
 	return 1, [], 'not served by a handler'  # stop, sent to an in-process store
 
 
@@ -7584,18 +7600,18 @@ def _serveRespond(store, line, bulk=None, logger=None):
 	"""The response to one request (spec §21.6), as lines without their '\\n'."""
 	log = _ServeLog(logger)
 	try:
-		status, lines, message = _serveDispatch(store, line, bulk, log)
+		status, rows, message = _serveDispatch(store, line, bulk, log)
 	except _ServeUsage as e:
-		status, lines, message = 2, [], str(e)
+		status, rows, message = 2, [], str(e)
 	except Exception as e:
-		status, lines, message = 1, [], str(e) or type(e).__name__
+		status, rows, message = 1, [], str(e) or type(e).__name__
 		if logger is not None:
 			logger.teelog('tsvz: {}: request {!r} failed: {}'.format(store.path, line[:80], message), 'error')
 	failing = store.writer.failing
 	if failing:
 		log.lines.append('TSVZ warning: {}: writes are failing ({}); writes acknowledged before they were written '
 						 'may be lost'.format(store.path, failing))
-	response = ['#!\t' + _serveEncode(text) for text in log.lines] + list(lines)
+	response = ['#!\t' + _serveEncode(text) for text in log.lines] + [_specFormatRecord(row, '\t') for row in rows]
 	response.append('#{}\t{}'.format(status, _serveEncode(message)) if message else '#{}'.format(status))
 	return response
 
@@ -8762,92 +8778,6 @@ def _cliStoreExists(store):
 	return os.path.isfile(store)
 
 
-def _cliWritten(args, logger):
-	"""Exit status after a write: 1, with an error, when STORE still does not exist (it could not be created)."""
-	if _cliStoreExists(args.store):
-		return 0
-	logger.teelog('tsvz: {}: the store could not be created; nothing was written'.format(args.store), 'error')
-	return 1
-
-
-def _cliSpecLoad(args, delimiter, logger):
-	"""Load a spec store for ``read`` / ``get``; return ``(load, readable)``.
-
-	``readable`` is False when a part could not be opened or read to its end;
-	the rows of the other parts are still loaded.
-	"""
-	reporter = _Reporter(args.store, logger)
-	try:
-		load = _specLoad(args.store, delimiter, defaults=_normalizeDefaults(args.defaults, delimiter),
-						 strict=args.strict, reporter=reporter, teeLogger=logger, verbose=args.verbose)
-		readable = not reporter.incomplete()
-	finally:
-		reporter.flush()
-	return load, readable
-
-
-def _cliUnreadable(args, logger):
-	"""Exit status 1, with an error that -q keeps, for a store with a part that could not be read."""
-	logger.teelog('tsvz: {}: could not read every part of the store'.format(args.store), 'error')
-	return 1
-
-
-def _cliRead(args, delimiter, logger, stdin, stdout):
-	"""``read STORE`` (spec §20.2): every live row, in first-appearance order.
-
-	Exit 1 when a part could not be read; the rows of the other parts are printed.
-	"""
-	if not _cliStoreExists(args.store):
-		raise _CliStoreMissing()
-	if not _isSpecPath(args.store):
-		data = readTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
-							   strict=args.strict, delimiter=delimiter, defaults=args.defaults)
-		_cliEmitRows(list(data.values()), args, stdout, False, delimiter, headerRow=True)
-		return 0
-	load, readable = _cliSpecLoad(args, delimiter, logger)
-	_cliEmitRows(list(load.data.values()), args, stdout, True, delimiter)
-	return 0 if readable else _cliUnreadable(args, logger)
-
-
-def _cliGet(args, delimiter, logger, stdin, stdout):
-	"""``get STORE KEY ...`` (spec §20.2): each KEY's row in argument order; exit 3 when one is missing.
-
-	Each KEY names a key as §20.2.7 says. For a missing key of a
-	spec store this prints what ``TSVZed`` returns for it (§14.5): the key and
-	the active defaults while ``#_return_defaults_when_missing_#`` is true,
-	else nothing. A missing key of a loose file prints nothing.
-	"""
-	if not _cliStoreExists(args.store):
-		raise _CliStoreMissing()
-	spec = _isSpecPath(args.store)
-	readable = True
-	if spec:
-		load, readable = _cliSpecLoad(args, delimiter, logger)
-		data, state = load.data, load.state
-	else:
-		data = readTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
-							   strict=args.strict, delimiter=delimiter, defaults=args.defaults)
-	rows = []
-	missing = False
-	for key in args.args:
-		if spec:
-			key = _specNameKey(key, delimiter, state.strip, data)
-		else:
-			key = key.rstrip()
-		row = data.get(key)
-		if row is None:
-			missing = True
-			if not (spec and state.returnDefaults):
-				continue
-			row = [key] + list(state.defaults[1:])
-			row += [''] * (load.correctColumnNum - len(row))
-		rows.append(row)
-	_cliEmitRows(rows, args, stdout, spec, delimiter)
-	if not readable:
-		return _cliUnreadable(args, logger)
-	return 3 if missing else 0
-
-
 def _cliStdinLines(stdin, reporter):
 	"""The committed lines of ``stdin`` (spec §4.3, §20.3), decoded as UTF-8, without terminators.
 
@@ -8865,32 +8795,6 @@ def _cliStdinLines(stdin, reporter):
 	if lines and lines[0].startswith(b'\xef\xbb\xbf'):
 		lines[0] = lines[0][3:]
 	return [_decodeLine(raw, reporter, 'line {}'.format(lineNo)) for lineNo, raw in enumerate(lines, 1)]
-
-
-def _cliStdinBatch(args, delimiter, logger, stdin, keysOnly):
-	"""Turn standard input into one batch for ``set STORE -`` / ``delete STORE -`` (spec §20.3).
-
-	A spec store gets formatted records: a data line's fields are decoded
-	(§13) and written again as ``set`` writes them, and a line whose first
-	field matches the reserved pattern is a marker line, written as given. A
-	loose file gets 3.39 rows. Comment lines and empty lines are skipped, and
-	so is a line with an empty key (reported). ``keysOnly`` keeps the first
-	field only: a tombstone, or a marker reset.
-	"""
-	rows = _cliStdinRows(args, delimiter, logger, stdin, keysOnly)
-	if not _isSpecPath(args.store):
-		return [cells for cells, marker in rows]
-	return [_specFormatRecord(cells, delimiter, marker=marker) for cells, marker in rows]
-
-
-def _cliStdinRows(args, delimiter, logger, stdin, keysOnly):
-	"""Standard input for ``set STORE -`` / ``delete STORE -`` as ``[(cells, marker), ...]`` (spec §20.3)."""
-	source = _Reporter('<stdin>', logger)
-	try:
-		return _parseRecordLines(_cliStdinLines(stdin, source), delimiter, _isSpecPath(args.store), keysOnly,
-								 source)
-	finally:
-		source.flush()
 
 
 def _parseRecordLines(texts, delimiter, spec, keysOnly, reporter):
@@ -8923,183 +8827,30 @@ def _parseRecordLines(texts, delimiter, spec, keysOnly, reporter):
 	return rows
 
 
-def _cliAppendBatch(args, delimiter, logger, batch):
-	"""Append ``batch`` from ``_cliStdinBatch`` to STORE in one write, creating STORE if needed."""
-	if not _isSpecPath(args.store):
-		appendLinesTabularFile(args.store, batch, teeLogger=logger, header=args.header, createIfNotExist=True,
-							   verbose=args.verbose, strict=args.strict, delimiter=delimiter)
-		return
-	reporter = _Reporter(args.store, logger)
-	try:
-		_specAppendRecords(args.store, batch, reporter, teeLogger=logger,
-						   header=_formatHeader(args.header, delimiter=delimiter), createIfNotExist=True,
-						   verbose=args.verbose, strict=args.strict, delimiter=delimiter)
-	finally:
-		reporter.flush()
-
-
-def _cliSet(args, delimiter, logger, stdin, stdout):
-	"""``set`` / ``append STORE KEY [VALUE ...]`` (spec §20.2): one record; a lone KEY is a tombstone.
-
-	``set STORE -`` appends every record on standard input in one write (§20.3).
-	"""
-	if args.args == ['-']:
-		_cliAppendBatch(args, delimiter, logger, _cliStdinBatch(args, delimiter, logger, stdin, keysOnly=False))
-		return _cliWritten(args, logger)
-	appendTabularFile(args.store, args.args, teeLogger=logger, header=args.header, createIfNotExist=True,
-					  verbose=args.verbose, strict=args.strict, delimiter=delimiter)
-	return _cliWritten(args, logger)
-
-
-def _cliDelete(args, delimiter, logger, stdin, stdout):
-	"""``delete STORE KEY [KEY ...]`` (spec §20.2): one tombstone per KEY, appended in one write.
-
-	``delete STORE -`` deletes the first field of every line on standard input (§20.3).
-	A key that a reader would strip names a key of the store (§20.2.7), so the
-	store is read first; when it cannot be read whole nothing is written and
-	the exit status is 1.
-	"""
-	if not _isSpecPath(args.store):
-		if args.args == ['-']:
-			_cliAppendBatch(args, delimiter, logger, _cliStdinBatch(args, delimiter, logger, stdin, keysOnly=True))
-		else:
-			appendLinesTabularFile(args.store, [[key] for key in args.args], teeLogger=logger, header=args.header,
-								   createIfNotExist=True, verbose=args.verbose, strict=args.strict,
-								   delimiter=delimiter)
-		return _cliWritten(args, logger)
-	if args.args == ['-']:
-		rows = _cliStdinRows(args, delimiter, logger, stdin, keysOnly=True)
-	else:
-		rows = [([key], bool(_MARKER_RE.match(key))) for key in args.args]
-	if _specNamesKeys(rows, delimiter):
-		strip, live = True, {}  # a store delete creates starts with stripping on (spec §10.3)
-		if _cliStoreExists(args.store):
-			load, readable = _cliSpecLoad(args, delimiter, logger)
-			if not readable:
-				logger.teelog('tsvz: {}: could not read every part of the store; nothing was written'.format(
-					args.store), 'error')
-				return 1
-			strip, live = load.state.strip, load.data
-		rows = _specDeleteRows(rows, delimiter, strip, live)
-	_cliAppendBatch(args, delimiter, logger, [_specFormatRecord(cells, delimiter, marker=marker) for cells, marker in rows])
-	return _cliWritten(args, logger)
-
-
-def _cliClear(args, delimiter, logger, stdin, stdout):
-	"""``clear STORE`` (spec §20.2); exit 1 when it was refused and nothing was written."""
-	if not _isSpecPath(args.store):
-		clearTabularFile(args.store, teeLogger=logger, header=args.header, verifyHeader=args.strict,
-						 verbose=args.verbose, delimiter=delimiter)
-		return 0
-	if _specClearTabularFile(args.store, teeLogger=logger, header=args.header, verifyHeader=args.strict,
-							 verbose=args.verbose, delimiter=delimiter):
-		return 0
-	logger.teelog('tsvz: {}: clear refused; nothing was written'.format(args.store), 'error')
-	return 1
-
-
-def _cliScrub(args, delimiter, logger, stdin, stdout):
-	"""``scrub STORE`` (spec §20.2): compact a single-part store in place; exit 1 when refused."""
-	if not _cliStoreExists(args.store):
-		raise _CliStoreMissing()
-	if not _isSpecPath(args.store):
-		scrubTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
-						 strict=args.strict, delimiter=delimiter, defaults=args.defaults)
-		return 0
-	_, done = _specScrub(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
-						 strict=args.strict, delimiter=delimiter, defaults=args.defaults)
-	if done:
-		return 0
-	if done is None:
-		logger.teelog('tsvz: {}: the read stopped at damaged data (#_on_corruption_# stop); the store was rewritten '
-					  'from what was read, and the original part was kept as a .damaged- copy'.format(args.store), 'error')
-		return 1
-	logger.teelog('tsvz: {}: scrub refused; nothing was written'.format(args.store), 'error')
-	return 1
-
-
-def _cliVerify(args, delimiter, logger, stdin, stdout):
-	"""``verify STORE`` (spec §20.2): one line per checksum mismatch; exit 4 when there is one."""
-	if not _cliStoreExists(args.store):
-		raise _CliStoreMissing()
-	if not _isSpecPath(args.store):
-		return 0  # a loose file has no checksums (spec §20.2.4)
-	reporter = _Reporter(args.store, logger)
-	try:
-		mismatches = _specVerify(args.store, delimiter, reporter)
-		readable = not reporter.incomplete()
-	finally:
-		reporter.flush()
-	rows = [[path, str(lineNo), algo, expected, computed] for path, lineNo, algo, expected, computed in mismatches]
-	_cliEmitFields(rows, ['path', 'line', 'algorithm', 'expected', 'computed'], args, stdout)
-	if not readable:
-		return _cliUnreadable(args, logger)  # not every segment could be checked
-	return 4 if rows else 0
-
-
-def _cliParts(args, delimiter, logger, stdin, stdout):
-	"""``parts STORE`` (spec §20.2): index, hexadecimal ordinal, path and flags of each part, in replay order."""
-	if not _cliStoreExists(args.store):
-		raise _CliStoreMissing()
-	reporter = _Reporter(args.store, logger)
-	try:
-		rows = _partRows(args.store, reporter)
-	finally:
-		reporter.flush()
-	_cliEmitFields(rows, ['index', 'ordinal', 'path', 'flags'], args, stdout)
-	return 0
-
-
 def _cliRequestLine(args):
 	"""The protocol request (spec §21.5) for a parsed command line: its arguments are literal."""
 	return '\t'.join([args.operation] + [_serveEncode(arg) for arg in args.args])
 
 
 def _cliEmitServed(args, delimiter, logger, stdout, response):
-	"""Print a response (spec §21.6) as the operation prints on the files (§20.8); return the exit status."""
-	lines, diagnostics, status, message = response
+	"""Print a response (``(rows, diagnostics, status, message)``) as the operation prints on the files (§20.8);
+	return the exit status."""
+	rows, diagnostics, status, message = response
 	for text in diagnostics:
 		logger.teelog(text, 'warning')
 	spec = _isSpecPath(args.store)
 	operation = args.operation
-	if operation in ('read', 'get', 'pop', 'popitem', 'setdefault'):
-		_cliEmitRows([_serveDecodeLine(line) for line in lines], args, stdout, spec, delimiter,
-					 headerRow=operation == 'read' and not spec)
-	elif operation == 'keys':
-		_cliEmitRows([[_specDecodeField(line, '\t')] for line in lines], args, stdout, spec, delimiter)
+	if operation in ('read', 'get', 'keys', 'pop', 'popitem', 'setdefault'):
+		_cliEmitRows(rows, args, stdout, spec, delimiter, headerRow=operation == 'read' and not spec)
 	elif operation == 'len':
-		_cliWrite(stdout, ''.join(line + '\n' for line in lines))
+		_cliWrite(stdout, ''.join(row[0] + '\n' for row in rows))
 	elif operation == 'verify':
-		_cliEmitFields([_serveDecodeLine(line) for line in lines], ['path', 'line', 'algorithm', 'expected', 'computed'],
-					   args, stdout)
+		_cliEmitFields(rows, ['path', 'line', 'algorithm', 'expected', 'computed'], args, stdout)
 	elif operation == 'parts':
-		_cliEmitFields([_serveDecodeLine(line) for line in lines], ['index', 'ordinal', 'path', 'flags'], args, stdout)
+		_cliEmitFields(rows, ['index', 'ordinal', 'path', 'flags'], args, stdout)
 	if message and status in (1, 2):
 		logger.teelog('tsvz: {}: {}'.format(args.store, message), 'error')
 	return status
-
-
-def _cliSetdefaultArgs(args, delimiter, creating):
-	"""Refuse, before a store is created or written, what a ``setdefault`` would have to write and cannot.
-
-	A header or defaults written to a store this creates is looked at. Arguments that hold a byte that is not
-	UTF-8 (``args.writeArgs``) are refused here when the store does not exist: KEY is not live, so they would
-	have to be written. When it exists, see ``_cliSetdefaultLookup``.
-	"""
-	if creating:
-		header = _formatHeader(args.header, delimiter=delimiter)
-		if any(header):
-			_checkRow(header, delimiter, 'utf8', 'strict', what='header')
-		if args.defaults and len(args.defaults) > 1:
-			_checkRow(args.defaults, delimiter, 'utf8', 'strict', what='defaults')
-		if args.writeArgs is not None:
-			_cliRefuseSetdefault(args, delimiter)
-
-
-def _cliRefuseSetdefault(args, delimiter):
-	"""Raise the ``TSVZEncodeError`` a write of ``args.writeArgs`` meets: they hold a byte that is not UTF-8."""
-	_checkRow(_sanitize(args.writeArgs, delimiter=delimiter), delimiter, 'utf8', 'strict', None)
-	raise TSVZEncodeError('cannot write {} as UTF-8'.format(ascii(args.writeArgs)))  # not reached: they cannot be encoded
 
 
 def _cliSetdefaultLookup(args, delimiter, logger, stdout, request):
@@ -9110,46 +8861,69 @@ def _cliSetdefaultLookup(args, delimiter, logger, stdout, request):
 	with one ``get`` request (``request``): through a handler that is the handler's own view, in one request, never
 	a write with the byte replaced; on the files it is the in-process engine's.
 	"""
-	lines, diagnostics, status, message = request('\t'.join(['get', _serveEncode(args.args[0])]))
+	rows, diagnostics, status, message = request('\t'.join(['get', _serveEncode(args.args[0])]))
 	if status == 3:
 		for text in diagnostics:
 			logger.teelog(text, 'warning')
-		_cliRefuseSetdefault(args, delimiter)
-	return _cliEmitServed(args, delimiter, logger, stdout, (lines[:1] if status == 0 else [], diagnostics, status, message))
+		_checkRow(_sanitize(args.writeArgs, delimiter=delimiter), delimiter, 'utf8', 'strict', None)  # raises
+	return _cliEmitServed(args, delimiter, logger, stdout, (rows[:1] if status == 0 else [], diagnostics, status, message))
+
+
+def _cliBulk(args, delimiter, logger, stdin):
+	"""The record lines ``set -`` / ``delete -`` read from standard input (spec §20.3), else None."""
+	if args.operation not in ('set', 'append', 'delete') or args.args != ['-']:
+		return None
+	source = _Reporter('<stdin>', logger)
+	try:
+		rows = _parseRecordLines(_cliStdinLines(stdin, source), delimiter, _isSpecPath(args.store),
+								 args.operation == 'delete', source)
+	finally:
+		source.flush()
+	return [_serveRecordLine(cells, marker) for cells, marker in rows]
 
 
 def _cliEngineOp(args, delimiter, logger, stdin, stdout):
-	"""``has``, ``len``, ``keys``, ``pop``, ``popitem``, ``setdefault`` (spec §20.2) on the files.
+	"""Every operation but ``serve`` and ``stop``, on the files (spec §20.2).
 
-	They run through an in-process write-handler engine, so they behave as
-	they do through a handler, except that ``pop``, ``popitem`` and
-	``setdefault`` are not atomic against other writers.
+	It is one request to an in-process write-handler engine, so it behaves as it does through a handler
+	(§20.8), except that ``pop``, ``popitem``, ``setdefault`` and a ``delete`` that reads the store are not
+	atomic against other writers (§20.2.5).
 	"""
-	create = args.operation == 'setdefault'
+	operation = args.operation
 	exists = _cliStoreExists(args.store)
-	if not create and not exists:
+	if not exists and operation not in _CLI_CREATES:
 		raise _CliStoreMissing()
+	if operation == 'setdefault' and not exists:
+		# What a refused setdefault would write is looked at before the store is created, so it creates nothing.
+		header = _formatHeader(args.header, delimiter=delimiter)
+		if any(header):
+			_checkRow(header, delimiter, 'utf8', 'strict', what='header')
+		if args.defaults and len(args.defaults) > 1:
+			_checkRow(args.defaults, delimiter, 'utf8', 'strict', what='defaults')
+		if args.writeArgs is not None:
+			_checkRow(_sanitize(args.writeArgs, delimiter=delimiter), delimiter, 'utf8', 'strict', None)  # raises
+	bulk = _cliBulk(args, delimiter, logger, stdin)
+	store = _ServeStore(args.store, delimiter=delimiter, header=args.header, defaults=args.defaults,
+						strict=args.strict, teeLogger=logger, verbose=args.verbose,
+						create=not exists and operation != 'clear',  # clear creates the store itself
+						createDefaults=None if operation == 'setdefault' else [],
+						checkHeader=operation in ('set', 'append', 'delete', 'clear'), lazy=True)  # as 3.39 did
 
-	def openStore(creating):
-		return _ServeStore(args.store, delimiter=delimiter, header=args.header, defaults=args.defaults,
-						   strict=args.strict, teeLogger=logger, verbose=args.verbose, create=creating)
-	store = openStore(False) if exists else None
+	def request(line, bulk=None):
+		"""The response to ``line``; the engine's messages go to stderr as they come, at their own level."""
+		try:
+			status, rows, message = _serveDispatch(store, line, bulk, logger)
+		except _ServeUsage as e:
+			status, rows, message = 2, [], str(e)
+		return rows, [], status, message
 	try:
-		if create:
-			# Before a missing store is created: a setdefault that will be refused creates nothing.
-			_cliSetdefaultArgs(args, delimiter, not exists)
-			if args.writeArgs is not None:
-				return _cliSetdefaultLookup(args, delimiter, logger, stdout, _ServeLocal(store).request)
-			if store is None:
-				store = openStore(True)
-		response = _ServeLocal(store).request(_cliRequestLine(args))
+		if args.writeArgs is not None:
+			return _cliSetdefaultLookup(args, delimiter, logger, stdout, request)
+		written = ['--x-written'] if operation in ('set', 'append', 'delete') else []  # a failed write fails
+		response = request('\t'.join(written + [_cliRequestLine(args)]), bulk)
 	finally:
-		if store is not None:
-			store.close()
-	status = _cliEmitServed(args, delimiter, logger, stdout, response)
-	if store.writer.failures:
-		return 1  # the write was not made; the writer reported why
-	return status
+		store.close()
+	return _cliEmitServed(args, delimiter, logger, stdout, response)
 
 
 def _cliServe(args, delimiter, logger, stdin, stdout):
@@ -9221,6 +8995,7 @@ def _cliStop(args, delimiter, logger, stdin, stdout):
 
 
 _CLI_WRITES_HEADER = ('set', 'append', 'setdefault', 'clear', 'delete', 'scrub', 'serve')
+_CLI_CREATES = ('set', 'append', 'delete', 'clear', 'setdefault')  # a missing store (spec §20.2.2)
 _CLI_READ_ONLY = ('read', 'get', 'has', 'len', 'keys', 'verify', 'parts')
 
 
@@ -9258,44 +9033,29 @@ def _cliHandler(args, delimiter, logger):
 
 def _cliRouted(connection, args, delimiter, logger, stdin, stdout):
 	"""Run a command line through STORE's handler; print the response as the files would give it (§20.8)."""
-	bulk = None
-	if args.operation in ('set', 'append', 'delete') and args.args == ['-']:
-		source = _Reporter('<stdin>', logger)
+	def request(line, bulk=None):
+		lines, diagnostics, status, message = connection.request(line, bulk)
+		return [_serveDecodeLine(line) for line in lines], diagnostics, status, message
+	if args.writeArgs is not None:
 		try:
-			rows = _parseRecordLines(_cliStdinLines(stdin, source), delimiter, _isSpecPath(args.store),
-									 args.operation == 'delete', source)
-		finally:
-			source.flush()
-		bulk = [_serveRecordLine(cells, marker) for cells, marker in rows]
-	elif args.operation == 'setdefault' and args.writeArgs is not None:
-		try:
-			return _cliSetdefaultLookup(args, delimiter, logger, stdout, connection.request)
+			return _cliSetdefaultLookup(args, delimiter, logger, stdout, request)
 		except _ServeLost as e:  # a lookup only: the files answer it as well
 			logger.teelog('TSVZ warning: {}: lost the handler ({}); using the files directly'.format(args.store, e),
 						  'warning')
-			return _CLI_HANDLERS[args.operation](args, delimiter, logger, stdin, stdout)
-	elif args.operation in ('set', 'append') and len(args.args) > 1:
-		# Checked as the files are, naming the cell, before anything is sent: a request cannot carry
-		# text that is not UTF-8 (and would be quoted whole).
-		_checkRow(_sanitize(args.args, delimiter=delimiter), delimiter, 'utf8', 'strict', None)
+			return _cliEngineOp(args, delimiter, logger, stdin, stdout)
+	bulk = _cliBulk(args, delimiter, logger, stdin)
 	try:
 		written = ['--x-written'] if args.operation in ('set', 'append', 'delete') else []
-		response = connection.request('\t'.join(written + [_cliRequestLine(args)]), bulk)
+		response = request('\t'.join(written + [_cliRequestLine(args)]), bulk)
 	except _ServeLost as e:
 		if args.operation in _CLI_READ_ONLY:
 			logger.teelog('TSVZ warning: {}: lost the handler ({}); using the files directly'.format(args.store, e),
 						  'warning')
-			return _CLI_HANDLERS[args.operation](args, delimiter, logger, stdin, stdout)
+			return _cliEngineOp(args, delimiter, logger, stdin, stdout)
 		logger.teelog('tsvz: {}: lost the handler ({}); the {} may or may not have been applied'.format(
 			args.store, e, args.operation), 'error')
 		return 1
 	return _cliEmitServed(args, delimiter, logger, stdout, response)
-
-
-_CLI_HANDLERS = {'read': _cliRead, 'get': _cliGet, 'set': _cliSet, 'append': _cliSet, 'delete': _cliDelete,
-				 'clear': _cliClear, 'scrub': _cliScrub, 'verify': _cliVerify, 'parts': _cliParts,
-				 'has': _cliEngineOp, 'len': _cliEngineOp, 'keys': _cliEngineOp, 'pop': _cliEngineOp,
-				 'popitem': _cliEngineOp, 'setdefault': _cliEngineOp, 'serve': _cliServe, 'stop': _cliStop}
 
 
 def _cliMain(argv, stdin=None, stdout=None, stderr=None):
@@ -9346,13 +9106,19 @@ def _cliMain(argv, stdin=None, stdout=None, stderr=None):
 				args.defaults = [DEFAULTS_INDICATOR_KEY] + values[1:]
 			else:
 				args.defaults = []
+			if args.operation in ('set', 'append') and len(args.args) > 1:
+				# A value that is not UTF-8 is refused, naming the cell, before a store is created or a request
+				# (which cannot carry it) is sent.
+				_checkRow(_sanitize(args.args, delimiter=delimiter), delimiter, 'utf8', 'strict',
+						  _formatHeader(args.header, delimiter=delimiter))
 			connection = _cliHandler(args, delimiter, logger)
 			if connection is not None:
 				try:
 					return _cliRouted(connection, args, delimiter, logger, stdin, stdout)
 				finally:
 					connection.close()
-			return _CLI_HANDLERS[args.operation](args, delimiter, logger, stdin, stdout)
+			run = {'serve': _cliServe, 'stop': _cliStop}.get(args.operation, _cliEngineOp)
+			return run(args, delimiter, logger, stdin, stdout)
 	except _CliUsageError as e:
 		_cliWrite(stderr, 'tsvz: {}\n{}\n'.format(e, _CLI_USAGE))
 		return 2

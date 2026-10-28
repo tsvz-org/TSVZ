@@ -3075,8 +3075,9 @@ def test_cli_legacy_matches_339(tmp_path):
 	follow the positionals: 3.39's argparse rejects ``STORE -c H append ...``
 	on Python 3.6 and 3.7.
 	"""
-	steps = (['append', 'k', 'v', '-c', 'id\\tval'], ['append', 'j', 'w'], ['delete', 'k'], ['read'],
-			 ['scrub'], ['read'], ['clear', '-c', 'id\\tval'])
+	steps = (['append', 'k', 'v', '-c', 'id\\tval'], ['append', 'w', '1', '2', '3', '-c', 'id\\tval'],  # fitted to H
+			 ['append', 'x', 'y', '-c', 'id\\tval\\tmore'], ['append', 'j', 'w'], ['delete', 'k'], ['read'],
+			 ['scrub'], ['read'], ['clear', '-c', 'id\\tval'], ['append', 'z', '1', '2', '-c', 'id\\tval'])
 	results = []
 	for script in ('TSVZ.py', 'TSVZ_old.py'):
 		d = tmp_path / script.split('.')[0]
@@ -4329,7 +4330,7 @@ def test_cli_write_that_cannot_create_the_store_fails(tmp_path):
 		for argv, stdin in ((['set', store, 'k', 'v'], ''), (['append', store, 'k'], ''), (['delete', store, 'k'], ''),
 							(['set', store, '-'], 'k\tv\n'), (['delete', store, '-'], 'k\n')):
 			status, out, err = _run('-q', *argv, stdin=stdin)
-			assert (status, out) == (1, '') and 'could not be created' in err, (store, argv)
+			assert (status, out) == (1, '') and 'tsvz: {}: '.format(store) in err, (store, argv, err)
 	assert not os.path.exists(str(tmp_path / 'nodir'))
 
 
@@ -5006,6 +5007,28 @@ _ROUTED_STEPS = (
 	(['setdefault', 'k', 'other'], ''), (['read', '--format', 'table'], ''), (['verify'], ''),
 	(['scrub'], ''), (['read'], ''), (['clear'], ''), (['read'], ''), (['popitem'], ''),
 )
+
+
+@pytest.mark.parametrize('suffix', ['.tsvz', '.tsv'])
+def test_cli_reads_a_store_only_for_what_needs_its_rows(tmp_path, monkeypatch, suffix):
+	"""Every operation runs on the in-process engine, which reads the store only when the answer needs it."""
+	p = str(tmp_path / ('r' + suffix))
+	_touch(p, b'a\t1\nb\t2\n')
+	reads = []
+	real = TSVZ._ServeStore.reload
+	monkeypatch.setattr(TSVZ._ServeStore, 'reload', lambda self, log: (reads.append(1), real(self, log))[1])
+	for argv, stdin in ((['set', 'k', 'v'], ''), (['append', 'j'], ''), (['set', '-'], 'm\tn\n'), (['delete', 'a'], ''),
+						(['delete', '-'], 'b\n'), (['parts'], ''), (['verify'], ''), (['scrub'], ''), (['clear'], '')):
+		assert _run(argv[0], p, *argv[1:], stdin=stdin)[0] == 0, argv
+		assert reads == [], argv
+	assert _run('len', p) == (0, '0\n', '') and reads == [1]
+
+
+def test_cli_reads_a_compressed_loose_file_holding_nothing_as_an_empty_store(tmp_path):
+	for suffix in ('.tsv.gz', '.tsv.bz2', '.tsv.xz'):
+		p = str(tmp_path / ('e' + suffix))
+		_touch(p)
+		assert [_run(op, p) for op in ('read', 'len', 'keys')] == [(0, '', ''), (0, '0\n', ''), (0, '', '')], suffix
 
 
 @pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
@@ -7390,13 +7413,13 @@ def test_cli_refusal_names_the_cell_and_no_option_it_lacks_with_or_without_a_han
 		assert _run('set', path, 'k', 'v')[0] == 0
 	served(q)
 	before = _bytes(q)
-	real = TSVZ._CLI_HANDLERS['set']
+	real = TSVZ._cliEngineOp
 
 	def onTheFiles(args, *rest):
 		assert args.store != q, 'not routed through the handler'
 		return real(args, *rest)
 
-	monkeypatch.setitem(TSVZ._CLI_HANDLERS, 'set', onTheFiles)
+	monkeypatch.setattr(TSVZ, '_cliEngineOp', onTheFiles)
 	errors = []
 	for path in (p, q):
 		status, out, err = _run('set', path, 'k2', 'v\udcff')
@@ -7416,16 +7439,16 @@ def test_cli_setdefault_with_a_byte_it_cannot_write_never_writes_even_when_the_k
 	# made it write U+FFFD for the user's byte, exit 0.
 	p = str(tmp_path / ('sd' + suffix))
 	TSVZ.appendLinesTabularFile(p, [['k', 'old']], createIfNotExist=True)
-	real = TSVZ._ServeLocal.request
+	real = TSVZ._serveDispatch
 	sent = []
 
-	def request(self, line, bulk=None):
+	def dispatch(store, line, bulk, log):
 		sent.append(line.split('\t')[0])
-		out = real(self, line, bulk)
+		out = real(store, line, bulk, log)
 		TSVZ.appendLinesTabularFile(p, [['k']])  # another writer deletes the key right after
 		return out
 
-	monkeypatch.setattr(TSVZ._ServeLocal, 'request', request)
+	monkeypatch.setattr(TSVZ, '_serveDispatch', dispatch)
 	assert _run('setdefault', p, 'k', 'v\udcff') == (0, 'k\told\n', '')
 	assert sent == ['get'] and b'\xef\xbf\xbd' not in _bytes(p)
 	del sent[:]
