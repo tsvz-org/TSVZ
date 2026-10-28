@@ -3118,22 +3118,6 @@ def _specSnapshotStart(parts, delimiter):
 	return 0
 
 
-def _specReplayLine(raw, lineNo, label, path, state, delimiter, reporter, atStart=False):
-	"""``_specReplayLines`` for the one committed line ``raw`` (with its b'\\n'), line ``lineNo`` of the part ``path``.
-
-	``atStart`` says it begins the part, the one place a byte order mark is removed
-	(spec §4.7). Returns ``(text, record)``, None for a line that gives no record (the
-	checksum marker of a supported algorithm, an ignored zero-filled line), or ``_STOP``.
-	"""
-	if atStart and raw.startswith(b'\xef\xbb\xbf'):
-		raw = raw[3:]
-		reporter.note('bom', '{}line {}'.format(label, lineNo), 'stripped a UTF-8 byte order mark')
-	info = _PartInfo(path, '')  # a follower follows plain parts only
-	for _, _, text, record in _specReplayLines(((raw, 0),), info, label, state, delimiter, reporter, lineNo - 1):
-		return text, record
-	return _STOP if info.stopped else None
-
-
 def _storeParts(path, reporter=None):
 	"""Return ``(parts, active)`` for the store ``path`` names (spec §17).
 
@@ -7131,9 +7115,11 @@ class _ServeStore(object):
 			return False  # 3.39 reads an unterminated last line as a record; a reload does too
 		reporter = _Reporter(self.path, log)
 		try:
-			if end:
-				for i, raw in enumerate(data[:end].split(b'\n')[:-1]):
-					self._apply(raw + b'\n', reporter, atStart=self.offset == 0 and i == 0)
+			if end and self.spec:
+				self._replay(data[:end], path, reporter)
+			elif end:
+				for raw in data[:end].split(b'\n')[:-1]:
+					self._apply(raw + b'\n', reporter)
 			tail = data[end:]
 			if tail and tail != self.tailSeen:
 				reporter.note('tail', None, 'ignored uncommitted bytes after the last newline: {!r}'.format(tail[:80]))
@@ -7145,33 +7131,42 @@ class _ServeStore(object):
 		self.stamps[path] = stamp[:1] + (self.offset + len(data) - end,) + stamp[2:]
 		return True
 
-	def _apply(self, raw, reporter, atStart=False):
-		"""Replay one appended committed line of the active part into the view; ``atStart``: it begins the part."""
+	def _apply(self, raw, reporter):
+		"""Replay one line appended to a loose file into the view, as a 3.39 read does."""
 		self.lineNo += 1
-		if not self.spec:
-			try:
-				text = raw.decode('utf8')
-			except UnicodeDecodeError:
-				text = raw.decode('utf8', errors='replace')
-				reporter.note('decode', 'line {}'.format(self.lineNo), 'invalid utf8 replaced with U+FFFD')
-			self.width, _ = _processLine(text, self.data, self.width, strict=self.strict, delimiter=self.delimiter,
-										 defaults=self.legacyDefaults, reporter=reporter)
-			return
+		try:
+			text = raw.decode('utf8')
+		except UnicodeDecodeError:
+			text = raw.decode('utf8', errors='replace')
+			reporter.note('decode', 'line {}'.format(self.lineNo), 'invalid utf8 replaced with U+FFFD')
+		self.width, _ = _processLine(text, self.data, self.width, strict=self.strict, delimiter=self.delimiter,
+									 defaults=self.legacyDefaults, reporter=reporter)
+
+	def _replay(self, data, path, reporter):
+		"""Replay the committed lines ``data`` appended to the active part ``path`` into the view (spec §7)."""
 		if self.stopped:
 			return  # a stop policy ended the read: nothing after it is read (spec §4.10)
-		replayed = _specReplayLine(raw, self.lineNo, self.label, self.parts[-1], self.state, self.delimiter,
-								   reporter, atStart)
-		if replayed is _STOP:
+		lines = []
+		offset = self.offset
+		for raw in data.split(b'\n')[:-1]:
+			lines.append((raw + b'\n', offset))
+			offset += len(raw) + 1
+		if self.offset == 0 and lines[0][0].startswith(b'\xef\xbb\xbf'):  # only at the start of a part (spec §4.7)
+			lines[0] = (lines[0][0][3:], 3)
+			reporter.note('bom', '{}line {}'.format(self.label, self.lineNo + 1), 'stripped a UTF-8 byte order mark')
+		info = _PartInfo(path, '')  # a follower follows plain parts only
+		for _, _, _, record in _specReplayLines(lines, info, self.label, self.state, self.delimiter, reporter, self.lineNo):
+			if record is None:
+				continue
+			key, row = record
+			if row is None:
+				self.data.pop(key, None)
+			else:
+				self.width = _specPadRow(row, self.state, self.width)
+				self.data[key] = row
+		self.lineNo = info.lines
+		if info.stopped:
 			self.stopped = self.unreadable = True
-			return
-		if replayed is None or replayed[1] is None:
-			return
-		key, row = replayed[1]
-		if row is None:
-			self.data.pop(key, None)
-			return
-		self.width = _specPadRow(row, self.state, self.width)
-		self.data[key] = row
 
 	def _fresh(self, log):
 		"""Read-your-writes (spec §21.8): wait for queued writes, then follow the files."""
