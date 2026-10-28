@@ -5548,11 +5548,6 @@ def test_legacy_upper_case_compressed_name_is_rewritten_as_compressed(tmp_path, 
 		assert 'b\t2' in gzip.decompress(f.read()).decode().splitlines()
 
 
-
-if __name__ == '__main__':
-	sys.exit(pytest.main([__file__] + sys.argv[1:]))
-
-
 def test_spec_a_read_starts_at_the_last_snapshot_part(tmp_path):
 	# Spec §19.10.3: a reader may skip the parts before a part that begins with #_snapshot_#.
 	# The parts here are crafted so that a skip shows: the snapshot part does not restate a,
@@ -9073,3 +9068,7 @@ def test_tsvzed_legacy_append_landing_right_after_the_store_s_own_write_is_still
 	t.checkExternalChanges()
 	t.rewrite()
 	assert dict(t) == {'a': ['a', '1'], 'b': ['b', '1'], 'ext': ['ext', 'B']} == _back(p)
+
+
+if __name__ == '__main__':
+	sys.exit(pytest.main([__file__] + sys.argv[1:]))
