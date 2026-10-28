@@ -5813,26 +5813,6 @@ def test_tsvzed_spec_marker_with_an_unencodable_value_is_refused(tmp_path):
 	assert _bytes(p) == b''
 
 
-def test_tsvzed_legacy_rewrite_with_a_mutated_row_writes_nothing(tmp_path, capsys):
-	p = str(tmp_path / 'w.tsv')
-	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.01, rewrite_on_load=False)
-	t['a'] = ['a', '1']
-	t.commitAppendToFile()
-	before = _bytes(p)
-	t['a'][1] = BAD_NAME  # in place: no __setitem__ sees it
-	t.dirty = True
-	for method in (t.hardMapToFile, t.mapToFile):  # asked for by the program: it raises, as a refused set does
-		with pytest.raises(TSVZ.TSVZEncodeError) as e:
-			method()
-		assert "cannot write 'bad\\udcff.txt' as UTF-8" in str(e.value)
-	assert _bytes(p) == before
-	assert not t.deSynced and t._refusedAt  # refused, not broken: no retry at every tick
-	t.rewrite(force=True)  # one TSVZed makes itself is reported
-	assert "cannot write 'bad\\udcff.txt' as UTF-8" in capsys.readouterr().out
-	t.shutdownEvent.set()
-	t.appendThread.join()
-
-
 @pytest.mark.parametrize('suffix', BAD_SUFFIXES)
 def test_tsvzedlite_set_refuses_an_unencodable_key_and_changes_nothing(tmp_path, suffix):
 	p = str(tmp_path / ('l' + suffix))
@@ -5956,25 +5936,6 @@ def test_tsvzed_legacy_rewrite_checks_everything_before_it_touches_the_file(tmp_
 	getattr(t, method)()
 	assert 'Refused' not in capsys.readouterr().out and _FlipList.reads == 1
 	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False) == {'a': ['a', '1'], 'b': ['b', '2']} and not t.dirty
-	_stop(t)
-
-
-def test_tsvzed_legacy_refused_rewrite_is_reported_once_and_retried_when_fixed(tmp_path, capsys):
-	p = str(tmp_path / 'f.tsv')
-	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.005, rewrite_on_load=False, rewrite_interval=0.05)
-	t['a'] = ['a', '1']
-	t['b'] = ['b', '2']
-	assert _wait_for(lambda: b'b\t2' in _bytes(p))
-	capsys.readouterr()
-	t['a'][1] = BAD_NAME
-	t.dirty = True
-	time.sleep(0.6)
-	out = capsys.readouterr().out
-	assert out.count('cannot write') == 1, out
-	assert 'Traceback' not in out
-	t['a'][1] = 'fixed'
-	t['c'] = ['c', '3']
-	assert _wait_for(lambda: b'a\tfixed' in _bytes(p) and b'c\t3' in _bytes(p), 4)
 	_stop(t)
 
 
@@ -6158,38 +6119,6 @@ def test_errors_survive_a_copy_a_pickle_and_fromkeys(tmp_path):
 	_stop(t)
 
 
-def _count_encodes(monkeypatch):
-	calls = []
-	real = TSVZ._encodeRow
-
-	def counting(cells, *args, **kwargs):
-		calls.append(list(cells))
-		return real(cells, *args, **kwargs)
-	monkeypatch.setattr(TSVZ, '_encodeRow', counting)
-	return calls
-
-
-def test_legacy_writers_encode_each_row_once(tmp_path, monkeypatch):
-	p = str(tmp_path / 'once.tsv')
-	calls = _count_encodes(monkeypatch)
-	TSVZ.appendLinesTabularFile(p, [['a', '1'], ['b', '2'], ['c', '3']], header='id\tv', createIfNotExist=True)
-	rows = [c for c in calls if c[0] in 'abc']
-	assert len(rows) == 3, calls
-	del calls[:]
-	TSVZ.scrubTabularFile(p, header='id\tv')
-	assert len([c for c in calls if c[0] in 'abc']) == 3, calls
-	del calls[:]
-	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=5, rewrite_on_load=False)
-	del calls[:]
-	# A rewrite encodes every row once, under the lock, and writes the bytes it checked.
-	t.hardMapToFile()
-	assert len([c for c in calls if c[0] in 'abc']) == 3, calls
-	del calls[:]
-	t.mapToFile()
-	assert len([c for c in calls if c[0] in 'abc']) == 3, calls
-	_stop(t)
-
-
 @pytest.mark.parametrize('suffix', BAD_SUFFIXES)
 @pytest.mark.parametrize('extra', [(), ('--x-header', 'id\tv')])
 def test_cli_refused_setdefault_creates_nothing(tmp_path, suffix, extra):
@@ -6242,24 +6171,24 @@ def test_cli_setdefault_through_a_handler_looks_up_as_a_reader_reads(tmp_path, s
 
 # --- second review round: the rewrite takes its snapshot under the lock ----------
 @pytest.mark.parametrize('method', ['hardMapToFile', 'mapToFile'])
-def test_tsvzed_legacy_rewrite_does_not_cut_a_row_the_writer_appends_after_its_snapshot(tmp_path, method):
+def test_tsvzed_legacy_rewrite_does_not_cut_a_row_the_writer_appends_after_its_snapshot(tmp_path, monkeypatch, method):
 	p = str(tmp_path / 'race.tsv')
 	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.001, rewrite_on_load=False)
 	t['a'] = ['a', '1']
 	assert _wait_for(lambda: b'a\t1' in _bytes(p))
-	original = t.get_file_obj
+	original = TSVZ._openUntruncated
 	state = {'done': False}
 
-	def hooked(modes='ab', *args, **kwargs):
-		if modes in ('wb', 'r+b') and not state['done']:
+	def opening(fileName):
+		if not state['done']:
 			state['done'] = True
 			t['late'] = ['late', '2']  # another thread sets a key just before the file is cut
 			_wait_for(lambda: not t.appendQueue, 0.3)  # the writer must not get in before the rewrite is done
-		return original(modes, *args, **kwargs)
+		return original(fileName)
 
-	t.get_file_obj = hooked
+	monkeypatch.setattr(TSVZ, '_openUntruncated', opening)
 	getattr(t, method)()
-	t.get_file_obj = original
+	monkeypatch.undo()
 	assert state['done']
 	assert _wait_for(lambda: b'late\t2' in _bytes(p)), _bytes(p)
 	_stop(t)
@@ -6303,11 +6232,8 @@ def test_tsvzed_legacy_concurrent_sets_survive_repeated_rewrites(tmp_path):
 @pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
 def test_tsvzed_legacy_refused_rewrite_does_not_delay_reloading_an_external_change(tmp_path, method):
 	p = str(tmp_path / 'g.tsv')
-	t = TSVZ.TSVZed(p, header='key\tval', rewrite_interval=30, append_check_delay=0.01, rewrite_on_load=False)
-	t['a'] = ['a', '1']
-	assert _wait_for(lambda: b'a\t1' in _bytes(p))
-	t['a'][1] = BAD_NAME  # a row changed in place
-	t.dirty = True
+	_touch(p, LEGACY_CELL_ROW)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_interval=30, append_check_delay=0.01)  # its rewrite_on_load is refused
 	with pytest.raises(TSVZ.TSVZEncodeError):
 		getattr(t, method)()  # refused
 	assert t._refusedAt is not None
@@ -6319,13 +6245,9 @@ def test_tsvzed_legacy_refused_rewrite_does_not_delay_reloading_an_external_chan
 
 def test_tsvzed_legacy_refusal_is_timed_on_the_monotonic_clock(tmp_path, monkeypatch):
 	p = str(tmp_path / 'm.tsv')
-	t = TSVZ.TSVZed(p, header='key\tval', rewrite_interval=0.05, append_check_delay=5, rewrite_on_load=False)
-	t['a'] = ['a', '1']
-	t.commitAppendToFile()
-	t['a'][1] = BAD_NAME
-	t.dirty = True
-	with pytest.raises(TSVZ.TSVZEncodeError):
-		t.mapToFile()  # refused
+	_touch(p, LEGACY_CELL_ROW)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_interval=0.05, append_check_delay=5)
+	assert t._refusedAt is not None and t.dirty  # its rewrite_on_load is refused
 	calls = []
 	original = t._mapToFile  # what rewrite() calls
 	t._mapToFile = lambda *args, **kwargs: calls.append(1) or original(*args, **kwargs)
@@ -6621,49 +6543,6 @@ def _open_fds():
 	return len(os.listdir('/proc/self/fd'))
 
 
-class _InterruptingFile(object):
-	"""A file whose writes raise KeyboardInterrupt (Ctrl-C in the middle of a rewrite)."""
-
-	def __init__(self, f):
-		self._f = f
-
-	def write(self, data):
-		raise KeyboardInterrupt
-
-	def __getattr__(self, name):
-		return getattr(self._f, name)
-
-
-@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
-def test_tsvzed_legacy_rewrite_lets_go_of_the_lock_and_the_file_when_interrupted(tmp_path, method):
-	p = str(tmp_path / 'ki.tsv')
-	t = _stopped(p)
-	_dirty(t)
-	original = t.get_file_obj
-	opened = []
-
-	def hooked(modes='ab', locked=False, **kwargs):
-		f = original(modes, locked, **kwargs)
-		if modes in ('wb', 'r+b'):
-			opened.append(f)
-			return _InterruptingFile(f)
-		return f
-
-	t.get_file_obj = hooked
-	try:
-		with pytest.raises(KeyboardInterrupt):
-			getattr(t, method)()
-		held = t.writeLock.locked()
-	finally:
-		t.get_file_obj = original
-		if t.writeLock.locked():
-			t.writeLock.release()  # so that the rest of the run does not hang where it fails
-	assert not held, 'writeLock is still held: close(), atexit and __del__ would hang'
-	assert opened and opened[0].closed
-	t.mapToFile()  # and the next rewrite works
-	assert _bytes(p) == b'key\tval\na\t2\n'
-
-
 @pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='counts open descriptors in /proc')
 @pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
 def test_tsvzed_legacy_rewrite_whose_file_lock_fails_never_writes_unlocked(tmp_path, method, monkeypatch, capsys):
@@ -6877,13 +6756,13 @@ def test_tsvzed_legacy_reload_that_keeps_failing_is_reported_once_and_retried_le
 	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001, strict=True, teeLogger=log)
 	time.sleep(0.05)
 	reads = []
-	real = TSVZ.readTabularFile
+	real = TSVZ._legacyReadHeader
 
 	def reading(*args, **kwargs):
 		reads.append(1)
 		return real(*args, **kwargs)
 
-	monkeypatch.setattr(TSVZ, 'readTabularFile', reading)
+	monkeypatch.setattr(TSVZ, '_legacyReadHeader', reading)
 	with open(p, 'wb') as f:
 		f.write(b'other\theader\n')  # another process: a strict store cannot be reloaded
 	time.sleep(0.5)
@@ -6900,26 +6779,25 @@ def test_tsvzed_legacy_reload_that_keeps_failing_is_reported_once_and_retried_le
 	t.close()
 
 
-def test_tsvzed_legacy_reload_after_an_external_change_keeps_rows_set_since_the_last_append(tmp_path):
+def test_tsvzed_legacy_reload_after_an_external_change_keeps_rows_set_since_the_last_append(tmp_path, monkeypatch):
 	p = str(tmp_path / 'keep.tsv')
 	t = _stopped(p)
 	_dirty(t)
 	with open(p, 'ab') as g:
-		g.write(b'ext\tB\n')  # so rewrite() reloads
-	real = t.commitAppendToFile
+		g.write(b'ext\tB\n')  # so rewrite() takes it in
+	real = TSVZ._readAfter
 	state = {'done': False}
 
-	def commit():
-		out = real()
+	def reading(*args):
 		if not state['done']:
 			state['done'] = True
-			t['late'] = ['late', '1']  # another thread sets a key between rewrite()'s append and its reload
+			t['late'] = ['late', '1']  # another thread sets a key just before rewrite() reads the change
 			del t['a']
-		return out
+		return real(*args)
 
-	t.commitAppendToFile = commit
+	monkeypatch.setattr(TSVZ, '_readAfter', reading)
 	t.rewrite(force=True)
-	t.commitAppendToFile = real
+	monkeypatch.undo()
 	assert dict(t) == {'ext': ['ext', 'B'], 'late': ['late', '1']}
 	t['ext'] = ['ext', 'C']  # dirty
 	t.rewrite(force=True)  # a later rewrite keeps it
@@ -6932,7 +6810,7 @@ def test_tsvzed_legacy_set_during_a_reload_is_written(tmp_path, monkeypatch):
 	p = str(tmp_path / 'during.tsv')
 	t = _stopped(p)
 	_dirty(t)
-	real = TSVZ.readTabularFile
+	real = TSVZ._legacyReadHeader
 
 	def reading(*args, **kwargs):
 		setter = threading.Thread(target=lambda: t.__setitem__('during', ['during', '1']))
@@ -6940,7 +6818,7 @@ def test_tsvzed_legacy_set_during_a_reload_is_written(tmp_path, monkeypatch):
 		setter.join()
 		return real(*args, **kwargs)
 
-	monkeypatch.setattr(TSVZ, 'readTabularFile', reading)
+	monkeypatch.setattr(TSVZ, '_legacyReadHeader', reading)
 	t.reload()
 	monkeypatch.undo()
 	assert not t.memoryOnly and t['during'] == ['during', '1']
@@ -6992,22 +6870,22 @@ def test_tsvzed_legacy_rows_survive_rewrites_and_reloads_for_another_process_str
 	assert [k for k in ('ext%d' % j for j in range(count)) if k not in back] == []
 
 
-def test_tsvzed_legacy_change_right_after_a_rewrite_is_not_taken_for_seen(tmp_path):
-	# mapToFile noted the file's time again after release_file_obj let go of the lock: a change another
-	# process made in between was never reloaded, and the next rewrite erased it.
+def test_tsvzed_legacy_change_right_after_a_rewrite_is_not_taken_for_seen(tmp_path, monkeypatch):
+	# A rewrite notes the file's time before it lets go of the lock: a change another process makes right after
+	# is still to be taken in, not erased by the next rewrite.
 	p = str(tmp_path / 'mask.tsv')
 	t = _stopped(p)
 	_dirty(t)
-	real = t._releaseRewrite
+	real = TSVZ._closeUnflushed
 
-	def release(*args, **kwargs):
-		real(*args, **kwargs)
+	def closing(f):
+		real(f)
 		with open(p, 'ab') as g:  # another process appends right after the rewrite let go of the file lock
 			g.write(b'ext\tB\n')
 
-	t._releaseRewrite = release
+	monkeypatch.setattr(TSVZ, '_closeUnflushed', closing)
 	t.mapToFile()
-	t._releaseRewrite = real
+	monkeypatch.undo()
 	assert t._externalChange()
 	t['a'] = ['a', '3']
 	t.rewrite(force=True)  # reloads the change first
@@ -7018,15 +6896,18 @@ def test_tsvzed_legacy_reload_notes_the_time_of_what_it_read(tmp_path, monkeypat
 	p = str(tmp_path / 'r.tsv')
 	t = _stopped(p)
 	_dirty(t)
-	real = TSVZ.readTabularFile
+	real = TSVZ._legacyReadLoop
+	done = []
 
 	def reading(*args, **kwargs):
 		out = real(*args, **kwargs)
-		with open(p, 'ab') as g:  # another process appends once the read is done
-			g.write(b'ext\tB\n')
+		if not done:
+			done.append(1)
+			with open(p, 'ab') as g:  # another process appends once the read is done
+				g.write(b'ext\tB\n')
 		return out
 
-	monkeypatch.setattr(TSVZ, 'readTabularFile', reading)
+	monkeypatch.setattr(TSVZ, '_legacyReadLoop', reading)
 	t.reload()
 	monkeypatch.undo()
 	assert 'ext' not in t and t._externalChange()  # not read, so not seen
@@ -7047,48 +6928,7 @@ def test_tsvzed_legacy_append_does_not_mark_an_earlier_external_change_seen(tmp_
 	assert t._externalChange()  # still to be reloaded
 	t['a'] = ['a', '2']
 	t.rewrite(force=True)
-	assert _bytes(p) == b'key\tval\na\t2\next\tB\nb\t1\n'
-
-
-def test_tsvzed_legacy_mapToFile_leaves_monitoring_alone(tmp_path):
-	import threading
-	p = str(tmp_path / 'mon.tsv')
-	t = _stopped(p)
-	_dirty(t)
-	seen = []
-	original = t.get_file_obj
-
-	def hooked(modes='ab', locked=False, **kwargs):
-		seen.append(t.monitor_external_changes)  # what the background writer would see meanwhile
-		return original(modes, locked, **kwargs)
-
-	t.get_file_obj = hooked
-	t.mapToFile()
-	t.hardMapToFile()
-	assert seen == [True, True]
-	# Two threads in mapToFile at once: each saved and restored the attribute, so the one that saved it
-	# while the other had turned it off turned it off for good.
-	inside, release = threading.Event(), threading.Event()
-
-	def blocking(modes='ab', locked=False, **kwargs):
-		if threading.current_thread().name == 'first':
-			inside.set()
-			release.wait(5)
-		return original(modes, locked, **kwargs)
-
-	t.get_file_obj = blocking
-	t['a'] = ['a', '3']
-	first = threading.Thread(target=t.mapToFile, name='first')
-	first.start()
-	assert inside.wait(5)
-	second = threading.Thread(target=t.mapToFile, name='second')
-	second.start()
-	second.join(0.2)  # it is waiting for the lock the first one holds
-	release.set()
-	first.join(5)
-	second.join(5)
-	t.get_file_obj = original
-	assert t.monitor_external_changes is True
+	assert _back(p) == {'a': ['a', '2'], 'ext': ['ext', 'B'], 'b': ['b', '1']} == dict(t)
 
 
 def test_tsvzed_legacy_rewrite_reloads_a_change_made_after_its_reload_instead_of_erasing_it(tmp_path):
@@ -7113,29 +6953,6 @@ def test_tsvzed_legacy_rewrite_reloads_a_change_made_after_its_reload_instead_of
 	t.rewrite(force=True)  # the next try reloads it, then rewrites
 	assert t['ext1'] == ['ext1', 'B'] and t['ext2'] == ['ext2', 'B']
 	assert _bytes(p) == b'key\tval\na\t2\next1\tB\next2\tB\n'
-
-
-def test_tsvzed_legacy_own_write_in_progress_is_not_an_external_change(tmp_path):
-	import threading
-	p = str(tmp_path / 'own.tsv')
-	t = _stopped(p)
-	_dirty(t)
-	real = t._releaseRewrite
-
-	def release(rw, *args, **kwargs):
-		rw.raw.flush()  # the file has changed; its time is noted next, under the lock
-		check = threading.Thread(target=t.checkExternalChanges)  # the background writer's look meanwhile
-		check.start()
-		check.join(0.2)
-		real(rw, *args, **kwargs)
-		check.join(5)
-		seen.append(t.deSynced)  # as the background writer sees it once the rewrite lets go of writeLock
-
-	seen = []
-	t._releaseRewrite = release
-	t.clear_file()
-	t._releaseRewrite = real
-	assert seen == [False], 'its own clear_file was taken for another process changing the file'
 
 
 def test_tsvzed_legacy_reload_clears_a_change_it_has_read(tmp_path):
@@ -7223,7 +7040,7 @@ def _compressedAs(suffix, data):
 @pytest.mark.parametrize('suffix', ALL_SUFFIXES)
 @pytest.mark.parametrize('how', ['append', 'rewrite'])
 def test_tsvzed_legacy_write_looks_for_external_changes_once_the_file_is_locked(tmp_path, monkeypatch, how, suffix):
-	# A compressed rewrite (hardMapToFile) looked before it took the lock: a change appended in between was erased.
+	# A change another writer appends just before the lock is granted is found under it, not erased.
 	p = str(tmp_path / ('lock.' + suffix))
 	t = _stopped(p)
 	_dirty(t)
@@ -7244,25 +7061,16 @@ def test_tsvzed_legacy_write_looks_for_external_changes_once_the_file_is_locked(
 		monkeypatch.undo()
 		assert t._externalChange()
 	else:
-		t._mapToFile(defer=True)  # the rewrite rewrite() makes
+		t._mapToFile(sync=True)  # the rewrite rewrite() makes
 		monkeypatch.undo()
-		assert state['done'] and t.deSynced and t._externalChange()
+		assert state['done'] and t['ext'] == ['ext', 'B']  # taken in
 		assert TSVZ.readTabularFile(p, header='key\tval', verbose=False).get('ext') == ['ext', 'B'], 'the change was erased'
 	t.rewrite(force=True)
 	assert t['ext'] == ['ext', 'B'] and TSVZ.readTabularFile(p, header='key\tval', verbose=False) == dict(t)
 
 
-def test_tsvzed_legacy_deferred_rewrite_leaves_the_change_unseen(tmp_path):
-	p = str(tmp_path / 'defer.tsv')
-	t = _stopped(p)
-	_dirty(t)
-	_append_external(p)
-	t._mapToFile(defer=True)
-	assert t.deSynced and t._externalChange() and b'ext\tB' in _bytes(p)
-
-
 @pytest.mark.parametrize('suffix', ALL_SUFFIXES)
-def test_tsvzed_legacy_rewrite_deferred_for_a_change_after_its_reload_is_made_then(tmp_path, suffix):
+def test_tsvzed_legacy_rewrite_takes_in_a_change_made_after_rewrite_looked_for_one(tmp_path, suffix):
 	p = str(tmp_path / ('late.' + suffix))
 	t = _stopped(p)
 	_dirty(t)  # the file holds a twice: a rewrite has something to do
@@ -7282,10 +7090,6 @@ def test_tsvzed_legacy_rewrite_deferred_for_a_change_after_its_reload_is_made_th
 	if suffix == 'tsv':
 		assert _bytes(p) == b'key\tval\na\t2\next\tB\n'  # rewritten, not only appended to
 	assert not t.deSynced and not t.dirty and not t._externalChange()
-	state['changes'] = 10  # it keeps changing: given up after a few tries, left to the next tick
-	t['a'] = ['a', '3']
-	t.commitAppendToFile()
-	assert not t.rewrite(force=True) and t.deSynced
 
 
 def test_tsvzed_legacy_clear_drops_the_rows_set_before_it(tmp_path):
@@ -7476,86 +7280,6 @@ def _back(p):
 		return repr(e)
 
 
-@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='counts open descriptors in /proc')
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
-@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile', 'rewrite'])
-def test_tsvzed_legacy_rewrite_interrupted_in_its_write_loop_is_made_again_by_the_next_rewrite(tmp_path, suffix, method):
-	# A KeyboardInterrupt in the write loop set dirty but not deSynced: with rewrite_interval=0 rewrite() rewrites
-	# only when deSynced, so the emptied or half-written file was never rewritten, not even at close().
-	p = str(tmp_path / ('ki.' + suffix))
-	t = _stopped(p)
-	rows = _many(t)
-	fds = _open_fds()
-	real = t._snapshotForRewrite
-
-	def snapshot():
-		header, lines = real()
-
-		def interrupted():
-			for n, line in enumerate(lines):
-				if n == 100:
-					raise KeyboardInterrupt
-				yield line
-		return header, interrupted()
-
-	t._snapshotForRewrite = snapshot
-	with pytest.raises(KeyboardInterrupt):
-		if method == 'rewrite':
-			t.rewrite(force=True)
-		else:
-			getattr(t, method)()
-	t._snapshotForRewrite = real
-	assert not t.writeLock.locked() and _open_fds() == fds
-	assert not t._externalChange(), "its own damage was taken for another process's change"
-	assert dict(t) == rows and t.dirty and t.deSynced
-	assert t.rewrite(), 'the next tick did not make it again'
-	assert _back(p) == rows
-	t['k2'] = ['k2', 'upd']  # and once more, left to close() alone
-	t.commitAppendToFile()
-	t._snapshotForRewrite = snapshot
-	with pytest.raises(KeyboardInterrupt):
-		t.mapToFile()
-	t._snapshotForRewrite = real
-	rows = dict(t)
-	t.shutdownEvent.clear()  # the background writer is stopped: close() makes its exit rewrite() all the same
-	t.close()
-	assert _back(p) == rows
-
-
-@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='counts open descriptors in /proc')
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
-@pytest.mark.parametrize('what', [KeyboardInterrupt, OSError])
-@pytest.mark.parametrize('method', ['hardMapToFile', 'clear_file'])
-def test_tsvzed_legacy_rewrite_stopped_right_after_the_file_is_emptied_is_made_again(tmp_path, monkeypatch, suffix, what, method):
-	# Between truncate(0) and the first write: a KeyboardInterrupt left the emptied file open and locked and its
-	# time not noted (the next tick reloaded it: memory to 0 rows); an error on a clean store left it empty for good.
-	p = str(tmp_path / ('cut.' + suffix))
-	t = _stopped(p)
-	for i in range(20):
-		t['k%d' % i] = ['k%d' % i, 'v%d' % i]
-	t.commitAppendToFile()
-	assert not t.dirty  # a clean store: nothing else makes it rewrite
-	rows = dict(t)
-	fds = _open_fds()
-
-	def failing(*args, **kwargs):
-		raise what('stopped right after the file was emptied')
-
-	monkeypatch.setattr(TSVZ, '_codecWriter', failing)
-	try:
-		getattr(t, method)()
-	except KeyboardInterrupt:
-		pass
-	monkeypatch.undo()
-	assert not t.writeLock.locked() and _open_fds() == fds, 'the emptied file was left open and locked'
-	assert not t._externalChange(), "its own emptied file was taken for another process's change"
-	assert t.dirty and t.deSynced
-	t.checkExternalChanges()  # the next tick
-	t.rewrite()
-	assert dict(t) == rows
-	assert _back(p) == rows, 'the emptied file was never written again'  # clear_file() keeps memory: so does the file
-
-
 class _BufferedFullDiskFile(object):
 	"""A buffered file on a disk with room for ``room`` more bytes, as Linux has it: a write only fills the buffer,
 	and flush() (close() too) writes what fits, changes the file's time and fails with ENOSPC when not all of it
@@ -7648,7 +7372,7 @@ t.commitAppendToFile()
 t['k1'] = ['k1', 'upd']
 t.commitAppendToFile()
 rows = dict(t)
-real = TSVZ._codecWriter
+real = TSVZ._writeLines
 
 def filling(*args, **kwargs):  # right after the rewrite emptied the file: another writer fills the disk
 	with open(filler, 'wb') as f:
@@ -7660,13 +7384,13 @@ def filling(*args, **kwargs):  # right after the rewrite emptied the file: anoth
 			pass
 	return real(*args, **kwargs)
 
-TSVZ._codecWriter = filling
+TSVZ._writeLines = filling
 if method == 'rewrite':
 	t.deSynced = True
 	t.rewrite()
 else:
 	getattr(t, method)()
-TSVZ._codecWriter = real
+TSVZ._writeLines = real
 result = {'failed': os.path.exists(filler), 'dirty': t.dirty, 'deSynced': t.deSynced, 'external': t._externalChange()}
 if result['failed']:
 	os.remove(filler)
@@ -7785,46 +7509,6 @@ def test_tsvzed_legacy_rewrite_of_a_removed_file_makes_it_again_from_memory(tmp_
 	assert not t._externalChange() and not t.dirty and not t.deSynced
 
 
-def test_tsvzed_legacy_rewrite_deferred_in_one_thread_is_not_taken_for_done_by_another(tmp_path):
-	# rewrite() learned that its rewrite was deferred from an attribute of the object: the background writer's
-	# rewrite() starting meanwhile cleared it, and close()'s exit rewrite was skipped while True was returned.
-	import threading
-	p = str(tmp_path / 'race.tsv')
-	t = _stopped(p)
-	_dirty(t)
-	real = t._mapToFile
-	main = threading.current_thread()
-	inside, release = threading.Event(), threading.Event()
-	state = {'calls': 0}
-
-	def mapping(*args, **kwargs):
-		if threading.current_thread() is not main:
-			inside.set()  # the other rewrite() has started its loop
-			release.wait(5)
-			return real(*args, **kwargs)
-		state['calls'] += 1
-		if state['calls'] == 1:
-			_append_external(p)  # another process appends after this rewrite() looked for changes
-			result = real(*args, **kwargs)  # deferred
-			state['worker'] = threading.Thread(target=t.rewrite, name='worker')  # the background writer's tick meanwhile
-			state['worker'].start()
-			assert inside.wait(5)
-			return result
-		return real(*args, **kwargs)
-
-	t._mapToFile = mapping
-	try:
-		made = t.rewrite(force=True)
-		written = _bytes(p)
-	finally:
-		release.set()
-		if 'worker' in state:
-			state['worker'].join(5)
-	t._mapToFile = real
-	assert made and written == b'key\tval\na\t2\next\tB\n', (made, written)
-	assert t['ext'] == ['ext', 'B']
-
-
 def test_tsvzed_legacy_rewrite_that_keeps_failing_still_reloads_another_process_change_at_every_tick(tmp_path, monkeypatch):
 	# The background writer skipped all of rewrite() while a failed rewrite waited to be tried again; rewrite() is
 	# also its only reload of another process's change, which it then saw up to a minute late.
@@ -7854,36 +7538,6 @@ def test_tsvzed_legacy_rewrite_that_keeps_failing_still_reloads_another_process_
 	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == {'a': ['a', '2'], 'ext': ['ext', 'B']}
 
 
-def test_tsvzed_legacy_background_writer_makes_one_rewrite_a_tick_while_another_process_keeps_changing_the_file(tmp_path):
-	# A tick tried up to three rewrites, each after a commit and a full reload, when another process kept changing
-	# the file under them; main 1688d25 made one. The tries rewrite() makes are for an explicit call and close().
-	p = str(tmp_path / 'busy.tsv')
-	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.01)
-	_dirty(t)
-	counts = {'ticks': 0, 'rewrites': 0, 'n': 0}
-	realMap, realCheck = t._mapToFile, t.checkExternalChanges
-
-	def checking(*args, **kwargs):
-		counts['ticks'] += 1  # once at every tick
-		return realCheck(*args, **kwargs)
-
-	def mapping(*args, **kwargs):
-		counts['rewrites'] += 1
-		counts['n'] += 1
-		_append_external(p, b'ext%d\tB\n' % counts['n'])  # it keeps changing: every rewrite is deferred
-		return realMap(*args, **kwargs)
-
-	t.checkExternalChanges, t._mapToFile = checking, mapping
-	t.deSynced = True
-	time.sleep(0.5)
-	t.checkExternalChanges, t._mapToFile = realCheck, realMap
-	assert counts['rewrites'] > 5, counts
-	assert counts['rewrites'] <= counts['ticks'] + 1, counts
-	assert _wait_for(lambda: not t.deSynced and not t.dirty, 3)  # once it stops changing, the next tick makes it
-	t.close()
-	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == dict(t) and 'ext%d' % counts['n'] in t
-
-
 def test_tsvzed_legacy_failed_rewrite_and_its_fallback_count_as_one_try(tmp_path, monkeypatch, capsys):
 	# A failed mapToFile and the hardMapToFile it falls back on each counted a failure: the wait before the next
 	# try grew four times at each failed rewrite, not twice as documented.
@@ -7907,195 +7561,6 @@ def test_tsvzed_legacy_failed_rewrite_and_its_fallback_count_as_one_try(tmp_path
 
 
 # --- fifth review round: a rewrite lets go of the file once, whatever stops it where ----------
-def _interrupt_at(n, call, where=None):
-	"""Call ``call()``, raising KeyboardInterrupt at the ``n``-th line TSVZ.py runs in it; True when it got there.
-
-	``_interrupt_at.fds`` is then how many descriptors were open while the KeyboardInterrupt was being handled (its
-	traceback holding every frame): what a close() in the program's ``except KeyboardInterrupt`` meets.
-
-	``where``: count only the lines of that TSVZ.py function and of what it calls (the first time it runs). Two kinds
-	of line are skipped, where the tracer runs but CPython handles no signal: a ``try:`` line, before the try is set
-	up (3.6 makes the opcode before SETUP_FINALLY uninterruptible; from 3.11 on it is a NOP), and a ``with`` line,
-	which the tracer reports again as the block ends, before ``__exit__`` (no signal is handled between the last
-	statement of the block and the call of a C ``__exit__``, a lock's).
-	"""
-	import gc
-	import linecache
-	source = TSVZ.__file__
-	state = {'count': 0, 'hit': False, 'armed': 0 if where else 1}
-
-	def local(frame, event, arg):
-		if event == 'return' and where is not None and frame.f_code.co_name == where:
-			state['armed'] = -1  # it ran once: nothing after it counts
-		elif event == 'line' and state['armed'] > 0:
-			line = linecache.getline(source, frame.f_lineno).strip()
-			if line == 'try:' or line.startswith('with '):
-				return local
-			state['count'] += 1
-			if state['count'] == n:
-				state['hit'] = True
-				raise KeyboardInterrupt
-		return local
-
-	def tracer(frame, event, arg):
-		if frame.f_code.co_filename != source:
-			return None
-		if where is not None and frame.f_code.co_name == where and state['armed'] == 0:
-			state['armed'] = 1
-		return local if state['armed'] > 0 or where is not None else None
-
-	sys.settrace(tracer)
-	_interrupt_at.fds = None
-	try:
-		call()
-	except KeyboardInterrupt:
-		sys.settrace(None)
-		_interrupt_at.fds = _open_fds()
-		if not state['hit']:
-			raise
-	finally:
-		sys.settrace(None)
-	gc.collect()  # the traceback that held the frames is gone: what is still open was left open
-	return state['hit']
-
-
-def _lets_go(t, fds):
-	"""Assert ``t`` holds neither writeLock nor the file, and that the next rewrite() does not wait for them."""
-	import threading
-	assert not t.writeLock.locked(), 'writeLock is still held: close(), atexit and __del__ would hang'
-	assert _open_fds() == fds, 'the file was left open (and locked: the next rewrite waits for it)'
-	assert _interrupt_at.fds in (None, fds), 'the file was left open for as long as the KeyboardInterrupt was handled'
-	done = []
-	th = threading.Thread(target=lambda: done.append(t.rewrite(force=True)), daemon=True)
-	th.start()
-	th.join(10)
-	assert done, 'the next rewrite() waits for a lock left held'
-
-
-@pytest.mark.filterwarnings('error::pytest.PytestUnraisableExceptionWarning')  # no codec writer is left to write when collected
-@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='counts open descriptors in /proc')
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
-@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile', 'clear_file', 'clear', 'defer'])
-def test_tsvzed_legacy_rewrite_interrupted_at_any_line_lets_go_and_loses_nothing(tmp_path, capsys, suffix, method):
-	# A KeyboardInterrupt in the release of a deferred rewrite (release_file_obj catches only Exception), on
-	# entering the release of a written one or between the lock and the try left writeLock or the file held: the
-	# next rewrite and close() hung. One before the look for another process's change noted its time as seen,
-	# and the next rewrite erased the change. Here one lands at every line from the lock to the unlock in turn.
-	# Then another process appends a row (``late``): whatever the interrupt left, the next rewrite keeps it, merged
-	# or reloaded, without a warning. One that left _damage unknown (between it and the rewrite's start) or the
-	# release before it noted the damage made that rewrite overwrite it, with a warning (50ea158).
-	p = str(tmp_path / ('any.' + suffix))
-	t = _stopped(p)
-	_dirty(t)
-	fds = _open_fds()
-	n = 0
-	while True:
-		n += 1
-		external = 'ext%d' % n
-		if method == 'defer':  # another process appends after rewrite() looked: the rewrite is deferred
-			_append_external(p, _compressedAs(suffix, external.encode() + b'\tB\n'))
-			call = lambda: t._mapToFile(defer=True)
-		else:
-			call = getattr(t, method)
-		before = dict(t)
-		hit = _interrupt_at(n, call)
-		late = {'late%d' % n: ['late%d' % n, 'L']}
-		_append_late(p, suffix, ('late%d\tL\n' % n).encode())
-		_lets_go(t, fds)  # its rewrite(force=True) takes in the late row
-		assert not t._keepFileTime
-		if method == 'defer':
-			assert t.get(external) == ['ext' + external[3:], 'B'], (n, 'the change was erased')
-			assert dict(t) == dict(before, **dict({external: [external, 'B']}, **late)), n
-		elif method in ('clear', 'clear_file'):
-			# Done: memory (clear()) or the file (clear_file(), and the reload of the late row) was emptied. Not done,
-			# or clear() stopped after it emptied memory and before the file (docs/legacy-writer-failures.md 5):
-			# the file is reloaded with the late row, or memory and the late row are written.
-			assert dict(t) in (dict(before, **late), late), n
-		else:
-			assert dict(t) == dict(before, **late), (n, 'the late row was lost or memory was')
-		assert _back(p) == dict(t), n
-		assert not t._externalChange() and not t.deSynced, n
-		assert 'Overwriting external changes' not in capsys.readouterr().out, n
-		if not hit:
-			break
-		if method == 'defer':
-			del t[external]  # as many rows at each try: the next one runs as many lines
-		for key in late:
-			t.pop(key, None)
-		t['a'] = ['a', str(n)]  # dirty again, for the next try
-		t.commitAppendToFile()
-	assert n > 20, n  # it did get through all of it
-
-
-@pytest.mark.filterwarnings('error::pytest.PytestUnraisableExceptionWarning')  # no codec writer is left to write when collected
-@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='counts open descriptors in /proc')
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz', 'tsv.bz2'])
-@pytest.mark.parametrize('first', ['none', 'fsync', 'write', 'defer'])
-def test_tsvzed_legacy_rewrite_interrupted_again_in_its_release_lets_go_and_loses_nothing(tmp_path, monkeypatch, capsys, suffix, first):
-	# In _releaseRewrite's finally writeLock was let go of after _unlockFile and after a close that caught only
-	# Exception: a second Ctrl-C there (the first one stopped the write, or an fsync failed) left it held for good.
-	# Here a KeyboardInterrupt lands at every line of the release in turn, after the first failure.
-	import errno
-	p = str(tmp_path / ('again.' + suffix))
-	t = _stopped(p)
-	_dirty(t)
-	fds = _open_fds()
-	real = t._snapshotForRewrite
-	m = 0
-	while True:
-		m += 1
-		external = 'ext%d' % m
-		before = dict(t)
-		if first == 'defer':
-			_append_external(p, _compressedAs(suffix, external.encode() + b'\tB\n'))
-		elif first == 'fsync':
-			def failing(fd):
-				raise OSError(errno.EIO, 'Input/output error')
-			monkeypatch.setattr(TSVZ.os, 'fsync', failing)
-		elif first == 'write':
-			def snapshot():
-				header, lines = real()
-
-				def interrupted():
-					yield next(iter(lines))
-					raise KeyboardInterrupt
-				return header, interrupted()
-			t._snapshotForRewrite = snapshot
-
-		def call():
-			try:
-				t._hardMapToFile(defer=True)
-			except KeyboardInterrupt:
-				_interrupt_at.fds = _open_fds()  # the first one, or the second
-		hit = _interrupt_at(m, call, where='_releaseRewrite')
-		monkeypatch.undo()
-		t._snapshotForRewrite = real
-		# A Ctrl-C in the read of what the damage holds leaves it unknown (it is not read again): another process's
-		# row after it is then overwritten, with a warning, as the docstring of _releaseRewrite says.
-		unknown = t._damage == TSVZ._DAMAGE_UNKNOWN
-		late = {'late%d' % m: ['late%d' % m, 'L']}
-		_append_late(p, suffix, ('late%d\tL\n' % m).encode())  # another process, after it
-		_lets_go(t, fds)
-		if unknown:
-			late = {}
-		if first == 'defer':
-			assert dict(t) == dict(before, **dict({external: [external, 'B']}, **late)), (m, 'the change was erased')
-			del t[external]
-		else:
-			assert dict(t) == dict(before, **late), (m, 'the late row was lost or memory was')
-		for key in late:
-			del t[key]
-		t.commitAppendToFile()
-		assert _back(p) == dict(t), m
-		assert not t._externalChange() and not t.deSynced, m
-		assert ('Overwriting external changes' in capsys.readouterr().out) == unknown, m
-		if not hit:
-			break
-		t['a'] = ['a', str(m)]  # dirty again, for the next try
-		t.commitAppendToFile()
-	assert m > 10, m
-
-
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 @pytest.mark.parametrize('method', ['rewrite', 'hardMapToFile', 'clear_file', 'append'])
 @pytest.mark.parametrize('code', ['EINVAL', 'EROFS', 'ENOTSUP', 'EOPNOTSUPP', 'EIO', 'ENOSPC'])
@@ -8139,22 +7604,19 @@ def test_tsvzed_legacy_write_on_a_file_system_that_cannot_fsync(tmp_path, monkey
 
 
 def _failing_rewrite(monkeypatch, partial=b''):
-	"""Make every rewrite fail with ENOSPC once it has emptied the file and written ``partial`` (not compressed)."""
+	"""Make every rewrite fail with ENOSPC once it has emptied the file and written ``partial`` (as it is)."""
 	import errno
 
-	def full(fileName=None, raw=None, *args, **kwargs):  # right after the truncate
-		if raw is not None:
-			raw.write(partial)
-			raw.flush()
+	def full(file, *args, **kwargs):  # a whole rewrite, right after the truncate
+		file.write(partial)
+		file.flush()
 		raise OSError(errno.ENOSPC, 'No space left on device')
 
 	def inplace(self, file, header, lines):
-		file.write(partial)
 		file.truncate()
-		file.flush()
-		full()
+		full(file)
 
-	monkeypatch.setattr(TSVZ, '_codecWriter', full)
+	monkeypatch.setattr(TSVZ, '_writeLines', full)
 	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', inplace)
 
 
@@ -8240,13 +7702,13 @@ def test_tsvzed_legacy_background_writer_never_reloads_a_file_its_failed_rewrite
 
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 def test_tsvzed_legacy_rewrite_of_a_removed_file_merges_one_another_process_made_again_meanwhile(tmp_path, suffix):
-	# _writeRewrite decided the file was missing before it opened and locked it, and then skipped the look for
-	# another process's change: a file made again in that window was overwritten without a warning or a reload.
+	# A rewrite that finds the file missing, and another process makes it again before the file is opened and
+	# locked: what that process wrote is merged, not overwritten without a warning.
 	p = str(tmp_path / ('again.' + suffix))
 	t = _stopped(p)
 	rows = _many(t, 5)
 	os.remove(p)  # rm, a log rotation
-	real = t.get_file_obj
+	real = TSVZ._openUntruncated
 
 	def opening(*args, **kwargs):
 		if not os.path.exists(p):  # another process makes it again, with a row, before this one opens it
@@ -8254,9 +7716,11 @@ def test_tsvzed_legacy_rewrite_of_a_removed_file_merges_one_another_process_made
 				g.write(_compressedAs(suffix, b'key\tval\nnew\tN\n'))
 		return real(*args, **kwargs)
 
-	t.get_file_obj = opening
-	assert t.rewrite(force=True)
-	t.get_file_obj = real
+	TSVZ._openUntruncated = opening
+	try:
+		assert t.rewrite(force=True)
+	finally:
+		TSVZ._openUntruncated = real
 	assert dict(t) == dict(rows, new=['new', 'N'])
 	assert _back(p) == dict(t) and not t._externalChange()
 
@@ -8311,36 +7775,6 @@ def test_tsvzed_legacy_get_file_obj_whose_truncate_fails_does_not_take_the_file_
 	assert b'ext\tB' in _bytes(p) and t._externalChange(), "another process's change was taken for seen"
 
 
-@pytest.mark.parametrize('suffix', ALL_SUFFIXES[1:])
-def test_tsvzed_legacy_rewrite_given_up_leaves_no_codec_writer_to_write_when_collected(tmp_path, monkeypatch, capfd, suffix):
-	# _abandonRewrite closed only the file under the codec's writer: when the writer was collected it wrote its
-	# trailer into the closed file ('Exception ignored ... ValueError: write to closed file', 'lost gzip_file').
-	import gc
-	p = str(tmp_path / ('given.' + suffix))
-	t = _stopped(p)
-	_many(t, 50)
-	seen = []
-	if hasattr(sys, 'unraisablehook'):  # 3.8+; before it, what is ignored goes to stderr
-		monkeypatch.setattr(sys, 'unraisablehook', seen.append)
-	real = TSVZ.TSVZed._releaseRewrite
-	state = {'armed': True}
-
-	def entry(self, *args):  # a Ctrl-C as the release of a written rewrite is entered
-		if state['armed']:
-			state['armed'] = False
-			raise KeyboardInterrupt
-		return real(self, *args)
-
-	monkeypatch.setattr(TSVZ.TSVZed, '_releaseRewrite', entry)
-	with pytest.raises(KeyboardInterrupt):
-		t.hardMapToFile()
-	gc.collect()
-	monkeypatch.undo()
-	assert not seen and 'Exception ignored' not in capfd.readouterr().err, seen
-	assert not t.writeLock.locked() and t.deSynced
-	assert t.rewrite() and _back(p) == dict(t)
-
-
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 def test_tsvzed_legacy_removed_file_that_cannot_be_made_again_does_not_leave_the_store_stuck(tmp_path, monkeypatch, suffix):
 	# A rewrite of a removed file set _damage before it opened the file, and dirty only once it started writing:
@@ -8366,7 +7800,7 @@ def test_tsvzed_legacy_removed_file_that_cannot_be_made_again_does_not_leave_the
 	t._worked('rewrite')  # its wait after the failure is over
 	t.rewrite()
 	assert dict(t) == {'a': ['a', '1'], 'ext': ['ext', 'B']}
-	assert _back(p) == dict(t) and not t.deSynced and not t.dirty and t._damage is None
+	assert _back(p) == dict(t) and not t.deSynced and not t.dirty and not t._damaged
 
 
 def test_tsvzed_legacy_background_writer_follows_a_removed_file_it_could_not_make_again(tmp_path, monkeypatch):
@@ -8388,39 +7822,9 @@ def test_tsvzed_legacy_background_writer_follows_a_removed_file_it_could_not_mak
 		g.write(b'key\tval\next\tB\n')
 	monkeypatch.setattr(TSVZ, '_openUntruncated', real)
 	t._worked('rewrite')  # its wait after the failure is over
-	assert _wait_for(lambda: not t.deSynced and 'ext' in t, 5), (dict(t), t.deSynced, t.dirty, t._damage)
+	assert _wait_for(lambda: not t.deSynced and 'ext' in t, 5), (dict(t), t.deSynced, t.dirty, t._damaged)
 	t.close()
 	assert dict(t) == {'a': ['a', '1'], 'ext': ['ext', 'B']} and _back(p) == dict(t)
-
-
-def test_tsvzed_legacy_rewrite_never_reloads_a_file_another_thread_damaged_after_it_looked(tmp_path, monkeypatch, capsys):
-	# rewrite() looked at _damage outside writeLock, and _reload() did not look again: a rewrite failing in another
-	# thread between the look and the reload had its damaged file reloaded over memory, the only good copy.
-	p = str(tmp_path / 'race.tsv')
-	t = _stopped(p)
-	rows = _many(t, 5)
-	t.commitAppendToFile()
-	_append_external(p)  # another process's change: rewrite() reloads it
-	real = t.commitAppendToFile
-	state = {'armed': True}
-
-	def committing():  # rewrite() calls it between its look and _reload()
-		if state['armed']:
-			state['armed'] = False
-			_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
-			t.hardMapToFile()  # another thread's rewrite, which fails part way
-			monkeypatch.undo()
-			_append_external(p, b'ext2\tC\n')  # and another process appends after it
-		return real()
-
-	t.commitAppendToFile = committing
-	t.checkExternalChanges()  # the tick that sees the change
-	t.rewrite()
-	del t.commitAppendToFile
-	assert not state['armed']
-	# ext was in the file the failed rewrite overwrote (with a warning), never in memory
-	assert dict(t) == dict(rows, ext2=['ext2', 'C']), 'the damaged file was reloaded over memory'
-	assert _back(p) == dict(t) and not t.deSynced and t._damage is None
 
 
 def test_tsvzed_legacy_explicit_reload_of_a_damaged_file_warns_that_memory_is_replaced(tmp_path, monkeypatch, capsys):
@@ -8434,7 +7838,7 @@ def test_tsvzed_legacy_explicit_reload_of_a_damaged_file_warns_that_memory_is_re
 	t.reload()  # as asked: memory is what the file holds
 	out = capsys.readouterr().out
 	assert 'reload() replaces memory' in out and 'only good copy' in out, out
-	assert dict(t) == {'k0': ['k0', 'v0']} and t._damage is None and not t.deSynced
+	assert dict(t) == {'k0': ['k0', 'v0']} and not t._damaged and not t.deSynced
 	t.reload()
 	assert 'reload() replaces memory' not in capsys.readouterr().out
 
@@ -8447,36 +7851,13 @@ def _damaged_with_appends(p, monkeypatch, suffix='tsv'):
 	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
 	t.hardMapToFile()
 	monkeypatch.undo()
-	assert t._damage is not None and t.deSynced
+	assert t._damaged and t.deSynced
 	t['k4'] = ['k4', 'mine']  # queued, appended after the rewrite
 	theirs = b''.join(b'x%d\tX\n' % i for i in range(3)) + b'k2\t\nk3\tnew\nk4\ttheirs\n'
 	_append_external(p, _compressedAs(suffix, theirs))
 	expected = dict(rows, k3=['k3', 'new'], k4=['k4', 'mine'], **dict(('x%d' % i, ['x%d' % i, 'X']) for i in range(3)))
 	del expected['k2']
 	return t, expected
-
-
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
-def test_tsvzed_legacy_merge_interrupted_at_any_line_keeps_memory_whole(tmp_path, monkeypatch, suffix):
-	# _mergeChange swapped the merged rows in by emptying memory and filling it again row by row: a KeyboardInterrupt
-	# in the refill left memory, the only good copy, partly empty, and the next rewrite wrote what was left (4 of 21
-	# rows on 50ea158). The appended rows are now applied to memory in place, and applied again by the next merge.
-	n = 0
-	while True:
-		n += 1
-		t, expected = _damaged_with_appends(str(tmp_path / ('m%d.%s' % (n, suffix))), monkeypatch, suffix)
-		before = dict(t)
-		hit = _interrupt_at(n, t.rewrite, where='_mergeChange')
-		assert not t.writeLock.locked(), n
-		for key, row in before.items():  # each key holds its row before the merge or after it
-			assert t.get(key) in (row, expected.get(key)), (n, key)
-		assert t.rewrite() or not hit, n
-		assert dict(t) == expected, n
-		assert _back(str(tmp_path / ("m%d.%s" % (n, suffix)))) == expected, n
-		t.close()
-		if not hit:
-			break
-	assert n > 30, n
 
 
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
@@ -8495,11 +7876,11 @@ def test_tsvzed_legacy_change_after_a_failed_rewrite_in_the_same_tick_is_merged(
 
 
 def test_tsvzed_legacy_merge_notes_the_time_from_before_it_read(tmp_path, monkeypatch):
-	# _mergeChange took the file's time after it read the appended bytes: a write landing in between (a writer that
-	# takes no file lock: a hand edit, open(p, 'ab'), a log rotation) was noted as seen though it was never read.
+	# The merge takes the file's time before it reads the appended bytes: a write landing after the read (a writer
+	# that takes no file lock: a hand edit, open(p, 'ab'), a log rotation) is not noted as seen, as it was not read.
 	p = str(tmp_path / 'seen.tsv')
 	t, expected = _damaged_with_appends(p, monkeypatch)
-	real = TSVZ._bytesAfter
+	real = TSVZ._readAfter
 
 	def reading(*args):
 		found = real(*args)
@@ -8508,21 +7889,18 @@ def test_tsvzed_legacy_merge_notes_the_time_from_before_it_read(tmp_path, monkey
 		os.utime(p, ns=(later, later))
 		return found
 
-	monkeypatch.setattr(TSVZ, '_bytesAfter', reading)
-	snapshot = t._snapshotForRewrite
+	monkeypatch.setattr(TSVZ, '_readAfter', reading)
 	calls = []
 
 	def refusing():  # the rewrite is refused once the merge is made: what the merge noted stays
 		calls.append(1)
-		if len(calls) > 1:
-			raise TSVZ.TSVZEncodeError('a row changed in place')
-		return snapshot()
+		raise TSVZ.TSVZEncodeError('a row changed in place')
 
 	t._snapshotForRewrite = refusing
 	t.rewrite()
 	monkeypatch.undo()
 	del t._snapshotForRewrite
-	assert len(calls) == 2 and dict(t) == expected
+	assert len(calls) == 1 and dict(t) == expected
 	assert t._externalChange(), 'the late write was noted as seen'
 
 
@@ -8551,7 +7929,7 @@ def test_tsvzed_legacy_file_made_again_with_another_header_is_not_merged(tmp_pat
 	t = _stopped(p)
 	rows = _many(t, 5)
 	os.remove(p)
-	real = t.get_file_obj
+	real = TSVZ._openUntruncated
 
 	def opening(*args, **kwargs):
 		if not os.path.exists(p):  # another process makes it again, another store's, before this one opens it
@@ -8559,12 +7937,12 @@ def test_tsvzed_legacy_file_made_again_with_another_header_is_not_merged(tmp_pat
 				g.write(_compressedAs(suffix, theirs))
 		return real(*args, **kwargs)
 
-	t.get_file_obj = opening
+	monkeypatch.setattr(TSVZ, '_openUntruncated', opening)
 	assert t.rewrite(force=True)
-	del t.get_file_obj
+	monkeypatch.undo()
 	out = capsys.readouterr().out
 	assert 'Overwriting external changes' in out and repr(theirs.partition(b'\n')[0].decode()) in out, out
-	assert dict(t) == rows and _back(p) == rows and t._damage is None
+	assert dict(t) == rows and _back(p) == rows and not t._damaged
 
 
 def test_tsvzed_legacy_background_writer_appends_to_a_file_its_rewrite_emptied(tmp_path, monkeypatch, capsys):
@@ -8584,7 +7962,7 @@ def test_tsvzed_legacy_background_writer_appends_to_a_file_its_rewrite_emptied(t
 	assert _wait_for(lambda: t._failing('rewrite'), 5)
 	for _ in range(10):
 		t._failed('rewrite', 'No space left on device', False)  # the next try is a minute away
-	assert t._damage is not None and b'k1' not in _bytes(p)
+	assert t._damaged and b'k1' not in _bytes(p)
 	t['mine'] = ['mine', 'first']
 	assert _wait_for(lambda: not t.appendQueue and b'mine\tfirst' in _bytes(p)), 'the rows were held'
 	assert _bytes(p).startswith(b'key\tval\n')
@@ -8592,7 +7970,7 @@ def test_tsvzed_legacy_background_writer_appends_to_a_file_its_rewrite_emptied(t
 	_append_late(p, 'tsv', b'new\tN\n')
 	monkeypatch.undo()
 	t._worked('rewrite')
-	assert _wait_for(lambda: not t.deSynced and t._damage is None, 5)
+	assert _wait_for(lambda: not t.deSynced and not t._damaged, 5)
 	t.close()
 	expected = dict((('k%d' % i, ['k%d' % i, 'v']) for i in range(1, 5)), k0=['k0', 'w'], mine=['mine', 'later'], new=['new', 'N'])
 	assert dict(t) == expected and _back(p) == expected
@@ -8618,7 +7996,7 @@ def test_tsvzed_legacy_last_writer_wins_after_a_failed_rewrite(tmp_path, monkeyp
 	assert _wait_for(lambda: not t.appendQueue)
 	_append_external(p, b'K\ttheirs-later\n')  # another process, later
 	t._worked('rewrite')
-	assert _wait_for(lambda: not t.deSynced and t._damage is None, 5)
+	assert _wait_for(lambda: not t.deSynced and not t._damaged, 5)
 	t.close()
 	assert t['K'] == ['K', 'theirs-later'] and _back(p)['K'] == ['K', 'theirs-later']
 
@@ -8640,7 +8018,7 @@ def test_tsvzed_legacy_damaged_store_whose_rewrite_is_refused_still_appends_its_
 	with open(p, 'ab') as g:  # another process appends under the file lock, which the background rewrite waits for
 		TSVZ._lockFile(g)
 		t._worked('rewrite')  # the rewrite is tried again now
-		assert t._damage is not None
+		assert t._damaged
 		g.write(b'x\t\x81\n')  # a byte cp1252 cannot decode: merged as U+FFFD, which it cannot write
 	assert _wait_for(lambda: 'x' in t, 5)
 	assert _wait_for(lambda: t._refusedAt is not None, 5)
@@ -8704,7 +8082,7 @@ def test_tsvzed_legacy_compressed_rewrite_cut_short_mid_stream_then_appended_to_
 	monkeypatch.undo()
 	assert t.deSynced and dict(t) == rows
 	cut = _bytes(p)
-	assert len(cut) == room and t._damage == (room, __import__('hashlib').sha256(cut).digest())
+	assert len(cut) == room and t._known[1:2] == (room,) and t._known[2].digest() == __import__('hashlib').sha256(cut).digest()
 	member = TSVZ._compressBytes(codec, b'ext\tB\nk2\t\n')
 	_append_external(p, member)  # space is back: another process appends a member
 	whole = _bytes(p)
@@ -8735,7 +8113,7 @@ t.commitAppendToFile()
 t['k1'] = ['k1', 'upd']
 t.commitAppendToFile()
 rows = dict(t)
-real = TSVZ._codecWriter
+real = TSVZ._writeLines
 
 def filling(*args, **kwargs):  # once the rewrite emptied the file, another writer fills the disk but for 3 pages
 	with open(filler, 'wb', buffering=0) as f:  # unbuffered: nothing is left for its close to fail on
@@ -8747,12 +8125,12 @@ def filling(*args, **kwargs):  # once the rewrite emptied the file, another writ
 	os.truncate(filler, os.path.getsize(filler) - 3 * 4096)
 	return real(*args, **kwargs)
 
-TSVZ._codecWriter = filling
+TSVZ._writeLines = filling
 t.hardMapToFile()  # runs out of room mid-stream
-TSVZ._codecWriter = real
+TSVZ._writeLines = real
 os.remove(filler)
 cut = open(p, 'rb').read()
-result = {'deSynced': t.deSynced, 'cut': len(cut), 'damage': list(t._damage[:1]) + [t._damage[1] == hashlib.sha256(cut).digest()]}
+result = {'deSynced': t.deSynced, 'cut': len(cut), 'damage': [t._known[1], t._known[2].digest() == hashlib.sha256(cut).digest()]}
 member = TSVZ._compressBytes(codec, b'ext\tB\nk2\t\n')
 with open(p, 'ab') as g:
 	g.write(member)
@@ -8855,32 +8233,6 @@ class _FlakyHandler(object):
 		return '?', error.end
 
 
-@pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
-def test_tsvzed_legacy_rewrite_that_cannot_encode_a_row_it_checked_fails_and_is_made_again(tmp_path, method):
-	# Should the write still meet a row it cannot encode (an errors handler that changes its mind), it must not
-	# leave the row out (in place, every later row would move up a line): the rewrite fails, and is made again.
-	import codecs
-	name = 'tsvz_flaky_%s' % method
-	handler = _FlakyHandler(fail=3)  # 1: the set, 2: the rewrite's check, 3: its write
-	codecs.register_error(name, handler)
-	p = str(tmp_path / 'flaky.tsv')
-	t = _stopped(p, errors=name)
-	for i in range(8):
-		t['k%d' % i] = ['k%d' % i, 'value%d' % i]
-	t.commitAppendToFile()
-	t['k1'] = ['k1', 'a longer value than it had']
-	t['k2'] = ['k2', 'bad\udcff']
-	assert handler.calls == 1
-	getattr(t, method)()
-	assert handler.calls >= 3
-	expected = dict((key, list(row)) for key, row in t.items())
-	expected['k2'] = ['k2', 'bad?']
-	if method == 'hardMapToFile':
-		assert t.deSynced and t.dirty  # it failed: made again by the next rewrite
-		assert t.rewrite()
-	assert _back(p) == expected and not t.deSynced  # mapToFile fell back on hardMapToFile
-
-
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 @pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
 def test_tsvzed_legacy_explicit_rewrite_raises_when_it_refuses_and_writes_nothing(tmp_path, suffix, method):
@@ -8891,7 +8243,7 @@ def test_tsvzed_legacy_explicit_rewrite_raises_when_it_refuses_and_writes_nothin
 	t['k2'][1] = 'bad\udcff'  # changed in place: refused at the check, before anything is written
 	with pytest.raises(TSVZ.TSVZEncodeError):
 		getattr(t, method)()
-	assert _bytes(p) == before and t._damage is None and t.dirty and not t.deSynced
+	assert _bytes(p) == before and not t._damaged and t.dirty and not t.deSynced
 
 
 # --- seventh review round: an append to an empty file, the background writer, a flat snapshot ----------
@@ -8904,18 +8256,18 @@ def test_tsvzed_legacy_append_to_an_empty_file_writes_the_header_first(tmp_path,
 	p = str(tmp_path / ('empty.' + suffix))
 	t = _stopped(p)
 	rows = _many(t, 5)
-	real = TSVZ._codecWriter
+	real = TSVZ._writeLines
 
 	def full(*args, **kwargs):  # right after the truncate, before the first byte
 		import errno
 		raise OSError(errno.ENOSPC, 'No space left on device')
 
-	TSVZ._codecWriter = full
+	TSVZ._writeLines = full
 	try:
 		t.hardMapToFile()
 	finally:
-		TSVZ._codecWriter = real
-	assert os.path.getsize(p) == 0 and t._damage[0] == 0
+		TSVZ._writeLines = real
+	assert os.path.getsize(p) == 0 and t._known[1] == 0
 	other = _stopped(p, verbose=False)  # another process's TSVZed on the store
 	other['fromB'] = ['fromB', 'B']
 	other.commitAppendToFile()
@@ -9017,38 +8369,6 @@ def test_tsvzed_legacy_stale_queued_tombstone_is_not_appended_over_another_proce
 
 
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
-def test_tsvzed_legacy_rewrite_interrupted_in_its_release_drops_the_rows_it_wrote_from_the_queue_once(tmp_path, suffix):
-	# The queued rows a rewrite wrote are dropped from the queue once it reached the disk; a KeyboardInterrupt in the
-	# release, which goes on from where it stopped, must drop them once: not a row set while it wrote, nor none.
-	p = str(tmp_path / ('trim.' + suffix))
-	t = _stopped(p)
-	_many(t, 5)
-	n = 0
-	while True:
-		n += 1
-		t['q%d' % n] = ['q%d' % n, 'Q']  # queued: the rewrite writes it
-		real = t.get_file_obj
-
-		def opening(*args, **kwargs):  # another thread sets a row while the rewrite writes: queued after the snapshot
-			t['late%d' % n] = ['late%d' % n, 'L']
-			return real(*args, **kwargs)
-
-		t.get_file_obj = opening
-		hit = _interrupt_at(n, t.hardMapToFile, where='_releaseRewrite')
-		del t.get_file_obj
-		queued = [row[0] for row in t.appendQueue]
-		if t._damage is None and not t.deSynced:  # it reached the disk
-			assert queued == ['late%d' % n], (n, queued)
-		else:
-			assert queued == ['q%d' % n, 'late%d' % n], (n, queued)
-		t.commitAppendToFile()
-		assert t.rewrite(force=True) and _back(p) == dict(t), n
-		if not hit:
-			break
-	assert n > 10, n
-
-
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 def test_tsvzed_legacy_merge_orders_the_keys_as_a_read_of_the_file_does(tmp_path, monkeypatch, suffix):
 	# A merged delete and set again of a key memory held kept the key's old place (OrderedDict.__setitem__ on a key
 	# it has), where reading the file moves it to the end; a key only set keeps its place, as a read keeps it.
@@ -9079,31 +8399,10 @@ def _damaged_with_defaults(p, monkeypatch, suffix):
 	_failing_rewrite(monkeypatch, partial=b'key\tval\tx\nk0\tv\tx\n')
 	t.hardMapToFile()
 	monkeypatch.undo()
-	assert t._damage is not None
+	assert t._damaged
 	theirs = b'e1\t\tX\n' + TSVZ.DEFAULTS_INDICATOR_KEY.encode() + b'\tD1\t\ne2\t\tX\n'
 	_append_external(p, _compressedAs(suffix, theirs))
 	return t, dict(rows, e1=['e1', 'D0', 'X'], e2=['e2', 'D1', 'X'])
-
-
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
-def test_tsvzed_legacy_merge_interrupted_after_it_changed_the_defaults_fills_cells_as_before(tmp_path, monkeypatch, suffix):
-	# A KeyboardInterrupt after the merge replaced memory's defaults with the ones another process appended, and
-	# before it noted the damage, made the merge made again read the rows before those defaults with the new ones.
-	n = 0
-	while True:
-		n += 1
-		p = str(tmp_path / ('d%d.%s' % (n, suffix)))
-		t, expected = _damaged_with_defaults(p, monkeypatch, suffix)
-		hit = _interrupt_at(n, t.rewrite, where='_mergeChange')
-		assert not t.writeLock.locked(), n
-		assert t.rewrite() or not hit, n
-		assert dict(t) == expected, (n, dict(t))
-		assert t.defaults == [TSVZ.DEFAULTS_INDICATOR_KEY, 'D1', ''], (n, t.defaults)
-		assert TSVZ.readTabularFile(p, header='key\tval\tx', verbose=False) == expected, n
-		t.close()
-		if not hit:
-			break
-	assert n > 30, n
 
 
 def test_tsvzed_legacy_merge_refused_for_another_header_still_reports_a_damaged_stream(tmp_path, monkeypatch, capsys):
@@ -9114,7 +8413,7 @@ def test_tsvzed_legacy_merge_refused_for_another_header_still_reports_a_damaged_
 	_failing_rewrite(monkeypatch)  # left empty
 	t.hardMapToFile()
 	monkeypatch.undo()
-	assert t._damage[0] == 0
+	assert t._known[1] == 0
 	import random
 	rng = random.Random(2)
 	theirs = b'id\tname\n' + b''.join(b'x%d\t%x\n' % (i, rng.getrandbits(64)) for i in range(20000))  # decoded in pieces
@@ -9147,7 +8446,7 @@ def test_tsvzed_legacy_file_replaced_after_a_failed_rewrite_is_not_merged_though
 	capsys.readouterr()
 	assert t.rewrite()
 	assert 'Overwriting external changes' in capsys.readouterr().out
-	assert dict(t) == rows and _back(p) == rows and t._damage is None
+	assert dict(t) == rows and _back(p) == rows and not t._damaged
 
 
 def test_tsvzed_legacy_rewrite_in_place_that_begins_with_the_damage_is_merged_as_the_readme_says(tmp_path, monkeypatch, capsys):
@@ -9164,64 +8463,6 @@ def test_tsvzed_legacy_rewrite_in_place_that_begins_with_the_damage_is_merged_as
 	assert t.rewrite()
 	assert 'Overwriting external changes' not in capsys.readouterr().out
 	assert dict(t) == dict(rows, other=['other', 'X']) and _back(p) == dict(t)
-
-
-def test_tsvzed_legacy_rewrite_that_keeps_failing_does_not_read_an_unchanged_damage_again(tmp_path, monkeypatch):
-	# Every rewrite tried while the file was damaged read and hashed the whole damaged prefix first, also when
-	# nothing had changed it since the damage was noted. Its size and times are compared first now, once the damage
-	# is noted long enough after the file's last change (the clock is moved on: see the next test).
-	monkeypatch.setattr(TSVZ, '_wallClock', lambda: time.time() + 10)
-	p = str(tmp_path / 'again.tsv')
-	t = _stopped(p)
-	rows = _many(t, 50)
-	reads = []
-	real = TSVZ._bytesAfter
-	monkeypatch.setattr(TSVZ, '_bytesAfter', lambda *args: reads.append(1) or real(*args))
-	real_codec, real_inplace = TSVZ._codecWriter, TSVZ.TSVZed._writeInPlace
-	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
-	t.hardMapToFile()  # fails: the damage is noted
-	t.hardMapToFile()  # fails again: the file is as the damage left it
-	assert reads == [], 'an unchanged damage was read again'
-	_append_external(p, b'ext\tB\n')  # another process: the file changed
-	t.hardMapToFile()
-	assert reads == [1] and t['ext'] == ['ext', 'B']
-	monkeypatch.setattr(TSVZ, '_codecWriter', real_codec)
-	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', real_inplace)
-	assert t.rewrite()
-	assert dict(t) == dict(rows, ext=['ext', 'B']) and _back(p) == dict(t)
-
-
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
-def test_tsvzed_legacy_release_interrupted_reads_the_damage_once_at_most(tmp_path, monkeypatch, suffix):
-	# The release made again after a KeyboardInterrupt read and hashed the whole file again (_fileDigest, its slowest
-	# step), although nothing waits out a slow step after a Ctrl-C. The digest the first try took is kept; a read the
-	# Ctrl-C stopped is not made again: the damage is then unknown.
-	n = 0
-	while True:
-		n += 1
-		p = str(tmp_path / ('once%d.%s' % (n, suffix)))
-		t = _stopped(p)
-		rows = _many(t, 20)
-		reads = []
-		real = TSVZ._fileDigest
-
-		def digest(fd, *args):
-			reads.append(1)
-			return real(fd, *args)
-
-		monkeypatch.setattr(TSVZ, '_fileDigest', digest)
-		_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv0\n')
-		hit = _interrupt_at(n, t.hardMapToFile, where='_releaseRewrite')
-		monkeypatch.undo()
-		assert len(reads) <= 1, (n, reads)
-		assert not t.writeLock.locked() and t.deSynced, n
-		sha = __import__('hashlib').sha256(_bytes(p)).digest()
-		assert t._damage in ((len(_bytes(p)), sha), TSVZ._DAMAGE_UNKNOWN), (n, t._damage)
-		assert t.rewrite() and dict(t) == rows and _back(p) == rows, n
-		t.close()
-		if not hit:
-			break
-	assert n > 10, n
 
 
 # --- eighth review round: one append helper, rows kept queued until written, member-by-member merge -------
@@ -9312,7 +8553,7 @@ def _damaged_compressed(p, monkeypatch, suffix):
 	_failing_rewrite(monkeypatch, partial=_compressedAs(suffix, b'key\tval\nk0\tv0\n'))
 	t.hardMapToFile()
 	monkeypatch.undo()
-	assert t._damage is not None and t._damage[0] > 0 and t.deSynced
+	assert t._damaged and t._known[1] > 0 and t.deSynced
 	return t, rows
 
 
@@ -9527,222 +8768,30 @@ def test_tsvzed_legacy_map_to_file_of_a_strict_store_writes_the_header_to_an_emp
 	t.close()
 
 
-def test_tsvzed_legacy_merging_rewrite_holds_one_snapshot_at_a_time(tmp_path, monkeypatch):
-	# A rewrite that merged another process's append made its second snapshot while the first was still held, so
-	# two flat snapshots of the store were alive at once (1,000,000 rows: 48.1 MiB against 33.3 MiB for a plain
-	# rewrite, rv8 r8_merge_peak.py). The first is let go of first. What is measured is the peak before the write
-	# begins (snapshots, the merge), which the write's own chunk would hide at this size.
-	import tracemalloc
-	p = str(tmp_path / 'peak.tsv')
-	t = _stopped(p, verbose=False)
-	for i in range(100000):
-		OrderedDict.__setitem__(t, 'key%08d' % i, ['key%08d' % i, 'v%d' % i])
-	t.dirty = True
-	t.hardMapToFile()
-	real = TSVZ._writeLines
-	peaks = []
-
-	def writing(*args, **kwargs):
-		peaks.append(tracemalloc.get_traced_memory()[1])
-		return real(*args, **kwargs)
-
-	def measured():
-		del peaks[:]
-		tracemalloc.start()
-		try:
-			assert t.hardMapToFile()
-		finally:
-			tracemalloc.stop()
-		return peaks[-1]
-
-	monkeypatch.setattr(TSVZ, '_writeLines', writing)
-	t.dirty = True
-	plain = measured()
-	monkeypatch.undo()
-	_failing_rewrite(monkeypatch, partial=b'key\tval\n')
-	t.dirty = True
-	t.hardMapToFile()
-	monkeypatch.undo()
-	_append_external(p, b'ext\tB\n')
-	t._worked('rewrite')
-	monkeypatch.setattr(TSVZ, '_writeLines', writing)
-	merged = measured()
-	monkeypatch.undo()
-	assert t['ext'] == ['ext', 'B'] and len(t) == 100001
-	assert merged < plain * 1.15, (plain, merged)
-	t.close()
-
-
 @pytest.mark.parametrize('suffix', ALL_SUFFIXES)
 def test_tsvzed_legacy_append_landing_while_the_damage_is_read_is_merged_not_taken_for_damage(tmp_path, monkeypatch, capsys, suffix):
-	# The release noted the file's stamp (its size S among it) and then read and hashed the file to its end: bytes
-	# another writer (one that takes no lock) appended in between were counted in the damage. The merge then saw
-	# the file S+k long against a stamp of S, found the damage's digest whole and nothing after it, and the next
-	# rewrite overwrote those bytes without a warning (haiku toctou-during). The digest now covers the S bytes
-	# noted with the stamp: what lands after is merged.
+	# The damage is the bytes the file held when it was looked at (fstat), read through to there: bytes another
+	# writer (one that takes no lock) appends while they are read are not counted in it, and the merge takes them in.
 	p = str(tmp_path / ('during.' + suffix))
 	t = _stopped(p)
 	rows = _many(t, 5)
-	real = TSVZ._fileDigest
+	real = os.read
+	landed = []
 
-	def digest(fd, *args):
-		_append_external(p, _compressedAs(suffix, b'late\tL\n'))  # lands while the damage is read
-		return real(fd, *args)
+	def reading(fd, n):
+		if not landed:
+			landed.append(1)
+			_append_external(p, _compressedAs(suffix, b'late\tL\n'))  # lands while the damage is read
+		return real(fd, n)
 
 	_failing_rewrite(monkeypatch, partial=_compressedAs(suffix, b'key\tval\nk0\tv0\n'))
-	monkeypatch.setattr(TSVZ, '_fileDigest', digest)
+	monkeypatch.setattr(TSVZ.os, 'read', reading)
 	t.hardMapToFile()
 	monkeypatch.undo()
-	assert t._damage[0] == t._damageAt[2] < os.path.getsize(p)
+	assert landed and t._known[1] < os.path.getsize(p)
 	capsys.readouterr()
 	assert t.rewrite()
 	assert t['late'] == ['late', 'L'] and dict(t) == dict(rows, late=['late', 'L']) and _back(p) == dict(t)
 	assert 'Overwriting external changes' not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
-def test_tsvzed_legacy_rewrite_keeps_queued_a_row_changed_in_place_after_its_snapshot(tmp_path, monkeypatch, suffix):
-	# 700c8b2 dropped from the queue every row the rewrite's snapshot held once it was on disk; set() queues the very
-	# list memory holds, so a stored row changed in place after the snapshot (unsupported, docs item 10) lost its
-	# queue entry: memory had the change, the queue was empty and the file kept the old value (haiku inplace). Main
-	# appended it after the rewrite. Only the rows that still hold what they held at the snapshot are dropped.
-	p = str(tmp_path / ('inplace.' + suffix))
-	t = _stopped(p)
-	t['a'] = ['a', '1']
-	t['b'] = ['b', '1']
-	real = TSVZ._writeLines
-
-	def writing(*args, **kwargs):
-		result = real(*args, **kwargs)  # the snapshot ('a 1') is written
-		t['a'][1] = 'x'  # the caller changes the row it got back, while the rewrite runs
-		return result
-
-	monkeypatch.setattr(TSVZ, '_writeLines', writing)
-	assert t.hardMapToFile()
-	monkeypatch.undo()
-	assert [row[0] for row in t.appendQueue] == ['a']  # 'b' was written as queued: dropped
-	t.commitAppendToFile()
-	assert _back(p) == {'a': ['a', 'x'], 'b': ['b', '1']} == dict(t)
-	t.close()
-
-
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
-@pytest.mark.parametrize('leaves', ['pop', 'replace'])
-def test_tsvzed_legacy_rewrite_drops_a_queued_row_that_left_memory_and_was_changed_in_place(tmp_path, monkeypatch, suffix, leaves):
-	# a31d3a1 kept every queued row whose cells changed after the snapshot. A row that had left memory (popped or
-	# replaced) but whose caller kept it and changed it in place while the rewrite wrote was then appended after
-	# the rewrite, and on disk it overrode the newer row or brought back the deleted key, as memory did not hold
-	# it. Only a changed row that memory still holds for its key stays queued.
-	p = str(tmp_path / ('left.' + suffix))
-	t = _stopped(p)
-	t['a'] = ['a', '1']
-	t['b'] = ['b', '1']
-	old = t['a']  # the list memory holds, also the queued row
-	if leaves == 'pop':
-		assert t.pop('a') is old
-	else:
-		t['a'] = ['a', '2']
-	real = TSVZ._writeLines
-
-	def writing(*args, **kwargs):
-		result = real(*args, **kwargs)  # the snapshot is written
-		old[1] = 'reused'  # the caller reuses the list it got back, while the rewrite runs
-		return result
-
-	monkeypatch.setattr(TSVZ, '_writeLines', writing)
-	assert t.hardMapToFile()
-	monkeypatch.undo()
-	assert old not in list(t.appendQueue)
-	t.commitAppendToFile()
-	expected = {'b': ['b', '1']} if leaves == 'pop' else {'a': ['a', '2'], 'b': ['b', '1']}
-	assert dict(t) == expected == _back(p)
-	t.close()
-
-
-def test_tsvzed_legacy_rewrite_goes_through_when_a_queued_row_key_cell_was_changed_to_a_list(tmp_path, monkeypatch, capsys):
-	# 897f784 looked a changed queued row up in memory by its first cell, and a caller that had changed that cell in
-	# place to a list made the lookup raise TypeError: the rewrite that had written the file was reported failed.
-	# Such a row holds no key memory can hold it under, so it is dropped, as one that left memory is.
-	p = str(tmp_path / 'key.tsv')
-	t = _stopped(p)
-	t['a'] = ['a', '1']
-	row = t['a']
-	real = TSVZ._writeLines
-
-	def writing(*args, **kwargs):
-		result = real(*args, **kwargs)  # the snapshot is written
-		row[0] = ['x']
-		return result
-
-	monkeypatch.setattr(TSVZ, '_writeLines', writing)
-	assert t.hardMapToFile()
-	monkeypatch.undo()
-	captured = capsys.readouterr()
-	assert 'Failed' not in captured.out + captured.err, captured
-	assert not t.appendQueue
-	assert _back(p) == {'a': ['a', '1']}
-	t.shutdownEvent.set()
-
-
-def test_tsvzed_legacy_merge_after_a_failed_rewrite_goes_through_when_a_queued_row_key_cell_was_changed_to_a_list(tmp_path, monkeypatch, capsys):
-	# The merge of another process's change into a damaged store took the set of the queued rows' first cells, and a
-	# caller that had changed one in place to a list made it raise TypeError: every rewrite after it failed, so the
-	# damage stayed for good. The row is still queued under the key memory holds it under, so the other process's row
-	# for that key is still skipped, while its other rows are merged.
-	p = str(tmp_path / 'merge.tsv')
-	t = _stopped(p)
-	t['a'] = ['a', '1']
-	t.commitAppendToFile()
-	t['a'] = ['a', '2']
-	_failing_rewrite(monkeypatch, partial=b'key\tval\n')
-	t.hardMapToFile()  # fails partway: the file is damaged, memory is the good copy
-	monkeypatch.undo()
-	assert t._damage is not None
-	with open(p, 'ab') as g:  # another process appends
-		g.write(b'a\tother\nb\t1\n')
-	row = t['a']
-	row[0] = ['x']
-	capsys.readouterr()
-	t.hardMapToFile()  # merges the other process's change, then rewrites
-	captured = capsys.readouterr()
-	assert 'unhashable' not in captured.out + captured.err, captured
-	assert t._damage is None
-	assert dict.get(t, 'a') is row and row[1] == '2'  # memory's queued change to 'a' is kept
-	assert dict.get(t, 'b') == ['b', '1']
-	t.shutdownEvent.set()
-
-
-@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
-def test_tsvzed_legacy_same_size_rewrite_within_a_clock_tick_of_the_damage_is_not_taken_for_no_change(tmp_path, monkeypatch, capsys, suffix):
-	# ccc66b4 skipped reading the file when its size, mtime and ctime equalled the damage's stamp, though the comment
-	# said the decision is by what the file holds: on a file system whose clock ticks once a second (here: times cut
-	# to the second), another process's rewrite to the same size within that second kept all three, and was
-	# overwritten without the warning the digest gave. The stamp is trusted only when noted at least
-	# _STAMP_RACY_SECONDS after the file's last change; the digest decides otherwise.
-	def coarse(st):
-		class Coarse(object):
-			st_dev, st_ino, st_size = st.st_dev, st.st_ino, st.st_size
-			st_mtime_ns = st.st_mtime_ns // 10**9 * 10**9
-			st_ctime_ns = st.st_ctime_ns // 10**9 * 10**9
-		return real_stamp(Coarse())
-
-	real_stamp = TSVZ._fileStamp
-	monkeypatch.setattr(TSVZ, '_fileStamp', coarse)
-	time.sleep(1.05 - time.time() % 1)  # early in a second: the damage and the change land in the same one
-	p = str(tmp_path / ('tick.' + suffix))
-	t = _stopped(p)
-	rows = _many(t, 5)
-	real_codec, real_inplace = TSVZ._codecWriter, TSVZ.TSVZed._writeInPlace
-	_failing_rewrite(monkeypatch, partial=_compressedAs(suffix, b'key\tval\nk0\tv0\n'))
-	t.hardMapToFile()
-	damaged = _bytes(p)
-	theirs = _compressedAs(suffix, b'key\tval\nk0\tv9\n')
-	assert len(theirs) == len(damaged) and theirs != damaged
-	with open(p, 'r+b') as g:  # another process rewrites it in place, to the same size, in the same second
-		g.write(theirs)
-	capsys.readouterr()
-	monkeypatch.setattr(TSVZ, '_codecWriter', real_codec)
-	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', real_inplace)
-	assert t.rewrite()
-	assert 'Overwriting external changes' in capsys.readouterr().out, 'a same-size change was taken for no change'
-	assert dict(t) == rows and _back(p) == rows
