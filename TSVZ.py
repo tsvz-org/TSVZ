@@ -5096,6 +5096,7 @@ memoryOnly:{self.memoryOnly}
 			# Not while a failed rewrite of this store's has left the file damaged: memory holds the only good copy,
 			# and the rewrite below makes the file again from it, merging what another process appended.
 			if reloadInternalFromFile and not self._damaged and self._externalChange():
+				self._commit()  # what is queued goes after the change in the file, so it goes after it in memory too
 				self._syncFile()
 			self._worked('sync')
 			if self.memoryOnly:
@@ -5340,7 +5341,10 @@ memoryOnly:{self.memoryOnly}
 		header = None
 		# A last line with no newline is read again: what is appended may complete it (a compressed file's appends
 		# are members of their own).
-		if found is not None and (found[2] or self._damaged or _isCompressedFile(self._fileName)):
+		# Not while rows are queued (unless the file is damaged): what follows would go after them in memory, where the
+		# file will hold them after it.
+		if (found is not None and (found[2] or self._damaged or _isCompressedFile(self._fileName))
+				and (self._damaged or not self.appendQueue)):
 			rest, known, _ = found
 			header = self._applyAppended(f, rest, self._known[1])
 			if header is None:
@@ -5675,6 +5679,8 @@ memoryOnly:{self.memoryOnly}
 				return self
 			try:
 				known = None if self._changedSince(f) else self._known
+				if known is None and not self._damaged:
+					self._known = None  # another process's change is not known until it is read: the next sync reads all
 				with self._memLock:  # a set or delete queues under it: not while the queue is listed
 					rows = list(self.appendQueue)
 				chunks = []

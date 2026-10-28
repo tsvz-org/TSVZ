@@ -8948,6 +8948,77 @@ def test_tsvzed_legacy_another_process_append_is_read_from_where_the_store_left_
 	assert reads == [1] and dict(t) == {'z': ['z', '9']}
 
 
+def _fresh_keys(p):
+	r = _stopped(p)
+	keys = list(r)
+	r.close()
+	return keys
+
+
+@pytest.mark.parametrize('commit_first', [False, True])
+def test_tsvzed_legacy_another_process_append_keeps_the_file_order_of_a_queued_row(tmp_path, commit_first):
+	# A row this store queued is written after another process's append: memory had it before the appended row,
+	# and kept it there, though the file and every read have it after (a later popitem or rewrite went by memory).
+	p = str(tmp_path / 'order.tsv')
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	t['x'] = ['x', '9']  # queued
+	_append_external(p, b'y\t8\n')
+	if commit_first:
+		t.commitAppendToFile()  # written after y, before y is read
+	t.checkExternalChanges()
+	t.rewrite()
+	t.commitAppendToFile()
+	assert list(t) == _fresh_keys(p) == ['a', 'y', 'x']
+
+
+def test_tsvzed_legacy_row_cleared_by_another_process_does_not_come_back(tmp_path, monkeypatch):
+	# This store appended a row while the file held another process's row it had not read: the bytes it knew no
+	# longer ended where the file did. A clear by a third process then looked like nothing appended, memory kept the
+	# cleared row, and the next rewrite wrote it back.
+	p = str(tmp_path / 'clear.tsv')
+	t = _stopped(p)
+	_append_external(p, b'k1\t1\n')
+	monkeypatch.setattr(t, '_syncFile', lambda: None)  # the row is not read before the append below
+	t['x'] = ['x', '9']
+	t.commitAppendToFile()
+	monkeypatch.undo()
+	other = _stopped(p)
+	other.clear()
+	other.close()
+	t.checkExternalChanges()
+	t.rewrite()
+	assert dict(t) == {}
+	t.mapToFile()
+	assert _fresh_keys(p) == []
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_same_size_rewrite_of_the_damage_is_not_merged(tmp_path, monkeypatch, capsys, suffix):
+	# Another process rewrote the file a failed rewrite left, to the same size and with other bytes: that is not an
+	# append, so memory, the good copy, is written over it with the warning, whatever the file's times say.
+	p = str(tmp_path / ('same.' + suffix))
+	t = _stopped(p)
+	rows = _many(t, 5)
+	real_lines, real_inplace = TSVZ._writeLines, TSVZ.TSVZed._writeInPlace
+	_failing_rewrite(monkeypatch, partial=_compressedAs(suffix, b'key\tval\nk0\tv0\n'))
+	t.hardMapToFile()
+	damaged = _bytes(p)
+	theirs = _compressedAs(suffix, b'key\tval\nk0\tv9\n')
+	assert len(theirs) == len(damaged) and theirs != damaged
+	st = os.stat(p)
+	with open(p, 'r+b') as g:  # another process rewrites it in place, to the same size
+		g.write(theirs)
+	os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))  # and keeps its modification time
+	capsys.readouterr()
+	monkeypatch.setattr(TSVZ, '_writeLines', real_lines)
+	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', real_inplace)
+	assert t.rewrite()
+	assert 'Overwriting external changes' in capsys.readouterr().out
+	assert dict(t) == rows and _back(p) == rows
+
+
 def test_tsvzed_legacy_a_reload_never_leaves_a_live_key_missing(tmp_path):
 	# A reload emptied memory and filled it again: another thread found live keys missing meanwhile.
 	p = str(tmp_path / 'swap.tsv')
