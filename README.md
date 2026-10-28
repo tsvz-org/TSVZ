@@ -222,7 +222,9 @@ its background thread only: `rewrite()`, `mapToFile()`, `hardMapToFile()`,
 constructor's load hand it the job and wait, so a Ctrl-C stops the wait, never the
 write (the call still raises `KeyboardInterrupt`). At exit a write in progress is
 finished: a Ctrl-C then says so and keeps waiting, and a second one abandons it. A
-closed store is freed.
+closed store is freed. (`get_file_obj()` and `release_file_obj()`, kept from 3.39,
+hand the locked file to the calling thread.) A file another process removed is made
+again from memory by the store's next write, an append included.
 
 It knows the size and SHA-256 of the bytes it last read or wrote. When another process
 has changed the file, and it is the same file (device and inode) and still begins with
@@ -304,7 +306,7 @@ damaged file, as asked, and warns.
 | L11 | `pop()` and `popitem()` of a `#` key, which lives in memory only, write no tombstone line to the file. |
 | L12 | A rewrite of a file whose header line has no newline writes the rows on lines of their own; 3.39 wrote the first one onto the header line. |
 | L13 | A compressed file is rewritten in members of at most 1 MiB, as appends already were: the bytes differ, the rows read are the same, and 3.39 reads them. |
-| L14 | Opening a compressed file in a codec this Python lacks (zstd before Python 3.14) raises `ImportError` instead of reading the compressed bytes as text. |
+| L14 | `TSVZed` opening a compressed file in a codec this Python lacks (zstd before Python 3.14) raises `ImportError` instead of reading the compressed bytes as text. |
 
 ### `.tsvz`, `.csvz`, `.nsvz`, `.psvz`: now tsvz-spec-v1
 

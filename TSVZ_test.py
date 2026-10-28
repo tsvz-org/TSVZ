@@ -8995,6 +8995,112 @@ def test_tsvzed_legacy_row_cleared_by_another_process_does_not_come_back(tmp_pat
 
 
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_file_seen_empty_while_another_process_writes_it_loses_no_row(tmp_path, monkeypatch, suffix):
+	# The read found the file empty and then hashed the rows another process wrote right after: the store took them
+	# for known without having read them, and its next rewrite wrote memory without them over the file.
+	p = str(tmp_path / ('empty.' + suffix))
+	content = b'key\tval\n' + b''.join(b'k%d\tv%d\n' % (i, i) for i in range(1000))
+	_touch(p, _compressedAs(suffix, content))
+	t = _stopped(p)
+	t['k1'] = ['k1', 'updated']  # the store is dirty: its rewrite writes memory
+	t.commitAppendToFile()
+	content = gzip.decompress(_bytes(p)) if suffix.endswith('.gz') else _bytes(p)
+	with open(p, 'r+b') as f:  # another process's whole rewrite, emptied first
+		f.truncate(0)
+	real = TSVZ._holdsNothing
+
+	def holdsNothing(f, codec, size):
+		found = real(f, codec, size)
+		if found:  # its rows land right after the store looked
+			monkeypatch.setattr(TSVZ, '_holdsNothing', real)
+			with open(p, 'r+b') as g:
+				g.write(_compressedAs(suffix, content))
+		return found
+
+	monkeypatch.setattr(TSVZ, '_holdsNothing', holdsNothing)
+	t.checkExternalChanges()
+	t.rewrite()
+	t.checkExternalChanges()
+	t.rewrite(force=True)
+	assert len(_back(p)) == 1000 and _back(p)['k1'] == ['k1', 'updated']
+
+
+def test_tsvzed_legacy_compressed_file_read_half_rewritten_loses_no_row(tmp_path):
+	# A read of a .tsv.gz that another process was rewriting stopped at the half-written member, yet took every
+	# byte its codec had consumed for known: the next read began inside that member, which was then left out.
+	p = str(tmp_path / 'torn.tsv.gz')
+	rows = b''.join(b'k%04d\t%s\n' % (i, b'x' * 40) for i in range(3000))
+	_touch(p, TSVZ._compressBytes('gzip', b'key\tval\n' + rows, memberSize=8192))
+	t = _stopped(p)
+	theirs = TSVZ._compressBytes('gzip', b'key\tval\n' + rows + b'new\tN\n', memberSize=8192)
+	with open(p, 'r+b') as f:  # another process's whole rewrite, half written when the tick reads it
+		f.truncate(0)
+		f.write(theirs[:len(theirs) // 2 + 7])
+	t.checkExternalChanges()
+	t.rewrite()
+	with open(p, 'r+b') as f:  # its rewrite ends
+		f.write(theirs)
+	t.checkExternalChanges()
+	t.rewrite()  # nothing queued: what follows the bytes the store knows is read
+	assert len(t) == 3001
+	t['mine'] = ['mine', 'M']
+	t.rewrite(force=True)
+	back = _back(p)
+	assert len(back) == 3002 and back['new'] == ['new', 'N'] and back['mine'] == ['mine', 'M']
+
+
+def test_tsvzed_legacy_compressed_append_read_while_it_is_written_loses_no_row(tmp_path):
+	# What another process's append had written of a member was read, and the store took the whole of it for known:
+	# the rest of that member was never read.
+	p = str(tmp_path / 'append.tsv.gz')
+	_touch(p, TSVZ._compressBytes('gzip', b'key\tval\nk0\t0\n'))
+	t = _stopped(p)
+	batch = TSVZ._compressBytes('gzip', b''.join(b'n%05d\t%s\n' % (i, b'y' * 30) for i in range(3000)))
+	with open(p, 'ab') as f:  # half written when the tick reads it
+		f.write(batch[:len(batch) // 2])
+	t.checkExternalChanges()
+	t.rewrite()
+	with open(p, 'ab') as f:
+		f.write(batch[len(batch) // 2:])
+	t['k0'] = ['k0', 'updated']
+	t.commitAppendToFile()
+	t.checkExternalChanges()
+	t.rewrite(force=True)
+	back = _back(p)
+	assert sum(1 for k in back if k.startswith('n')) == 3000 and back['k0'] == ['k0', 'updated']
+
+
+def test_tsvzed_legacy_another_process_row_takes_the_defaults_of_the_file(tmp_path):
+	# What another process appended was filled with this store's defaults (set in memory only by setDefaults()),
+	# not with the file's, as every read of the file fills it.
+	p = str(tmp_path / 'defaults.tsv')
+	_touch(p, b'key\tval\tx\n#_defaults_#\tOLD\tOLDX\na\t1\t2\n')
+	t = _stopped(p, header='key\tval\tx')
+	t.setDefaults(['NEW', 'NEWX'])
+	_append_external(p, b'theirs\t\tT\n')
+	t.checkExternalChanges()
+	t.rewrite()
+	assert t['theirs'] == TSVZ.readTabularFile(p, header='key\tval\tx')['theirs'] == ['theirs', 'OLD', 'T']
+	assert t.defaults == ['#_defaults_#', 'NEW', 'NEWX']  # memory's own defaults stay
+
+
+def test_tsvzed_legacy_set_after_the_file_was_removed_keeps_every_row(tmp_path):
+	# An append to a removed file made a new file holding only the new row, and the next read made memory that file:
+	# every other row was gone. A rewrite makes such a file again from memory; an append now does the same.
+	p = str(tmp_path / 'removed.tsv')
+	t = _stopped(p)
+	for i in range(5):
+		t['k%d' % i] = ['k%d' % i, str(i)]
+	t.commitAppendToFile()
+	os.remove(p)
+	t['new'] = ['new', 'N']
+	t.commitAppendToFile()
+	t.checkExternalChanges()
+	t.rewrite()
+	assert sorted(t) == ['k0', 'k1', 'k2', 'k3', 'k4', 'new'] and sorted(_back(p)) == sorted(t)
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 def test_tsvzed_legacy_same_size_rewrite_of_the_damage_is_not_merged(tmp_path, monkeypatch, capsys, suffix):
 	# Another process rewrote the file a failed rewrite left, to the same size and with other bytes: that is not an
 	# append, so memory, the good copy, is written over it with the warning, whatever the file's times say.
