@@ -3660,10 +3660,11 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 	"""Replace a part's bytes in place (same inode, spec §18.7 / §19.8).
 
 	``content`` is uncompressed; it is compressed for a compressed part. The
-	file is left alone when its bytes already match. Returns True if written,
-	False if unchanged. ``expect`` is a ``_specStamp`` taken before the caller
-	read the part: when the part no longer matches it under the lock, another
-	writer committed in between, so nothing is written and None is returned.
+	file is left alone when its bytes already match. Returns ``(written, stamp)``:
+	whether it wrote, and the part's ``_specStamp`` then, taken under the lock.
+	``expect`` is a ``_specStamp`` taken before the caller read the part: when
+	the part no longer matches it under the lock, another writer committed in
+	between, so nothing is written and None is returned.
 	"""
 	codec = _parsePartName(path).codec
 	_requireCodec(codec)
@@ -3680,7 +3681,7 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 				# the file is written below: a read-ahead in f would leave it a stale position to close at.
 				old = _readFrom0(fd, st.st_size)
 				if old == raw:
-					return False
+					return False, _specStamp(st)
 				try:
 					_reserveSpace(fd, len(raw))  # spec §19.8: a full disk refuses the rewrite before any byte changes
 					_writeFrom0(fd, raw)
@@ -3698,7 +3699,7 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 						_warn('TSVZ warning: ' + damaged)  # an interrupt stays an interrupt
 					raise
 				os.fsync(fd)
-				return True
+				return True, _specStamp(os.fstat(fd))
 			finally:
 				try:
 					_seekRawStart(f)  # msvcrt unlocks from the raw position: the range it locked
@@ -3923,9 +3924,15 @@ def _specKeptHeader(load, header, delimiter, errors):
 	return [_specHeaderComment(header, delimiter)]
 
 
-def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=False, verbose=False,
-						  encoding='utf8', strict=False, delimiter=..., errors='strict'):
-	"""``clearTabularFile`` for spec paths (design §5.5, §5.8). Returns True when the store was cleared.
+def _specClearTabularFile(fileName, **kwargs):
+	"""``clearTabularFile`` for spec paths (``_specClear``): True when the store was cleared."""
+	return _specClear(fileName, **kwargs)[0]
+
+
+def _specClear(fileName, teeLogger=None, header='', verifyHeader=False, verbose=False,
+			   encoding='utf8', strict=False, delimiter=..., errors='strict'):
+	"""Clear a spec store (design §5.5, §5.8); return ``(cleared, seen)``: whether it was cleared, and the
+	``_specStamp`` of the part written, taken under its lock right after the write (None when none was).
 
 	A single file is read without a lock and rewritten in place only if no
 	other writer changed it since the read (else it is read again, up to
@@ -3937,14 +3944,14 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 	changing = 'clear skipped: the store kept changing while it was being cleared; nothing was written'
 	reporter = _Reporter(fileName, teeLogger)
 	attempt = None
-	cleared = False
+	cleared, seen = False, None
 	try:
 		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
 		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
 		name = _parsePartName(fileName)
 		if name.ordinal is not None or name.rotated:
 			reporter.note('fragment', None, 'clear skipped: {} names one part of a multi-part store; clear the store path instead; nothing was written'.format(fileName))
-			return False
+			return False, None
 		if not _specEnsureStore(fileName, True, header, [DEFAULTS_INDICATOR_KEY], False, teeLogger, delimiter, errors):
 			raise FileNotFoundError("Something catastrophic happened! File still not found after creation")
 		headerChecked = False
@@ -3955,16 +3962,17 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
 			if attempt.has('torn'):  # read again already: never clear the keys of a torn view
 				attempt.note('changing', None, changing)
-				return False
+				return False, None
 			if attempt.incomplete():
 				if _storeParts(fileName)[0] != parts:
 					continue  # a part went away during the read (a rotation): read again
 				attempt.note('refused', None, 'clear skipped: a part of the store could not be read; nothing was written')
-				return False
+				return False, None
 			if len(load.parts) > 1:
 				tombstones = _specFormatRecords(_specTombstones(load.data, delimiter, load.state.strip), delimiter)
 				if tombstones:
-					_specAppendPayload(load.active, _encodeText(tombstones, 'utf-8', errors), attempt, memberSize=load.state.memberSize)
+					seen = _specAppendPayload(load.active, _encodeText(tombstones, 'utf-8', errors), attempt,
+											  memberSize=load.state.memberSize)[2]
 				attempt.note('multipart', None, 'cleared a multi-part store by appending tombstones; older parts are not compacted')
 				cleared = True
 				break
@@ -3973,15 +3981,16 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			if load.state.newestVersion > MAX_SPEC_VERSION:
 				attempt.note('refused', None, 'clear skipped: the part declares a spec version newer than {} (#_version_#), whose '
 							 'markers this TSVZ cannot keep (spec §19.8); nothing was written'.format(MAX_SPEC_VERSION))
-				return False
+				return False, None
 			if any(header) and verifyHeader and load.headerLine is not None and not headerChecked:
 				headerChecked = True
 				if not _lineContainHeader(header, load.headerLine[1:], verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter):
 					__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
 			lines = _specKeptHeader(load, header, delimiter, errors) + _specPreamble(load.state, delimiter, version=False)
-			if _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors), expect=stamp,
-								   memberSize=load.state.memberSize) is not None:
-				cleared = True
+			done = _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors),
+									   expect=stamp, memberSize=load.state.memberSize)
+			if done is not None:
+				cleared, seen = True, done[1]
 				break
 		else:
 			attempt.note('changing', None, changing)
@@ -3991,7 +4000,7 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			attempt.flush()
 	if verbose and cleared:
 		__teePrintOrNot(f"Cleared {fileName}",teeLogger=teeLogger)
-	return cleared
+	return cleared, seen
 
 
 def _specPostamble(state, delimiter):
@@ -4122,10 +4131,11 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 					attempt.note('refused', None, 'scrub skipped: could not keep a copy of the damaged part ({}); nothing was written'.format(e))
 					return taskDic, False
 				backedUp = stamp
-			written = _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors), expect=stamp,
-										  memberSize=state.memberSize)
-			if written is None:
+			done = _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors),
+									   expect=stamp, memberSize=state.memberSize)
+			if done is None:
 				continue  # another writer committed after the read
+			written = done[0]
 			if verbose:
 				__teePrintOrNot(f"Scrubbed {fileName}: {len(rows)} records, {'rewritten' if written else 'unchanged'}",teeLogger=teeLogger)
 			# A read that stopped at damaged data was rewritten as far as it went, but it still failed (spec §4.10).
@@ -4983,9 +4993,10 @@ class TSVZed(OrderedDict):
 					self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: queued records could not be committed; not clearing",'error')
 					self.deSynced = True
 					return self
-				cleared = _specClearTabularFile(self._fileName, teeLogger=self.teeLogger, header=self.header,
-												verbose=self.verbose, delimiter=self.delimiter, errors=self.errors)
-				self._specNoteSeen(_specFileStamp(self._activePath))
+				cleared, seen = _specClear(self._fileName, teeLogger=self.teeLogger, header=self.header,
+										   verbose=self.verbose, delimiter=self.delimiter, errors=self.errors)
+				if seen is not None:
+					self._specNoteSeen(seen)  # the part as the clear left it: an append after that is a change
 			self.dirty = False
 			# A skipped clear (reported) left the store as it was: reload it into memory.
 			self.deSynced = not cleared

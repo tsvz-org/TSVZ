@@ -2467,9 +2467,9 @@ def test_spec_rewrite_in_place_keeps_inode_and_skips_identical(tmp_path):
 	p = str(tmp_path / 'r.tsvz')
 	_touch(p, b'a\t1\nb\t2\n')
 	ino = os.stat(p).st_ino
-	assert TSVZ._specRewriteInPlace(p, b'a\t1\n') is True
+	assert TSVZ._specRewriteInPlace(p, b'a\t1\n') == (True, TSVZ._specStamp(os.stat(p)))
 	assert open(p, 'rb').read() == b'a\t1\n' and os.stat(p).st_ino == ino
-	assert TSVZ._specRewriteInPlace(p, b'a\t1\n') is False
+	assert TSVZ._specRewriteInPlace(p, b'a\t1\n') == (False, TSVZ._specStamp(os.stat(p)))
 
 
 def test_spec_clear_keeps_header_and_markers(tmp_path):
@@ -3537,6 +3537,27 @@ def test_spec_tsvzed_commit_does_not_hide_an_append_made_before_it(tmp_path):
 	assert t.deSynced
 	t._specSync()
 	assert t['ext'] == ['ext', 'X'] and t['a'] == ['a', '1']
+
+
+def test_spec_tsvzed_clear_does_not_hide_an_append_made_right_after_it(tmp_path, monkeypatch):
+	p = str(tmp_path / 's.tsvz')
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	real = TSVZ._specRewriteInPlace
+
+	def rewrite(*args, **kwargs):
+		done = real(*args, **kwargs)
+		monkeypatch.undo()
+		TSVZ.appendLinesTabularFile(p, [['ext', 'X']])  # another writer, right after the clear's rewrite
+		return done
+	monkeypatch.setattr(TSVZ, '_specRewriteInPlace', rewrite)
+	t.clear()
+	assert 'a' not in t
+	t.checkExternalChanges()
+	assert t.deSynced
+	t._specSync()
+	assert dict(t) == {'ext': ['ext', 'X']}
 
 
 def test_spec_tsvzed_reload_keeps_what_is_set_and_deleted_during_its_read(tmp_path, monkeypatch):
