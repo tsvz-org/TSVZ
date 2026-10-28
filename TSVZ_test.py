@@ -9022,6 +9022,31 @@ def test_tsvzed_legacy_a_reload_never_leaves_a_live_key_missing(tmp_path):
 	assert not misses and len(t) == 20000
 
 
+def test_tsvzed_spec_a_reload_never_leaves_a_live_key_missing(tmp_path):
+	# The same for a .tsvz store: its reload changes memory in place too.
+	import threading
+	p = str(tmp_path / 'swap.tsvz')
+	_touch(p, b''.join(b'k%d\t%d\n' % (i, i) for i in range(20000)))
+	t = _stopped(p, header='')
+	stop = threading.Event()
+	misses = []
+
+	def reader():
+		while not stop.is_set():
+			if 'k19999' not in t:
+				misses.append(1)
+
+	th = threading.Thread(target=reader)
+	th.start()
+	try:
+		for _ in range(5):
+			t.reload()
+	finally:
+		stop.set()
+		th.join()
+	assert not misses and len(t) == 20000 and list(t)[:2] == ['k0', 'k1']
+
+
 def test_tsvzed_legacy_set_changes_the_column_count_under_memlock(tmp_path):
 	# __setitem__ set correctColumnNum outside _memLock, under which a reload sets it too.
 	import threading

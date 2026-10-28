@@ -4474,12 +4474,11 @@ class TSVZed(OrderedDict):
 			finally:
 				reporter.flush()
 			with self._memLock:
-				OrderedDict.clear(self)
 				width = -1
 				if load is not None:
 					_specReplayQueued(load, self.appendQueue, self.delimiter)
-					for key, row in load.data.items():
-						OrderedDict.__setitem__(self, key, row)
+				self._replaceRows(load.data if load is not None else {})  # a live key never goes missing meanwhile
+				if load is not None:
 					self._specState = load.state
 					self.defaults = list(load.state.defaults)
 					self._parts, self._activePath = load.parts, load.active
