@@ -4703,9 +4703,9 @@ class TSVZed(OrderedDict):
 			# What is written is what is checked: the row as cut to the column count and filled with the defaults,
 			# and before memory, the queue or the column count change.
 			self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
-		self.correctColumnNum = newColumnNum
 		if key == DEFAULTS_INDICATOR_KEY:
-			with self._memLock:
+			with self._memLock:  # with memory and the queue: a reload sets the column count under it too
+				self.correctColumnNum = newColumnNum
 				self.defaults = value
 				if self.verbose:
 					self.__teePrintOrNot(f"Defaults set to {value}")
@@ -4718,6 +4718,7 @@ class TSVZed(OrderedDict):
 		if self.verbose:
 			self.__teePrintOrNot(f"Setting {key} to {value}")
 		with self._memLock:  # memory and the queue change together: see reload()
+			self.correctColumnNum = newColumnNum
 			if key in self:
 				if self[key] == value:
 					if self.verbose:
@@ -5093,7 +5094,7 @@ memoryOnly:{self.memoryOnly}
 			self._checkDelete(key)
 			value = OrderedDict.__getitem__(self, key)
 			OrderedDict.__delitem__(self, key)
-			if not self.memoryOnly:
+			if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
 				self.__appendEmptyLine(key)
 			self.lastUpdateTime = get_time_ns()
 		return key, value
@@ -5116,7 +5117,7 @@ memoryOnly:{self.memoryOnly}
 			self._checkDelete(key)
 			value = OrderedDict.__getitem__(self, key)
 			OrderedDict.__delitem__(self, key)
-			if not self.memoryOnly:
+			if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
 				self.__appendEmptyLine(key)
 			self.lastUpdateTime = get_time_ns()
 		return value
@@ -5644,7 +5645,8 @@ memoryOnly:{self.memoryOnly}
 		if headerBytes is not None:
 			line = file.readline().decode(self.encoding,errors='replace')
 			aftPos = file.tell()
-			if not line or not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
+			# A header line with no newline (the file ends right after it) is written again with one.
+			if not line.endswith('\n') or not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
 				header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
 				file.seek(0)
 				file.write(headerBytes+b'\n')
