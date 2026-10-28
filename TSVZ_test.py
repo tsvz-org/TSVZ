@@ -2202,7 +2202,6 @@ def test_spec_non_strict_creation_in_a_missing_codec_returns_instead_of_raising(
 
 
 def test_spec_checksums_arm_verify_and_span_parts(tmp_path, capsys):
-	import zlib
 	base = str(tmp_path / 'm.tsvz')
 	body = b'b\t2\n'
 	crc = '%08x' % (zlib.crc32(b'a\t1\r\n' + body) & 0xffffffff)
@@ -2225,7 +2224,6 @@ def test_spec_marker_values_are_not_stripped(capsys):
 
 
 def test_spec_a_checksum_value_with_a_space_is_a_mismatch(tmp_path, capsys):
-	import zlib
 	p = str(tmp_path / 'a.tsvz')
 	crc = '%08x' % (zlib.crc32(b'a\t1\n') & 0xffffffff)
 	_touch(p, ('#_checksum_crc32_#\na\t1\n#_checksum_crc32_#\t%s \n' % crc).encode())
@@ -2235,7 +2233,6 @@ def test_spec_a_checksum_value_with_a_space_is_a_mismatch(tmp_path, capsys):
 
 
 def test_spec_checksum_covers_other_algorithms_markers(tmp_path, capsys):
-	import zlib
 	p = str(tmp_path / 'a.tsvz')
 	sha_line = b'#_checksum_sha256_#\n'
 	crc = '%08x' % (zlib.crc32(sha_line + b'a\t1\n') & 0xffffffff)
@@ -4266,7 +4263,6 @@ def test_cli_read_piped_into_set_copies_the_store(tmp_path, ext):
 # CLI (spec §20.2): verify and parts
 # ==========================================================================
 def _crc32(data):
-	import zlib
 	return '%08x' % (zlib.crc32(data) & 0xffffffff)
 
 
@@ -5493,7 +5489,6 @@ def test_tsvz_serve_stops_cleanly_on_sighup(tmp_path):
 @pytest.mark.skipif(os.name != 'posix', reason='flock')
 def test_serve_reports_a_file_system_without_locks(tmp_path, monkeypatch):
 	"""M3: flock failing with ENOLCK is reported as such, not as another handler."""
-	import errno
 
 	def nolock(fd, operation):
 		raise OSError(errno.ENOLCK, 'No locks available')
@@ -5566,7 +5561,6 @@ def test_spec_a_read_starts_at_the_last_snapshot_part(tmp_path):
 	# Spec §19.10.3: a reader may skip the parts before a part that begins with #_snapshot_#.
 	# The parts here are crafted so that a skip shows: the snapshot part does not restate a,
 	# which a producer may not do (§19.10.2a), but which tells a skip from a full replay.
-	import gzip
 	p = str(tmp_path / 's.tsvz')
 	_touch(p, b'#h\tv\na\t1\n')
 	_touch(p + '.1', b'#h\tv\n#_snapshot_#\nb\t2\n')
@@ -6200,7 +6194,6 @@ def test_tsvzed_legacy_rewrite_does_not_cut_a_row_the_writer_appends_after_its_s
 def test_tsvzed_legacy_concurrent_sets_survive_repeated_rewrites(tmp_path):
 	# A rewrite in one thread and sets in another: no row set meanwhile is lost, whether the rewrite
 	# reloads (an append of its own is not an external change), cuts the file, or fixes it in place.
-	import threading
 	p = str(tmp_path / 'many.tsv')
 	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.0005, rewrite_on_load=False)
 	stop = threading.Event()
@@ -6546,7 +6539,6 @@ def _open_fds():
 @pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='counts open descriptors in /proc')
 @pytest.mark.parametrize('method', ['mapToFile', 'hardMapToFile'])
 def test_tsvzed_legacy_rewrite_whose_file_lock_fails_never_writes_unlocked(tmp_path, method, monkeypatch, capsys):
-	import errno
 	p = str(tmp_path / 'nolock.tsv')
 	t = _stopped(p)
 	_dirty(t)
@@ -6607,7 +6599,6 @@ class _FullDiskFile(object):
 		self._f = f
 
 	def write(self, data):
-		import errno
 		data = bytes(data)
 		self._f.write(data[:data.find(b'\n') + 1])
 		self._f.flush()
@@ -6615,7 +6606,6 @@ class _FullDiskFile(object):
 		raise OSError(errno.ENOSPC, 'No space left on device')
 
 	def flush(self):
-		import errno
 		_touch_mtime(self._f)
 		raise OSError(errno.ENOSPC, 'No space left on device')
 
@@ -6661,7 +6651,6 @@ def test_tsvzed_legacy_rewrite_that_fails_half_way_is_made_again_from_memory(tmp
 @pytest.mark.parametrize('how', ['lock fails', 'interrupted'])
 @pytest.mark.parametrize('method', ['hardMapToFile', 'clear_file', 'clear'])
 def test_tsvzed_legacy_rewrite_empties_the_file_only_once_it_is_locked(tmp_path, monkeypatch, capsys, suffix, how, method):
-	import errno
 	p = str(tmp_path / ('lockwait.' + suffix))
 	t = _stopped(p)
 	t['a'] = ['a', '1']
@@ -6806,7 +6795,6 @@ def test_tsvzed_legacy_reload_after_an_external_change_keeps_rows_set_since_the_
 
 
 def test_tsvzed_legacy_set_during_a_reload_is_written(tmp_path, monkeypatch):
-	import threading
 	p = str(tmp_path / 'during.tsv')
 	t = _stopped(p)
 	_dirty(t)
@@ -6846,7 +6834,6 @@ print(n)
 def test_tsvzed_legacy_rows_survive_rewrites_and_reloads_for_another_process_stress(tmp_path):
 	# The other writer is a process: lockf locks belong to a process, so a thread of this one would lose its
 	# lock whenever TSVZed closes a descriptor of the file.
-	import subprocess
 	p = str(tmp_path / 'two.tsv')
 	stop = str(tmp_path / 'stop')
 	t = TSVZ.TSVZed(p, header='key\tv', append_check_delay=0.0005, rewrite_interval=0.0001, rewrite_on_load=False)
@@ -6972,7 +6959,6 @@ def test_tsvzed_legacy_reload_clears_a_change_it_has_read(tmp_path):
 
 
 def test_tsvzed_legacy_own_writes_never_make_the_writer_rewrite_stress(tmp_path, capsys):
-	import threading
 	p = str(tmp_path / 'desync.tsv')
 	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.0001, rewrite_interval=0, rewrite_on_load=False)
 	calls = []
@@ -7109,7 +7095,6 @@ def test_tsvzed_legacy_clear_drops_the_rows_set_before_it(tmp_path):
 
 
 def test_tsvzed_legacy_clear_and_sets_in_another_thread_agree_stress(tmp_path):
-	import threading
 	p = str(tmp_path / 'clrs.tsv')
 	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.0002, rewrite_on_load=False)
 	stop = threading.Event()
@@ -7295,7 +7280,6 @@ class _BufferedFullDiskFile(object):
 		return len(data)
 
 	def flush(self):
-		import errno
 		if not self._pending:
 			return
 		fits, self._pending = self._pending[:self._room], self._pending[self._room:]
@@ -7323,7 +7307,6 @@ def test_tsvzed_legacy_rewrite_whose_flush_or_fsync_fails_is_made_again(tmp_path
 	# release_file_obj swallowed a failed flush, fsync or close: the rewrite whose bytes never reached the disk (they
 	# sat in the file's or the codec's buffer) was marked done, and after close() the file was empty or header-only.
 	# Its time was also noted before close() wrote the buffer again, which changes it: the damage was then reloaded.
-	import errno
 	p = str(tmp_path / ('buf.' + suffix))
 	t = _stopped(p)
 	rows = _many(t, 20)
@@ -7412,7 +7395,6 @@ def _full_tmpfs(tmp_path, *args, **kwargs):
 	(root on Linux)."""
 	import json
 	import shutil
-	import subprocess
 	if not sys.platform.startswith('linux') or os.geteuid() != 0 or not shutil.which('unshare'):
 		pytest.skip('a real full disk needs root on Linux and unshare (a tmpfs in a private mount namespace)')
 	mnt = tmp_path / 'mnt'
@@ -7467,7 +7449,6 @@ def test_tsvzed_legacy_rewrite_is_all_on_disk_before_it_unlocks_the_file(tmp_pat
 def test_tsvzed_legacy_failed_release_reports_the_real_error(tmp_path, monkeypatch, capsys, suffix, verbose):
 	# release_file_obj logged file.name once it had closed the file: BZ2File and LZMAFile have no name before
 	# Python 3.13 (AttributeError), and a closed one refuses it since (ValueError), which hid the real error.
-	import errno
 	p = str(tmp_path / ('r.' + suffix))
 	t = _stopped(p, verbose=verbose)
 	t['a'] = ['a', '1']
@@ -7566,7 +7547,6 @@ def test_tsvzed_legacy_failed_rewrite_and_its_fallback_count_as_one_try(tmp_path
 def test_tsvzed_legacy_write_on_a_file_system_that_cannot_fsync(tmp_path, monkeypatch, capsys, suffix, method, code):
 	# Where fsync always fails because the file system cannot sync (EINVAL, ENOTSUP), a write whose data was written
 	# is a written one; only an fsync error that may mean the data is not on disk (EIO, ENOSPC) fails it.
-	import errno
 	if not hasattr(errno, code):
 		pytest.skip('no errno.' + code + ' here')
 	p = str(tmp_path / ('nosync.' + suffix))
@@ -7602,7 +7582,6 @@ def test_tsvzed_legacy_write_on_a_file_system_that_cannot_fsync(tmp_path, monkey
 
 def _failing_rewrite(monkeypatch, partial=b''):
 	"""Make every rewrite fail with ENOSPC once it has emptied the file and written ``partial`` (as it is)."""
-	import errno
 
 	def full(file, *args, **kwargs):  # a whole rewrite, right after the truncate
 		file.write(partial)
@@ -7749,7 +7728,6 @@ class _FailingTruncate(object):
 		self._f = f
 
 	def truncate(self, *args):
-		import errno
 		raise OSError(errno.EIO, 'Input/output error')
 
 	def __getattr__(self, name):
@@ -7776,7 +7754,6 @@ def test_tsvzed_legacy_get_file_obj_whose_truncate_fails_does_not_take_the_file_
 def test_tsvzed_legacy_removed_file_that_cannot_be_made_again_does_not_leave_the_store_stuck(tmp_path, monkeypatch, suffix):
 	# A rewrite that cannot make a removed file again (the open fails) leaves the store dirty and damaged, so that
 	# a later one makes it, merging the file another process made meanwhile: the store follows the file again.
-	import errno
 	p = str(tmp_path / ('gone.' + suffix))
 	t = _stopped(p)
 	t['a'] = ['a', '1']
@@ -7800,7 +7777,6 @@ def test_tsvzed_legacy_removed_file_that_cannot_be_made_again_does_not_leave_the
 
 
 def test_tsvzed_legacy_background_writer_follows_a_removed_file_it_could_not_make_again(tmp_path, monkeypatch):
-	import errno
 	p = str(tmp_path / 'gonebg.tsv')
 	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001, teeLogger=_ErrorLog())
 	t['a'] = ['a', '1']
@@ -8045,7 +8021,6 @@ class _QuotaFileIO(io.FileIO):
 		self.room = room
 
 	def write(self, data):
-		import errno
 		if not self.room:
 			raise OSError(errno.ENOSPC, 'No space left on device')
 		data = bytes(data)[:self.room]
@@ -8061,7 +8036,6 @@ def test_tsvzed_legacy_compressed_rewrite_cut_short_mid_stream_then_appended_to_
 	# whole member of its own) is the tail the merge decodes, from its first byte: a clean member sequence, which
 	# decodes whole, although the file read from its start stops at the cut. (The stub of _failing_rewrite writes
 	# raw bytes as the partial; this is the codec's own writer cut short by the disk.)
-	import random
 	p = str(tmp_path / ('cut.' + suffix))
 	codec = suffix.rpartition('.')[2]
 	t = _stopped(p)
@@ -8245,7 +8219,6 @@ def test_tsvzed_legacy_append_to_an_empty_file_writes_the_header_first(tmp_path,
 	real = TSVZ._writeLines
 
 	def full(*args, **kwargs):  # right after the truncate, before the first byte
-		import errno
 		raise OSError(errno.ENOSPC, 'No space left on device')
 
 	TSVZ._writeLines = full
@@ -8400,7 +8373,6 @@ def test_tsvzed_legacy_merge_refused_for_another_header_still_reports_a_damaged_
 	t.hardMapToFile()
 	monkeypatch.undo()
 	assert t._known[1] == 0
-	import random
 	rng = random.Random(2)
 	theirs = b'id\tname\n' + b''.join(b'x%d\t%x\n' % (i, rng.getrandbits(64)) for i in range(20000))  # decoded in pieces
 	_append_external(p, TSVZ._compressBytes('gz', theirs) + b'\x1f\x8b\x08\x00 damaged member')
@@ -8821,8 +8793,6 @@ def test_tsvzed_legacy_ctrl_c_during_a_rewrite_never_cuts_it(tmp_path, mode):
 	# A Ctrl-C lands in the wait of the thread that asked for the write, never in the write: the store's writer
 	# thread finishes it, also once the program ends (one in the constructor's rewrite of a .tsv.gz left nothing
 	# readable). At exit a first Ctrl-C keeps waiting for the write, and says so; a second abandons it.
-	import gzip
-	import subprocess
 	p = str(tmp_path / 'ki.tsv.gz')
 	expected = dict(('k%d' % i, ['k%d' % i, 'new%d' % i]) for i in range(5000))
 	with gzip.open(p, 'wt') as f:
@@ -8888,8 +8858,6 @@ def test_tsvzed_legacy_ctrl_c_in_an_append_leaves_writelock_free_and_the_row_wri
 
 def test_tsvzed_legacy_release_file_obj_lets_go_of_writelock_once(tmp_path, monkeypatch):
 	# Once its sync failed, release_file_obj let go of writeLock, and then again when another thread had taken it.
-	import errno
-	import threading
 	p = str(tmp_path / 'once.tsv')
 	t = _stopped(p)
 	f = t.get_file_obj('ab')
@@ -8999,7 +8967,6 @@ def test_tsvzed_legacy_another_process_append_is_read_from_where_the_store_left_
 
 def test_tsvzed_legacy_a_reload_never_leaves_a_live_key_missing(tmp_path):
 	# A reload emptied memory and filled it again: another thread found live keys missing meanwhile.
-	import threading
 	p = str(tmp_path / 'swap.tsv')
 	_touch(p, b'key\tval\n' + b''.join(b'k%d\t%d\n' % (i, i) for i in range(20000)))
 	t = _stopped(p)
@@ -9024,7 +8991,6 @@ def test_tsvzed_legacy_a_reload_never_leaves_a_live_key_missing(tmp_path):
 
 def test_tsvzed_spec_a_reload_never_leaves_a_live_key_missing(tmp_path):
 	# The same for a .tsvz store: its reload changes memory in place too.
-	import threading
 	p = str(tmp_path / 'swap.tsvz')
 	_touch(p, b''.join(b'k%d\t%d\n' % (i, i) for i in range(20000)))
 	t = _stopped(p, header='')
@@ -9049,7 +9015,6 @@ def test_tsvzed_spec_a_reload_never_leaves_a_live_key_missing(tmp_path):
 
 def test_tsvzed_legacy_set_changes_the_column_count_under_memlock(tmp_path):
 	# __setitem__ set correctColumnNum outside _memLock, under which a reload sets it too.
-	import threading
 	t = _stopped(str(tmp_path / 'cols.tsv'), header='')
 	assert t.correctColumnNum == -1
 	setter = threading.Thread(target=t.__setitem__, args=('a', ['a', '1', '2']))
