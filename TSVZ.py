@@ -5,7 +5,7 @@
 # dependencies = [
 # ]
 # ///
-"""TSVZ 4.2: a key-value store kept in a delimiter-separated text file.
+"""TSVZ: a key-value store kept in a delimiter-separated text file.
 
 Plain ``.tsv`` / ``.csv`` / ``.nsv`` / ``.psv`` files (and any other
 extension) keep the exact TSVZ 3.39 format. ``.tsvz`` / ``.csvz`` / ``.nsvz``
@@ -41,10 +41,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '4.9'
+version = '5.0'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-10-16'
+COMMIT_DATE = '2026-10-28'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
