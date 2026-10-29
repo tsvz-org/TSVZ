@@ -5760,8 +5760,8 @@ memoryOnly:{self.memoryOnly}
 
 	def _remakeDue(self):
 		"""True when the next commit makes the file again from memory (_remake), not while a rewrite was refused or
-		failed lately (the background writer's back-off)."""
-		return self._remake and not self._refusalPending() and not self._failing('rewrite')
+		failed lately (the background writer's back-off), unless the store is closing (its last try)."""
+		return self._remake and (self._closing or not self._refusalPending() and not self._failing('rewrite'))
 
 	def _commitOnce(self):
 		"""_commit(), once: 'remake' when another writer's change it read under the lock is damage (_remakeDue)."""
@@ -5816,6 +5816,8 @@ memoryOnly:{self.memoryOnly}
 					# back-off): memory holds the only good copy, as after a rewrite that fails part way (the merge rule).
 					self.dirty = self.deSynced = True
 					self._damaged, self._unseen = True, False
+				elif self._remake:
+					self.dirty = True  # appended after the damage while a remake is refused: the next rewrite makes it again
 				if known is None and not self._damaged:
 					# Another process's change is not known until it is read: the next tick reads all of it, whatever
 					# the file's time says (a time that ticks coarsely may not have moved).

@@ -9877,7 +9877,8 @@ def test_tsvzed_legacy_refusal_reported_while_running_is_reported_again_at_close
 
 
 def test_tsvzed_legacy_refusal_of_a_store_whose_writer_thread_is_stopped_says_none_is_tried_again(tmp_path, capsys):
-	# A forked child's store has no writer thread, and was never closed: nothing tries a rewrite on its own there.
+	# A store whose writer thread has stopped without close() (as in a forked child, which has none): nothing tries a
+	# rewrite on its own there.
 	p = str(tmp_path / 'child.tsv')
 	_touch(p, LEGACY_KEY_ROW)
 	t = _stopped(p, header='id\tv', encoding='ascii')
@@ -9952,6 +9953,29 @@ def test_tsvzed_legacy_rewrite_failure_that_lasts_to_close_is_reported_again(tmp
 	t.close()
 	out = capsys.readouterr().out
 	assert 'Failed to write at mapToFile()' in out and 'not reported again' not in out, out
+
+
+@pytest.mark.parametrize('when', ['queued', 'committed'])
+def test_tsvzed_legacy_close_makes_again_a_damaged_file_after_a_refused_mapToFile(tmp_path, when):
+	# An explicit mapToFile() of a store that read damage another writer left is refused (a row changed in place to
+	# text ASCII cannot hold). With that row fixed in place, a row set within the second is still queued at close(),
+	# or appended after the damage: close() makes the file again from memory either way, and the row reads back.
+	p = str(tmp_path / 'd.tsv.gz')
+	cut = TSVZ._compressBytes('gzip', b'zz\t1\nyy\t1\n' * 50)[:-30]
+	_touch(p, TSVZ._compressBytes('gzip', b'id\tv\nok\t1\nk\t1\n') + cut + TSVZ._compressBytes('gzip', b'after\t1\n'))
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, verbose=False,
+					append_check_delay=60 if when == 'queued' else 0.01)
+	assert t._remake
+	t['ok'][1] = 'r\xe9'
+	with pytest.raises(TSVZ.TSVZEncodeError):
+		t.mapToFile()
+	t['ok'][1] = '2'
+	t['new'] = ['new', '1']
+	if when == 'committed':
+		assert _wait_for(lambda: not t.appendQueue)
+	t.close()
+	back = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
+	assert back['new'] == ['new', '1'] and back['ok'] == ['ok', '2']
 
 
 def test_tsvzed_legacy_close_interrupted_leaves_a_store_that_runs_on(tmp_path, monkeypatch):
