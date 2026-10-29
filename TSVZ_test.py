@@ -8821,7 +8821,11 @@ def test_tsvzed_legacy_ctrl_c_during_a_rewrite_never_cuts_it(tmp_path, mode):
 	finishing = proc.stderr.count('is being finished; Ctrl-C again to abandon it')
 	if mode == 'twice':
 		assert finishing == 1 and time.time() - started < 60, proc.stderr
-		assert _back(p) != expected  # abandoned: the program did not wait out the write
+		try:  # abandoned: not written whole (left as it was, or new bytes over the old ones)
+			with gzip.open(p) as f:
+				assert f.read().count(b'\n') != 5001
+		except (OSError, EOFError):
+			pass  # cut part way: damaged
 		return
 	assert finishing == (mode == 'exit'), proc.stderr
 	assert mode == 'exit' or 'KeyboardInterrupt' in proc.stderr, proc.stderr
