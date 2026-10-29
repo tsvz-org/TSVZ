@@ -5758,6 +5758,8 @@ memoryOnly:{self.memoryOnly}
 			if missing:
 				return self
 			self.dirty = True  # failed or refused: the rewrite that gets through makes the file again
+			if not self._refusalPending():  # failed: memory holds the only good copy (the merge rule), as when one
+				self._damaged, self._unseen = True, False  # fails part way; what follows the bytes known is merged
 		with self.writeLock:
 			try:
 				if self.verbose:

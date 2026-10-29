@@ -9606,8 +9606,6 @@ def test_tsvzed_legacy_file_rotated_after_an_unread_change_is_made_again_merging
 	b['b1'] = ['b1', 'B']
 	b.commitAppendToFile()  # the other store makes it again first
 	a.commitAppendToFile()
-	monkeypatch.setattr(TSVZ, '_FAILURE_RETRY_FIRST', 0)
-	a._failures.clear()
 	a.rewrite()
 	assert sorted(_back(p)) == ['a0', 'a1', 'a2', 'b0', 'b1']
 	assert 'Overwriting external changes' not in capsys.readouterr().out
@@ -9634,6 +9632,32 @@ def test_tsvzed_legacy_remake_that_fails_to_open_the_file_is_made_again_by_the_n
 	t.commitAppendToFile()
 	t.rewrite()  # the tick's, or close()'s
 	assert sorted(_back(p)) == ['a0', 'a1']
+
+
+def test_tsvzed_legacy_remake_that_fails_to_open_keeps_its_rows_through_a_read(tmp_path, monkeypatch):
+	# A remake of a damaged file that failed before it wrote anything left the store undamaged: the rows it appended
+	# after the damage were lost from memory by the next read of the file (which stops at the damage), here one that
+	# another process's append started. Memory now holds the only good copy, as after a rewrite that fails part way.
+	p = str(tmp_path / 'damaged.tsv.gz')
+	_touch(p, TSVZ._compressBytes('gzip', b'key\tval\na0\tA\n') + b'garbage echoed\n')
+	t = _stopped(p)
+	real = TSVZ._openUntruncated
+	tries = []
+
+	def opening(path):
+		if not tries:
+			tries.append(1)
+			raise OSError(errno.EMFILE, 'Too many open files')
+		return real(path)
+
+	monkeypatch.setattr(TSVZ, '_openUntruncated', opening)
+	t['a1'] = ['a1', 'A']
+	t.commitAppendToFile()
+	TSVZ.appendTabularFile(p, ['c1', 'C'], header='key\tval', verbose=False)
+	t['a2'] = ['a2', 'A']
+	t.checkExternalChanges()
+	t.rewrite()
+	assert sorted(t) == ['a0', 'a1', 'a2', 'c1'] and sorted(_back(p)) == ['a0', 'a1', 'a2', 'c1']
 
 
 if __name__ == '__main__':
