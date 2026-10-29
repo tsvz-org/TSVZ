@@ -9448,7 +9448,7 @@ def test_tsvzed_legacy_rows_appended_after_another_writer_damage_survive_a_fresh
 	t['mine'] = ['mine', 'M']
 	t.commitAppendToFile()
 	t.close()
-	fresh = TSVZ.TSVZed(p, header='key\tval', verbose=False)  # rewrite_on_load
+	fresh = TSVZ.TSVZed(p, header='key\tval', verbose=False)  # the next program's open
 	fresh.close()
 	back = _back(p)
 	assert back['mine'] == ['mine', 'M'] and all('k%d' % i in back for i in range(2000))

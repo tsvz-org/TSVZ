@@ -4436,6 +4436,7 @@ class TSVZed(OrderedDict):
 			return
 		self._readWhole = True  # memory's defaults now differ from the file's: another process's change is read whole
 		self.defaults = defaults
+		self._readWhole = True  # again: a read that ended in between cleared it
 
 	def load(self):
 		self.reload()
