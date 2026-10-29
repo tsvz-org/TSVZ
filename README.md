@@ -224,14 +224,19 @@ write (the call still raises `KeyboardInterrupt`). At exit a write in progress i
 finished: a Ctrl-C then says so and keeps waiting, and a second one abandons it. A
 closed store is freed. (`get_file_obj()` and `release_file_obj()`, kept from 3.39,
 hand the locked file to the calling thread.) A file another process removed is made
-again from memory by the store's next write, an append included.
+again from memory by the store's next write, an append included. So is a compressed
+file another writer left damaged (L5: every read stops at the damage, so rows
+appended after it would be read by no one); the bytes after the damage go. Appends
+that do not read the store first (`tsvz set`, `appendTabularFile`, `TSVZedLite`)
+still land after it ([docs/limitations.md](docs/limitations.md)).
 
 It knows the size and SHA-256 of the bytes it last read or wrote. When another process
 has changed the file, and it is the same file (device and inode) and still begins with
-those bytes, and nothing this store set is still waiting to be written, only what
-follows is read and applied to memory, as a read of the file applies it: memory keeps
-an order set by `move_to_end`, and its `#` keys. Any other change reloads the file,
-changing memory in place, so a live key is never missing meanwhile.
+those bytes, nothing this store set is still waiting to be written, and
+`setDefaults()` has not changed its defaults since, only what follows is read and
+applied to memory, as a read of the file applies it: memory keeps an order set by
+`move_to_end`, and its `#` keys. Any other change reloads the file, changing memory
+in place, so a live key is never missing meanwhile.
 
 A rewrite writes over the file and then cuts it to its new length, so a reader never
 meets it emptied. One that fails part way (a full disk, an I/O error), or that cannot

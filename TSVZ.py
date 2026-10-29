@@ -24,6 +24,7 @@ import io
 import os
 import re
 import shutil
+import stat
 import threading
 import time
 import sys
@@ -2087,7 +2088,6 @@ def getFileUpdateTimeNs(fileName):
 
 def _updateTimeNs(st):
 	"""getFileUpdateTimeNs() of the file ``st`` is the stat of: 0 for one that is not a regular file (/dev/null)."""
-	import stat
 	return st.st_mtime_ns if stat.S_ISREG(st.st_mode) else 0
 
 def get_time_ns():
@@ -4434,8 +4434,8 @@ class TSVZed(OrderedDict):
 		if not self._constructed:
 			self.defaults = defaults
 			return
-		self.defaults = defaults
 		self._readWhole = True  # memory's defaults now differ from the file's: another process's change is read whole
+		self.defaults = defaults
 
 	def load(self):
 		self.reload()
@@ -5163,6 +5163,9 @@ memoryOnly:{self.memoryOnly}
 	# another process's appends (the merge rule, _syncFrom); _known is then what the file held when it stopped.
 	_damaged = False
 	_readWhole = False  # setDefaults() gave memory defaults the file may not hold: its next change is read whole
+	# A read under the file lock met damage another writer left (a compressed file: every read of it stops there, L5).
+	# Rows appended after it would be lost to the next read, so the next commit makes the file again from memory.
+	_remake = False
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
 
@@ -5325,13 +5328,14 @@ memoryOnly:{self.memoryOnly}
 					# Written over what the file holds, then cut to its end (spec §19.8): a reader that takes no lock
 					# never meets it emptied, and a write cut short leaves the old bytes after the new ones.
 					_writeLines(f, header, lines, codec=_fileCodec(self._fileName))
-					f.truncate()
+					if stat.S_ISREG(os.fstat(f.fileno()).st_mode):  # /dev/null cannot be cut
+						f.truncate()
 				else:
 					self._writeInPlace(f, header, lines)
 				f.flush()
 				_fsync(f.fileno())
 				end = f.tell()  # its own bytes end here: a writer that takes no lock may append after them
-				self._damaged = False
+				self._damaged = self._remake = False
 				self.dirty = self.deSynced = False
 			except BaseException:
 				if started:
@@ -5464,9 +5468,10 @@ memoryOnly:{self.memoryOnly}
 		read apart from memory, then memory is changed in place under _memLock, never emptied (a key the file still
 		holds is never missing for another thread) and takes the file's order. _known is then the bytes read."""
 		seen = getFileUpdateTimeNs(self._fileName)  # before the read: a change during or after it is seen by the next check
-		self._readWhole = False  # memory takes the file's defaults
+		self._readWhole = False  # the read gives memory the file's defaults
 		loaded = _TSVZedLoad(self, self.correctColumnNum, list(self.defaults))
 		known = _KNOWN_NOTHING
+		damaged = False
 		if f is not None:
 			codec = _fileCodec(self._fileName)
 			reader = _HashingReader(f)
@@ -5490,8 +5495,9 @@ memoryOnly:{self.memoryOnly}
 							stream.close()
 				# Read up to damage without the lock: maybe a whole rewrite still being written, so not known. Under it,
 				# the damage stays: the bytes after it are known as they are (what follows them is read on from there).
-				cut = not locked and reporter.has('damaged')
-				if locked and reporter.has('damaged'):
+				damaged = reporter.has('damaged')
+				cut = not locked and damaged
+				if locked and damaged:
 					while reader.read(1 << 20):
 						pass
 			finally:
@@ -5514,6 +5520,7 @@ memoryOnly:{self.memoryOnly}
 				self.correctColumnNum = -1
 		self._known = known
 		self._damaged = False  # memory is what the file holds, damaged or not
+		self._remake = locked and damaged
 		self.externalFileUpdateTime = self.lastUpdateTime = seen
 		self.deSynced = False  # memory is the file again: a change seen before needs no rewrite
 		return known is None and f is not None
@@ -5724,12 +5731,16 @@ memoryOnly:{self.memoryOnly}
 			if self.verbose:
 				self.__teePrintOrNot("Memory only mode. Append queue cleared.")
 			return self
-		if not os.path.exists(self._fileName):
+		missing = not os.path.exists(self._fileName)
+		if missing or (self._remake and not self._refusalPending()):
 			# Removed (rm, a log rotation): memory is the only copy, so the file is made again from it, as a rewrite
 			# makes it, not begun with these rows alone (the next read would then drop every other row from memory).
+			# Damaged where every read stops (_remake): made again too; a rewrite refused, these rows are appended.
 			if self._hardMapToFile(sync=True):
 				self._worked('append')
-			return self
+				return self
+			if missing:
+				return self
 		with self.writeLock:
 			try:
 				if self.verbose:
@@ -5771,7 +5782,6 @@ memoryOnly:{self.memoryOnly}
 						_fsync(f.fileno())  # a sync that fails fails the append: the rows stay queued
 					finally:
 						reporter.flush()
-					import stat
 					if known is not None and stat.S_ISREG(os.fstat(f.fileno()).st_mode):  # /dev/null holds none of it
 						# What it wrote, not what the file now holds: another writer's append that lands meanwhile
 						# (one that takes no lock) is still to be read, and one that landed first fails the next look.

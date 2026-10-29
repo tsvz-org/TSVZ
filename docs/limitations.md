@@ -79,3 +79,27 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   bookkeeping.
 - Revisit when: someone uses `get_file_obj()` on compressed stores.
 - Approved: 2026-10-29, the user chose "Defer (Recommended)".
+
+### A compressed member cut short by a writer killed mid-append can end its cut line with garbage
+- Kind: deferred
+- What the operator sees: a writer killed part way through an append to a `.tsv.gz` (more rarely `.xz`) leaves a
+  member cut short; once another member is appended after it, Python's GzipFile decodes some of that member's bytes
+  as the rest of the cut line before it fails at the damage. A read then holds that one row with a garbage value
+  (in 72 of 200 random cases on gzip, 2 of 200 on xz, none on bz2; 4.9 and main do the same), and a `TSVZed`
+  opened with its defaults writes it back.
+- Why: the fix is a reader of its own for compressed full reads (`readTabularFile`, `TSVZed`, the CLI) that
+  decodes member by member, uses a member only once it checks out and keeps only the whole lines of a cut one,
+  holding each member's text until it is checked: a reader redesign of its own.
+- Revisit when: someone finds a garbage value in a compressed store after a crash.
+- Approved: 2026-10-29, the user chose "Defer (Recommended)".
+
+### Appends that do not read the store first land after damage, where reads do not reach them
+- Kind: known limitation
+- What the operator sees: once another writer has left a compressed `.tsv` file damaged, every read stops at the
+  damage (L5). A running `TSVZed` makes the file again from memory at its next write, so its rows stay readable,
+  but a one-shot `tsvz set`, `appendTabularFile()` or a `TSVZedLite` appends without reading the file first, so its
+  rows land after the damage, where no read reaches them, and the next `TSVZed` or scrub that makes the file again
+  drops them. 4.9 and main do the same.
+- Why: covering them would make every such append read the whole file first; today `tsvz set` is one append.
+- Revisit when: someone mixes one-shot appends with crashing writers on one compressed file.
+- Approved: 2026-10-29, the user chose "Known limitation (Recommended)".

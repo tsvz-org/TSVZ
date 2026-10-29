@@ -9423,5 +9423,57 @@ def test_tsvzed_legacy_file_removed_before_the_locked_read_is_not_made_empty(tmp
 	assert len(_back(p)) == 101
 
 
+@pytest.mark.parametrize('suffix', ['tsv.gz', 'tsv.bz2', 'tsv.xz'])
+@pytest.mark.parametrize('damage', ['rewrite', 'append'])
+def test_tsvzed_legacy_rows_appended_after_another_writer_damage_survive_a_fresh_open(tmp_path, suffix, damage):
+	# Another writer left the file damaged (its whole rewrite stopped before the cut, or its append part way), and
+	# every read of a compressed file stops at the damage (L5): a running store appended its rows after it, so the
+	# next store to open the file never saw them, and its rewrite on load wrote the file without them.
+	p = str(tmp_path / ('damaged.' + suffix))
+	codec = suffix.rpartition('.')[2]
+	rng = random.Random(7)
+	_touch(p, TSVZ._compressBytes(codec, b'key\tval\n' + b''.join(b'k%d\t%032x\n' % (i, rng.getrandbits(128)) for i in range(2000)), memberSize=4096))
+	t = _stopped(p)
+	if damage == 'rewrite':
+		with open(p, 'r+b') as f:  # new streams over the old ones, the cut never made
+			f.write(TSVZ._compressBytes(codec, b'key\tval\n' + b''.join(b'k%d\tNEW\n' % i for i in range(2000))))
+	else:
+		torn = TSVZ._compressBytes(codec, b''.join(b'n%d\t%032x\n' % (i, rng.getrandbits(128)) for i in range(500)))
+		_append_external(p, torn[:len(torn) // 2])  # its writer killed part way
+	t.checkExternalChanges()
+	t.rewrite()
+	t['mine'] = ['mine', 'M']
+	t.commitAppendToFile()
+	t.close()
+	fresh = TSVZ.TSVZed(p, header='key\tval', verbose=False)  # rewrite_on_load
+	fresh.close()
+	back = _back(p)
+	assert back['mine'] == ['mine', 'M'] and all('k%d' % i in back for i in range(2000))
+
+
+def test_tsvzed_legacy_damaged_file_whose_remake_is_refused_still_gets_the_rows_appended(tmp_path, capsys):
+	# A rewrite refused (a row changed in place to text the encoding cannot hold) does not hold the rows back: they
+	# are appended after the damage, as before.
+	p = str(tmp_path / 'refused.tsv.gz')
+	_touch(p, TSVZ._compressBytes('gzip', b'key\tval\na\t1\n') + b'garbage echoed\n')
+	t = _stopped(p, encoding='latin-1')
+	t['a'][1] = '€'  # no latin-1 for it: a rewrite is refused
+	t['b'] = ['b', 'B2']
+	t.commitAppendToFile()
+	assert not t.appendQueue and b'b\tB2\n' in TSVZ._decodeMembers('gzip', open(p, 'rb').read())[0]
+	assert 'Refused at hardMapToFile()' in capsys.readouterr().out
+
+
+@pytest.mark.skipif(not os.path.exists('/dev/null'), reason='needs /dev/null')
+def test_tsvzed_legacy_rewrite_of_a_store_on_dev_null_succeeds(capsys):
+	# A rewrite cut /dev/null to its new length, which a character device refuses (EINVAL): every rewrite failed.
+	t = _stopped('/dev/null')
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	t['a'] = ['a', '2']
+	t.rewrite(force=True)
+	assert t['a'] == ['a', '2'] and not t.dirty and 'Failed' not in capsys.readouterr().out
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
