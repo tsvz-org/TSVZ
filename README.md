@@ -224,8 +224,10 @@ write (the call still raises `KeyboardInterrupt`). At exit a write in progress i
 finished: a Ctrl-C then says so and keeps waiting, and a second one abandons it. A
 closed store is freed. (`get_file_obj()` and `release_file_obj()`, kept from 3.39,
 hand the locked file to the calling thread.) A file another process removed is made
-again from memory by the store's next write, an append included. So is a compressed
-file another writer left damaged (L5: every read stops at the damage, so rows
+again from memory by the store's next write, an append included; while that rewrite
+fails or is refused, the rows are appended to a new file there, and memory keeps all of
+them for the rewrite that gets through. A compressed file another writer left damaged
+is made again too (L5: every read stops at the damage, so rows
 appended after it would be read by no one); the bytes after the damage go. While that
 rewrite fails, the rows are appended after the damage and memory keeps them for the
 next rewrite that gets through (`close()` tries one more, whatever `rewrite_on_exit`

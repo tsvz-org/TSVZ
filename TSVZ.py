@@ -5203,7 +5203,8 @@ memoryOnly:{self.memoryOnly}
 			raise error
 		message = str(error)
 		if self._closing or not self.appendThread.is_alive():
-			retry = "None is tried again on its own: this store's writer thread is stopping or stopped (close())."
+			retry = ("None is tried again on its own: this store's writer thread is stopping or stopped (close(), a "
+					 "forked child).")
 		elif self.rewrite_interval or self.deSynced:  # deSynced: the file is to be made again, at any interval
 			retry = f"A rewrite is tried again at most every {max(self.rewrite_interval, _REFUSED_RETRY_SECONDS):g} s."
 		else:
@@ -5213,8 +5214,8 @@ memoryOnly:{self.memoryOnly}
 		if self._refusalReported == (message, retry):
 			return
 		self._refusalReported = (message, retry)
-		damaged = (" The file is damaged (a rewrite of this object's failed) or was removed: until a rewrite gets "
-				   "through, memory holds the only good copy." if self._damaged else "")
+		damaged = (" The file is damaged (a rewrite of this object's failed) or was removed (rows are appended to a new "
+				   "one): until a rewrite gets through, memory holds the only good copy." if self._damaged else "")
 		self.__teePrintOrNot(f"Refused at {where} to {self._fileName}: {message}. The file is left as it is, and rows that can "
 							 f"be written are still appended.{damaged} It is rewritten once every row can be written: set or delete the row; "
 							 f"a key that cannot be written cannot be deleted either, so for one, edit the file, clear() the store "
@@ -5872,9 +5873,13 @@ memoryOnly:{self.memoryOnly}
 					self._specSync()
 				else:
 					self._closing = True
-					# A damaged file is tried once more, however lately a rewrite was refused or failed: memory holds the
-					# only good copy, and goes with the store.
-					self.rewrite(force=self.rewrite_on_exit or self._damaged)  # Ensure any final sync operations are performed
+					try:
+						# A damaged file is tried once more, however lately a rewrite was refused or failed: memory holds
+						# the only good copy, and goes with the store.
+						self.rewrite(force=self.rewrite_on_exit or self._damaged)  # Ensure any final sync operations are performed
+					except BaseException:
+						self._closing = False  # a Ctrl-C stopped the wait: the store runs on
+						raise
 			self._finish()
 			if self.verbose:
 				self.__teePrintOrNot(f"Append thread for {self._fileName} stopped")

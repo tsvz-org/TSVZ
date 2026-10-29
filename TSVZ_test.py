@@ -9876,6 +9876,33 @@ def test_tsvzed_legacy_refusal_reported_while_running_is_reported_again_at_close
 	assert 'memory holds the only good copy' in refused[1] and _bytes(p) == LEGACY_KEY_ROW
 
 
+def test_tsvzed_legacy_refusal_of_a_store_whose_writer_thread_is_stopped_says_none_is_tried_again(tmp_path, capsys):
+	# A forked child's store has no writer thread, and was never closed: nothing tries a rewrite on its own there.
+	p = str(tmp_path / 'child.tsv')
+	_touch(p, LEGACY_KEY_ROW)
+	t = _stopped(p, header='id\tv', encoding='ascii')
+	t.rewrite(force=True)
+	refused = _refusals(capsys)
+	assert len(refused) == 1 and 'None is tried again on its own' in refused[0] and 'a forked child' in refused[0]
+	assert not t._closing and _bytes(p) == LEGACY_KEY_ROW
+
+
+def test_tsvzed_legacy_close_interrupted_leaves_a_store_that_runs_on(tmp_path, monkeypatch):
+	# A Ctrl-C that stops close()'s wait leaves the store running (its writer finishes the job): it is not closing,
+	# and a later refusal says it is tried again.
+	t = TSVZ.TSVZed(str(tmp_path / 'on.tsv'), header='key\tval', append_check_delay=0.01)
+
+	def interrupted(*args, **kwargs):
+		raise KeyboardInterrupt
+
+	monkeypatch.setattr(t, 'rewrite', interrupted)
+	with pytest.raises(KeyboardInterrupt):
+		t.close()
+	assert not t._closing and t.appendThread.is_alive()
+	monkeypatch.undo()
+	t.close()
+
+
 def test_tsvzed_legacy_close_makes_a_damaged_file_again_however_lately_a_rewrite_was_refused(tmp_path, monkeypatch):
 	monkeypatch.setattr(TSVZ, '_REFUSED_RETRY_SECONDS', 60.0)  # no retry of the background writer's in between
 	p = str(tmp_path / 'last.tsv')
