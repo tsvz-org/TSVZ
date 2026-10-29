@@ -5727,8 +5727,8 @@ memoryOnly:{self.memoryOnly}
 	def _commit(self):
 		"""commitAppendToFile() for a legacy file, under writeLock and the file lock. The rows stay queued until they are
 		on disk (a merge keeps memory's row for a queued key). When the file held what _known says, what it appended
-		is known too and its time noted; else another process's change is still to be taken in (a compressed file's at
-		once, under the lock: if it is damage every read stops at, the file is made again from memory instead)."""
+		is known too and its time noted; else another process's change is still to be taken in (in a compressed file,
+		what it appended is first looked at for damage every read stops at: then the file is made again from memory)."""
 		if self._commitOnce() == 'remake':
 			self._commitOnce()  # the lock let go of: the file is made again from memory
 		return self
