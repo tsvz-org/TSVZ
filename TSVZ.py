@@ -1654,9 +1654,17 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 											 ),delimiter=delimiter),delimiter,encoding,errors,what='header')
 			try:
 				codec = _fileCodec(fileName)
-				_requireCodec(codec)
-				with open(fileName, 'xb') as file:  # not over a file another writer made since it was looked for
-					file.write(_compressBytes(codec, headerBytes + b'\n') if codec else headerBytes + b'\n')
+				data = _compressBytes(codec, headerBytes + b'\n') if codec else headerBytes + b'\n'  # before: no gap
+				# Not over a file another writer made since it was looked for ('xb'), nor a link (its target is made),
+				# and under the lock, as every writer writes: an append that took it first has written the header.
+				with open(os.path.realpath(fileName), 'xb') as file:
+					_lockFile(file)
+					try:
+						if not os.fstat(file.fileno()).st_size:
+							file.write(data)
+							file.flush()
+					finally:
+						_unlockFile(file)
 				__teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
 				return True
 			except FileExistsError:
@@ -4461,10 +4469,11 @@ class TSVZed(OrderedDict):
 		the only good copy: it is read all the same, as asked, with a warning."""
 		with self.writeLock:
 			if self._damaged:
-				self.__teePrintOrNot(f"Warning: reload() replaces memory with {self._fileName}, which a rewrite of this "
-									 f"object's left damaged (it failed part way: a full disk, an I/O error, the file "
-									 f"removed); memory held the only good copy of the rows it was writing, and they are "
-									 f"dropped. Without reload(), the next rewrite makes the file again from memory",'warning')
+				self.__teePrintOrNot(f"Warning: reload() replaces memory with {self._fileName}, which is damaged and not yet "
+									 f"made again from memory (a rewrite of this object's failed: a full disk, an I/O error, "
+									 f"the file removed, damage another writer left); memory held the only good copy, and "
+									 f"what it held beyond the file is dropped. Without reload(), the next rewrite makes the "
+									 f"file again from memory",'warning')
 			if self.verbose:
 				self.__teePrintOrNot(f"Loading {self._fileName}")
 			if not os.path.isfile(self._fileName) and not _verifyFileExistence(
@@ -5196,7 +5205,7 @@ memoryOnly:{self.memoryOnly}
 		else:
 			retry = ("With rewrite_interval=0 none is tried again on its own, only one asked for (mapToFile(), "
 					 "rewrite(force=True), rewrite_on_exit) or one made after another process changes the file.")
-		damaged = (" A rewrite of this object's failed before this one and left the file damaged: until one gets through, "
+		damaged = (" A rewrite of this object's failed before this one, and the file is damaged: until one gets through, "
 				   "memory holds the only good copy." if self._damaged else "")
 		self.__teePrintOrNot(f"Refused at {where} to {self._fileName}: {message}. The file is left as it is, and rows that can "
 							 f"be written are still appended.{damaged} It is rewritten once every row can be written: set or delete the row; "
@@ -5410,10 +5419,10 @@ memoryOnly:{self.memoryOnly}
 				return cut
 		if self._damaged:
 			why = ("another process made it again with a first line that is not this store's header ({!r})".format(header)
-				   if isinstance(header, str) else "and they do not follow what it left")
-			self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}: they were made after a rewrite of "
-								 f"this object's failed and left the file damaged, {why}; memory holds what the rewrite was "
-								 f"writing",'warning')
+				   if isinstance(header, str) else "and they do not follow the bytes the file held then")
+			self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}: they were made while the file was "
+								 f"damaged and memory held the only good copy (a rewrite of this object's failed, part way or "
+								 f"before it began on damage another writer left), {why}; memory is written over them",'warning')
 			return False
 		return self._readFrom(f, locked)
 

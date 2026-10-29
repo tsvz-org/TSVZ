@@ -9655,8 +9655,7 @@ def test_tsvzed_legacy_remake_that_fails_to_open_keeps_its_rows_through_a_read(t
 	t.commitAppendToFile()
 	TSVZ.appendTabularFile(p, ['c1', 'C'], header='key\tval', verbose=False)
 	t['a2'] = ['a2', 'A']
-	t.checkExternalChanges()
-	t.rewrite()
+	t.rewrite()  # reads the file first
 	assert sorted(t) == ['a0', 'a1', 'a2', 'c1'] and sorted(_back(p)) == ['a0', 'a1', 'a2', 'c1']
 
 
@@ -9671,6 +9670,20 @@ def test_a_file_another_writer_made_after_the_look_is_not_emptied(tmp_path, monk
 	assert TSVZ._verifyFileExistence(p, header=['key', 'val'])
 	monkeypatch.undo()
 	assert _back(p) == {'a1': ['a1', 'A']}
+
+
+@pytest.mark.skipif(not hasattr(os, 'symlink') or os.name != 'posix', reason='needs symlinks')
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_a_store_path_that_is_a_link_to_a_missing_file_makes_the_file(tmp_path, suffix):
+	# Making the file with 'xb' refused a link whose target is missing (it exists, as a link): the store then failed
+	# to read it. A store linked into place before its first run makes the target, as 4.9 did.
+	target = str(tmp_path / ('data.' + suffix))
+	link = str(tmp_path / ('link.' + suffix))
+	os.symlink(target, link)
+	t = TSVZ.TSVZed(link, header='key\tval', verbose=False)
+	t['a'] = ['a', '1']
+	t.close()
+	assert os.path.isfile(target) and _back(target) == {'a': ['a', '1']}
 
 
 if __name__ == '__main__':
