@@ -9766,5 +9766,15 @@ def test_tsvzed_legacy_commit_after_damage_while_a_rewrite_waits_out_its_back_of
 	assert 'x' in s and 'x' in _back(p) and 'Overwriting external changes' in capsys.readouterr().out
 
 
+@pytest.mark.skipif(not hasattr(os, 'symlink') or os.name != 'posix', reason='needs symlinks')
+def test_a_link_loop_at_the_store_path_is_reported_as_not_made(tmp_path):
+	# Making the file with 'xb' took a link loop (it exists, as a link) for a file another writer had made: the read
+	# that followed raised OSError (ELOOP) even with strict=False, where 4.9 reported that the file could not be made.
+	a, b = str(tmp_path / 'a.tsv'), str(tmp_path / 'b.tsv')
+	os.symlink(b, a)
+	os.symlink(a, b)
+	assert TSVZ.readTabularFile(a, header='key\tval', createIfNotExist=True, strict=False, verbose=False) == {}
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

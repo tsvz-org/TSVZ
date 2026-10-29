@@ -1669,8 +1669,8 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 				__teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
 				return True
 			except FileExistsError:
-				if not os.path.isdir(fileName):
-					return True  # another writer made it meanwhile
+				if os.path.exists(fileName) and not os.path.isdir(fileName):
+					return True  # another writer made it meanwhile (not a directory, nor a link that leads nowhere)
 			except Exception:
 				pass
 			__teePrintOrNot('Failed to create '+fileName,'error',teeLogger=teeLogger)

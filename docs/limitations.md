@@ -8,8 +8,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   are not Linux, or a Linux file system that refuses those locks), it locks a file with `lockf`, and closing
   any descriptor of that file in the process drops the lock. A read of the store in another thread of the same
   process (a handler's, another `TSVZed`'s, a `readTabularFile`) can then drop a write's lock while the write
-  holds it, and another process's write can land in the middle of it. On Linux with open file description
-  locks (the usual case) this does not happen.
+  holds it, and another process's write can land in the middle of it. A `lockf` lock belongs to the process, so
+  two writes from threads of one process (two stores on one file, or a store and `appendTabularFile`) do not
+  exclude each other either: one starting on a missing file can write its header twice, read as a row `key`
+  (main does the same). On Linux with open file description locks (the usual case) none of this happens.
 - Why: 4.9 tried a close gate (a close waits while another thread holds the lock) and took it out again
   (cbe1829): five review rounds kept finding hangs in it. A fix needs its own design, for example `flock` on
   macOS, checked on a Mac.
