@@ -31,3 +31,48 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone loses a store this way.
 - Approved: 2026-10-24, the user chose "One writer thread (Recommended)", whose description said "At exit the
   program finishes a write in progress, and a second Ctrl-C abandons it."
+
+### A write after close(), or in a forked child, can be cut by a Ctrl-C
+- Kind: known limitation
+- What the operator sees: a `TSVZed` has no writer thread once it is closed, nor in a child that `fork()` made, so
+  a `rewrite()`, `mapToFile()` or `hardMapToFile()` called there runs in the caller's thread, as in 4.9. A Ctrl-C
+  during it can leave a `.tsv`-family file damaged, a compressed one unreadable; if the program goes on, the next
+  rewrite makes it again from memory under the merge rule.
+- Why: calls after `close()` and writes from forked children are rare, and covering them means starting a writer
+  thread again in both cases, with its lifetime to get right.
+- Revisit when: someone writes through a closed store or from a forked child and hits it.
+- Approved: 2026-10-29, the user chose "Known limitation (Recommended)".
+
+### A compressed file whose text has no final newline takes an appended member as lines of its own
+- Kind: known limitation
+- What the operator sees: a `.tsv.gz` (or `.bz2`, `.xz`, `.zst`) written by hand or by another tool whose text
+  does not end in a newline: when another process appends a member, a `TSVZed` reading it from where it left off
+  takes the member's first line as a row of its own, where a full read joins it onto the file's last line. Memory
+  then holds one row more than a reopened store, until its next full read. TSVZ always ends its lines.
+- Why: only hand-made files are affected, and TSVZ's own appends to such a file make the same join; fixing it
+  means tracking whether the decompressed text ends in a newline, in two places.
+- Revisit when: someone keeps compressed stores written by another tool.
+- Approved: 2026-10-29, the user chose "Known limitation (Recommended)".
+
+### A delete during another process's whole rewrite can be lost
+- Kind: deferred
+- What the operator sees: while another process rewrites a `.tsv`-family file whole (it empties it, then writes
+  every row back), a `TSVZed`'s background read takes no lock and can see the file empty for a moment. A `del`
+  of a key in that moment finds no key and writes nothing, so the key is live again once the rewrite ends. 4.9 and
+  main do the same; a stress run of two rewriting processes saw it in 2 of 24 runs.
+- Why: the fix is for reads to take a shared lock and wait out another process's rewrite, which changes how every
+  read locks (spec §18.6 asks for such a lock); that is a design change of its own.
+- Revisit when: someone runs two writers that both rewrite the same file.
+- Approved: 2026-10-29, the user chose "Defer (Recommended)".
+
+### get_file_obj('ab') on a compressed store unlocks before the trailer
+- Kind: deferred
+- What the operator sees: `get_file_obj('ab')` and `release_file_obj()`, the 3.39 API, hand a program the store's
+  file through its codec; on release the lock is let go of before the codec writes its trailer (and, for bz2 and
+  xz, its data), so another writer appending in that gap can corrupt the stream. 3.39, 4.9 and main do the same.
+  `TSVZed`'s own writes do not use them.
+- Why: only programs that call this API on a compressed store while another process appends are affected; the
+  fix (close the codec writer first, keeping the lock through a duplicated descriptor) touches the `lockf`
+  bookkeeping.
+- Revisit when: someone uses `get_file_obj()` on compressed stores.
+- Approved: 2026-10-29, the user chose "Defer (Recommended)".
