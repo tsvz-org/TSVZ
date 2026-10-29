@@ -9956,10 +9956,11 @@ def test_tsvzed_legacy_rewrite_failure_that_lasts_to_close_is_reported_again(tmp
 
 
 @pytest.mark.parametrize('when', ['queued', 'committed'])
-def test_tsvzed_legacy_close_makes_again_a_damaged_file_after_a_refused_mapToFile(tmp_path, when):
+def test_tsvzed_legacy_close_makes_again_a_damaged_file_after_a_refused_mapToFile(tmp_path, monkeypatch, when):
 	# An explicit mapToFile() of a store that read damage another writer left is refused (a row changed in place to
-	# text ASCII cannot hold). With that row fixed in place, a row set within the second is still queued at close(),
-	# or appended after the damage: close() makes the file again from memory either way, and the row reads back.
+	# text ASCII cannot hold). With that row fixed in place, a row set while the refusal is recent is still queued at
+	# close(), or appended after the damage: close() makes the file again from memory either way, and the row reads back.
+	monkeypatch.setattr(TSVZ, '_REFUSED_RETRY_SECONDS', 60.0)  # recent however slow the run
 	p = str(tmp_path / 'd.tsv.gz')
 	cut = TSVZ._compressBytes('gzip', b'zz\t1\nyy\t1\n' * 50)[:-30]
 	_touch(p, TSVZ._compressBytes('gzip', b'id\tv\nok\t1\nk\t1\n') + cut + TSVZ._compressBytes('gzip', b'after\t1\n'))
@@ -9979,8 +9980,8 @@ def test_tsvzed_legacy_close_makes_again_a_damaged_file_after_a_refused_mapToFil
 
 
 def test_tsvzed_legacy_close_interrupted_leaves_a_store_that_runs_on(tmp_path, monkeypatch):
-	# A Ctrl-C that stops close()'s wait leaves the store running (its writer finishes the job): it is not closing, so
-	# a later refusal's report says it is tried again.
+	# A Ctrl-C that stops close()'s wait leaves the store running (its writer finishes the job): it is not closing,
+	# which is what a later refusal's report reads to say it is tried again.
 	t = TSVZ.TSVZed(str(tmp_path / 'on.tsv'), header='key\tval', append_check_delay=0.01)
 
 	def interrupted(*args, **kwargs):

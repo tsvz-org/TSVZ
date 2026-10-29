@@ -5879,9 +5879,9 @@ memoryOnly:{self.memoryOnly}
 					self._closing = True
 					self._reported = {}  # a failure that lasts to the end is reported once more: nothing tries after it
 					try:
-						# A damaged file (or one another writer left damaged: _remake) is tried once more, however lately
-						# a rewrite was refused (no failed one's back-off is waited out here either): memory holds the
-						# only good copy, and goes with the store.
+						# A damaged file, or one another writer left damaged that rows went after (_remake and dirty), is
+						# tried once more, however lately a rewrite was refused (no failed one's back-off is waited out
+						# here either): memory holds the only good copy, and goes with the store.
 						self.rewrite(force=self.rewrite_on_exit or self._damaged or self._remake)  # Ensure any final sync operations are performed
 					except BaseException:
 						self._closing = self._exiting  # a Ctrl-C stopped the wait: the store runs on, but not at exit
