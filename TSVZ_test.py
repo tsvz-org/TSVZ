@@ -9660,5 +9660,18 @@ def test_tsvzed_legacy_remake_that_fails_to_open_keeps_its_rows_through_a_read(t
 	assert sorted(t) == ['a0', 'a1', 'a2', 'c1'] and sorted(_back(p)) == ['a0', 'a1', 'a2', 'c1']
 
 
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_a_file_another_writer_made_after_the_look_is_not_emptied(tmp_path, monkeypatch, suffix):
+	# A store that found the file missing made it with a truncating open: another writer that had made it meanwhile
+	# and committed a row lost the row (two programs starting on a new file; 4.9 did the same).
+	p = str(tmp_path / ('new.' + suffix))
+	_touch(p, _compressedAs(suffix, b'key\tval\na1\tA\n'))
+	real = os.path.isfile
+	monkeypatch.setattr(os.path, 'isfile', lambda path: False if path == p else real(path))  # looked before it was made
+	assert TSVZ._verifyFileExistence(p, header=['key', 'val'])
+	monkeypatch.undo()
+	assert _back(p) == {'a1': ['a1', 'A']}
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

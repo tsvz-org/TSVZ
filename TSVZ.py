@@ -1653,9 +1653,13 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 											 delimiter=delimiter,
 											 ),delimiter=delimiter),delimiter,encoding,errors,what='header')
 			try:
-				with openFileAsCompressed(fileName, mode ='wb',encoding=encoding,teeLogger=teeLogger) as file:
-					file.write(headerBytes+b'\n')
+				codec = _fileCodec(fileName)
+				_requireCodec(codec)
+				with open(fileName, 'xb') as file:  # not over a file another writer made since it was looked for
+					file.write(_compressBytes(codec, headerBytes + b'\n') if codec else headerBytes + b'\n')
 				__teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
+				return True
+			except FileExistsError:
 				return True
 			except Exception:
 				__teePrintOrNot('Failed to create '+fileName,'error',teeLogger=teeLogger)

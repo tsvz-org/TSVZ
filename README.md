@@ -231,8 +231,9 @@ rewrite fails, the rows are appended after the damage and memory keeps them for 
 next rewrite that gets through; while it is refused (a row changed in place to text
 the encoding cannot hold), they are appended after it as in 4.9, and the next read
 drops them. Appends that do not read the store first (`tsvz set`,
-`appendTabularFile`, `TSVZedLite`, a `TSVZed` with `monitor_external_changes=False`)
-still land after it ([docs/limitations.md](docs/limitations.md)).
+`appendTabularFile`, `TSVZedLite`, and a `TSVZed` with `monitor_external_changes=False`
+for damage that lands after it loaded the file) still land after it
+([docs/limitations.md](docs/limitations.md)).
 
 It knows the size and SHA-256 of the bytes it last read or wrote. When another process
 has changed the file, and it is the same file (device and inode) and still begins with
@@ -250,8 +251,9 @@ reloaded over memory; the background writer still appends the rows set meanwhile
 the next rewrite (the background writer's, `rewrite()`, `close()`) makes the file
 again from memory. A change another process
 made meanwhile is merged into memory first, as above, when the file is still the one
-the damage was left in and still begins with exactly the bytes it left; after a damage
-that left the file empty, what follows must also begin with this store's header.
+the damage was left in (for a file that was removed, any file made there since) and
+still begins with exactly the bytes it left; after a damage that left the file empty
+(or removed it), what follows must also begin with this store's header.
 Otherwise that change is overwritten, with the warning `Overwriting external changes`.
 What cannot be told from an append is merged as one: another process's rewrite of the
 same file in place that begins with exactly the bytes the damage left, and, for a store
