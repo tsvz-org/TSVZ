@@ -9308,5 +9308,116 @@ def test_tsvzed_legacy_append_landing_right_after_the_store_s_own_write_is_still
 	assert dict(t) == {'a': ['a', '1'], 'b': ['b', '1'], 'ext': ['ext', 'B']} == _back(p)
 
 
+@pytest.mark.parametrize('suffix', ['tsv.bz2', 'tsv.xz'])
+@pytest.mark.parametrize('rows', [200, 3000])  # what the cut leaves after the new streams: under the codec's 8 KiB read, and over it
+def test_tsvzed_legacy_bz2_xz_rewrite_cut_short_leaves_no_old_rows(tmp_path, capsys, suffix, rows):
+	# A whole rewrite writes over the file and cuts it at the end. One that stopped before the cut (kill -9, a power
+	# cut) left the new streams and then the old file's tail, which BZ2File and LZMAFile take for the end of the file,
+	# silently: a store knew only what they read, and read the old members in the tail as another process's append,
+	# writing old values and deleted keys back into the file. It is damage, noted as gzip's is.
+	p = str(tmp_path / ('torn.' + suffix))
+	codec = suffix.rpartition('.')[2]
+	rng = random.Random(rows)
+	_touch(p, TSVZ._compressBytes(codec, b'key\tval\n' + b''.join(b'k%d\t%032x\n' % (i, rng.getrandbits(128)) for i in range(rows)), memberSize=4096))
+	new = TSVZ._compressBytes(codec, b'key\tval\n' + b''.join(b'k%d\tNEW\n' % i for i in range(1, rows, 2)))
+	assert len(new) < os.path.getsize(p)
+	with open(p, 'r+b') as f:
+		f.write(new)
+	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.001, verbose=False)  # rewrite_on_load: written whole
+	time.sleep(0.05)  # background ticks
+	t.close()
+	back = _back(p)
+	assert len(back) == rows // 2 and all(v == ['k' + k[1:], 'NEW'] for k, v in back.items())
+	assert 'compressed stream is damaged' in capsys.readouterr().err
+
+
+def test_tsvzed_legacy_defaults_set_in_memory_survive_the_store_own_append(tmp_path, capsys):
+	# setDefaults() made the store forget the bytes it knew, so its own next append was taken for another process's
+	# change: the file was read whole and memory's defaults went back to the file's.
+	p = str(tmp_path / 'defaults.tsv')
+	_touch(p, b'key\tval\tx\n#_defaults_#\tOLD\tOLDX\na\t1\t2\n')
+	t = _stopped(p, header='key\tval\tx')
+	t.setDefaults(['NEW', 'NEWX'])
+	t['b'] = ['b', '', 'B']
+	t.commitAppendToFile()
+	t.checkExternalChanges()
+	t.rewrite()
+	t['c'] = ['c', '', 'C']
+	assert t['c'] == ['c', 'NEW', 'C'] and t.defaults == ['#_defaults_#', 'NEW', 'NEWX']
+	assert 'External changes' not in capsys.readouterr().out
+
+
+@pytest.mark.skipif(not os.path.exists('/dev/null'), reason='needs /dev/null')
+def test_tsvzed_legacy_store_on_dev_null_keeps_its_rows(capsys):
+	# /dev/null always holds nothing and its time is no file's: a store took each of its appends for a change of the
+	# file and read it again, empty.
+	t = _stopped('/dev/null')
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	t.checkExternalChanges()
+	t.rewrite()
+	assert t['a'] == ['a', '1'] and 'External changes' not in capsys.readouterr().out
+
+
+def test_tsvzed_legacy_change_landing_before_its_own_append_on_a_coarse_clock_is_read(tmp_path):
+	# Another process's append landed, then this store's own, within one tick of a file system clock that ticks
+	# coarsely: the time had not moved, and the store, which no longer knew the file's bytes, never read the change.
+	p = str(tmp_path / 'coarse.tsv')
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	at = os.stat(p).st_mtime_ns
+	_append_external(p)
+	t['b'] = ['b', '2']
+	t.commitAppendToFile()
+	os.utime(p, ns=(at, at))
+	t.checkExternalChanges()
+	t.rewrite()
+	assert dict(t) == _back(p) == {'a': ['a', '1'], 'ext': ['ext', 'B'], 'b': ['b', '2']}
+
+
+def test_tsvzed_legacy_damaged_gzip_keeps_the_store_own_rows(tmp_path):
+	# A read cut short by damage was taken for unknown: a .tsv.gz damaged part way was read whole at every change, up
+	# to the damage, and the store's own rows after it went from memory. Read again under the lock, the damage stays
+	# and the bytes after it are known.
+	p = str(tmp_path / 'damaged.tsv.gz')
+	_touch(p, TSVZ._compressBytes('gzip', b'key\tval\na\t1\n') + b'garbage echoed\n')
+	t = _stopped(p)
+	t['mine'] = ['mine', 'M']
+	t.commitAppendToFile()
+	for _ in range(3):
+		t.checkExternalChanges()
+		t.rewrite()
+	_append_external(p, TSVZ._compressBytes('gzip', b'theirs\tT\n'))
+	t.checkExternalChanges()
+	t.rewrite()
+	assert sorted(t) == ['a', 'mine', 'theirs']
+
+
+def test_tsvzed_legacy_file_removed_before_the_locked_read_is_not_made_empty(tmp_path, monkeypatch):
+	# A read cut short by damage is read again under the lock: a file removed (rm, a log rotation) just before that
+	# was made again, empty, and read, emptying memory.
+	p = str(tmp_path / 'rotated.tsv.gz')
+	t = _stopped(p)
+	for i in range(100):
+		t['k%d' % i] = ['k%d' % i, 'v']
+	t.commitAppendToFile()
+	_append_external(p, b'garbage\n')
+	real = t._openLocked
+
+	def removed_first(opener):
+		monkeypatch.setattr(t, '_openLocked', real)
+		os.remove(p)
+		return real(opener)
+
+	monkeypatch.setattr(t, '_openLocked', removed_first)
+	t.checkExternalChanges()
+	t.rewrite()
+	assert len(t) == 100 and not os.path.exists(p)
+	t['new'] = ['new', 'N']
+	t.commitAppendToFile()
+	assert len(_back(p)) == 101
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

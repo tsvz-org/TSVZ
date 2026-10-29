@@ -67,6 +67,21 @@ def _codecModule(codec):
 	import importlib
 	return importlib.import_module(_CODECS[_CODEC_NAMES.get(codec, codec)][0])
 
+def _openStreams(codec, f):
+	"""The text of ``codec``'s streams in the open binary file ``f``, one after another. BZ2File, LZMAFile and
+	ZstdFile take bytes after a stream that do not begin one for the end of the file, silently; this reader raises
+	there, as GzipFile does, so a read notes the damage (a whole rewrite cut short leaves the old bytes after the
+	new streams)."""
+	module = _codecModule(codec)
+	name = _CODEC_NAMES.get(codec, codec)
+	if name == 'gzip':
+		return module.open(f, 'rb')
+	try:
+		from compression._common._streams import DecompressReader  # Python 3.14+
+	except ImportError:
+		from _compression import DecompressReader
+	return io.BufferedReader(DecompressReader(f, getattr(module, _CODECS[name][1])))  # no trailing_error: it raises
+
 def _fileCodec(fileName):
 	"""The codec name ``fileName``'s compression suffix names, or None for a file that is not compressed."""
 	return _CODEC_NAMES.get(fileName.rpartition('.')[2].lower())
@@ -2069,6 +2084,11 @@ def getFileUpdateTimeNs(fileName):
 	except Exception:
 		__teePrintOrNot(f"Failed to get file update time for {fileName}",'error')
 		return get_time_ns()
+
+def _updateTimeNs(st):
+	"""getFileUpdateTimeNs() of the file ``st`` is the stat of: 0 for one that is not a regular file (/dev/null)."""
+	import stat
+	return st.st_mtime_ns if stat.S_ISREG(st.st_mode) else 0
 
 def get_time_ns():
 	try:
@@ -4414,9 +4434,8 @@ class TSVZed(OrderedDict):
 		if not self._constructed:
 			self.defaults = defaults
 			return
-		with self.writeLock:  # memory's defaults now differ from the file's: another process's change is read whole
-			self.defaults = defaults
-			self._known = None
+		self.defaults = defaults
+		self._readWhole = True  # memory's defaults now differ from the file's: another process's change is read whole
 
 	def load(self):
 		self.reload()
@@ -5135,7 +5154,7 @@ memoryOnly:{self.memoryOnly}
 			st = os.stat(self._fileName)
 		except OSError:
 			return False
-		return self.externalFileUpdateTime < st.st_mtime_ns or (self._known is not None and st.st_size != self._known[1])
+		return self.externalFileUpdateTime < _updateTimeNs(st) or (self._known is not None and st.st_size != self._known[1])
 
 	# ``(identity, size, sha256)`` of the bytes this store last read or wrote in its legacy file; None when not known.
 	_known = None
@@ -5143,6 +5162,7 @@ memoryOnly:{self.memoryOnly}
 	# memory holds the only good copy: the file is never read over it, and the next rewrite makes it again, merging
 	# another process's appends (the merge rule, _syncFrom); _known is then what the file held when it stopped.
 	_damaged = False
+	_readWhole = False  # setDefaults() gave memory defaults the file may not hold: its next change is read whole
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
 
@@ -5258,13 +5278,13 @@ memoryOnly:{self.memoryOnly}
 		"""True when the open file ``f`` may not hold what _known says: unknown, another file, size or time."""
 		st = os.fstat(f.fileno())
 		known = self._known
-		return (known is None or st.st_size != known[1] or st.st_mtime_ns != self.externalFileUpdateTime
+		return (known is None or st.st_size != known[1] or _updateTimeNs(st) != self.externalFileUpdateTime
 				or (known[0][1] is not None and _fileIdentity(st) != known[0]))
 
 	def _writeFile(self, whole, sync=True, snapshot=None):
-		"""Write memory (or ``snapshot()``'s, a clear's) over the legacy file in place, or emptied first (``whole``, a
-		compressed file, written as whole members, or a missing one): True when all of it is on disk, False when the
-		file could not be opened or locked (reported); what stops it raises.
+		"""Write memory (or ``snapshot()``'s, a clear's) over the legacy file in place, or whole (``whole``, a compressed
+		file, written as whole members, or a missing one: written over the file, then cut to its end): True when all of
+		it is on disk, False when the file could not be opened or locked (reported); what stops it raises.
 
 		The file is locked before anything is read and until all of it is on disk. Another process's change is taken
 		in first (``sync``; False: overwritten with a warning; None, a clear: not looked for) and again if it lands
@@ -5344,9 +5364,9 @@ memoryOnly:{self.memoryOnly}
 	def _readLocked(self, read):
 		"""``read(f)`` again with the file open and locked. A read cut short by damage without the lock may have met
 		another writer's write in progress, which every writer finishes under the lock; damage still there under it
-		stays, and what that read took is known. Not when the file cannot be opened for writing (read-only)."""
+		stays, and what that read took is known. Not when the file cannot be opened for writing (read-only) or is gone."""
 		try:
-			f = self._openLocked(_openUntruncated)
+			f = self._openLocked(lambda path: open(path, 'r+b'))  # removed meanwhile: not made again, empty
 		except OSError:
 			return
 		try:
@@ -5368,7 +5388,7 @@ memoryOnly:{self.memoryOnly}
 		# are members of their own). Not while rows are queued (unless the file is damaged): what follows would go after
 		# them in memory, where the file will hold them after it.
 		if (found is not None and (found[2] or self._damaged or _isCompressedFile(self._fileName))
-				and (self._damaged or not self.appendQueue)):
+				and (self._damaged or (not self.appendQueue and not self._readWhole))):
 			rest, known, _ = found
 			header, torn = self._applyAppended(f, rest, self._known[1])
 			if header is None:
@@ -5444,6 +5464,7 @@ memoryOnly:{self.memoryOnly}
 		read apart from memory, then memory is changed in place under _memLock, never emptied (a key the file still
 		holds is never missing for another thread) and takes the file's order. _known is then the bytes read."""
 		seen = getFileUpdateTimeNs(self._fileName)  # before the read: a change during or after it is seen by the next check
+		self._readWhole = False  # memory takes the file's defaults
 		loaded = _TSVZedLoad(self, self.correctColumnNum, list(self.defaults))
 		known = _KNOWN_NOTHING
 		if f is not None:
@@ -5457,7 +5478,7 @@ memoryOnly:{self.memoryOnly}
 					reader.read(size)  # no line: an empty store with its header; only the bytes looked at are known
 				else:
 					_requireCodec(codec)
-					stream = _codecModule(codec).open(reader, 'rb') if codec else reader
+					stream = _openStreams(codec, reader) if codec else reader
 					try:
 						start = _legacyReadHeader(stream, self._fileName, self.header, self.verifyHeader, self.verbose,
 												  self.teeLogger, self.strict, self.delimiter, -1, self.encoding, reporter)
@@ -5750,7 +5771,8 @@ memoryOnly:{self.memoryOnly}
 						_fsync(f.fileno())  # a sync that fails fails the append: the rows stay queued
 					finally:
 						reporter.flush()
-					if known is not None:
+					import stat
+					if known is not None and stat.S_ISREG(os.fstat(f.fileno()).st_mode):  # /dev/null holds none of it
 						# What it wrote, not what the file now holds: another writer's append that lands meanwhile
 						# (one that takes no lock) is still to be read, and one that landed first fails the next look.
 						digest = known[2].copy()

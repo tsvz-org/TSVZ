@@ -234,10 +234,9 @@ an order set by `move_to_end`, and its `#` keys. Any other change reloads the fi
 changing memory in place, so a live key is never missing meanwhile.
 
 A rewrite writes over the file and then cuts it to its new length, so a reader never
-meets it emptied, and one that makes the file shorter never runs out of room. One that
-fails part way (a full disk, an I/O error), or that cannot make again a file that was
-removed, leaves the file damaged: the new bytes it wrote, then the old ones after them.
-Memory then holds the only good copy. Until a rewrite gets through, the file is not
+meets it emptied. One that fails part way (a full disk, an I/O error), or that cannot
+make again a file that was removed, leaves the file damaged: the new bytes it wrote,
+then the old ones after them. Memory then holds the only good copy. Until a rewrite gets through, the file is not
 reloaded over memory; the background writer still appends the rows set meanwhile, and
 the next rewrite (the background writer's, `rewrite()`, `close()`) makes the file
 again from memory. A change another process
