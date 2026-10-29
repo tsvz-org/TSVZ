@@ -68,18 +68,18 @@ def _codecModule(codec):
 	return importlib.import_module(_CODECS[_CODEC_NAMES.get(codec, codec)][0])
 
 def _openStreams(codec, f):
-	"""The text of ``codec``'s streams in the open binary file ``f``, one after another. BZ2File, LZMAFile and
-	ZstdFile take bytes after a stream that do not begin one for the end of the file, silently; this reader raises
-	there, as GzipFile does, so a read notes the damage (a whole rewrite cut short leaves the old bytes after the
+	"""The text of ``codec``'s streams in the open binary file ``f``, one after another. BZ2File and LZMAFile take
+	bytes after a stream that do not begin one for the end of the file, silently; this reader raises there, as
+	GzipFile and ZstdFile do, so a read notes the damage (a whole rewrite cut short leaves the old bytes after the
 	new streams)."""
 	module = _codecModule(codec)
 	name = _CODEC_NAMES.get(codec, codec)
-	if name == 'gzip':
+	if name not in ('bzip2', 'xz'):
 		return module.open(f, 'rb')
-	try:
-		from compression._common._streams import DecompressReader  # Python 3.14+
-	except ImportError:
-		from _compression import DecompressReader
+	if sys.version_info >= (3, 14):
+		from compression._common._streams import DecompressReader
+	else:
+		from _compression import DecompressReader  # not a top-level 'compression': before 3.14 that is no stdlib's
 	return io.BufferedReader(DecompressReader(f, getattr(module, _CODECS[name][1])))  # no trailing_error: it raises
 
 def _fileCodec(fileName):
