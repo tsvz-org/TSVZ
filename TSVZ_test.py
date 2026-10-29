@@ -9577,5 +9577,64 @@ def test_tsvzed_legacy_read_that_fails_keeps_set_defaults_reading_the_next_chang
 	assert t._readWhole
 
 
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_tsvzed_legacy_file_rotated_after_an_unread_change_is_made_again_merging_another_store(tmp_path, monkeypatch, capsys, suffix):
+	# A store that had committed over another process's change it had not read (_unseen) found the file rotated away;
+	# its remake kept _unseen, so while the file was damaged it could not merge: it warned that it was overwriting
+	# external changes, and once its first try failed and the other store made the file again, it did overwrite it.
+	p = str(tmp_path / ('rotated.' + suffix))
+	a, b = _stopped(p), _stopped(p)
+	a['a0'] = ['a0', 'A']
+	a.commitAppendToFile()
+	b['b0'] = ['b0', 'B']
+	b.commitAppendToFile()
+	a['a1'] = ['a1', 'A']
+	a.commitAppendToFile()  # over b0, unread
+	os.rename(p, p + '.1')
+	real = TSVZ._openUntruncated
+	tries = []
+
+	def opening(path):
+		if not tries:
+			tries.append(1)
+			raise OSError(errno.EMFILE, 'Too many open files')
+		return real(path)
+
+	monkeypatch.setattr(TSVZ, '_openUntruncated', opening)
+	a['a2'] = ['a2', 'A']
+	a.commitAppendToFile()  # the file is missing: made again from memory, which fails once
+	b['b1'] = ['b1', 'B']
+	b.commitAppendToFile()  # the other store makes it again first
+	a.commitAppendToFile()
+	monkeypatch.setattr(TSVZ, '_FAILURE_RETRY_FIRST', 0)
+	a._failures.clear()
+	a.rewrite()
+	assert sorted(_back(p)) == ['a0', 'a1', 'a2', 'b0', 'b1']
+	assert 'Overwriting external changes' not in capsys.readouterr().out
+
+
+def test_tsvzed_legacy_remake_that_fails_to_open_the_file_is_made_again_by_the_next_rewrite(tmp_path, monkeypatch):
+	# A remake of a damaged file that failed before it wrote anything (the file could not be opened) left the store
+	# neither dirty nor damaged: the rows it appended after the damage were never written where a read reaches them.
+	p = str(tmp_path / 'damaged.tsv.bz2')
+	_touch(p, TSVZ._compressBytes('bz2', b'key\tval\na0\tA\n') + b'garbage echoed\n')
+	t = _stopped(p)
+	assert t._remake
+	real = TSVZ._openUntruncated
+	tries = []
+
+	def opening(path):
+		if not tries:
+			tries.append(1)
+			raise OSError(errno.EMFILE, 'Too many open files')
+		return real(path)
+
+	monkeypatch.setattr(TSVZ, '_openUntruncated', opening)
+	t['a1'] = ['a1', 'A']
+	t.commitAppendToFile()
+	t.rewrite()  # the tick's, or close()'s
+	assert sorted(_back(p)) == ['a0', 'a1']
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

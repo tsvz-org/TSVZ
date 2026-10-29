@@ -5302,7 +5302,7 @@ memoryOnly:{self.memoryOnly}
 				# Removed (rm, a log rotation): memory is the only copy. Made again whole; what another process writes
 				# there meanwhile is merged, whatever file it is.
 				self.dirty = self._damaged = True
-				self._known = _KNOWN_NOTHING
+				self._known, self._unseen = _KNOWN_NOTHING, False  # merged whatever is there, whichever file it is
 				whole = True
 			try:
 				f = self._openLocked(_openUntruncated)
@@ -5512,8 +5512,8 @@ memoryOnly:{self.memoryOnly}
 			# once appended will, so memory stays what the file will hold.
 			loaded.replay(list(self.appendQueue))
 			self._replaceRows(loaded)
+			self._readWhole = False  # before the defaults: a setDefaults() between the two sets it again
 			self.defaults = loaded.defaults
-			self._readWhole = False
 			if loaded.dirty:
 				self.dirty = True  # a key the file holds twice
 			if self.header and any(self.header) and self.verifyHeader:
@@ -5757,6 +5757,7 @@ memoryOnly:{self.memoryOnly}
 				return self
 			if missing:
 				return self
+			self.dirty = True  # failed or refused: the rewrite that gets through makes the file again
 		with self.writeLock:
 			try:
 				if self.verbose:
