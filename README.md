@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 4.9**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.0**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -19,7 +19,7 @@ pip install -e .          # editable, from this directory
 
 | Extension | Rules |
 |---|---|
-| `.tsv` `.csv` `.nsv` `.psv` (and any other) | The TSVZ **3.39** format, unchanged. A 3.39 host can read every file 4.x writes. |
+| `.tsv` `.csv` `.nsv` `.psv` (and any other) | The TSVZ **3.39** format, unchanged. A 3.39 host can read every file this version writes. |
 | `.tsvz` `.csvz` `.nsvz` `.psvz` | The **[tsvz-spec-v1](tsvz-spec-v1.md)** append-only key-value log. |
 
 The delimiter follows the extension: tab, comma, NUL, pipe. A trailing
@@ -65,7 +65,7 @@ tsvz people.tsvz append carol Carol 5     # the 3.39 form still works
 tsvz -V
 ```
 
-## What TSVZ 4 does with `.tsvz` files
+## What TSVZ does with `.tsvz` files
 
 - **Reads** everything a conformant writer can produce: markers
   (`#_defaults_#`, `#_strip_trailing_whites_#`, `#_fill_empty_with_default_#`,
@@ -92,7 +92,12 @@ tsvz -V
   `setdefault` and `pop` behave like a dict.
 - **`#` keys** are stored (`<#>key`). Keys of the form `#_name_#` are marker
   writes: `t['#_defaults_#'] = [...]` sets the defaults, and so does
-  `setDefaults([...])` once the object is constructed.
+  `setDefaults([...])` once the object is constructed. `#_snapshot_#` is
+  refused (spec §19.10.2).
+- **Other writers:** a `TSVZed` notices another process's change by the active
+  part's inode, size and times and by the list of parts, and reloads. Rows it
+  has queued but not yet written stay in memory across that reload, and a live
+  key is never missing while it runs.
 
 ## Command line
 
@@ -101,6 +106,9 @@ tsvz -V
 lone `--`. The 3.39 form `tsvz STORE [OPERATION] [ARG ...]` works too; a store
 named like an operation then needs a path prefix (`./read`).
 
+- **One engine.** Every operation runs through the engine `tsvz serve` uses,
+  in its own process when no server runs, so a command prints the same with or
+  without a server.
 - **stdout carries only rows.** It gets a table on a terminal and records
   otherwise; `--format table|records` overrides. Records use the store's
   delimiter and escaping, so `tsvz read A | tsvz set B -` copies a store of
@@ -169,7 +177,8 @@ with TSVZ.TSVZClient('people.tsvz') as people:  # served, or in this process whe
 `setDefaults`. Its writes return once they are written (raising `OSError` if they
 cannot be), one client may be shared between threads, and without a server it
 warns once and works on the files in-process, finishing its writes when the
-program exits.
+program exits. A server of a `.tsv`-family file names its delimiter in
+`STORE.serve`, and `TSVZClient` splits string values on it.
 
 ## Fault tolerance
 
@@ -193,57 +202,111 @@ delimiter or encoding argument that conflicts with the extension.
 Writing is stricter than reading: a key, value, header or marker that cannot be
 encoded as UTF-8, such as the lone surrogate `os.fsdecode` gives for a
 non-UTF-8 file name, raises a `ValueError` (`TSVZEncodeError`) that names it
-and writes nothing, instead of storing `?`. Pass `errors='replace'` to the
-writing functions or to `TSVZed`, `TSVZedLite` and `TSVZClient` to get the old `?` (any codec error handler is taken; a name that is not one
-is a `ValueError` where it is given). `TSVZed` and `TSVZedLite` refuse a row in
-`__setitem__`, so the background writer never meets one; a refused rewrite leaves
-the file as it is: `mapToFile()` and `hardMapToFile()` raise the error, and a rewrite
-`TSVZed` makes itself reports it once (again after `clear()` or `reload()`, or for
-another row; with `rewrite_interval=0` it is not tried again on its own). With a
-non-UTF-8 `encoding=`, U+FFFD (what the reader puts for a byte it could not decode) is
-text that encoding may lack, and it is refused like any other: such a store's rewrite is
-refused (also the one `rewrite_on_load` makes, which then leaves the file as it is,
-without failing), appends of rows that can be written still work, and the delete or
-update of a key that holds U+FFFD raises. Such a key stays until the file is edited, the
+and writes nothing, instead of storing `?`. Pass `errors='replace'` (or any codec
+error handler) to the writing functions or to `TSVZed`, `TSVZedLite` and `TSVZClient`
+to get the old `?`. `TSVZed` and `TSVZedLite` refuse such a row when it is set. A
+rewrite that meets such text leaves the file as it is: `mapToFile()` and
+`hardMapToFile()` raise the error, and the rewrites `TSVZed` makes itself report it
+once. With a non-UTF-8 `encoding=`, U+FFFD (what the reader puts for a byte it could
+not decode) is text that encoding may lack, and it is refused like any other: such a
+store is not rewritten (`rewrite_on_load` leaves the file as it is, without failing),
+appends of rows that can be written still work, and the delete or update of a key that
+holds U+FFFD raises. Such a key stays until the file is edited, the
 store cleared, or the store opened with the encoding it was written in; `errors='replace'`
 would write `?` for U+FFFD, losing the bytes the file holds there. The `tsvz` command
-exits 1 with the message, naming the cell as it does on the files when a handler runs,
-and without the advice about `errors=`, an option it does not take.
+exits 1 with the message.
 
-A `TSVZed` rewrite of a `.tsv`, `.csv`, `.nsv` or `.psv` file (compressed or not)
-that fails part way, on a full disk, a `KeyboardInterrupt` or an I/O error, or that
-cannot make again a file that was removed, leaves the file damaged: memory then holds
-the only good copy. Until a rewrite gets through, `TSVZed` does not reload the file
-over memory; its background writer still appends the rows set meanwhile (to a file left
-empty, after the header, as every append to an empty file does), and they are merged
-back as they are. The next rewrite (the background writer's, `rewrite()`, `close()`)
-makes the file again from memory.
+A `TSVZed` writes a `.tsv`, `.csv`, `.nsv` or `.psv` file (compressed or not) from
+its background thread only: `rewrite()`, `mapToFile()`, `hardMapToFile()`,
+`commitAppendToFile()`, `clear()`, `clear_file()`, `reload()`, `close()` and the
+constructor's load hand it the job and wait, so a Ctrl-C stops the wait, never the
+write (the call still raises `KeyboardInterrupt`). At exit a write in progress is
+finished: a Ctrl-C then says so and keeps waiting, and a second one abandons it. A
+closed store is freed. (`get_file_obj()` and `release_file_obj()`, kept from 3.39,
+hand the locked file to the calling thread.) A file another process removed is made
+again from memory by the store's next write, an append included; while that rewrite
+fails or is refused, the rows are appended to a new file there, and memory keeps all of
+them for the rewrite that gets through. A compressed file another writer left damaged
+is made again too (L5: every read stops at the damage, so rows
+appended after it would be read by no one); the bytes after the damage go. While that
+rewrite fails, the rows are appended after the damage and memory keeps them for the
+next rewrite that gets through; while it is refused (a row changed in place to text
+the encoding cannot hold), they are appended after it as in 4.9, and the next read
+drops them. Either way `close()` tries the rewrite once more, whatever
+`rewrite_on_exit` says. Appends that do not read the store first (`tsvz set`,
+`appendTabularFile`, `TSVZedLite`, and a `TSVZed` with `monitor_external_changes=False`
+for damage that lands after it loaded the file) still land after it
+([docs/limitations.md](docs/limitations.md)).
 
-A change another process made to the file meanwhile is merged into memory first, as a
-read of the file would apply it (each set or delete in turn, the last one of a key
-winning), when it can have been only appended: the file is still the one the failed
-rewrite left (the same device and inode; when the file was missing, any file) and still
-begins with exactly the bytes it left (their size and SHA-256). After a damage that left
-the file empty, what follows must also begin with this store's header, which every append
-to an empty file writes first. Otherwise memory is kept, and that change is overwritten
-with the warning `Overwriting external changes`: this catches another process that
-rewrote the file shorter or with other bytes where the damage was, replaced it with
-another file (renamed one over it, or removed it and made it again), or made it again
-with another header or with no header.
+It knows the size and SHA-256 of the bytes it last read or wrote. When another process
+has changed the file, and it is the same file (device and inode) and still begins with
+those bytes, nothing this store set is still waiting to be written, and
+`setDefaults()` has not changed its defaults since, only what follows is read and
+applied to memory, as a read of the file applies it: memory keeps an order set by
+`move_to_end`, and its `#` keys. Any other change reloads the file, changing memory
+in place, so a live key is never missing meanwhile.
 
-What cannot be told from an append, and is merged as one: another process's rewrite of
-the same file in place (written over, or truncated and written again, as `TSVZed`'s own
-rewrites are) whose content begins with exactly the bytes the damage left; after a
-damage that left the file empty, any such rewrite that begins with this store's header;
-and, for a store with no header (or `verifyHeader=False`), anything written to a file
-the damage left empty. Its rows are then applied on top of memory: the keys it sets or
-deletes take its values, and keys it left out keep memory's. An explicit `reload()`
-while the file is damaged is unsafe: it replaces memory with the damaged file, as asked,
-and warns that the rows only memory held are dropped.
+A rewrite writes over the file and then cuts it to its new length, so a reader never
+meets it emptied. One that fails part way (a full disk, an I/O error), or that cannot
+make again a file that was removed, leaves the file damaged: the new bytes it wrote,
+then the old ones after them. Memory then holds the only good copy, as it does when
+the store appends after damage another writer left that it cannot make the file again
+over yet (that rewrite failed, or waits out a failed one's back-off). Until a rewrite gets through, the file is not
+reloaded over memory; the background writer still appends the rows set meanwhile, and
+the next rewrite (the background writer's, `rewrite()`, `close()`) makes the file
+again from memory. A change another process
+made meanwhile is merged into memory first, as above, when the file is still the one
+the damage was left in (for a file that was removed, any file made there since) and
+still begins with exactly the bytes it left; after a damage that left the file empty
+(or removed it), what follows must also begin with this store's header.
+Otherwise that change is overwritten, with the warning `Overwriting external changes`.
+What cannot be told from an append is merged as one: another process's rewrite of the
+same file in place that begins with exactly the bytes the damage left, and, for a store
+with no header (or `verifyHeader=False`), anything written to a file the damage left
+empty; the keys it sets or deletes then take its values, and the keys it left out keep
+memory's. An explicit `reload()` while the file is damaged replaces memory with the
+damaged file, as asked, and warns.
+
+## Upgrading to 5.0 from 4.9
+
+- **Writes refuse text they cannot encode.** A key, value, header, defaults line or
+  marker the file's encoding cannot hold (UTF-8 for `.tsvz`; `encoding=` for a
+  `.tsv`), such as the lone surrogate `os.fsdecode` gives for a non-UTF-8 file name,
+  raises `TSVZEncodeError` (a `ValueError`) and writes nothing; 4.9 stored `?`.
+  `errors='replace'` brings `?` back. Under a non-UTF-8 `encoding=`, a key read as
+  U+FFFD cannot be deleted or updated. `tsvz` exits 1 with the message. See Fault
+  tolerance.
+- **A Ctrl-C no longer cuts a `.tsv` write.** Every write of a `.tsv`-family file
+  runs on the store's background thread; a call waits for it, a Ctrl-C raises in the
+  caller and the write still finishes, and at exit a write in progress is finished
+  (a second Ctrl-C abandons it). In 4.9 a Ctrl-C while `TSVZed()` opened a
+  compressed store (its rewrite on load) could leave the file with no readable row.
+  A closed `TSVZed` or `TSVZedLite` is freed; 4.9 kept every one until exit.
+- **Another process's change is taken in, not reloaded over memory.** An append to
+  a `.tsv`-family file is read from where the store left off, so an order set by
+  `move_to_end` and `#` keys survive it; any reload (both dialects) changes memory
+  in place, so another thread never finds a live key missing. After a rewrite of
+  the store's own fails part way, memory is kept and another process's appends are
+  merged into it (Fault tolerance).
+- **`.tsvz` stores** see another process's append made right after their load, a
+  commit or a clear (4.9 missed it until the next change), keep the rows set while
+  they reload, refuse `#_snapshot_#` (spec §19.10.2), and raise a strict header
+  mismatch at the first read.
+- **`.tsv` files:** an append to an existing empty file writes the header first, and
+  reading one gives an empty store; see L8 to L14 for the rest.
+- **`tsvz`** runs every operation through the engine `tsvz serve` uses, with the same
+  output. A server of a `.tsv` (or other tab- or NUL-delimited) file is now found by
+  `tsvz` commands, `TSVZClient` and `tsvz stop`; 4.9's clients rejected its pointer
+  file. The 3.39 warning that a file name does not end in `.tsv` is printed only
+  when a command creates such a file, and a write that cannot be made reports the
+  operating system's error.
+- **macOS and other systems that lock with `lockf`:** 4.9's close gate is gone, so
+  a read in another thread of the process can drop a write's lock
+  ([docs/limitations.md](docs/limitations.md)).
 
 ## Breaking changes from 3.39
 
-### `.tsv`, `.csv`, `.nsv`, `.psv`: bug fixes only
+### `.tsv`, `.csv`, `.nsv`, `.psv`: the format is unchanged
 
 | # | Change |
 |---|---|
@@ -256,6 +319,11 @@ and warns that the rows only memory held are dropped.
 | L7 | `TSVZed`'s `in` and `get` find a key as `t[key]` does: the live key equal to it, else the key right-stripped. 3.39 matched them exactly, so `'x ' in t` was false while `t['x ']` read `x`, and `t.setdefault('x ', …)` overwrote `x`. |
 | L8 | Appending (`TSVZed`, `TSVZedLite`, `appendTabularFile`, `appendLinesTabularFile`) to an existing empty file (no byte, or a compressed file holding only empty streams) writes the store's header first, as creating the file does; 3.39 wrote the rows alone (a read then took the first one for the header), and `appendTabularFile` with `strict` refused the file. |
 | L9 | Reading such an empty file with a header (and `verifyHeader`) gives an empty store with that header: `readTabularFile`, `TSVZed` and `TSVZedLite` with `strict` no longer refuse it with `Header mismatch` (a `TSVZed` restarted after a rewrite that left the file empty failed in its constructor), and without `strict` no longer print a header mismatch. |
+| L10 | Writing text the file's encoding cannot hold (a lone surrogate from `os.fsdecode`, a character the `encoding=` lacks) raises `TSVZEncodeError`, a `ValueError`, and writes nothing; 3.39 and 4.9 wrote `?`, which `errors='replace'` brings back. |
+| L11 | `pop()` and `popitem()` of a `#` key, which lives in memory only, write no tombstone line to the file. |
+| L12 | A rewrite of a file whose header line has no newline writes the rows on lines of their own; 3.39 wrote the first one onto the header line. |
+| L13 | A compressed file is rewritten in members of at most 1 MiB, as appends already were: the bytes differ, the rows read are the same, and 3.39 reads them. |
+| L14 | `TSVZed` opening a compressed file in a codec this Python lacks (zstd before Python 3.14) raises `ImportError` instead of reading the compressed bytes as text. |
 
 ### `.tsvz`, `.csvz`, `.nsvz`, `.psvz`: now tsvz-spec-v1
 
@@ -305,7 +373,7 @@ Conformance testing).
 
 - §17.5: a numbered part opened directly is read alone, with a warning.
 - §14.5: the defaults-on-missing read applies to `t[key]` only.
-- §18.6: locking is one exclusive whole-file lock per write plus an in-process lock; readers do not lock. On Linux it is an open file description lock, which still excludes 3.39's `lockf`; elsewhere (macOS and other systems, or a Linux file system that refuses those locks) it is `lockf`, which closing any descriptor of the file in the process drops: there a read in another thread of the same process, such as a handler's or a `TSVZed`'s, can drop a write's lock while it is held. A known limitation, to be fixed separately.
+- §18.6: locking is one exclusive whole-file lock per write plus an in-process lock; readers do not lock. On Linux it is an open file description lock, which still excludes 3.39's `lockf`; elsewhere (macOS and other systems, or a Linux file system that refuses those locks) it is `lockf`, which closing any descriptor of the file in the process drops: there a read in another thread of the same process, such as a handler's or a `TSVZed`'s, can drop a write's lock while it is held. A known limitation, deferred: see [docs/limitations.md](docs/limitations.md).
 - §19.4: a scrub whose rows would read differently under the final markers writes them with stripping and fill-empty off, then restores the final markers after the rows.
 - §20.7: `-q` also silences informational messages ("Created …"); only errors remain.
 - §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.
@@ -392,7 +460,9 @@ python3 benchTSVZ.py /tmp/b.tsv -n 100000 --compare-old    # benchmark (not a te
 ```
 
 `TSVZ_old.py` is the frozen 3.39 module the differential tests compare against;
-it is not installed.
+it is not installed. CI (`.github/workflows/test.yml`) runs the three test files on
+Python 3.6, 3.9, 3.12 and 3.14. Accepted limitations are listed in
+[docs/limitations.md](docs/limitations.md).
 
 ## License
 

@@ -5,7 +5,7 @@
 # dependencies = [
 # ]
 # ///
-"""TSVZ 4.2: a key-value store kept in a delimiter-separated text file.
+"""TSVZ: a key-value store kept in a delimiter-separated text file.
 
 Plain ``.tsv`` / ``.csv`` / ``.nsv`` / ``.psv`` files (and any other
 extension) keep the exact TSVZ 3.39 format. ``.tsvz`` / ``.csvz`` / ``.nsvz``
@@ -21,10 +21,10 @@ import errno
 import functools
 import hashlib
 import io
-import itertools
 import os
 import re
 import shutil
+import stat
 import threading
 import time
 import sys
@@ -42,10 +42,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '4.9'
+version = '5.0'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-10-16'
+COMMIT_DATE = '2026-10-28'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -67,6 +67,21 @@ def _codecModule(codec):
 	"""The module for ``codec`` (a suffix or a name): gzip, bz2, lzma or compression.zstd."""
 	import importlib
 	return importlib.import_module(_CODECS[_CODEC_NAMES.get(codec, codec)][0])
+
+def _openStreams(codec, f):
+	"""The text of ``codec``'s streams in the open binary file ``f``, one after another. BZ2File and LZMAFile take
+	bytes after a stream that do not begin one for the end of the file, silently; this reader raises there, as
+	GzipFile and ZstdFile do, so a read notes the damage (a whole rewrite cut short leaves the old bytes after the
+	new streams)."""
+	module = _codecModule(codec)
+	name = _CODEC_NAMES.get(codec, codec)
+	if name not in ('bzip2', 'xz'):
+		return module.open(f, 'rb')
+	if sys.version_info >= (3, 14):
+		from compression._common._streams import DecompressReader
+	else:
+		from _compression import DecompressReader  # not a top-level 'compression': before 3.14 that is no stdlib's
+	return io.BufferedReader(DecompressReader(f, getattr(module, _CODECS[name][1])))  # no trailing_error: it raises
 
 def _fileCodec(fileName):
 	"""The codec name ``fileName``'s compression suffix names, or None for a file that is not compressed."""
@@ -161,22 +176,13 @@ def _openUntruncated(fileName):
 
 def _compressedWriter(fileName, raw, compressLevel=1):
 	"""A writer that compresses into the open file ``raw`` with the codec ``fileName`` names, or None for none.
-
-	Closing it does not close ``raw``: _closeFile closes both.
-	"""
-	writer = _codecWriter(fileName, raw, compressLevel)
-	if writer is not None:
-		writer._tsvzRaw = raw
-	return writer
-
-
-def _codecWriter(fileName, raw, compressLevel=1):
-	"""_compressedWriter without the file noted on it: a rewrite holds the file itself, and takes the writer in the
-	line that makes it (a KeyboardInterrupt never leaves one made and not held, whose collection writes)."""
+	Its ``_tsvzRaw`` is ``raw``, which closing it does not close (release_file_obj closes both)."""
 	codec = _fileCodec(fileName)
 	if not codec:
 		return None
-	return _codecModule(codec).open(raw, 'wb', **_codecWriteOptions(codec, compressLevel))
+	writer = _codecModule(codec).open(raw, 'wb', **_codecWriteOptions(codec, compressLevel))
+	writer._tsvzRaw = raw
+	return writer
 
 
 class _RewriteRows(object):
@@ -186,17 +192,15 @@ class _RewriteRows(object):
 
 	The snapshot is every row's cells in one list (``cells``) and each row's count in an array (``lengths``), made
 	from ``values`` (the rows, listed under _memLock; those of '#' keys left out) in one pass that takes each
-	row's cells once, so the two always agree: 8 bytes a cell and 4 a row, not the rows' bytes. check() encodes every row of it, dropping each,
-	and raises the TSVZEncodeError of one that cannot be written, before anything is: it encodes the cells as
-	they are, joined, and sanitizes (_sanitize) only a row that fails so, for the error naming its cell
-	(sanitizing replaces only characters every encoding has with ASCII tokens, so it changes no row's fate, and
-	the warnings it prints for a reserved token are printed once, by the write). Under an ``errors`` handler that
-	never raises, there is nothing to check.
+	row's cells once, so the two always agree: 8 bytes a cell and 4 a row, not the rows' bytes. check() encodes
+	every row of it, dropping each, and raises the TSVZEncodeError of one that cannot be written, before anything
+	is: it encodes the cells as they are, joined, and sanitizes (_sanitize) only a row that fails so, for the error
+	naming its cell (sanitizing replaces only characters every encoding has with ASCII tokens, so it changes no
+	row's fate, and the warnings it prints for a reserved token are printed once, by the write). Under an
+	``errors`` handler that never raises, there is nothing to check.
 
 	The write encodes the same cells again, so it writes exactly what was checked: a row another thread changes
-	in place after the snapshot is written as it was then. It never meets a row it cannot encode and never leaves
-	one out (an in-place rewrite would write every later row a line early). Should it meet one all the same (an
-	``errors`` handler that changed its mind), it raises a RuntimeError: the rewrite fails, and is made again.
+	in place after the snapshot is written as it was then.
 	"""
 
 	def __init__(self, first, values, delimiter, encoding, errors, header):
@@ -246,175 +250,93 @@ class _RewriteRows(object):
 			yield line
 		encode, delimiter = self.encode, self.delimiter
 		for row in self._rows():
-			try:
-				yield encode(_sanitize(row,delimiter=delimiter))
-			except TSVZEncodeError as e:
-				raise RuntimeError('a row the rewrite checked could not be encoded again ({}): the rewrite fails, '
-								   'and is made again'.format(e)) from None
+			yield encode(_sanitize(row,delimiter=delimiter))
 
 
-class _Discard(object):
-	"""A file that keeps nothing written to it: what a codec writer a rewrite gives up on writes into (_discardWriter)."""
-	closed = False
-
-	def write(self, data):
-		return len(data)
-
-	def flush(self):
-		pass
+def _fileIdentity(st):
+	"""``(st_dev, st_ino)`` of the os.stat_result ``st``: which file it is; (None, None) where the platform gives no
+	inode number."""
+	return (st.st_dev, st.st_ino) if st.st_ino else (None, None)
 
 
-def _discardWriter(writer):
-	"""Close the codec ``writer`` (GzipFile, BZ2File, LZMAFile, ZstdFile) without writing anything more into the file
-	under it.
-
-	It is pointed at a _Discard first (``fileobj`` for gzip, ``_fp`` for the others; also when a close it began set
-	it to None): what it still holds and its trailer go there, and neither this close nor its collection later
-	writes into the file, closed or not ('ValueError: write to closed file', 'RuntimeError: lost gzip_file').
-	"""
-	sink = _Discard()
-	for name in ('fileobj', '_fp'):
-		if hasattr(writer, name):
-			setattr(writer, name, sink)
-	try:
-		writer.close()
-	except Exception:
-		pass  # a close it began and could not end: nothing it says can reach the file now
+#: What a legacy store knows its file holds (TSVZed._known) when it knows the file holds nothing, whichever file it is.
+_KNOWN_NOTHING = ((None, None), 0, hashlib.sha256())
 
 
-class _Rewrite(object):
-	"""How far a legacy rewrite (TSVZed._writeRewrite) has got: what _releaseRewrite lets go of, and what it did
-	already, so that a second call (after a KeyboardInterrupt stopped the first) goes on from there."""
-	__slots__ = ('raw', 'writer', 'started', 'written', 'failed', 'reached', 'noted', 'error', 'queued', 'kept',
-				 'hashing', 'damage')
+class _HashingReader(object):
+	"""The open binary file ``f``, read through it: what is read is hashed (``digest``) and counted (``size``), so
+	that what a read parsed is what the store then knows the file holds, byte for byte, even when another writer
+	appends meanwhile. A codec's reader reads through it too."""
 
-	def __init__(self):
-		self.raw = None  # the file, open and locked: None until get_file_obj hands it out
-		self.writer = None  # the codec's writer over it, until it is closed
-		self.started = False  # the rewrite changes (or makes) the file: its own change, noted once it lets go
-		self.written = False  # all of it was handed to the file (or its codec): left to close, flush and sync
-		self.failed = False  # closing, flushing or syncing failed: ``error``
-		self.reached = False  # all of it is on disk
-		self.noted = False  # the file's time and what it holds are noted
-		self.error = None
-		self.queued = ()  # _queuedRowHashes of the queued rows (the first ones) the rows written hold: dropped once on disk
-		self.kept = None  # the queue without them, once it is
-		self.hashing = False  # the read of what the file holds, to note the damage, has begun
-		self.damage = None  # (_damage, _damageAt) it noted, once it has
+	def __init__(self, f):
+		self.f = f
+		self.digest = hashlib.sha256()
+		self.size = 0
 
-	def fail(self, error):
-		self.failed = True
-		if self.error is None:
-			self.error = error
+	def _took(self, data):
+		self.digest.update(data)
+		self.size += len(data)
+		return data
 
+	def read(self, size=-1):
+		return self._took(self.f.read(size))
 
-def _rowHash(row):
-	"""hash() of the cells of the queued ``row``, to tell later whether it was changed in place; -1, which hash()
-	never gives, when it cannot be taken."""
-	try:
-		return hash(tuple(row))
-	except TypeError:
-		return -1
+	def readline(self, size=-1):
+		return self._took(self.f.readline(size))
 
+	def __iter__(self):
+		return self
 
-def _heldRow(store, key):
-	"""What the legacy ``store``'s memory holds for ``key``, the first cell of one of its queued rows: its defaults for
-	the defaults row, else its row; None when it holds none, or when ``key`` cannot be a key. A caller that changes a
-	row's key cell in place (not supported: memory keeps the row under its old key) gets it looked up under the new
-	cell, so it is not found, rather than raising."""
-	if key == DEFAULTS_INDICATOR_KEY:
-		return store.defaults
-	try:
-		return dict.get(store, key)
-	except TypeError:
-		return None
+	def __next__(self):
+		line = self.readline()
+		if not line:
+			raise StopIteration
+		return line
+
+	def tell(self):
+		return self.f.tell()
 
 
-def _queuedKeys(store, queue):
-	"""The keys of the rows queued in the legacy ``store``'s ``queue``: their first cells, but for a row whose first cell
-	a caller changed in place to one that cannot be a key (a list), the key memory still holds that row under (the
-	defaults' for the defaults row), found by identity, rather than raising."""
-	keys = set()
-	lost = set()
-	for row in queue:
-		if row:
-			try:
-				keys.add(row[0])
-			except TypeError:
-				lost.add(id(row))
-	if lost:
-		keys.update(key for key, row in dict.items(store) if id(row) in lost)
-		if id(store.defaults) in lost:
-			keys.add(DEFAULTS_INDICATOR_KEY)
-	return keys
-
-
-def _queuedRowHashes(queue):
-	"""An array of _rowHash of each row of the legacy append ``queue``: what a rewrite's snapshot notes of the rows
-	queued when it is taken, 8 bytes a row."""
-	return array.array('q', map(_rowHash, queue))
-
-
-_DAMAGE_UNKNOWN = (None, None)  # TSVZed._damage when what the file holds is not known
-_DAMAGE_EMPTY = (0, hashlib.sha256(b'').digest())  # TSVZed._damage for a file that holds nothing
-
-
-def _fileDigest(fd, limit):
-	"""``(size, sha256)`` of the first ``limit`` bytes the open file ``fd`` holds on disk (fewer when it is shorter),
-	read through ``fd`` itself (a buffer over it is left alone: closing the file another way still drops it).
-
-	``limit`` is the size noted with the file's stamp, just before: bytes another writer appends during the read
-	(one that takes no lock) are then in neither, and a merge reads them as appended after the damage, instead of
-	taking them for part of it (where the next rewrite overwrote them)."""
+def _fileKnown(fd, end=None):
+	"""``(identity, size, sha256)`` of the first ``end`` bytes (default: all) the open file descriptor ``fd`` holds,
+	read through it: a buffer over it, which a failed write may have left holding bytes, is not flushed (the file is
+	closed right after)."""
+	st = os.fstat(fd)
+	end = st.st_size if end is None else end
 	digest = hashlib.sha256()
 	size = 0
 	os.lseek(fd, 0, os.SEEK_SET)
-	while size < limit:
-		chunk = os.read(fd, min(1 << 20, limit - size))
+	while size < end:
+		chunk = os.read(fd, min(1 << 20, end - size))
 		if not chunk:
 			break
 		digest.update(chunk)
 		size += len(chunk)
-	return size, digest.digest()
+	return _fileIdentity(st), size, digest
 
 
-#: A file changed less than this long before its stamp is taken may change again within the same tick of the file
-#: system's clock (2 s on FAT; 1 s on HFS+ and ext3) and keep its times: such a stamp cannot tell that change.
-_STAMP_RACY_SECONDS = 2.0
-_wallClock = time.time  # the clock file times are compared with (tests move it)
-
-
-def _fileStamp(st):
-	"""``(st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns, settled)`` of the os.stat_result ``st``, taken now: which
-	file it is (None, None where the platform gives no inode number), how large and when last changed, and whether
-	that change is older than _STAMP_RACY_SECONDS. Only a settled stamp that a later one equals shows the file
-	unchanged: a change after it gets a later time, where one within the tick of a racy stamp may keep its times
-	(and its size: a same-size rewrite in place), as git's racily clean index entries."""
-	identity = (st.st_dev, st.st_ino) if st.st_ino else (None, None)
-	settled = _wallClock() - max(st.st_mtime_ns, st.st_ctime_ns) / 1e9 >= _STAMP_RACY_SECONDS
-	return identity + (st.st_size, st.st_mtime_ns, st.st_ctime_ns, settled)
-
-
-def _bytesAfter(file, size, digest):
-	"""``(rest, (size, sha256))``: what the open ``file`` holds after its first ``size`` bytes, and the size and digest
-	of all of it; None when those first bytes are not the ones ``digest`` was taken of. ``file`` is left at offset 0."""
-	try:
-		file.seek(0)
-		whole = hashlib.sha256()
-		left = size
-		while left:
-			chunk = file.read(min(left, 1 << 20))
-			if not chunk:
-				return None  # shorter now: another process rewrote it
-			whole.update(chunk)
-			left -= len(chunk)
-		if whole.digest() != digest:
-			return None
-		rest = file.read()
-		whole.update(rest)
-		return rest, (size + len(rest), whole.digest())
-	finally:
-		file.seek(0)
+def _readAfter(f, known):
+	"""``(rest, known, endsLine)``: what the open binary file ``f`` holds after the bytes ``known`` (``(identity,
+	size, sha256)``) says it holds, what is known of it once that is read, and whether those bytes end a line (or
+	are none). None when ``known`` is None, or the file is not one that begins with them: another file (an
+	identity of None stands for any), shorter, or other bytes there."""
+	if known is None:
+		return None
+	identity, size, digest = known
+	if identity[1] is not None and _fileIdentity(os.fstat(f.fileno())) != identity:
+		return None
+	reader = _HashingReader(f)
+	f.seek(0)
+	last = b''
+	while reader.size < size:
+		chunk = reader.read(min(1 << 20, size - reader.size))
+		if not chunk:
+			return None  # shorter now
+		last = chunk[-1:]
+	if reader.digest.digest() != digest.digest():
+		return None
+	rest = reader.read()
+	return rest, (_fileIdentity(os.fstat(f.fileno())), reader.size, reader.digest), not size or last == b'\n'
 
 
 def _decodeMembers(codec, data):
@@ -462,7 +384,7 @@ _FSYNC_UNSUPPORTED = frozenset([errno.EINVAL, errno.EROFS] + [getattr(errno, nam
 
 
 def _fsync(fd):
-	"""os.fsync(fd), which does nothing where the file system cannot sync (_FSYNC_UNSUPPORTED), as main 1688d25 did."""
+	"""os.fsync(fd), which does nothing where the file system cannot sync (_FSYNC_UNSUPPORTED)."""
 	try:
 		os.fsync(fd)
 	except OSError as e:
@@ -470,12 +392,14 @@ def _fsync(fd):
 			raise
 
 
-def _writeLines(file, header, lines, chunk=1 << 20):
-	"""Write ``header`` (None for none) and ``lines`` to ``file``, each with its newline, ``chunk`` bytes at a time.
+def _writeLines(file, header, lines, chunk=1 << 20, codec=None):
+	"""Write ``header`` (None for none) and ``lines`` to ``file``, each with its newline, ``chunk`` bytes at a time;
+	compressed in ``codec`` when given, each chunk then a whole member, as appends write them.
 
 	Joined here rather than through a buffered writer: nothing is left in a buffer of its own that a failure would
 	drop when it is collected, or that would write into a file already closed; a header alone is one write.
 	"""
+	write = file.write if codec is None else (lambda data: file.write(_compressBytes(codec, data)))
 	parts = [] if header is None else [header, b'\n']
 	size = 0 if header is None else len(header) + 1
 	for line in lines:
@@ -483,27 +407,17 @@ def _writeLines(file, header, lines, chunk=1 << 20):
 		parts.append(b'\n')
 		size += len(line) + 1
 		if size >= chunk:
-			file.write(b''.join(parts))
+			write(b''.join(parts))
 			parts = []
 			size = 0
 	if parts:
-		file.write(b''.join(parts))
+		write(b''.join(parts))
 
 
 def _closeUnflushed(f):
 	"""Close the open file ``f`` without writing what its buffer still holds (after a write that failed)."""
 	inner = getattr(f, 'raw', None)  # the descriptor under a buffered file: closing it closes both
 	(inner if inner is not None else f).close()
-
-
-def _closeFile(file):
-	"""Close ``file`` and, for a writer _compressedWriter made, the file under it."""
-	try:
-		file.close()
-	finally:
-		raw = getattr(file, '_tsvzRaw', None)
-		if raw is not None:
-			raw.close()
 
 
 def openFileAsCompressed(fileName,mode = 'rb',encoding = 'utf8',teeLogger = None,compressLevel = 1):
@@ -567,8 +481,6 @@ def pretty_format_table(data, delimiter="\t", header=None, full=False):
 	color code none.
 	"""
 	import unicodedata
-	version = 1.13
-	_ = version
 	ansi = re.compile(r"(\x1b\[[0-?]*[ -/]*[@-~])")
 	def char_width(ch):
 		if ch < "\u0300":  # ASCII and Latin-1
@@ -904,7 +816,6 @@ def _isSpecPath(path):
 
 
 _REFUSED_RETRY_SECONDS = 1.0  # shortest wait before a refused rewrite is tried again
-_DEFERRED_REWRITE_TRIES = 3  # rewrites rewrite() tries when another process keeps changing the file under them
 _FAILURE_RETRY_FIRST = 0.1  # seconds the background writer waits before it tries a failed legacy write again,
 _FAILURE_RETRY_MAX = 60.0  # doubled at each failure in a row up to this
 
@@ -1250,7 +1161,8 @@ def _fileHoldsNothing(fileName):
 		return _holdsNothing(f, _fileCodec(fileName), os.fstat(f.fileno()).st_size)
 
 
-def _appendOpen(f, payload, codec=None, header=None, tailPolicy='newline', reporter=None, fsync=False, memberSize=None):
+def _appendOpen(f, payload, codec=None, header=None, tailPolicy='newline', reporter=None, fsync=False, memberSize=None,
+				written=None):
 	"""Append ``payload`` (whole lines, each ending in b'\\n') to the open file ``f``: the one write of every append
 	to a legacy file (and of _lockedAppend's to a spec part). Returns the offset in ``f`` where the payload's first
 	line begins (for a compressed file, where what was written begins).
@@ -1272,7 +1184,8 @@ def _appendOpen(f, payload, codec=None, header=None, tailPolicy='newline', repor
 	made, whose close would write a member of its own. They are written with os.write, past any buffer of ``f``
 	(nothing is left in one for a close to write later), and synced with ``fsync``. An error raises; one in the
 	write first cuts off again what it wrote of them, so an append cut short (a full disk) leaves no torn row for
-	a reader, or a merge, to take for a row (a failed sync leaves what was all written).
+	a reader, or a merge, to take for a row (a failed sync leaves what was all written). ``written``, a list, gets
+	the bytes written once they all are, as they are on disk.
 	"""
 	f.flush()
 	size = f.seek(0, os.SEEK_END)
@@ -1310,6 +1223,8 @@ def _appendOpen(f, payload, codec=None, header=None, tailPolicy='newline', repor
 			except Exception:
 				pass  # the error raised says the append failed
 			raise
+		if written is not None:
+			written.append(data)
 		if fsync:
 			os.fsync(fd)  # all of it was written, and is read: a sync that fails leaves it
 	finally:
@@ -1738,15 +1653,30 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 											 delimiter=delimiter,
 											 ),delimiter=delimiter),delimiter,encoding,errors,what='header')
 			try:
-				with openFileAsCompressed(fileName, mode ='wb',encoding=encoding,teeLogger=teeLogger) as file:
-					file.write(headerBytes+b'\n')
+				codec = _fileCodec(fileName)
+				data = _compressBytes(codec, headerBytes + b'\n') if codec else headerBytes + b'\n'  # before: no gap
+				# Not over a file another writer made since it was looked for ('xb'), nor a link (its target is made),
+				# and under the lock, as every writer writes: an append that took it first has written the header.
+				with _pathLock(fileName), open(os.path.realpath(fileName), 'xb') as file:  # lockf excludes no thread
+					_lockFile(file)
+					try:
+						if not os.fstat(file.fileno()).st_size:
+							file.write(data)
+							file.flush()
+					finally:
+						_seekRawStart(file)  # msvcrt unlocks from the raw position: the range it locked
+						_unlockFile(file)
 				__teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
 				return True
+			except FileExistsError:
+				if os.path.exists(fileName) and not os.path.isdir(fileName):
+					return True  # another writer made it meanwhile (not a directory, nor a link that leads nowhere)
 			except Exception:
-				__teePrintOrNot('Failed to create '+fileName,'error',teeLogger=teeLogger)
-				if strict:
-					raise FileNotFoundError("Failed to create file")
-				return False
+				pass
+			__teePrintOrNot('Failed to create '+fileName,'error',teeLogger=teeLogger)
+			if strict:
+				raise FileNotFoundError("Failed to create file")
+			return False
 		elif strict:
 			__teePrintOrNot('File not found','error',teeLogger=teeLogger)
 			raise FileNotFoundError("File not found")
@@ -1841,38 +1771,48 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 	reporter = _Reporter(fileName, teeLogger)
 	try:
 		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
-			lineNo = 0
-			if any(header) and verifyHeader:
-				try:
-					raw = file.readline()
-				except Exception as e:
-					# L5: a compressed stream damaged inside the header line ends the read.
-					if lastLineOnly or not _isCompressedFile(fileName):
-						raise
-					reporter.note('damaged', None, 'compressed stream is damaged ({}: {}); read up to the damage'.format(type(e).__name__, e))
-					return taskDic
-				lineNo = 1
-				try:
-					line = raw.decode(encoding=encoding)
-				except UnicodeDecodeError:
-					line = raw.decode(encoding=encoding,errors='replace')
-					reporter.note('decode', 'line 1', 'invalid {} replaced with U+FFFD'.format(encoding))
-				# A file that holds nothing (no byte, or only empty compressed streams) is an empty store with this
-				# header, as an append to it takes it (it writes the header first): not a header mismatch.
-				if (not raw or _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter)) and correctColumnNum == -1:
-					correctColumnNum = len(header)
-					if verbose:
-						__teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
+			start = _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, strict, delimiter,
+									  correctColumnNum, encoding, reporter, lastLineOnly)
+			if start is None:
+				return taskDic
+			correctColumnNum, lineNo = start
 			if lastLineOnly:
-				lineCache = read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter, defaults=defaults,storeOffset=storeOffset)
-				# if lineCache:
-				# 	taskDic[lineCache[0]] = lineCache
-				return lineCache
+				return read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter, defaults=defaults,storeOffset=storeOffset)
 			_legacyReadLoop(file, fileName, taskDic, correctColumnNum, lineNo, strict, delimiter, defaults,
 							storeOffset, encoding, reporter)
 	finally:
 		reporter.flush()
 	return taskDic
+
+
+def _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, strict, delimiter, correctColumnNum,
+					  encoding, reporter, lastLineOnly=False):
+	"""Read and check the header line of the open legacy ``file`` when ``header`` is to be verified (readTabularFile).
+
+	Returns ``(correctColumnNum, lineNo)``, the column count and the lines read, or None when a compressed stream
+	is damaged inside the header line (noted on ``reporter``: nothing more is read, L5).
+	"""
+	if not (any(header) and verifyHeader):
+		return correctColumnNum, 0
+	try:
+		raw = file.readline()
+	except Exception as e:
+		if lastLineOnly or not _isCompressedFile(fileName):
+			raise
+		reporter.note('damaged', None, 'compressed stream is damaged ({}: {}); read up to the damage'.format(type(e).__name__, e))
+		return None
+	try:
+		line = raw.decode(encoding=encoding)
+	except UnicodeDecodeError:
+		line = raw.decode(encoding=encoding,errors='replace')
+		reporter.note('decode', 'line 1', 'invalid {} replaced with U+FFFD'.format(encoding))
+	# A file that holds nothing (no byte, or only empty compressed streams) is an empty store with this header, as
+	# an append to it takes it (it writes the header first): not a header mismatch.
+	if (not raw or _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter)) and correctColumnNum == -1:
+		correctColumnNum = len(header)
+		if verbose:
+			__teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
+	return correctColumnNum, 1
 
 
 def _legacyReadLoop(file, fileName, taskDic, correctColumnNum, lineNo, strict, delimiter, defaults, storeOffset,
@@ -2161,6 +2101,10 @@ def getFileUpdateTimeNs(fileName):
 		__teePrintOrNot(f"Failed to get file update time for {fileName}",'error')
 		return get_time_ns()
 
+def _updateTimeNs(st):
+	"""getFileUpdateTimeNs() of the file ``st`` is the stat of: 0 for one that is not a regular file (/dev/null)."""
+	return st.st_mtime_ns if stat.S_ISREG(st.st_mode) else 0
+
 def get_time_ns():
 	try:
 		return time.time_ns()
@@ -2399,7 +2343,6 @@ class _SpecState(object):
 	"""Reader state of spec §12, carried across records and parts."""
 
 	def __init__(self, defaults=None):
-		self.version = 1
 		self.newestVersion = 1  # the highest version a #_version_# line declared (spec §19.4, §19.8)
 		self.defaults = list(defaults) if defaults and len(defaults) > 1 else [DEFAULTS_INDICATOR_KEY]
 		self.strip = True
@@ -2433,6 +2376,15 @@ def _asciiLower(text):
 	return ''.join(c.lower() if c < '\x80' else c for c in text)
 
 
+def _asciiInt(value):
+	"""The number the ASCII digits ``value`` spell, else 0. A value of more than 64 significant digits, which int()
+	refuses from Python 3.11 when it is very long, counts as 10 ** 64: more than any version or member size."""
+	if not _ASCII_DIGITS_RE.match(value):
+		return 0
+	digits = value.lstrip('0') or '0'
+	return int(digits) if len(digits) <= 64 else 10 ** 64
+
+
 def _specApplyMarker(state, keyLower, values, reporter, where):
 	"""Apply an official marker (spec §12.4). Returns False when its value was rejected."""
 	value = values[0] if values else ''  # marker lines are not stripped (spec §10.4)
@@ -2440,21 +2392,14 @@ def _specApplyMarker(state, keyLower, values, reporter, where):
 		state.defaults = [DEFAULTS_INDICATOR_KEY] + list(values)
 		state.sawDefaults = True
 	elif keyLower == '#_version_#':
-		if not value:
-			state.version = 1
-		else:
-			number = 0
-			if _ASCII_DIGITS_RE.match(value):
-				digits = value.lstrip('0') or '0'
-				# int() refuses very long values (Python 3.11+); any such value is above every implemented version.
-				number = int(digits) if len(digits) <= 64 else MAX_SPEC_VERSION + 1
+		if value:  # an empty value resets to version 1, which changes nothing that is read
+			number = _asciiInt(value)
 			if number < 1:
 				reporter.note('bad-marker', where, 'ignored #_version_# with invalid value {!r}'.format(value))
 				return False
 			if number > MAX_SPEC_VERSION:
 				shown = value if len(value) <= 20 else '{}… ({} digits)'.format(value[:20], len(value))
 				reporter.note('newer-version', where, 'declares spec version {}; read as version {}'.format(shown, MAX_SPEC_VERSION))
-			state.version = number
 			state.newestVersion = max(state.newestVersion, number)
 	elif keyLower in _BOOL_MARKERS:
 		attr, default = _BOOL_MARKERS[keyLower]
@@ -2466,12 +2411,7 @@ def _specApplyMarker(state, keyLower, values, reporter, where):
 			reporter.note('bad-marker', where, 'ignored {} with invalid value {!r}'.format(keyLower, value))
 			return False
 	elif keyLower == MEMBER_SIZE_KEY:
-		size = 0
-		if _ASCII_DIGITS_RE.match(value):
-			try:
-				size = int(value)
-			except ValueError:  # more digits than int() converts (Python 3.11+ limit)
-				pass
+		size = _asciiInt(value)
 		if not value:
 			state.memberSize = _DEFAULT_MEMBER_SIZE
 		elif size >= 1:
@@ -2595,9 +2535,9 @@ def _cellText(item):
 class _PartInfo(object):
 	"""What reading one part found: its codec, uncommitted tail and damage."""
 
-	def __init__(self, path):
+	def __init__(self, path, codec=None):
 		self.path = path
-		self.codec = _parsePartName(path).codec
+		self.codec = _parsePartName(path).codec if codec is None else codec
 		self.tail = b''
 		self.damaged = []  # what was wrong with a compressed part's members, for the warning
 		self.lost = False  # damaged data was recovered, skipped or stopped at (spec §4.10): a rewrite keeps a copy
@@ -2738,7 +2678,7 @@ def _gzipHeaderLength(data):
 	"""The length of the gzip member header at the start of ``data`` (RFC 1952), or None when it is not all there."""
 	if len(data) < 10 or data[:3] != b'\x1f\x8b\x08':
 		return None
-	flags = data[3] if not isinstance(data[3], str) else ord(data[3])
+	flags = data[3]
 	pos = 10
 	if flags & 4:  # FEXTRA
 		if len(data) < pos + 2:
@@ -2837,56 +2777,45 @@ def _decompressChunks(f, info):
 	"""
 	src = _PartBytes(f)
 	try:
-		for piece in _decompressMembers(f, info, src):
-			yield piece
+		while True:
+			status, out, start, end, error = _readMember(src, info.codec)
+			if status == 'none':
+				break
+			if status == 'complete':
+				if out:
+					yield out
+				continue
+			following = _nextMemberStart(f, info.codec, start + 1)
+			stop = f.seek(0, os.SEEK_END) if following is None else following
+			f.seek(start)
+			raw = f.read(stop - start)
+			if _CODEC_NAMES[info.codec] == 'gzip':
+				raw = _gzipUnpad(raw)  # zero padding before the next member (spec §16.6)
+			cutShort, out, error = _decodeAlone(raw, info.codec)
+			if cutShort:
+				info.damaged.append('the member at byte {} is cut short; its whole lines are read'.format(start))
+				if out:
+					yield out
+			else:
+				info.lost = True
+				policy = info.state.onCorruption if info.state is not None else 'recover'
+				if policy == 'stop':
+					info.damaged.append('the member at byte {} is corrupt ({}); reading stopped there (#_on_corruption_# stop)'.format(start, error))
+					yield _STOP
+					return
+				if policy == 'skip':
+					info.damaged.append('skipped the corrupt member at byte {} ({})'.format(start, error))
+				else:
+					info.damaged.append('used {} bytes the corrupt member at byte {} decoded before it failed ({}); they are not verified'.format(len(out), start, error))
+					if out:
+						yield out
+			if following is None:
+				break
+			yield None
+			src.seek(following)  # the next member, damaged or not; the search moved the file
 	finally:
 		info.rawHead = src.head or b''
 		info.rawEnd, info.rawCheck = src.offset(), src.tail()
-
-
-def _decompressMembers(f, info, src):
-	"""The loop of ``_decompressChunks``."""
-	while True:
-		status, out, start, end, error = _readMember(src, info.codec)
-		if status == 'none':
-			break
-		if status == 'complete':
-			if out:
-				yield out
-			continue
-		following = _nextMemberStart(f, info.codec, start + 1)
-		if following is None:
-			f.seek(0, os.SEEK_END)
-			stop = f.tell()
-		else:
-			stop = following
-		f.seek(start)
-		raw = f.read(stop - start)
-		# Where the read ends now, and the bytes before it: those read up to the damage, then these.
-		if _CODEC_NAMES[info.codec] == 'gzip':
-			raw = _gzipUnpad(raw)  # zero padding before the next member (spec §16.6)
-		cutShort, out, error = _decodeAlone(raw, info.codec)
-		if cutShort:
-			info.damaged.append('the member at byte {} is cut short; its whole lines are read'.format(start))
-			if out:
-				yield out
-		else:
-			info.lost = True
-			policy = info.state.onCorruption if info.state is not None else 'recover'
-			if policy == 'stop':
-				info.damaged.append('the member at byte {} is corrupt ({}); reading stopped there (#_on_corruption_# stop)'.format(start, error))
-				yield _STOP
-				return
-			if policy == 'skip':
-				info.damaged.append('skipped the corrupt member at byte {} ({})'.format(start, error))
-			else:
-				info.damaged.append('used {} bytes the corrupt member at byte {} decoded before it failed ({}); they are not verified'.format(len(out), start, error))
-				if out:
-					yield out
-		if following is None:
-			break
-		yield None
-		src.seek(following)  # the next member, damaged or not; the search moved the file
 
 
 def _iterPartLines(info, reporter, label=''):
@@ -2978,7 +2907,7 @@ def _decodeLine(raw, reporter, where):
 	return text
 
 
-def _specChecksum(state, algo, text, delimiter, reporter, where, position=None):
+def _specChecksum(state, algo, text, delimiter, reporter, where, position):
 	"""Arm or verify-and-reset the ``algo`` accumulator (spec §15.3).
 
 	A mismatch is noted on ``reporter`` and appended to ``state.mismatches`` as
@@ -2991,7 +2920,7 @@ def _specChecksum(state, algo, text, delimiter, reporter, where, position=None):
 			actual = state.digests[algo].hexdigest()
 			if actual != expected:
 				reporter.note('checksum', where, '#_checksum_{}_# mismatch: expected {}, computed {}; data kept'.format(algo, expected, actual))
-				state.mismatches.append(tuple(position or (None, None)) + (algo, expected, actual))
+				state.mismatches.append(tuple(position) + (algo, expected, actual))
 	state.digests[algo] = _newDigest(algo)
 
 
@@ -3021,11 +2950,10 @@ def _specReplay(parts, delimiter, state, reporter, infos, start=0):
 	"""Replay ``parts`` as one stream (spec §7, §17.4).
 
 	Yields ``(partIndex, offset, text, record)`` for every committed line except
-	checksum markers of supported algorithms, where ``record`` is what
-	``_specProcessRecord`` returned. Marker state and checksum accumulators in
-	``state`` carry across parts. One ``_PartInfo`` per part is appended to
-	``infos``. The parts before ``start`` (a snapshot part, spec §19.10.3) are not
-	read: their infos are marked ``skipped``.
+	checksum markers of supported algorithms (``_specReplayLines``). Marker state
+	and checksum accumulators in ``state`` carry across parts. One ``_PartInfo``
+	per part is appended to ``infos``. The parts before ``start`` (a snapshot part,
+	spec §19.10.3) are not read: their infos are marked ``skipped``.
 	"""
 	multi = len(parts) > 1
 	for partIndex, path in enumerate(parts):
@@ -3036,39 +2964,53 @@ def _specReplay(parts, delimiter, state, reporter, infos, start=0):
 			info.skipped = True
 			continue
 		label = os.path.basename(path) + ' ' if multi else ''
-		lineNo = 0
-		for raw, offset in _iterPartLines(info, reporter, label):
-			lineNo += 1
-			where = '{}line {}'.format(label, lineNo)
-			whole = raw  # digests cover the line as written, zero bytes included (spec §4.9)
-			fill = _specZeroFill(raw, delimiter, state, reporter, where)
-			if fill is not raw:
-				info.lost = True
-				if fill is _STOP:
-					_reportPartDamage(info, reporter)  # the part reader stops here too, before its own report
-					info.stopped = True
-					info.lines = lineNo
-					info.committed = offset  # where reading stopped: a follower checks the bytes before it
-					return
-				if fill is None:
-					for digest in state.digests.values():
-						digest.update(whole)
-					continue
-				offset += len(raw) - len(fill)
-				raw = fill
-			text = _decodeLine(raw, reporter, where)
-			check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
-			algo = check.group(1).lower() if check and _digestSupported(check.group(1).lower()) else None
-			for name, digest in state.digests.items():
-				if name != algo:
-					digest.update(whole)
-			if algo:
-				_specChecksum(state, algo, text, delimiter, reporter, where, (path, lineNo))
-				continue
-			yield partIndex, offset, text, _specProcessRecord(text, state, delimiter, reporter, where)
-		info.lines = lineNo
+		yield from _specReplayLines(_iterPartLines(info, reporter, label), info, label, state, delimiter, reporter,
+									partIndex=partIndex)
 		if info.stopped:  # a stop policy ends the read of the whole store (spec §4.10)
 			return
+
+
+def _specReplayLines(lines, info, label, state, delimiter, reporter, lineNo=0, partIndex=0):
+	"""Replay committed lines of the part ``info`` describes (spec §4.9, §7, §15).
+
+	``lines`` yields ``(raw, offset)``: each line with its b'\\n' (a byte order
+	mark already removed) and where it begins in the part; ``lineNo`` lines of the
+	part come before them. Yields ``(partIndex, offset, text, record)`` for each
+	line except checksum markers of supported algorithms, where ``record`` is what
+	``_specProcessRecord`` returned; ``offset`` is past any zero fill. Sets
+	``info.lines``, and ``info.lost`` and ``info.stopped`` for damaged data.
+	"""
+	path = info.path
+	for raw, offset in lines:
+		lineNo += 1
+		where = '{}line {}'.format(label, lineNo)
+		whole = raw  # digests cover the line as written, zero bytes included (spec §4.9)
+		fill = _specZeroFill(raw, delimiter, state, reporter, where)
+		if fill is not raw:
+			info.lost = True
+			if fill is _STOP:
+				_reportPartDamage(info, reporter)  # the part reader stops here too, before its own report
+				info.stopped = True
+				info.lines = lineNo
+				info.committed = offset  # where reading stopped: a follower checks the bytes before it
+				return
+			if fill is None:
+				for digest in state.digests.values():
+					digest.update(whole)
+				continue
+			offset += len(raw) - len(fill)
+			raw = fill
+		text = _decodeLine(raw, reporter, where)
+		check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
+		algo = check.group(1).lower() if check and _digestSupported(check.group(1).lower()) else None
+		for name, digest in state.digests.items():
+			if name != algo:
+				digest.update(whole)
+		if algo:
+			_specChecksum(state, algo, text, delimiter, reporter, where, (path, lineNo))
+			continue
+		yield partIndex, offset, text, _specProcessRecord(text, state, delimiter, reporter, where)
+	info.lines = lineNo
 
 
 SNAPSHOT_KEY = '#_snapshot_#'
@@ -3120,41 +3062,6 @@ def _specSnapshotStart(parts, delimiter):
 		if _specIsSnapshotPart(parts[index], delimiter):
 			return index
 	return 0
-
-
-def _specReplayLine(raw, lineNo, label, path, state, delimiter, reporter, atStart=False):
-	"""Replay one committed line of the part ``path``, as ``_specReplay`` does for each line.
-
-	``raw`` is the line with its b'\\n'; ``lineNo`` counts from 1 within the
-	part and ``label`` prefixes locations in reports; ``atStart`` says the line
-	begins the part, the one place a byte order mark is removed (spec §4.7). Returns ``(text,
-	record)`` as ``_specProcessRecord`` sees it, None for the checksum marker
-	of a supported algorithm or an ignored zero-filled line, or ``_STOP``.
-	(``_specReplay`` keeps this logic inline for speed; the two must stay in
-	step.)
-	"""
-	where = '{}line {}'.format(label, lineNo)
-	if atStart and raw.startswith(b'\xef\xbb\xbf'):
-		raw = raw[3:]
-		reporter.note('bom', where, 'stripped a UTF-8 byte order mark')
-	whole = raw  # digests cover the line as written, zero bytes included (spec §4.9)
-	raw = _specZeroFill(raw, delimiter, state, reporter, where)
-	if raw is _STOP:
-		return raw
-	if raw is None:
-		for digest in state.digests.values():
-			digest.update(whole)
-		return None
-	text = _decodeLine(raw, reporter, where)
-	check = _CHECKSUM_RE.match(text.split(delimiter, 1)[0]) if text.startswith('#_') else None
-	algo = check.group(1).lower() if check and _digestSupported(check.group(1).lower()) else None
-	for name, digest in state.digests.items():
-		if name != algo:
-			digest.update(whole)
-	if algo:
-		_specChecksum(state, algo, text, delimiter, reporter, where, (path, lineNo))
-		return None
-	return text, _specProcessRecord(text, state, delimiter, reporter, where)
 
 
 def _storeParts(path, reporter=None):
@@ -3220,28 +3127,21 @@ def _specUnsteady(parts, infos):
 	for i, info in enumerate(infos):
 		if info.stamp is None:
 			continue
-		try:
-			stamp = _specStamp(os.stat(info.path))
-		except OSError:
-			stamp = None
+		stamp = _specFileStamp(info.path)
 		if stamp == info.stamp:
 			continue
 		if i != last:
 			return 'the parts before the last kept changing while they were read'
 		appended = stamp is not None and not info.stopped and stamp[0] == info.stamp[0] and stamp[1] > info.stamp[1]
-		if appended and info.codec:
+		if appended:
+			# Where the read ended, in raw bytes, and the bytes it saw before that (committed counts raw
+			# bytes only in a plain part, whose rawHead is empty).
+			end, check = (info.rawEnd, info.rawCheck) if info.codec else (info.committed, info.check)
 			try:
 				with open(info.path, 'rb') as f:
-					appended = stamp[1] >= info.rawEnd and f.read(len(info.rawHead)) == info.rawHead
-					f.seek(info.rawEnd - len(info.rawCheck))
-					appended = appended and f.read(len(info.rawCheck)) == info.rawCheck
-			except OSError:
-				appended = False
-		elif appended:  # committed counts raw bytes only in a plain part
-			try:
-				with open(info.path, 'rb') as f:
-					f.seek(info.committed - len(info.check))
-					appended = stamp[1] >= info.committed and f.read(len(info.check)) == info.check
+					appended = stamp[1] >= end and f.read(len(info.rawHead)) == info.rawHead
+					f.seek(end - len(check))
+					appended = appended and f.read(len(check)) == check
 			except OSError:
 				appended = False
 		if not appended:
@@ -3251,14 +3151,6 @@ def _specUnsteady(parts, infos):
 
 #: The clock a torn TSVZed load's next read again is timed by.
 _specClock = time.monotonic
-
-
-class _HeaderMismatch(Exception):
-	"""A strict read found a header line other than the one asked for (``line``): it stops there."""
-
-	def __init__(self, line):
-		Exception.__init__(self, line)
-		self.line = line
 
 
 def _specSteadyRead(read, reporter):
@@ -3347,26 +3239,7 @@ def _specLoad(fileName, delimiter, header=(), verifyHeader=True, strict=True, de
 		load = _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, correctColumnNum,
 							 storeOffset, taskDic, reporter, teeLogger, verbose)
 		return load, load.parts, load.infos
-	# A strict read stops at a header line other than the one asked for: raised when the next read finds
-	# that same line (the store's header, not a torn view of it; compared, not stamped), else read again.
-	mark = reporter.mark()
-	seen = []
-	while True:
-		try:
-			load = _specSteadyRead(read, reporter)
-			break
-		except _HeaderMismatch as e:
-			if (seen and seen[-1] == e.line) or len(seen) == _SPEC_READS - 1:
-				_lineContainHeader(header, e.line, verbose=verbose, teeLogger=teeLogger, strict=True,
-								   delimiter=delimiter)
-			seen.append(e.line)
-			reporter.rewind(mark)
-			if taskDic is not None:
-				taskDic.clear()
-				taskDic.update(given)
-	if seen and load.headerChecked is None:  # the line seen, and none read since (the part unreadable)
-		_lineContainHeader(header, seen[-1], verbose=verbose, teeLogger=teeLogger, strict=True,
-						   delimiter=delimiter)
+	load = _specSteadyRead(read, reporter)
 	if load.headerChecked is not None:  # judged silently in each read; said, or raised on, once
 		_lineContainHeader(header, load.headerChecked, verbose=verbose, teeLogger=teeLogger, strict=strict,
 						   delimiter=delimiter)
@@ -3408,7 +3281,8 @@ def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, c
 					if width == -1:
 						width = len(header)
 				elif strict:
-					raise _HeaderMismatch(candidate)  # ends this read (``_specLoad``)
+					_lineContainHeader(header, candidate, verbose=verbose, teeLogger=teeLogger, strict=True,
+									   delimiter=delimiter)  # raises: the store's own header line is not torn
 		if record is None:
 			if verbose and text.startswith('#_'):
 				f0 = text.split(delimiter, 1)[0]
@@ -3434,6 +3308,38 @@ def _specLoadOnce(fileName, delimiter, header, verifyHeader, strict, defaults, c
 		result.headerChecked = ''
 	result.correctColumnNum = width
 	return result
+
+
+def _specReplayQueued(load, records, delimiter):
+	"""Replay formatted ``records`` not yet committed on ``load`` (a ``_SpecLoad``), as a read after their commit would."""
+	quiet = _Reporter('')  # never flushed: they were checked when they were queued
+	for record in list(records):
+		for line in record.split('\n'):
+			replayed = _specProcessRecord(line, load.state, delimiter, quiet, None)
+			if replayed is None:
+				continue
+			key, row = replayed
+			if row is None:
+				load.data.pop(key, None)
+			else:
+				load.correctColumnNum = _specPadRow(row, load.state, load.correctColumnNum)
+				load.data[key] = row
+
+
+def _specCells(key, value, delimiter):
+	"""``(key, cells)`` as a .tsvz set takes them (as 3.39 did): the key and every cell right-stripped, the key first."""
+	key = str(key).rstrip()
+	if isinstance(value, str):
+		value = value.split(delimiter)
+	cells = [str(s).rstrip() if s else '' for s in value]
+	return key, (cells if cells and cells[0] == key else [key] + cells)
+
+
+def _specFill(cells, defaults):
+	"""Fill a set row's empty cells with ``defaults`` in place, as it is written (design §5.2)."""
+	for i in range(1, min(len(cells), len(defaults))):
+		if not cells[i] and defaults[i]:
+			cells[i] = defaults[i]
 
 
 def _specPadRow(row, state, width):
@@ -3605,17 +3511,36 @@ def _specBackupPart(path, reporter):
 	return backup
 
 
-def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None):
-	"""Append whole records to a spec part (design §5.4).
+def _specAppendTo(f, path, payload, reporter, fsync=False, memberSize=None):
+	"""Append whole records to the open part ``f`` (``path``) under its locks (design §5.4).
 
 	Uncompressed: an uncommitted tail is truncated first. Compressed: the
 	payload becomes new members of at most ``memberSize`` bytes (spec §16.7);
 	the part is not read or checked for damage, since readers handle a damaged
-	member (spec §16.6). A missing part is created.
+	member (spec §16.6). Returns ``(offset, before, after)``: where the payload
+	begins, and the part's ``_specStamp`` just before and after it is written,
+	both taken under the lock, so no other locked writer's append falls between.
 	"""
-	codec = _parsePartName(path).codec
-	_requireCodec(codec)
-	_lockedAppend(path, payload, 'truncate', reporter, fsync=fsync, codec=codec, memberSize=memberSize)
+	with _pathLock(path):
+		_seekRawStart(f)  # msvcrt locks from the raw position: lock and unlock the same range
+		_lockFile(f)
+		try:
+			before = _specStamp(os.fstat(f.fileno()))
+			offset = _appendOpen(f, payload, _parsePartName(path).codec, None, 'truncate', reporter, fsync, memberSize)
+			return offset, before, _specStamp(os.fstat(f.fileno()))
+		finally:
+			try:
+				_seekRawStart(f)
+			except OSError:
+				pass  # a failed write is already propagating; the lock must still be released
+			_unlockFile(f)
+
+
+def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None):
+	"""``_specAppendTo`` the part ``path``; a missing part is created."""
+	_requireCodec(_parsePartName(path).codec)
+	with open(path, 'a+b') as f:
+		return _specAppendTo(f, path, payload, reporter, fsync, memberSize)
 
 
 #: Reads a scrub or clear makes before it gives up on a store that keeps changing.
@@ -3629,15 +3554,18 @@ def _specStamp(st):
 	return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
+def _specFileStamp(path):
+	"""The ``_specStamp`` of the file ``path``, or None when it cannot be looked at."""
+	try:
+		return _specStamp(os.stat(path))
+	except OSError:
+		return None
+
+
 def _specSnapshot(fileName):
 	"""Return ``(parts, stamp)`` before a read: ``stamp`` is the single part's ``_specStamp``, else None."""
 	parts, _ = _storeParts(fileName)
-	if len(parts) != 1:
-		return parts, None
-	try:
-		return parts, _specStamp(os.stat(parts[0]))
-	except OSError:
-		return parts, None
+	return parts, (_specFileStamp(parts[0]) if len(parts) == 1 else None)
 
 
 def _matchOwner(fd, st):
@@ -3660,10 +3588,11 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 	"""Replace a part's bytes in place (same inode, spec §18.7 / §19.8).
 
 	``content`` is uncompressed; it is compressed for a compressed part. The
-	file is left alone when its bytes already match. Returns True if written,
-	False if unchanged. ``expect`` is a ``_specStamp`` taken before the caller
-	read the part: when the part no longer matches it under the lock, another
-	writer committed in between, so nothing is written and None is returned.
+	file is left alone when its bytes already match. Returns ``(written, stamp)``:
+	whether it wrote, and the part's ``_specStamp`` then, taken under the lock.
+	``expect`` is a ``_specStamp`` taken before the caller read the part: when
+	the part no longer matches it under the lock, another writer committed in
+	between, so nothing is written and None is returned.
 	"""
 	codec = _parsePartName(path).codec
 	_requireCodec(codec)
@@ -3680,7 +3609,7 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 				# the file is written below: a read-ahead in f would leave it a stale position to close at.
 				old = _readFrom0(fd, st.st_size)
 				if old == raw:
-					return False
+					return False, _specStamp(st)
 				try:
 					_reserveSpace(fd, len(raw))  # spec §19.8: a full disk refuses the rewrite before any byte changes
 					_writeFrom0(fd, raw)
@@ -3698,7 +3627,7 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 						_warn('TSVZ warning: ' + damaged)  # an interrupt stays an interrupt
 					raise
 				os.fsync(fd)
-				return True
+				return True, _specStamp(os.fstat(fd))
 			finally:
 				try:
 					_seekRawStart(f)  # msvcrt unlocks from the raw position: the range it locked
@@ -3912,27 +3841,45 @@ def _specAppendRecords(fileName, records, reporter, teeLogger=None, header=(), c
 	return True
 
 
-def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=False, verbose=False,
-						  encoding='utf8', strict=False, delimiter=..., errors='strict'):
-	"""``clearTabularFile`` for spec paths (design §5.5, §5.8). Returns True when the store was cleared.
+def _specKeptHeader(load, header, delimiter, errors):
+	"""The header line a clear or scrub writes, as a list of 0 or 1 lines: the store's own, else ``header``
+	(checked, as it is written only then)."""
+	if load.headerLine:
+		return [load.headerLine]
+	if not any(header):
+		return []
+	_checkRow(header, delimiter, 'utf-8', errors, what='header')
+	return [_specHeaderComment(header, delimiter)]
+
+
+def _specClearTabularFile(fileName, **kwargs):
+	"""``clearTabularFile`` for spec paths (``_specClear``): True when the store was cleared."""
+	return _specClear(fileName, **kwargs)[0]
+
+
+def _specClear(fileName, teeLogger=None, header='', verifyHeader=False, verbose=False,
+			   encoding='utf8', strict=False, delimiter=..., errors='strict'):
+	"""Clear a spec store (design §5.5, §5.8); return ``(cleared, seen)``: whether it was cleared, and the
+	``_specStamp`` of the part written, taken under its lock right after the write (None when none was).
 
 	A single file is read without a lock and rewritten in place only if no
 	other writer changed it since the read (else it is read again, up to
-	``_SPEC_REWRITE_ATTEMPTS`` times), as is a store whose read may be torn,
-	so a multi-part store never gets tombstones for the keys of a torn view.
-	A path naming one part of a multi-part store is refused, and so is a
+	``_SPEC_REWRITE_ATTEMPTS`` times). A store whose read may be torn is left
+	alone, so a multi-part store never gets tombstones for the keys of a torn
+	view. A path naming one part of a multi-part store is refused, and so is a
 	single file declaring a spec version newer than ``MAX_SPEC_VERSION``.
 	"""
+	changing = 'clear skipped: the store kept changing while it was being cleared; nothing was written'
 	reporter = _Reporter(fileName, teeLogger)
 	attempt = None
-	cleared = False
+	cleared, seen = False, None
 	try:
 		delimiter, encoding = _specOptions(fileName, delimiter, encoding, reporter)
 		header = _formatHeader(header, verbose=verbose, teeLogger=teeLogger, delimiter=delimiter)
 		name = _parsePartName(fileName)
 		if name.ordinal is not None or name.rotated:
 			reporter.note('fragment', None, 'clear skipped: {} names one part of a multi-part store; clear the store path instead; nothing was written'.format(fileName))
-			return False
+			return False, None
 		if not _specEnsureStore(fileName, True, header, [DEFAULTS_INDICATOR_KEY], False, teeLogger, delimiter, errors):
 			raise FileNotFoundError("Something catastrophic happened! File still not found after creation")
 		headerChecked = False
@@ -3941,17 +3888,19 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			parts, stamp = _specSnapshot(fileName)
 			load = _specLoad(fileName, delimiter, header=header, verifyHeader=False, strict=False,
 							 reporter=attempt, teeLogger=teeLogger, verbose=verbose)
-			if attempt.has('torn'):
-				continue  # the store kept changing under its reads: never clear the keys of a torn view
+			if attempt.has('torn'):  # read again already: never clear the keys of a torn view
+				attempt.note('changing', None, changing)
+				return False, None
 			if attempt.incomplete():
 				if _storeParts(fileName)[0] != parts:
 					continue  # a part went away during the read (a rotation): read again
 				attempt.note('refused', None, 'clear skipped: a part of the store could not be read; nothing was written')
-				return False
+				return False, None
 			if len(load.parts) > 1:
 				tombstones = _specFormatRecords(_specTombstones(load.data, delimiter, load.state.strip), delimiter)
 				if tombstones:
-					_specAppendPayload(load.active, _encodeText(tombstones, 'utf-8', errors), attempt, memberSize=load.state.memberSize)
+					seen = _specAppendPayload(load.active, _encodeText(tombstones, 'utf-8', errors), attempt,
+											  memberSize=load.state.memberSize)[2]
 				attempt.note('multipart', None, 'cleared a multi-part store by appending tombstones; older parts are not compacted')
 				cleared = True
 				break
@@ -3960,31 +3909,26 @@ def _specClearTabularFile(fileName, teeLogger=None, header='', verifyHeader=Fals
 			if load.state.newestVersion > MAX_SPEC_VERSION:
 				attempt.note('refused', None, 'clear skipped: the part declares a spec version newer than {} (#_version_#), whose '
 							 'markers this TSVZ cannot keep (spec §19.8); nothing was written'.format(MAX_SPEC_VERSION))
-				return False
+				return False, None
 			if any(header) and verifyHeader and load.headerLine is not None and not headerChecked:
 				headerChecked = True
 				if not _lineContainHeader(header, load.headerLine[1:], verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter):
 					__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
-			lines = []
-			headerLine = load.headerLine or (_specHeaderComment(header, delimiter) if any(header) else None)
-			if headerLine:
-				if not load.headerLine:
-					_checkRow(header, delimiter, 'utf-8', errors, what='header')  # the header is written only when the store has none
-				lines.append(headerLine)
-			lines += _specPreamble(load.state, delimiter, version=False)
-			if _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors), expect=stamp,
-								   memberSize=load.state.memberSize) is not None:
-				cleared = True
+			lines = _specKeptHeader(load, header, delimiter, errors) + _specPreamble(load.state, delimiter, version=False)
+			done = _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors),
+									   expect=stamp, memberSize=load.state.memberSize)
+			if done is not None:
+				cleared, seen = True, done[1]
 				break
 		else:
-			attempt.note('changing', None, 'clear skipped: the store kept changing while it was being cleared; nothing was written')
+			attempt.note('changing', None, changing)
 	finally:
 		reporter.flush()
 		if attempt is not None:
 			attempt.flush()
 	if verbose and cleared:
 		__teePrintOrNot(f"Cleared {fileName}",teeLogger=teeLogger)
-	return cleared
+	return cleared, seen
 
 
 def _specPostamble(state, delimiter):
@@ -4082,8 +4026,10 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 			if len(load.parts) != 1 or name.ordinal is not None or name.rotated:
 				attempt.note('multipart', None, 'scrub skipped: TSVZ does not compact multi-part stores or single parts of them; nothing was written')
 				return taskDic, False
-			if stamp is None or load.parts != parts or attempt.has('torn'):
-				continue  # the set of parts changed under the read, or the part kept changing while it was read
+			if attempt.has('torn'):
+				break  # the part kept changing while it was read, which was done again already
+			if stamp is None or load.parts != parts:
+				continue  # the set of parts changed under the read
 			if load.state.newestVersion > MAX_SPEC_VERSION:
 				attempt.note('refused', None, 'scrub skipped: the store declares a spec version newer than {0} (#_version_#), which '
 							 'this TSVZ reads as version {0} only (spec §6.3); a rewrite would make that reading permanent; '
@@ -4093,14 +4039,8 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 			state = load.state
 			rows = [_specScrubCells(row, state) for row in taskDic.values()]
 			compensate = not all(_specRoundTrips(cells, state) for cells in rows)
-			lines = []
-			headerLine = load.headerLine or (_specHeaderComment(header, delimiter) if any(header) else None)
-			if headerLine:
-				if not load.headerLine:
-					_checkRow(header, delimiter, 'utf-8', errors, what='header')  # the header is written only when the store has none
-				lines.append(headerLine)
 			preamble = _specPreamble(state, delimiter, compensate=compensate)
-			lines += preamble
+			lines = _specKeptHeader(load, header, delimiter, errors) + preamble
 			# Everything that is to be written is looked at before a copy of a damaged part is kept or the part is
 			# touched, and a refused cell is named (its key and column), not the file.
 			for line in preamble:
@@ -4119,10 +4059,11 @@ def _specScrub(fileName, teeLogger=None, header='', createIfNotExist=False, veri
 					attempt.note('refused', None, 'scrub skipped: could not keep a copy of the damaged part ({}); nothing was written'.format(e))
 					return taskDic, False
 				backedUp = stamp
-			written = _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors), expect=stamp,
-										  memberSize=state.memberSize)
-			if written is None:
+			done = _specRewriteInPlace(load.parts[0], _encodeText(''.join(line + '\n' for line in lines), 'utf-8', errors),
+									   expect=stamp, memberSize=state.memberSize)
+			if done is None:
 				continue  # another writer committed after the read
+			written = done[0]
 			if verbose:
 				__teePrintOrNot(f"Scrubbed {fileName}: {len(rows)} records, {'rewritten' if written else 'unchanged'}",teeLogger=teeLogger)
 			# A read that stopped at damaged data was rewritten as far as it went, but it still failed (spec §4.10).
@@ -4158,9 +4099,32 @@ def getListView(tsvzDic,header = [],delimiter = ...):
 		else:
 			return [header] + values
 
+#: Every TSVZed and TSVZedLite not yet stopped, by id(): _stopLiveStores stops them at exit. Weak: a store
+#: stopped (its writer thread ended) and dropped is freed.
+_LIVE_STORES = weakref.WeakValueDictionary()
+
+
+def _stopLiveStores():
+	"""At exit, stop every store still running (_atExit: a TSVZed's last rewrite and appends), letting a write in
+	progress finish: a first Ctrl-C meanwhile keeps waiting for it, and says so; a second abandons it."""
+	interrupted = False
+	for store in reversed(list(_LIVE_STORES.values())):  # the last made first, as atexit runs its own
+		try:
+			store._atExit()
+		except KeyboardInterrupt:
+			if interrupted:
+				raise
+			interrupted = True
+			eprint(f"TSVZ: the write to {store._fileName} is being finished; Ctrl-C again to abandon it")
+			store._finish()
+
+
+atexit.register(_stopLiveStores)
+
+
 # create a tsv class that functions like a ordered dictionary but will update the file when modified
 class _TSVZedLoad(OrderedDict):
-	"""What ``TSVZed.reload()`` reads a legacy file into, apart from the live store.
+	"""What ``TSVZed.reload()`` reads a legacy file into, apart from the live store (_readFrom).
 
 	Its rows are shaped as ``TSVZed.__setitem__`` shapes them in memory only (keys and cells right-stripped,
 	the column count and the defaults applied), with a column count and defaults of its own. ``dirty`` tells
@@ -4228,7 +4192,7 @@ class _TSVZedLoad(OrderedDict):
 
 
 class _TSVZedMerge(_TSVZedLoad):
-	"""What ``TSVZed._mergeChange`` reads the rows another process appended into, apart from the live store: the
+	"""What ``TSVZed._applyAppended`` reads the rows another process appended into, apart from the live store: the
 	last change of each key, to apply to memory after, as ``(row, readded)``: its row shaped as a read shapes it
 	(None for a delete), and whether a delete came before that row. A read moves a key deleted and set again to
 	the end, and keeps the place of one only set: the keys are in the order such a read leaves the ones it adds.
@@ -4361,17 +4325,21 @@ class TSVZed(OrderedDict):
 	- The special key '#_defaults_#' is used to store column default values.
 	- Supports compressed file formats through automatic detection.
 	- Thread-safe for concurrent access from multiple threads.
-	- A rewrite of a legacy file (.tsv, .csv, .nsv, .psv, compressed or not) that fails part way (a full
-	  disk, a KeyboardInterrupt, an I/O error), or cannot make again a removed file, leaves the file
-	  damaged and memory the only good copy. Until a rewrite gets through, the file is not reloaded over
-	  memory (the background writer still appends the rows set meanwhile, merged back as they are); the
-	  next rewrite (the background writer's, rewrite(), close()) makes it again from memory. Another
-	  process's change made meanwhile is merged into memory first when it can have been only appended:
-	  the file is the same one (device and inode) and still begins with exactly the bytes the failed
-	  rewrite left (a file left empty must then begin with this store's header); otherwise memory is kept
-	  and that change is overwritten, with a warning. A rewrite of the same file in place that begins with
-	  those bytes cannot be told from appends, and is merged (README). reload() is unsafe then: it replaces
-	  memory with the damaged file, as asked, and warns.
+	- A legacy file (.tsv, .csv, .nsv, .psv, compressed or not) is written by the store's background thread
+	  only: rewrite(), mapToFile(), hardMapToFile(), commitAppendToFile(), clear(), reload() and close() hand
+	  it the job and wait for it, so a KeyboardInterrupt stops the wait, never the write. At exit, a write in
+	  progress is finished (a second Ctrl-C abandons it).
+	- Another process's change to a legacy file that leaves the bytes this store knows it holds where they
+	  were (the same file, size and SHA-256) is read from there on and applied to memory; any other change
+	  reloads the file, with the queued rows replayed on it.
+	- A rewrite of a legacy file that fails part way (a full disk, an I/O error), or cannot make again a
+	  removed file, leaves the file damaged and memory the only good copy. Until a rewrite gets through, the
+	  file is not reloaded over memory (the background writer still appends the rows set meanwhile, merged
+	  back as they are); the next rewrite makes it again from memory. Another process's change made
+	  meanwhile is merged into memory first when it can have been only appended: the file is the same one
+	  (device and inode) and still begins with exactly the bytes the failed rewrite left (a file left empty
+	  must then begin with this store's header); otherwise memory is kept and that change is overwritten,
+	  with a warning. reload() is unsafe then: it replaces memory with the damaged file, as asked, and warns.
 	Examples
 	--------
 	>>> with TSVZed('data.tsv', header='id\tname\tvalue') as tsv:
@@ -4458,153 +4426,128 @@ class TSVZed(OrderedDict):
 			self._dirMtimeNs = _dirMtimeNs(fileName)
 			self._writeFailing = False
 			self._specLoaded = False
-		#self.appendEvent = threading.Event()
+		self._requests = deque()  # the jobs _call hands the writer thread
+		self._wake = threading.Event()  # set when one is handed: the thread does not wait out its tick
 		self.appendThread  = threading.Thread(target=self._appendWorker,daemon=True)
 		self.appendThread.start()
-		self.load()
-		atexit.register(self.stopAppendThread)
+		_LIVE_STORES[id(self)] = self  # before load(): what it writes is finished at exit, whatever ends the program
+		try:
+			self.load()
+		except Exception:
+			self._finish()  # it did not load: nothing of it is written at exit
+			raise
 		self._constructed = True
 
 	def setDefaults(self,defaults):
-		if not defaults:
-			defaults = []
-		if isinstance(defaults,str):
-			defaults = defaults.split(self.delimiter)
-		elif not isinstance(defaults,list):
-			try:
-				defaults = list(defaults)
-			except Exception:
-				if self.verbose:
-					self.__teePrintOrNot('Invalid defaults, setting defaults to empty.','error')
-				defaults = []
-		defaults = [str(s).rstrip() if s else '' for s in defaults]
-		if not any(defaults):
-			defaults = []
-		if not defaults or defaults[0] != DEFAULTS_INDICATOR_KEY:
-			defaults = [DEFAULTS_INDICATOR_KEY]+defaults
+		defaults = _normalizeDefaults(defaults, self.delimiter)
 		_checkRow(defaults, self.delimiter, self.encoding, self.errors, what='defaults')
 		if self._spec and self._constructed:
 			# Spec rows are written sparse and read back under the file's
 			# #_defaults_#, so new defaults are written as that marker.
 			self._specSetMarker(DEFAULTS_INDICATOR_KEY, defaults)
 			return
+		if not self._constructed:
+			self.defaults = defaults
+			return
+		self._readWhole = True  # memory's defaults now differ from the file's: another process's change is read whole
 		self.defaults = defaults
+		self._readWhole = True  # again: a read that ended in between cleared it
 
 	def load(self):
 		self.reload()
 		if self.rewrite_on_load and not self._spec:
-			self.rewrite(force = True,reloadInternalFromFile = False)
+			self.rewrite(force = True)  # it takes in a change another process made since the read
 		return self
 
 	def reload(self):
 		if self._spec:
 			return self._specReload()
-		self._reload(explicit=True)
+		self._call(self._reload)
 		self._accepted()  # memory is the file again: a refusal met later is reported again
 		return self
 
-	def _reload(self, explicit=False):
-		"""reload() for a legacy file, as rewrite() makes it after another process changed the file; True when read.
-
-		Not while a rewrite of this object's has left the file damaged (``_damage``, looked at under writeLock: a
-		rewrite in another thread may fail until then): memory holds the only good copy, and the next rewrite
-		makes the file again from it, merging another process's appends (_mergeChange). ``explicit`` (reload()):
-		it is read all the same, as asked, with a warning that memory is replaced by the damaged file.
-		"""
-		# Load or refresh data from the TSV file. It is read into a dict of its own, apart from the live store:
-		# rows set meanwhile by another thread go to memory and the queue as ever (memoryOnly is never
-		# turned on for the read, which stored them in memory only), and are kept below.
+	def _reload(self):
+		"""reload() for a legacy file: memory becomes what the file holds (_readFrom), the file made first when it is
+		missing and createIfNotExist. While a failed rewrite of this store's has left the file damaged, memory holds
+		the only good copy: it is read all the same, as asked, with a warning."""
 		with self.writeLock:
-			if self._damage is not None:
-				if not explicit:
-					return False
-				self.__teePrintOrNot(f"Warning: reload() replaces memory with {self._fileName}, which a rewrite of this "
-									 f"object's left damaged (it failed part way: a full disk, a KeyboardInterrupt, the file "
-									 f"removed); memory held the only good copy of the rows it was writing, and they are "
-									 f"dropped. Without reload(), the next rewrite makes the file again from memory",'warning')
+			if self._damaged:
+				self.__teePrintOrNot(f"Warning: reload() replaces memory with {self._fileName}, which is damaged and not yet "
+									 f"made again from memory (a rewrite of this object's failed: a full disk, an I/O error, "
+									 f"the file removed, damage another writer left); memory held the only good copy, and "
+									 f"what it held beyond the file is dropped. Without reload(), the next rewrite makes the "
+									 f"file again from memory",'warning')
 			if self.verbose:
 				self.__teePrintOrNot(f"Loading {self._fileName}")
-			# The time noted is the one of the content read: taken first, under the lock this object's writes
-			# take, so a change another process makes during or after the read is seen by the next check.
-			seen = getFileUpdateTimeNs(self._fileName)
-			loaded = _TSVZedLoad(self, self.correctColumnNum, list(self.defaults))
-			readTabularFile(self._fileName, teeLogger = self.teeLogger, header = self.header,
-						createIfNotExist = self.createIfNotExist, verifyHeader = self.verifyHeader,
-						verbose = self.verbose, taskDic = loaded,encoding = self.encoding if self.encoding else None,
-						strict = self.strict, delimiter = self.delimiter, defaults=loaded.defaults, errors = self.errors)
-			if not seen:
-				seen = getFileUpdateTimeNs(self._fileName)  # the read created it
-			with self._memLock:
-				# No set or delete is half done: each holds _memLock from its change of memory to its queueing.
-				# What is queued is not in the file (appends take writeLock, held here): replayed on what was
-				# read, as reading it once appended will, so memory stays what the file will hold.
-				loaded.replay(list(self.appendQueue))
-				OrderedDict.clear(self)
-				for key, row in loaded.items():
-					OrderedDict.__setitem__(self, key, row)
-				self.defaults = loaded.defaults
-				if loaded.dirty:
-					self.dirty = True  # a key the file holds twice
-				if self.header and any(self.header) and self.verifyHeader:
-					self.correctColumnNum = len(self.header)
-				elif self:
-					self.correctColumnNum = len(self[next(iter(self))])
-				else:
-					self.correctColumnNum = -1
-			self.externalFileUpdateTime = seen
-			self._damage = None  # memory is what the file holds, damaged or not
+			if not os.path.isfile(self._fileName) and not _verifyFileExistence(
+					self._fileName, createIfNotExist=self.createIfNotExist, teeLogger=self.teeLogger, header=self.header,
+					encoding=self.encoding, strict=self.strict, delimiter=self.delimiter, errors=self.errors):
+				self._readFrom(None, True)  # missing and not made: empty, until an append makes it
+			else:
+				with open(self._fileName, 'rb') as f:
+					cut = self._readFrom(f, False)
+				if cut:
+					self._readLocked(lambda f: self._readFrom(f, True))
 		if self.verbose:
 			self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
 			self.__teePrintOrNot(f"correctColumnNum: {self.correctColumnNum}")
 			self.__teePrintOrNot(f"TSVZed({self._fileName}) loaded")
-		self.lastUpdateTime = seen
-		self.deSynced = False  # memory is the file again: a change seen before needs no rewrite
 		return True
 
 	def _specReload(self):
-		"""Load a spec store into memory (design §4); rows bypass __setitem__ so nothing is re-normalised."""
+		"""Load a spec store into memory (design §4); rows bypass __setitem__ so nothing is re-normalised.
+
+		What is still queued is replayed on what was read, as a read once it is committed sees it: under
+		writeLock no commit of this object's runs meanwhile, and under _memLock no set is half done.
+		"""
 		if self.verbose:
 			self.__teePrintOrNot(f"Loading {self._fileName}")
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		load = None
-		try:
-			if _specEnsureStore(self._fileName, self.createIfNotExist, self.header, self._constructorDefaults,
-								self.strict, self.teeLogger, self.delimiter, self.errors):
-				load = _specLoad(self._fileName, self.delimiter, header=self.header, verifyHeader=self.verifyHeader,
-								 strict=self.strict, defaults=self._constructorDefaults, taskDic=OrderedDict(),
-								 reporter=reporter, teeLogger=self.teeLogger, verbose=self.verbose)
-			unreadable = reporter.incomplete()
-			torn = reporter.has('torn')
-		finally:
-			reporter.flush()
-		OrderedDict.clear(self)
-		width = -1
-		if load is not None:
-			for key, row in load.data.items():
-				OrderedDict.__setitem__(self, key, row)
-			self._specState = load.state
-			self.defaults = list(load.state.defaults)
-			self._parts, self._activePath = load.parts, load.active
-			width = load.correctColumnNum
-		if self.header and any(self.header) and self.verifyHeader:
-			self.correctColumnNum = len(self.header)
-		else:
-			self.correctColumnNum = width
+		with self.writeLock:
+			dirMtime = _dirMtimeNs(self._fileName)  # before the read: a part created during it is a change
+			try:
+				if _specEnsureStore(self._fileName, self.createIfNotExist, self.header, self._constructorDefaults,
+									self.strict, self.teeLogger, self.delimiter, self.errors):
+					load = _specLoad(self._fileName, self.delimiter, header=self.header, verifyHeader=self.verifyHeader,
+									 strict=self.strict, defaults=self._constructorDefaults, taskDic=OrderedDict(),
+									 reporter=reporter, teeLogger=self.teeLogger, verbose=self.verbose)
+				unreadable = reporter.incomplete()
+				torn = reporter.has('torn')
+			finally:
+				reporter.flush()
+			with self._memLock:
+				width = -1
+				if load is not None:
+					_specReplayQueued(load, self.appendQueue, self.delimiter)
+				self._replaceRows(load.data if load is not None else {})  # a live key never goes missing meanwhile
+				if load is not None:
+					self._specState = load.state
+					self.defaults = list(load.state.defaults)
+					self._parts, self._activePath = load.parts, load.active
+					width = load.correctColumnNum
+				if self.header and any(self.header) and self.verifyHeader:
+					self.correctColumnNum = len(self.header)
+				else:
+					self.correctColumnNum = width
+				if (load is not None and not load.state.sawDefaults and any(self._constructorDefaults[1:])
+						and not self.memoryOnly and not unreadable):  # the store's own defaults may be in the unread part
+					# Design §5.3: persist constructor defaults by appending, as 3.39 did by rewriting.
+					self.appendQueue.append(_specFormatRecord(self._constructorDefaults, self.delimiter, marker=True))
+					self._specState.sawDefaults = True
+			# The active part as it was just before it was read (else as it is now): whatever is appended
+			# after that, even before the read ends, is a change the next check sees.
+			info = load.infos[-1] if load is not None and load.infos else None
+			self._specNoteSeen(info.stamp if info is not None and info.stamp is not None else _specFileStamp(self._activePath))
 		if self.verbose:
 			self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
-		self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
 		self.lastUpdateTime = self.externalFileUpdateTime
 		# The store kept changing under every read: no part watched need change again for the next
 		# check to read it again (spec §19.8).
 		self._specTorn = torn
 		self._specTornAt = 0.0
 		self._specTornWait = 0.0  # a load that worked starts the waits over
-		self._dirMtimeNs = _dirMtimeNs(self._fileName)
-		if (load is not None and not load.state.sawDefaults and any(self._constructorDefaults[1:])
-				and not self.memoryOnly and not unreadable):  # the store's own defaults may be in the unread part
-			# Design §5.3: persist constructor defaults by appending, as 3.39 did by rewriting.
-			self.appendQueue.append(_specFormatRecord(self._constructorDefaults, self.delimiter, marker=True))
-			self._specState.sawDefaults = True
+		self._dirMtimeNs = dirMtime
 		self._specLoaded = True
 		return self
 
@@ -4624,6 +4567,11 @@ class TSVZed(OrderedDict):
 		"""'tsvz' for tsvz-spec-v1 files (.tsvz/.csvz/.nsvz/.psvz), 'tsv' for 3.39-format files."""
 		return 'tsvz' if self._spec else 'tsv'
 
+	def _specNoteSeen(self, stamp):
+		"""Note ``stamp`` (``_specStamp``, or None) as the active part's that memory and the queue account for."""
+		self._specSeen = stamp
+		self.externalFileUpdateTime = stamp[2] if stamp else 0
+
 	def _specSync(self, reloadInternalFromFile=None):
 		"""The part of 3.39's rewrite() that .tsvz keeps: reload after an external change."""
 		if not self.deSynced:
@@ -4640,15 +4588,12 @@ class TSVZed(OrderedDict):
 				self.__teePrintOrNot(f"Failed to reload {self._fileName} after an external change: {e}; keeping the in-memory state",'error')
 				# Mark the change as seen so the failure is reported once, not every tick. A torn view is
 				# read again after a while (1 s, doubling to a minute), not at every tick.
-				if getattr(self, '_specTorn', False):
-					self._specTornWait = min(max(1.0, getattr(self, '_specTornWait', 0.0) * 2), 60.0)
+				if self._specTorn:
+					self._specTornWait = min(max(1.0, self._specTornWait * 2), 60.0)
 					self._specTornAt = _specClock() + self._specTornWait
-				try:
-					self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
-					self._dirMtimeNs = _dirMtimeNs(self._fileName)
-					self._parts = _storeParts(self._fileName)[0]
-				except Exception:
-					pass
+				self._specNoteSeen(_specFileStamp(self._activePath))
+				self._dirMtimeNs = _dirMtimeNs(self._fileName)
+				self._parts = _storeParts(self._fileName)[0]
 				self.deSynced = False
 				return False
 		self.deSynced = False
@@ -4656,9 +4601,9 @@ class TSVZed(OrderedDict):
 
 	def _specExternalChanged(self):
 		"""True when another writer changed the active part or the set of parts, or the last load was torn."""
-		if getattr(self, '_specTorn', False) and _specClock() >= getattr(self, '_specTornAt', 0.0):
+		if self._specTorn and _specClock() >= self._specTornAt:
 			return True
-		if getFileUpdateTimeNs(self._activePath) > self.externalFileUpdateTime:
+		if _specFileStamp(self._activePath) != self._specSeen:
 			return True
 		dirMtime = _dirMtimeNs(self._fileName)
 		if dirMtime != self._dirMtimeNs:
@@ -4710,9 +4655,9 @@ class TSVZed(OrderedDict):
 			# What is written is what is checked: the row as cut to the column count and filled with the defaults,
 			# and before memory, the queue or the column count change.
 			self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
-		self.correctColumnNum = newColumnNum
 		if key == DEFAULTS_INDICATOR_KEY:
-			with self._memLock:
+			with self._memLock:  # with memory and the queue: a reload sets the column count under it too
+				self.correctColumnNum = newColumnNum
 				self.defaults = value
 				if self.verbose:
 					self.__teePrintOrNot(f"Defaults set to {value}")
@@ -4725,6 +4670,7 @@ class TSVZed(OrderedDict):
 		if self.verbose:
 			self.__teePrintOrNot(f"Setting {key} to {value}")
 		with self._memLock:  # memory and the queue change together: see reload()
+			self.correctColumnNum = newColumnNum
 			if key in self:
 				if self[key] == value:
 					if self.verbose:
@@ -4869,15 +4815,10 @@ class TSVZed(OrderedDict):
 
 	def _specSetItem(self, key, value):
 		"""__setitem__ for .tsvz (design §5.2): write the given cells, keep the padded row in memory."""
-		key = str(key).rstrip()
+		key, value = _specCells(key, value, self.delimiter)
 		if not key:
 			self.__teePrintOrNot('Key cannot be empty','error')
 			return
-		if isinstance(value,str):
-			value = value.split(self.delimiter)
-		value = [str(s).rstrip() if s else '' for s in value]
-		if not value or value[0] != key:
-			value = [key]+value
 		if _MARKER_RE.match(key):
 			self._specSetMarker(key, value)
 			return
@@ -4885,46 +4826,41 @@ class TSVZed(OrderedDict):
 			del self[key]
 			return
 		self._checkWritable(value)
-		if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
-			self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
-			return
-		defaults = self.defaults
-		for i in range(1, min(len(value), len(defaults))):
-			if not value[i] and defaults[i]:
-				value[i] = defaults[i]
-		written = list(value)
-		if self.correctColumnNum <= 0:
-			self.correctColumnNum = len(defaults) if len(defaults) > 1 else len(value)
-		target = max(self.correctColumnNum, len(defaults))
-		if len(value) < target:
-			value += [defaults[j] if j < len(defaults) else '' for j in range(len(value), target)]
-		if key in self:
-			if OrderedDict.__getitem__(self, key) == value:
+		with self._memLock:  # memory and the queue change together: see _specReload
+			if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
+				self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
 				return
-			self.dirty = True
-		OrderedDict.__setitem__(self, key, value)
-		if self.memoryOnly:
-			return
-		self.appendQueue.append(_specFormatRecord(written, self.delimiter))
-		self.lastUpdateTime = get_time_ns()
+			_specFill(value, self.defaults)
+			record = _specFormatRecord(value, self.delimiter)
+			self.correctColumnNum = _specPadRow(value, self._specState, self.correctColumnNum if self.correctColumnNum > 0 else -1)
+			if key in self:
+				if OrderedDict.__getitem__(self, key) == value:
+					return
+				self.dirty = True
+			OrderedDict.__setitem__(self, key, value)
+			if self.memoryOnly:
+				return
+			self.appendQueue.append(record)
+			self.lastUpdateTime = get_time_ns()
 
 	def _specSetMarker(self, key, value):
 		"""Write a reserved-key marker (design §5.2 e); official markers also update the reader state."""
 		self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
 		keyLower = key.lower()
-		if keyLower in _SPEC_MARKER_KEYS:
-			reporter = _Reporter(self._fileName, self.teeLogger)
-			applied = _specApplyMarker(self._specState, keyLower, value[1:], reporter, None)
-			reporter.flush()
-			if not applied:
+		with self._memLock:  # the reader state and the queue change together: see _specReload
+			if keyLower in _SPEC_MARKER_KEYS:
+				reporter = _Reporter(self._fileName, self.teeLogger)
+				applied = _specApplyMarker(self._specState, keyLower, value[1:], reporter, None)
+				reporter.flush()
+				if not applied:
+					return
+				self.defaults = list(self._specState.defaults)
+			if self.verbose:
+				self.__teePrintOrNot(f"Marker {key} set to {value[1:]}")
+			if self.memoryOnly:
 				return
-			self.defaults = list(self._specState.defaults)
-		if self.verbose:
-			self.__teePrintOrNot(f"Marker {key} set to {value[1:]}")
-		if self.memoryOnly:
-			return
-		self.appendQueue.append(_specFormatRecord(value, self.delimiter, marker=True))
-		self.lastUpdateTime = get_time_ns()
+			self.appendQueue.append(_specFormatRecord(value, self.delimiter, marker=True))
+			self.lastUpdateTime = get_time_ns()
 
 	def _specDelItem(self, key):
 		key = self._nameKey(key)
@@ -4932,16 +4868,17 @@ class TSVZed(OrderedDict):
 			# A lone marker key resets that marker (spec §12.1).
 			self._specSetMarker(key, [key])
 			return
-		if key not in self:
-			if self.verbose:
-				self.__teePrintOrNot(f"Key {key} not found")
-			return
-		self._checkDelete(key)
-		OrderedDict.__delitem__(self, key)
-		if self.memoryOnly:
-			return
-		self.__appendEmptyLine(key)
-		self.lastUpdateTime = get_time_ns()
+		with self._memLock:  # memory and the queue change together: see _specReload
+			if key not in self:
+				if self.verbose:
+					self.__teePrintOrNot(f"Key {key} not found")
+				return
+			self._checkDelete(key)
+			OrderedDict.__delitem__(self, key)
+			if self.memoryOnly:
+				return
+			self.__appendEmptyLine(key)
+			self.lastUpdateTime = get_time_ns()
 
 	def _specCommit(self):
 		"""Append the queued records to the active part (design §5.4).
@@ -4964,23 +4901,11 @@ class TSVZed(OrderedDict):
 			items.append(self.appendQueue.popleft())
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		try:
-			# A record that cannot be encoded is refused (reported, not kept): left in the queue it
-			# would hold back every later write for good. The others are written.
-			chunks = []
-			good = []
-			for item in items:
-				try:
-					chunks.append(_encodeText(item + '\n', 'utf-8', self.errors))
-					good.append(item)
-				except TSVZEncodeError as e:
-					self.dirty = True
-					self.__teePrintOrNot(f"Refused at commitAppendToFile() to {self._activePath}: {e}; the record is not written, the others are",'error')
-			items = good
-			if not chunks:
-				return self
-			payload = b''.join(chunks)
-			_specAppendPayload(self._activePath, payload, reporter, fsync=True, memberSize=self._specState.memberSize)
-			self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
+			payload = _encodeText(''.join(item + '\n' for item in items), 'utf-8', self.errors)  # checked when set
+			_, before, after = _specAppendPayload(self._activePath, payload, reporter, fsync=True,
+												  memberSize=self._specState.memberSize)
+			if before == self._specSeen:
+				self._specNoteSeen(after)  # else another writer changed the part first: the next check reloads
 			if self._writeFailing:
 				self._writeFailing = False
 				_warn(f'TSVZ warning: {self._fileName}: writes recovered', self.teeLogger)
@@ -5003,9 +4928,10 @@ class TSVZed(OrderedDict):
 					self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: queued records could not be committed; not clearing",'error')
 					self.deSynced = True
 					return self
-				cleared = _specClearTabularFile(self._fileName, teeLogger=self.teeLogger, header=self.header,
-												verbose=self.verbose, delimiter=self.delimiter, errors=self.errors)
-				self.externalFileUpdateTime = getFileUpdateTimeNs(self._activePath)
+				cleared, seen = _specClear(self._fileName, teeLogger=self.teeLogger, header=self.header,
+										   verbose=self.verbose, delimiter=self.delimiter, errors=self.errors)
+				if seen is not None:
+					self._specNoteSeen(seen)  # the part as the clear left it: an append after that is a change
 			self.dirty = False
 			# A skipped clear (reported) left the store as it was: reload it into memory.
 			self.deSynced = not cleared
@@ -5029,7 +4955,7 @@ class TSVZed(OrderedDict):
 				return self
 			self.clear_file()
 		else:
-			self._clearFile(dropRows=True)
+			self._call(self._clearFile, True)
 		self._accepted()  # nothing is left to refuse: a later refusal is reported again
 		self.lastUpdateTime = self.externalFileUpdateTime
 		return self
@@ -5037,37 +4963,28 @@ class TSVZed(OrderedDict):
 	def clear_file(self):
 		if self._spec:
 			return self._specClearFile()
-		return self._clearFile(dropRows=False)
+		return self._call(self._clearFile, False)
 
 	def _clearFile(self, dropRows):
-		"""clear_file() for a legacy file; ``dropRows`` (clear()) also empties memory and drops the queued rows.
+		"""clear_file() for a legacy file; ``dropRows`` (clear()) also empties memory and drops the queued rows, once the
+		file is open and locked (when it cannot be, nothing changed), under _memLock: no set is half done, and no row
+		set before it is kept or appended after the emptied file. Queued defaults lines are kept: the defaults stay."""
+		header = self._headerLine()
 
-		Both are done under writeLock and _memLock, with the file emptied in the same hold of writeLock: no append
-		runs in between and no set is half done, so a row set before it is neither kept in memory nor appended
-		after the emptied file (where it came back). Queued defaults lines are kept: the defaults stay.
-		"""
+		def emptied():
+			if dropRows:
+				with self._memLock:
+					OrderedDict.clear(self)
+					kept = [row for row in self.appendQueue if row and row[0] == DEFAULTS_INDICATOR_KEY]
+					self.appendQueue.clear()
+					self.appendQueue.extend(kept)
+			return header, [], ()
+
 		try:
-			headerBytes = self._headerLine()
-			if self.header:
-				header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
-
-			def emptied():  # under writeLock, before the file is opened: encoded first
-				if dropRows:
-					with self._memLock:
-						OrderedDict.clear(self)
-						kept = [row for row in self.appendQueue if row and row[0] == DEFAULTS_INDICATOR_KEY]
-						self.appendQueue.clear()
-						self.appendQueue.extend(kept)
-				return headerBytes, []
-
-			if not self._writeRewrite(whole=True, look=False, snapshot=emptied):
-				return self  # get_file_obj reported why; tried again later
+			if not self._writeFile(whole=True, sync=None, snapshot=emptied):
+				return self  # reported; tried again later
 			if self.verbose:
-				if headerBytes is not None:
-					self.__teePrintOrNot(f"Header {header} written to {self._fileName}")
-				else:
-					self.__teePrintOrNot(f"File {self._fileName} cleared empty")
-				self.__teePrintOrNot(f"File {self._fileName} size: {os.path.getsize(self._fileName)}")
+				self.__teePrintOrNot(f"File {self._fileName} cleared, size: {os.path.getsize(self._fileName)}")
 			self._worked('rewrite')
 		except Exception as e:
 			self._failed('rewrite', f"Failed to write at clear_file() to {self._fileName}: {e}")
@@ -5120,7 +5037,7 @@ memoryOnly:{self.memoryOnly}
 			self._checkDelete(key)
 			value = OrderedDict.__getitem__(self, key)
 			OrderedDict.__delitem__(self, key)
-			if not self.memoryOnly:
+			if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
 				self.__appendEmptyLine(key)
 			self.lastUpdateTime = get_time_ns()
 		return key, value
@@ -5143,7 +5060,7 @@ memoryOnly:{self.memoryOnly}
 			self._checkDelete(key)
 			value = OrderedDict.__getitem__(self, key)
 			OrderedDict.__delitem__(self, key)
-			if not self.memoryOnly:
+			if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
 				self.__appendEmptyLine(key)
 			self.lastUpdateTime = get_time_ns()
 		return value
@@ -5200,121 +5117,107 @@ memoryOnly:{self.memoryOnly}
 
 
 	def rewrite(self,force = False,reloadInternalFromFile = None):
-		return self._rewrite(force, reloadInternalFromFile)
-
-	def _rewrite(self, force=False, reloadInternalFromFile=None, background=False):
-		"""rewrite(); ``background``: the background writer's tick, which reloads another process's change at every
-		tick but makes no rewrite while one that failed waits to be tried again (see _failed), and tries one rewrite:
-		one that another process's change defers is made at the next tick, after the reload that tick makes."""
 		if self._spec:
 			_warnOnce(self, 'rewrite()', self._fileName,
 					  'rewrite() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
 					  self.teeLogger)
 			self._specSync(reloadInternalFromFile)
 			return False
+		return self._call(self._rewrite, force, reloadInternalFromFile)
+
+	def _rewrite(self, force=False, reloadInternalFromFile=None, background=False):
+		"""rewrite() for a legacy file. ``background``: the background writer's tick, which takes in another process's
+		change at every tick, but makes no rewrite while one that failed waits to be tried again (see _failed)."""
 		if not self.deSynced and not force:
 			if not self.dirty:
 				return False
-			if self.rewrite_interval == 0 or time.time() - os.path.getmtime(self._fileName) < self.rewrite_interval:
+			if self.rewrite_interval == 0 or time.time() - getFileUpdateTimeNs(self._fileName) / 1e9 < self.rewrite_interval:
 				return False
 		try:
-
 			if reloadInternalFromFile is None:
 				reloadInternalFromFile = self.monitor_external_changes
-			# Not while a rewrite of this object's has left the file damaged (_damage): memory holds the only good
-			# copy, and the rewrite below makes the file again from it. Looked at here once _externalChange() could
-			# take writeLock (a rewrite under way then clears it once it is all written), and again by _reload()
-			# under writeLock: a rewrite in another thread may fail in between.
-			if reloadInternalFromFile and self._externalChange() and self._damage is None:
-				# this will be needed if more than 1 process is accessing the file
-				self.commitAppendToFile()
-				if self._reload():
-					self.deSynced = False  # memory is the file again; a refused write below must not keep this set
+			# Not while a failed rewrite of this store's has left the file damaged: memory holds the only good copy,
+			# and the rewrite below makes the file again from it, merging what another process appended.
+			if reloadInternalFromFile and not self._damaged and self._externalChange():
+				self._syncFile()
 			self._worked('sync')
 			if self.memoryOnly:
 				if self.verbose:
 					self.__teePrintOrNot("Memory only mode. Map to file skipped.")
 				return False
 			made = True
-			# A rewrite that left the file damaged (or removed: _damage) leaves dirty and deSynced set with it, so the
-			# file is made again from memory; _damage alone is not looked at: a rewrite in another thread sets it
-			# while it writes, and this one would follow it with a rewrite of its own.
-			if self.dirty:
+			if self.dirty or self._damaged:
 				if not force and self._refusalPending():
 					return False  # the last rewrite was refused (text that cannot be written): try again later, not at every tick
 				if background and self._failing('rewrite'):
-					return False  # the last one failed: tried again later; another process's change was still reloaded above
+					return False  # the last one failed: tried again later; another process's change was still taken in above
 				if self.verbose:
 					self.__teePrintOrNot(f"Rewriting {self._fileName}")
-				tries = 1 if background else _DEFERRED_REWRITE_TRIES  # a tick does one reload and one rewrite, as on main
-				for attempt in range(tries):
-					# What this call's rewrite did is what it returns, not state of the object: close()'s rewrite()
-					# and the background writer's ran at once, and one could take the other's for its own.
-					made = self._mapToFile(defer=reloadInternalFromFile)
-					if made is not None:
-						break
-					if attempt == tries - 1:
-						return False  # it keeps changing: deSynced is set, the next tick tries again
-					# Another process changed the file after the reload above: that change is reloaded too, and the
-					# rewrite made then, not left to a next tick (at close() there is none: rewrite_on_exit was lost).
-					self.commitAppendToFile()
-					if self._reload():  # not over a file another thread's rewrite damaged meanwhile: it merges it
-						self.deSynced = False
+				made = self._mapToFile(sync=reloadInternalFromFile)
 				if made and self.verbose:
 					self.__teePrintOrNot(f"{len(self)} records rewrote to {self._fileName}")
 			if not self.appendThread.is_alive():
-				self.commitAppendToFile()
-			# else:
-			#     self.appendEvent.set()
+				self._commit()
 			return made  # False when the rewrite failed or was refused (reported)
 		except Exception as e:
 			self._failed('sync', f"Failed to write at sync() to {self._fileName}: {e}")
 			self.deSynced = True
 			return False
-		
+
 	def _externalChange(self):
-		"""True when the file changed since this object last wrote or read it.
+		"""True when the file changed since this object last wrote or read it: a later modification time, or another
+		size than the bytes it knows (an append that landed right after its own, in the same tick)."""
+		try:
+			st = os.stat(self._fileName)
+		except OSError:
+			return False
+		return self.externalFileUpdateTime < _updateTimeNs(st) or (self._known is not None and st.st_size != self._known[1])
 
-		Looked at under ``writeLock``, which this object's writer holds from the moment it
-		opens the file until it has noted the new modification time: its own append is
-		never mistaken for another process's change (a reload then would drop the rows set
-		since the append was queued).
-		"""
-		with self.writeLock:
-			return self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName)
-
-	_keepFileTime = False  # set by get_file_obj: the file changed under an append, which must not note the new time
-	# None, or the file is damaged by a rewrite of this object's that did not reach it all (a full disk, a
-	# KeyboardInterrupt) or removed: memory holds the only good copy, and until a rewrite makes the file again from
-	# memory another process's change is not reloaded over it (_rewrite) but merged into it (_mergeChange). It is
-	# (size, sha256) of what the file held when this object let go of it, _DAMAGE_UNKNOWN when that is not known.
-	_damage = None
-	_damageAt = None  # _fileStamp of the file _damage is in, as it was noted; None when the file was missing
-	_mergeBase = None  # (_damage, defaults, column count) a merge after that damage reads the rows with: see _mergeChange
+	# ``(identity, size, sha256)`` of the bytes this store last read or wrote in its legacy file; None when not known.
+	_known = None
+	# True from when a rewrite starts changing the file until all of it is on disk. While a failed one leaves it True,
+	# memory holds the only good copy: the file is never read over it, and the next rewrite makes it again, merging
+	# another process's appends (the merge rule, _syncFrom); _known is then what the file held when it stopped.
+	_damaged = False
+	_readWhole = False  # setDefaults() gave memory defaults the file may not hold: its next change is read whole
+	# A read under the file lock met damage another writer left (a compressed file: every read of it stops there, L5).
+	# Rows appended after it would be lost to the next read, so the next commit makes the file again from memory.
+	_remake = False
+	# A commit appended after another process's change it has not read: the file holds unread bytes after _known, so
+	# the next read is whole. _known still says how the file begins (a commit looks for damage after it).
+	_unseen = False
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
+	_closing = False  # stopAppendThread() makes its last rewrite: none is tried after it
+	_exiting = False  # _stopLiveStores stops it at exit: a Ctrl-C there finishes the store, which does not run on
 
 	def _refuse(self, where, error, explicit=False):
 		"""Remember that a rewrite was refused with ``error``; raise it for an ``explicit`` call, else report it once.
 
 		mapToFile() and hardMapToFile() called by the program raise it, as a refused set does: the caller learns
-		that nothing was written. The rewrites TSVZed makes itself report it, once for each different refusal
-		until a rewrite goes through, clear() or reload() (no traceback: it is not a bug).
+		that nothing was written. The rewrites TSVZed makes itself report it, once for each different refusal, and
+		again once the file is damaged or the writer thread stops (close() tries none again), until a rewrite goes
+		through, clear() or reload() (no traceback: it is not a bug).
 		"""
 		self._refusedAt = _specClock()
 		if explicit:
 			raise error
 		message = str(error)
-		if self._refusalReported == message:
+		stopped = self._closing or not self.appendThread.is_alive()
+		if (message, self._damaged, stopped) == self._refusalReported:
 			return
-		self._refusalReported = message
-		if self.rewrite_interval:
+		self._refusalReported = (message, self._damaged, stopped)
+		if stopped:
+			retry = ("None is tried again on its own: this store's writer thread is stopping or stopped (close(), a "
+					 "forked child).")
+		elif self.rewrite_interval or self.deSynced:  # deSynced: the file is to be made again, at any interval
 			retry = f"A rewrite is tried again at most every {max(self.rewrite_interval, _REFUSED_RETRY_SECONDS):g} s."
 		else:
 			retry = ("With rewrite_interval=0 none is tried again on its own, only one asked for (mapToFile(), "
-					 "rewrite(force=True), rewrite_on_exit) or one made after another process changes the file.")
-		damaged = (" A rewrite of this object's failed before this one and left the file damaged: until one gets through, "
-				   "memory holds the only good copy." if self._damage is not None else "")
+					 "rewrite(force=True), rewrite_on_exit), one made after another process changes the file, or, while "
+					 "damage another writer left is to be made good, one at a later append.")
+		damaged = (" The file is damaged (a rewrite of this object's failed) or was removed (rows are appended to a new "
+				   "one): until a rewrite gets through, memory holds the only good copy." if self._damaged else "")
 		self.__teePrintOrNot(f"Refused at {where} to {self._fileName}: {message}. The file is left as it is, and rows that can "
 							 f"be written are still appended.{damaged} It is rewritten once every row can be written: set or delete the row; "
 							 f"a key that cannot be written cannot be deleted either, so for one, edit the file, clear() the store "
@@ -5330,14 +5233,10 @@ memoryOnly:{self.memoryOnly}
 		self._refusalReported = False
 
 	def _failed(self, kind, message, trace=True, retry=True):
-		"""A legacy write of ``kind`` failed: report ``message``, unless it was since that kind last went through.
-
-		``kind`` is 'append', 'rewrite' (a rewrite or clear writing the file) or 'sync' (rewrite() reading
-		another process's change). The background writer waits before it tries that kind again, 0.1 s at
-		first and twice as long at each failure in a row, up to a minute: a failure that lasts (a file it may
-		not open, a strict header another process changed) is neither retried at every tick nor reported at
-		every try. ``retry=False``: the write goes on another way (mapToFile() falls back on hardMapToFile()),
-		and how that ends counts the try, once. True when it was reported.
+		"""A legacy write of ``kind`` ('append', 'rewrite' or 'sync') failed: report ``message`` unless it was since that
+		kind last went through, and (``retry``) have the background writer wait before it tries that kind again, 0.1 s
+		doubling to a minute. ``retry=False``: the write goes on another way (mapToFile() falls back on
+		hardMapToFile()), which counts the try. True when it was reported.
 		"""
 		if retry:
 			state = self._failures.get(kind)
@@ -5347,7 +5246,7 @@ memoryOnly:{self.memoryOnly}
 		if message in reported:
 			return False
 		reported.add(message)
-		self.__teePrintOrNot(f"{message}; not reported again until it works",'error')
+		self.__teePrintOrNot(message if self._closing else f"{message}; not reported again until it works",'error')
 		if trace:
 			import traceback
 			self.__teePrintOrNot(traceback.format_exc(),'error')
@@ -5363,20 +5262,6 @@ memoryOnly:{self.memoryOnly}
 		now = _specClock()
 		return any(state is not None and now < state[1] for state in map(self._failures.get, kinds))
 
-	def _externalChangeStops(self, defer):
-		"""True when the rewrite about to start must not: another process changed the file since this object read it.
-
-		Called under writeLock, once the file is locked where it can be. With ``defer`` (a rewrite() that reloads
-		such changes) it sets ``deSynced``, so the change is reloaded before the next try instead of erased; else
-		the rewrite overwrites it, with a warning.
-		"""
-		if self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName):
-			if defer:
-				self.deSynced = True
-				return True
-			self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
-		return False
-
 	def _headerLine(self):
 		"""The header line a legacy file of this store begins with, as bytes without its newline; None for no header.
 
@@ -5386,225 +5271,302 @@ memoryOnly:{self.memoryOnly}
 		return _encodeRow(_sanitize(list(self.header),delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header')
 
 	def _snapshotForRewrite(self):
-		"""Check that all a rewrite writes can be written, and return ``(header, lines)``: the header line (None for
-		no header), and the defaults line and every row after it (_RewriteRows), as bytes without their newline.
-
-		_writeRewrite calls it under ``writeLock``, before it opens the file: the background writer cannot append
-		a row after the rows were taken and before the file is cut (that row would be lost); a row set later is
-		appended after the rewrite. The rows and the defaults are listed under _memLock (no set or delete is half
-		done), and their cells copied into one flat snapshot, which is checked here and encoded again as it is
-		written, a chunk at a time (_writeLines): what a rewrite holds is the cells (references to them) and a
-		chunk, not the whole store encoded, and it writes exactly what it checked. A ``TSVZEncodeError`` leaves
-		the file untouched.
-		"""
+		"""``(header, lines, queued)``: the header line (None for none), the defaults line and the rows (_RewriteRows, a
+		flat snapshot taken under _memLock and checked: a TSVZEncodeError changes nothing), and the queued rows, taken
+		from the queue: memory holds them, so the rewrite writes them; _writeFile puts them back if it stops."""
 		delimiter, encoding, errors = self.delimiter, self.encoding, self.errors
 		header = self._headerLine()
 		with self._memLock:
 			values = list(self.values())
 			defaults = list(self.defaults)
-			queued = _queuedRowHashes(self.appendQueue)  # what each queued row holds now, see _releaseRewrite
-		first = []
-		if defaults and len(defaults) > 1:
-			# The defaults line comes right after the header, so it survives a
-			# full rewrite -- it is not a regular mapping key.
-			first.append(_encodeRow(_sanitize(defaults,delimiter=delimiter),delimiter,encoding,errors,what='defaults'))
-		rows = _RewriteRows(first, values, delimiter, encoding, errors, self.header)
-		rows.queued = queued
-		del values  # the snapshot holds the cells
-		rows.check()
-		return header, rows
+			queued, self.appendQueue = self.appendQueue, deque()
+		try:
+			first = []
+			if defaults and len(defaults) > 1:
+				# The defaults line comes right after the header, so it survives a
+				# full rewrite -- it is not a regular mapping key.
+				first.append(_encodeRow(_sanitize(defaults,delimiter=delimiter),delimiter,encoding,errors,what='defaults'))
+			rows = _RewriteRows(first, values, delimiter, encoding, errors, self.header)
+			del values  # the snapshot holds the cells
+			rows.check()
+		except BaseException:
+			with self._memLock:
+				self.appendQueue.extendleft(reversed(queued))
+			raise
+		return header, rows, queued
 
-	def _writeRewrite(self, whole, defer=False, look=True, snapshot=None):
-		"""Take writeLock, encode what to write (``snapshot()``, by default _snapshotForRewrite) and write it over
-		the file: what a rewrite and a clear share.
+	def _openLocked(self, opener):
+		"""``opener(fileName)``, locked (closed again when the lock fails)."""
+		f = opener(self._fileName)
+		try:
+			_lockFile(f)
+		except BaseException:
+			f.close()
+			raise
+		return f
 
-		``whole``: the file is emptied and written whole, through its codec; else it is rewritten in place
-		(mapToFile, for a file that is not compressed). ``look``: another process's change stops it as
-		_externalChangeStops says with ``defer``, or is merged into memory while ``_damage`` is set (_mergeChange);
-		it is looked for once the file is locked and before it is emptied, so no change made until then is
-		erased. A file that is not there (removed by another process: rm, a log rotation) is made whole, from
-		memory, and one another process makes again before it is locked is merged too.
+	def _changedSince(self, f):
+		"""True when the open file ``f`` may not hold what _known says: unknown, another file, size or time."""
+		st = os.fstat(f.fileno())
+		known = self._known
+		return (known is None or st.st_size != known[1] or _updateTimeNs(st) != self.externalFileUpdateTime
+				or (known[0][1] is not None and _fileIdentity(st) != known[0]))
 
-		True when it is written; None when another process's change stopped it; False when the file could not be
-		opened or locked (get_file_obj reported why), left as it was. From the moment it starts changing the file,
-		``dirty`` is set and ``_damage`` says the file may hold part of it; what stops it (an error, a
-		KeyboardInterrupt) also sets ``deSynced``: the file no longer holds memory, the next rewrite() (a tick,
-		close()) makes it again from memory, and until then no change another process makes is reloaded over
-		memory (see _damage). All three are cleared once all of it reached the file, before writeLock is let go
-		of (not before: a tick that saw ``deSynced`` meanwhile would make a rewrite of its own).
+	def _writeFile(self, whole, sync=True, snapshot=None):
+		"""Write memory (or ``snapshot()``'s, a clear's) over the legacy file in place, or whole (``whole``, a compressed
+		file, written as whole members, or a missing one: written over the file, then cut to its end): True when all of
+		it is on disk, False when the file could not be opened or locked (reported); what stops it raises.
 
-		One try/finally from the moment writeLock is taken lets go of the file with _releaseRewrite, whatever stops
-		it where: a _Rewrite says how far it got, and when a KeyboardInterrupt stops the release, it is called
-		again and goes on from there. writeLock is let go of by the ``with`` statement, which nothing skips.
-		Whether the file's time is noted as this object's own is decided here (``rw.started``): only once the look
-		found nothing to keep (or the file was missing), never for a file another process's change was found in or
-		not yet looked at.
-		"""
+		The file is locked before anything is read and until all of it is on disk. Another process's change is taken
+		in first (``sync``; False: overwritten with a warning; None, a clear: not looked for) and again if it lands
+		while the rows are taken; while the file is damaged it is merged by the merge rule (_syncFrom). What stops the
+		write leaves dirty, deSynced and _damaged set and puts the queued rows back."""
 		with self.writeLock:
-			rw = _Rewrite()
-			result = True
-			# Nothing returns from inside the try: the line a return is on is outside its handlers.
+			if not os.path.isfile(self._fileName):
+				# Removed (rm, a log rotation): memory is the only copy. Made again whole; what another process writes
+				# there meanwhile is merged, whatever file it is. deSynced: tried again at every tick if this one is
+				# refused, whatever rewrite_interval is.
+				self.dirty = self.deSynced = self._damaged = True
+				self._known, self._unseen = _KNOWN_NOTHING, False  # merged whatever is there, whichever file it is
+				whole = True
 			try:
-				header, lines = (snapshot or self._snapshotForRewrite)()
-				rw.queued = getattr(lines, 'queued', ())
-				missing = not os.path.isfile(self._fileName)  # under writeLock: this object does not remove it meanwhile
-				whole = whole or missing
-				if missing:
-					rw.started = True  # first: the release notes what the file holds from here on
-					self.dirty = True  # memory is the only copy left: made again until a rewrite gets through, and
-					self._mergeBase = None  # a new damage: what a merge after it starts from is taken again
-					self._damage, self._damageAt = _DAMAGE_EMPTY, None  # what another process writes meanwhile is merged
-				rw.raw = self.get_file_obj('wb' if whole else 'r+b', locked=True, empty=False)
-				if rw.raw is None:
-					self.deSynced = True  # tried again later
-					result = False
-				elif look and self._damage is None and self._externalChangeStops(defer):
-					result = None  # untouched; its time is not noted: the change is reloaded first
+				f = self._openLocked(_openUntruncated)
+			except Exception as e:
+				self._failed('rewrite', f"Failed to open file {self._fileName}: {e}", trace=False)
+				self.deSynced = True
+				return False
+			started = False
+			end = None
+			try:
+				for attempt in range(3):
+					if sync is not None and (self._damaged or (sync and self._changedSince(f))):
+						self._syncFrom(f, True)
+					elif sync is False and self._externalChange():
+						self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
+					header, lines, queued = (snapshot or self._snapshotForRewrite)()
+					if not sync or self._damaged or attempt == 2 or not self._changedSince(f):
+						break
+					# A writer that takes no lock appended while the rows were taken: taken in too, and taken again.
+					header = lines = None
+					with self._memLock:
+						self.appendQueue.extendleft(reversed(queued))
+				started = True
+				self.dirty = self._damaged = True
+				f.seek(0)
+				if whole:
+					# Written over what the file holds, then cut to its end (spec §19.8): a reader that takes no lock
+					# never meets it emptied, and a write cut short leaves the old bytes after the new ones.
+					_writeLines(f, header, lines, codec=_fileCodec(self._fileName))
+					if stat.S_ISREG(os.fstat(f.fileno()).st_mode):  # /dev/null cannot be cut
+						f.truncate()
 				else:
-					if look and self._damage is not None and self._mergeChange(rw.raw):
-						# Made again with what was merged, once the first is let go of: never two snapshots of the
-						# store alive at once.
-						header = lines = None
-						header, lines = (snapshot or self._snapshotForRewrite)()
-						rw.queued = getattr(lines, 'queued', ())
-					# Until it is all written, the file does not hold memory: a rewrite that stops is made again,
-					# and the file is not reloaded over memory meanwhile. ``started`` first: a release that sees it
-					# notes what the file then holds as the damage, which another process's appends are merged after.
-					rw.started = True
-					self._damage = _DAMAGE_UNKNOWN
-					self.dirty = True
-					if whole:
-						rw.raw.truncate(0)
-						rw.writer = _codecWriter(self._fileName, rw.raw)
-						_writeLines(rw.writer or rw.raw, header, lines)
-					else:
-						self._writeInPlace(rw.raw, header, lines)
-					rw.written = True
+					self._writeInPlace(f, header, lines)
+				f.flush()
+				_fsync(f.fileno())
+				end = f.tell()  # its own bytes end here: a writer that takes no lock may append after them
+				self._damaged = self._remake = False
+				self.dirty = self.deSynced = False
+			except BaseException:
+				if started:
+					self.dirty = self.deSynced = True  # made again from memory by the next rewrite
+					with self._memLock:
+						self.appendQueue.extendleft(reversed(queued))
+				raise
 			finally:
 				try:
-					self._releaseRewrite(rw)
-				except BaseException:
-					# A KeyboardInterrupt stopped it (or it raised what made the release fail, once done): it goes
-					# on from where it stopped, without waiting out a flush or a sync a Ctrl-C may have stopped.
-					rw.written = False
-					self._releaseRewrite(rw)
-					raise
-		return result
+					if started:
+						# What it wrote, or what stopping it left (the damage): read through the descriptor, before the
+						# file is let go of. Its time is noted as this object's own.
+						self._known, self._unseen = _fileKnown(f.fileno(), None if self._damaged else end), False
+						self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
+				except Exception:
+					self._known = None
+				finally:
+					_unlockFile(f)
+					_closeUnflushed(f)  # a buffer a failed write left is dropped, not written after the unlock
+		return True
 
-	def _mergeChange(self, file):
-		"""While ``_damage`` is set, merge another process's change into memory from ``file`` (open and locked).
+	def _syncFile(self):
+		"""Take in another process's change to the legacy file (_syncFrom), reading it as reload() does: not locked."""
+		with self.writeLock:
+			with open(self._fileName, 'rb') as f:
+				cut = self._syncFrom(f, False)
+			if cut:
+				self._readLocked(lambda f: self._syncFrom(f, True))
 
-		Memory then holds the only good copy, and the rewrite about to start makes the file again from it: the
-		change is not reloaded over memory (the rows the damage lost would go), nor erased. When the file still
-		begins with what the damage left (its size and digest), the rest is what other processes appended since
-		(appends, deletes, the file made again after it was removed): its rows are applied on top of memory, as a
-		read of the file would apply them, except for a key still queued. A queued row is a change memory holds
-		that is not known to be in the file: set or deleted since the last append got through, or one whose append
-		failed (commitAppendToFile keeps a row queued until it is on disk; a write cut short is cut off again, where
-		it can be). What the file holds of such a key is older, or a row torn by that failed append, so memory's is
-		kept: the rewrite writes it, and once that is on disk the queued rows it wrote leave the queue
-		(_releaseRewrite). Else (another process rewrote it, or what it held is not known) memory is kept and the
-		change is overwritten, with a warning. True when memory changed:
-		what the rewrite writes is encoded again.
-
-		The rows are read apart from memory first (_TSVZedMerge), without _memLock: other threads' sets wait only
-		for the appended rows to be applied. Each is applied to memory in place, the last change of its key: a
-		KeyboardInterrupt leaves memory with some of them applied, and the next merge applies all of them again
-		(``_damage`` is noted only once they are), which ends the same.
-		"""
-		size, digest = self._damage
-		# Taken before the bytes are read, as _reload takes it: a write landing after the read (a writer that takes
-		# no file lock) is not noted as seen. Noted once what was read is merged.
-		seen = getFileUpdateTimeNs(self._fileName)
-		# Decided by what the file holds (its size and digest), not by its time: on a file system with coarse
-		# timestamps, an append in the same tick as the failed rewrite leaves the time as it was. The stamp only spares
-		# the read where it proves the file unchanged: the same file, size and times, noted settled (_fileStamp). Only
-		# an unknown damage is judged by the time alone.
+	def _readLocked(self, read):
+		"""``read(f)`` again with the file open and locked. A read cut short by damage without the lock may have met
+		another writer's write in progress, which every writer finishes under the lock; damage still there under it
+		stays, and what that read took is known. Not when the file cannot be opened for writing (read-only) or is gone."""
 		try:
-			at = _fileStamp(os.fstat(file.fileno()))
-		except Exception:
-			at = None
-		noted = self._damageAt  # the file the damage is in: None when it was missing
-		if size is None:
-			found = None if self.externalFileUpdateTime < seen else (b'', self._damage)
-		elif noted is not None and at is not None and None not in at[:2] and at[:2] != noted[:2]:
-			# Another file now: another process replaced it (renamed one over it, removed it and made it again), even
-			# if what it holds begins with the damage. Not appended to.
-			found = None
-		elif noted is not None and at is not None and noted[5] and at[:5] == noted[:5]:
-			# The same file, as large and last changed when the damage was noted, which was then long enough ago that
-			# any change since would show in its times: nothing to read and hash again (a rewrite that keeps failing
-			# tried every time). A change of its size or times, or a stamp noted within the file system's clock tick
-			# of the file's last change, reads it: the digest decides then.
-			found = (b'', self._damage)
-		else:
-			found = _bytesAfter(file, size, digest)
-		if found is None:
-			self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}: they were made after a rewrite of "
-								 f"this object's failed and left the file damaged, and cannot be told apart from that damage; "
-								 f"memory holds what the rewrite was writing",'warning')
+			f = self._openLocked(lambda path: open(path, 'r+b'))  # removed meanwhile: not made again, empty
+		except OSError:
+			return
+		try:
+			read(f)
+		finally:
+			_unlockFile(f)
+			f.close()
+
+	def _syncFrom(self, f, locked):
+		"""Take in what another process changed in the open legacy file ``f``: when it is the same file and still begins
+		with the bytes _known says, only what follows is read and applied (_applyAppended), else it is read whole
+		(_readFrom). While the file is damaged (the merge rule), any other change is left to the rewrite about to
+		start to overwrite, with a warning: memory holds the only good copy. True when, not ``locked``, the read was
+		cut short by damage: nothing of it is known, and the caller reads it again under the lock (_readLocked)."""
+		seen = getFileUpdateTimeNs(self._fileName)  # before the read: a write landing after it is not noted as seen
+		found = None if self._unseen else _readAfter(f, self._known)
+		header = None  # True: a row was queued while what follows was read
+		# A last line with no newline is read again: what is appended may complete it (a compressed file's appends
+		# are members of their own). Not while rows are queued (unless the file is damaged): what follows would go after
+		# them in memory, where the file will hold them after it.
+		if (found is not None and (found[2] or self._damaged or _isCompressedFile(self._fileName))
+				and (self._damaged or (not self.appendQueue and not self._readWhole))):
+			rest, known, _ = found
+			header, torn = self._applyAppended(f, rest, self._known[1])
+			if header is None:
+				cut = torn and not locked  # a member cut short may be an append still being written
+				self._known = None if cut else known
+				self.externalFileUpdateTime = seen
+				return cut
+		if self._damaged:
+			why = ("another process made it again with a first line that is not this store's header ({!r})".format(header)
+				   if isinstance(header, str) else "and they do not follow the bytes the file held then")
+			self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}: they were made while the file was "
+								 f"damaged and memory held the only good copy (a rewrite of this object's failed, part way or "
+								 f"before it began on damage another writer left), {why}; memory is written over them",'warning')
 			return False
-		rest, whole = found
-		if not rest:
-			self._damage, self._damageAt, self.externalFileUpdateTime = whole, at, seen
-			return False
+		return self._readFrom(f, locked)
+
+	def _applyAppended(self, f, rest, size):
+		"""Apply ``rest``, what follows the first ``size`` bytes of the open legacy file ``f`` (a compressed one read member
+		by member), to memory as a read of the file applies it: the last change of a key wins, a key deleted and set
+		again moves to the end, a key still queued keeps memory's row. Returns ``(header, torn)``: ``header`` None when
+		applied; else, after bytes that hold nothing, their first line, which is not this store's header (an append to
+		an empty file writes it first), or True when a row was queued meanwhile (not while the file is damaged): what
+		follows would go before it in memory. ``torn`` when a compressed member is cut short or does not decode."""
+		codec = _fileCodec(self._fileName)
 		reporter = _Reporter(self._fileName, self.teeLogger)
-		try:  # what it notes is reported however it ends (a refused header, an error, a KeyboardInterrupt)
-			codec = _fileCodec(self._fileName)
+		damage = None
+		try:  # what it notes is reported however it ends
 			if codec:
 				rest, damage = _decodeMembers(codec, rest)
 				if damage:
 					reporter.note('damaged', None, 'compressed stream another process appended is damaged ({}); the rest is '
-								  'merged, and the damaged bytes are overwritten'.format('; '.join(damage)))
-			if any(self.header) and self.verifyHeader and _holdsNothing(file, codec, size):
-				# The damage left nothing (the file emptied, or removed; or only empty compressed streams, which an append
-				# takes for an empty file too): what another process wrote there begins with a header, as a read takes the
-				# first line of the file. Not after a damage that holds a line: a row there that reads as the header is a
-				# row. A header that is not this store's: another store's file, not merged.
+								  'read'.format('; '.join(damage)))
+			if any(self.header) and self.verifyHeader and _holdsNothing(f, codec, size):
 				first, _, rest = rest.partition(b'\n')
-				line = first.decode(self.encoding or 'utf8', errors='replace')
-				if not _headerMatches(self.header, line, self.delimiter):
-					reporter.flush()  # what was noted of the stream comes first
-					self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}: another process made it again "
-										 f"after a rewrite of this object's failed, with a first line that is not this store's "
-										 f"header ({line.rstrip()!r}); memory holds what the rewrite was writing",'warning')
-					return False
-			# What the rows are read with (the defaults that fill their empty cells, the column count) is what memory had
-			# when the first merge after this damage began: one stopped by a KeyboardInterrupt after it changed memory's
-			# defaults, and before it noted the damage, is made again from the same start, and ends the same.
-			base = self._mergeBase
-			if base is None or base[0] is not self._damage:
-				base = self._mergeBase = (self._damage, list(self.defaults), self.correctColumnNum)
-			defaults, columns = list(base[1]), base[2]
-			changes = _TSVZedMerge(self, columns, list(defaults))
-			_legacyReadLoop(io.BytesIO(rest), '', changes, columns, 0, self.strict, self.delimiter,
+				line = first.decode(self.encoding or 'utf8', errors='replace').rstrip()
+				if first and not _headerMatches(self.header, line, self.delimiter):
+					return line, False
+			defaults = list(self.defaults)
+			changes = _TSVZedMerge(self, self.correctColumnNum, list(defaults))
+			_legacyReadLoop(io.BytesIO(rest), '', changes, self.correctColumnNum, 0, self.strict, self.delimiter,
 							changes.defaults, False, self.encoding, reporter)
 		finally:
 			reporter.flush()
 		with self._memLock:
 			# No set or delete is half done: each holds _memLock from its change of memory to its queueing.
-			queued = _queuedKeys(self, self.appendQueue)
+			if self.appendQueue and not self._damaged:
+				return True, False
+			queued = set(row[0] for row in self.appendQueue if row)
 			for key, (row, readded) in changes.items():
 				if key in queued:
 					continue
+				held = dict.get(self, key)
 				if row is None:
-					if OrderedDict.__contains__(self, key):
-						OrderedDict.__delitem__(self, key)  # not OrderedDict.pop: on 3.6 it calls TSVZed.__delitem__, which takes _memLock
+					if held is not None:
+						OrderedDict.__delitem__(self, key)  # not OrderedDict.pop: on 3.6 it calls TSVZed.__delitem__
+						self.dirty = True  # the file holds the key twice
 				else:
+					if held is not None and held != row:
+						self.dirty = True
 					OrderedDict.__setitem__(self, key, row)
 					if readded:  # deleted and set again: a read of the file has it at the end, not in its old place
-						OrderedDict.move_to_end(self, key)  # not TSVZed.move_to_end: memory is not reordered by hand
+						OrderedDict.move_to_end(self, key)
 			if changes.defaults != defaults and DEFAULTS_INDICATOR_KEY not in queued:
 				self.defaults = changes.defaults
 			if self.correctColumnNum == -1 and self:
 				self.correctColumnNum = len(self[next(iter(self))])
-		self._damage, self._damageAt, self.externalFileUpdateTime = whole, at, seen  # a rewrite that does not start now merges only what comes next
 		if self.verbose:
-			self.__teePrintOrNot(f"Merged what another process wrote to {self._fileName} after a failed rewrite: {len(self)} records")
-		return True
+			self.__teePrintOrNot(f"Read what another process appended to {self._fileName}: {len(self)} records")
+		return None, bool(damage)
+
+	def _readFrom(self, f, locked):
+		"""Make memory what the open legacy file ``f`` holds (None: no file), with the queued rows replayed on it. It is
+		read apart from memory, then memory is changed in place under _memLock, never emptied (a key the file still
+		holds is never missing for another thread) and takes the file's order. _known is then the bytes read."""
+		seen = getFileUpdateTimeNs(self._fileName)  # before the read: a change during or after it is seen by the next check
+		loaded = _TSVZedLoad(self, self.correctColumnNum, list(self.defaults))
+		known = _KNOWN_NOTHING
+		damaged = False
+		if f is not None:
+			codec = _fileCodec(self._fileName)
+			reader = _HashingReader(f)
+			reporter = _Reporter(self._fileName, self.teeLogger)
+			try:
+				f.seek(0)
+				size = os.fstat(f.fileno()).st_size
+				if _holdsNothing(f, codec, size):
+					reader.read(size)  # no line: an empty store with its header; only the bytes looked at are known
+				else:
+					_requireCodec(codec)
+					stream = _openStreams(codec, reader) if codec else reader
+					try:
+						start = _legacyReadHeader(stream, self._fileName, self.header, self.verifyHeader, self.verbose,
+												  self.teeLogger, self.strict, self.delimiter, -1, self.encoding, reporter)
+						if start is not None:
+							_legacyReadLoop(stream, self._fileName, loaded, start[0], start[1], self.strict, self.delimiter,
+											loaded.defaults, False, self.encoding, reporter)
+					finally:
+						if codec:
+							stream.close()
+				# Read up to damage without the lock: maybe a whole rewrite still being written, so not known. Under it,
+				# the damage stays: the bytes after it are known as they are (what follows them is read on from there).
+				damaged = reporter.has('damaged')
+				cut = not locked and damaged
+				if locked and damaged:
+					while reader.read(1 << 20):
+						pass
+			finally:
+				reporter.flush()
+			known = None if cut else (_fileIdentity(os.fstat(f.fileno())), reader.size, reader.digest)
+		with self._memLock:
+			# No set or delete is half done: each holds _memLock from its change of memory to its queueing. What is
+			# queued is not in the file (appends take writeLock, held here): replayed on what was read, as reading it
+			# once appended will, so memory stays what the file will hold.
+			loaded.replay(list(self.appendQueue))
+			self._replaceRows(loaded)
+			self._readWhole = False  # before the defaults: a setDefaults() between the two sets it again
+			self.defaults = loaded.defaults
+			if loaded.dirty:
+				self.dirty = True  # a key the file holds twice
+			if self.header and any(self.header) and self.verifyHeader:
+				self.correctColumnNum = len(self.header)
+			elif self:
+				self.correctColumnNum = len(self[next(iter(self))])
+			else:
+				self.correctColumnNum = -1
+		self._known, self._unseen = known, False
+		self._damaged = False  # memory is what the file holds, damaged or not
+		self._remake = locked and damaged
+		self.externalFileUpdateTime = self.lastUpdateTime = seen
+		self.deSynced = False  # memory is the file again: a change seen before needs no rewrite
+		return known is None and f is not None
+
+	def _replaceRows(self, rows):
+		"""Make memory hold the mapping ``rows`` in its order, changed in place, never emptied: a key both hold is never
+		missing for another thread meanwhile (a reload). The caller holds _memLock."""
+		for key in [key for key in OrderedDict.__iter__(self) if not dict.__contains__(rows, key)]:
+			OrderedDict.__delitem__(self, key)
+		for key, row in rows.items():
+			OrderedDict.__setitem__(self, key, row)
+		if list(OrderedDict.__iter__(self)) != list(rows):  # another order: the keys take it, one at a time
+			for key in rows:
+				OrderedDict.move_to_end(self, key)
 
 	def _rewritten(self):
-		"""What mapToFile and hardMapToFile do once _writeRewrite wrote every row; True."""
+		"""What mapToFile and hardMapToFile do once _writeFile wrote every row; True."""
 		if self.verbose:
 			self.__teePrintOrNot(f"{len(self)} records written to {self._fileName}")
 			self.__teePrintOrNot(f"File {self._fileName} size: {os.path.getsize(self._fileName)}")
@@ -5618,16 +5580,13 @@ memoryOnly:{self.memoryOnly}
 					  'hardMapToFile() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
 					  self.teeLogger)
 			return self
-		self._hardMapToFile(explicit=True)
+		self._call(self._hardMapToFile, False, True)
 		return self
 
-	def _hardMapToFile(self, defer=False, explicit=False):
-		"""hardMapToFile(); ``defer``: see _externalChangeStops, ``explicit``: see _refuse.
-
-		True when the file is written, None when another process's change stopped it, else False.
-		"""
+	def _hardMapToFile(self, sync=False, explicit=False):
+		"""hardMapToFile(); ``sync``: see _writeFile, ``explicit``: see _refuse. True when the file is written."""
 		try:
-			return self._writeRewrite(whole=True, defer=defer) and self._rewritten()
+			return self._writeFile(whole=True, sync=sync) and self._rewritten()
 		except TSVZEncodeError as e:
 			self._refuse('hardMapToFile()', e, explicit)
 		except Exception as e:
@@ -5641,21 +5600,17 @@ memoryOnly:{self.memoryOnly}
 					  'mapToFile() is ignored for .tsvz; behaviour undefined; use scrubTabularFile for archival compaction',
 					  self.teeLogger)
 			return self
-		self._mapToFile(explicit=True)
+		self._call(self._mapToFile, False, True)
 		return self
 
-	def _mapToFile(self, defer=False, explicit=False):
-		"""mapToFile(); rewrite() calls it with ``defer`` (see _externalChangeStops), ``explicit``: see _refuse.
-
-		Whether to overwrite a change another process made is an argument, not monitor_external_changes turned
-		off for the time of the call: two threads in it at once left monitoring off for good. True when the file
-		is written, None when another process's change stopped it, else False.
-		"""
+	def _mapToFile(self, sync=False, explicit=False):
+		"""mapToFile(); rewrite() calls it with ``sync`` (see _writeFile), ``explicit``: see _refuse. True when the file
+		is written."""
 		try:
 			if _isCompressedFile(self._fileName):
 				# if the file is compressed, we need to use the hardMapToFile method
-				return self._hardMapToFile(defer, explicit)
-			return self._writeRewrite(whole=False, defer=defer) and self._rewritten()
+				return self._hardMapToFile(sync, explicit)
+			return self._writeFile(whole=False, sync=sync) and self._rewritten()
 		except TSVZEncodeError as e:
 			self._refuse('mapToFile()', e, explicit)
 			return False
@@ -5663,7 +5618,7 @@ memoryOnly:{self.memoryOnly}
 			if self._failed('rewrite', f"Failed to write at mapToFile() to {self._fileName}: {e}", retry=False):
 				self.__teePrintOrNot("Trying failback hardMapToFile()")
 			self.deSynced = True
-			return self._hardMapToFile(defer, explicit)
+			return self._hardMapToFile(sync, explicit)
 
 	def _writeInPlace(self, file, headerBytes, lines):
 		"""Rewrite the open, locked ``file`` in place to hold ``headerBytes`` and ``lines``: mapToFile()'s write."""
@@ -5671,7 +5626,8 @@ memoryOnly:{self.memoryOnly}
 		if headerBytes is not None:
 			line = file.readline().decode(self.encoding,errors='replace')
 			aftPos = file.tell()
-			if not line or not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
+			# A header line with no newline (the file ends right after it) is written again with one.
+			if not line.endswith('\n') or not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
 				header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
 				file.seek(0)
 				file.write(headerBytes+b'\n')
@@ -5719,39 +5675,71 @@ memoryOnly:{self.memoryOnly}
 				self.deSynced = True
 				self.__teePrintOrNot(f"External changes detected in {self._fileName}")
 			return self
-		# Under writeLock, as _externalChange(): a write of this object's own that holds it has changed the file
-		# but not yet noted its time, and must not be taken for another process's change (it set deSynced,
-		# and the background writer rewrote the whole file, rewrite_interval=0 or not).
-		with self.writeLock:
-			realExternalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
-			changed = self.externalFileUpdateTime < realExternalFileUpdateTime
-			if changed:
-				self.deSynced = True
-			elif self.externalFileUpdateTime > realExternalFileUpdateTime:
-				self.externalFileUpdateTime = realExternalFileUpdateTime
-				changed = None
-		if changed:
-			self.__teePrintOrNot(f"External changes detected in {self._fileName}")
-		elif changed is None:
-			self.__teePrintOrNot(f"Time anomalies detected in {self._fileName}, resetting externalFileUpdateTime")
+		self._call(self._checkExternalChanges)
 		return self
+
+	def _checkExternalChanges(self):
+		"""checkExternalChanges() for a legacy file, on the writer thread: never in the middle of this object's own write."""
+		realExternalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
+		if self._externalChange():
+			self.deSynced = True
+			self.__teePrintOrNot(f"External changes detected in {self._fileName}")
+		elif self.externalFileUpdateTime > realExternalFileUpdateTime:
+			self.externalFileUpdateTime = realExternalFileUpdateTime
+			self.__teePrintOrNot(f"Time anomalies detected in {self._fileName}, resetting externalFileUpdateTime")
+
+	def _call(self, fn, *args):
+		"""``fn(*args)``, run on the store's writer thread while this one waits: a KeyboardInterrupt stops the wait, never
+		the write. Run here on that thread itself, or when it is not running (after close, in a forked child)."""
+		thread = self.appendThread
+		if thread is threading.current_thread() or not thread.is_alive():
+			return fn(*args)
+		job = [fn, args, threading.Event(), None, None]
+		self._requests.append(job)
+		self._wake.set()
+		while not job[2].wait(0.1):  # in steps: a Ctrl-C stops the wait on every platform
+			if not thread.is_alive():  # it stopped before it took the job
+				try:
+					self._requests.remove(job)
+				except ValueError:
+					continue
+				return fn(*args)
+		if job[4] is not None:
+			raise job[4]
+		return job[3]
+
+	def _runRequests(self):
+		"""Run, on the writer thread, the jobs _call handed it, in order."""
+		while True:
+			try:
+				job = self._requests.popleft()
+			except IndexError:
+				return
+			try:
+				job[3] = job[0](*job[1])
+			except BaseException as e:
+				job[4] = e
+			job[2].set()
 
 	def _appendWorker(self):
 		while not self.shutdownEvent.is_set():
+			self._wake.clear()
+			self._runRequests()
 			if not self.memoryOnly:
-				self.checkExternalChanges()
-				if self._spec:
-					self._specSync()
-				elif not self._failing('sync'):
-					self._rewrite(background=True)  # it waits after a failed rewrite itself, but never to reload
-				# Also to a file a failed rewrite damaged (_damage): the rows are on disk as soon as they are set, as
-				# ever, after the header to a file left empty; the rewrite that makes the file again merges them back
-				# as they are, in their order among another process's appends (the last writer wins, as on main).
-				if self._spec or not self._failing('append'):
-					self.commitAppendToFile()
-			time.sleep(self.append_check_delay)
-			# self.appendEvent.wait()
-			# self.appendEvent.clear()
+				try:  # nothing stops the thread: the store would stop writing
+					self.checkExternalChanges()
+					if self._spec:
+						self._specSync()
+					elif not self._failing('sync'):
+						self._rewrite(background=True)  # it waits after a failed rewrite itself, but never to take in a change
+					# Also to a file a failed rewrite damaged: the rewrite that makes it again merges them back as they
+					# are, in their order among another process's appends (the last writer wins).
+					if self._spec or not self._failing('append'):
+						self.commitAppendToFile()
+				except Exception as e:
+					self._failed('sync', f"Failed to write at sync() to {self._fileName}: {e}")
+			self._wake.wait(self.append_check_delay)
+		self._runRequests()
 		if self.verbose:
 			self.__teePrintOrNot(f"Append worker for {self._fileName} shut down")
 		self.commitAppendToFile()
@@ -5759,28 +5747,83 @@ memoryOnly:{self.memoryOnly}
 	def commitAppendToFile(self):
 		if self._spec:
 			return self._specCommit()
-		if self.appendQueue:
-			if self.memoryOnly:
-				self.appendQueue.clear()
-				if self.verbose:
-					self.__teePrintOrNot("Memory only mode. Append queue cleared.") 
+		return self._call(self._commit)
+
+	def _commit(self):
+		"""commitAppendToFile() for a legacy file, under writeLock and the file lock. The rows stay queued until they are
+		on disk (a merge keeps memory's row for a queued key). When the file held what _known says, what it appended
+		is known too and its time noted; else another process's change is still to be taken in (in a compressed file,
+		what it appended is first looked at for damage every read stops at: then the file is made again from memory)."""
+		if self._commitOnce() == 'remake':
+			self._commitOnce()  # the lock let go of: the file is made again from memory
+		return self
+
+	def _remakeDue(self):
+		"""True when the next commit makes the file again from memory (_remake), not while a rewrite was refused or
+		failed lately (the background writer's back-off), unless the store is closing (its last try)."""
+		return self._remake and (self._closing or not self._refusalPending() and not self._failing('rewrite'))
+
+	def _commitOnce(self):
+		"""_commit(), once: 'remake' when another writer's change it read under the lock is damage (_remakeDue)."""
+		if not self.appendQueue:
+			return self
+		if self.memoryOnly:
+			self.appendQueue.clear()
+			if self.verbose:
+				self.__teePrintOrNot("Memory only mode. Append queue cleared.")
+			return self
+		missing = not os.path.exists(self._fileName)
+		if missing or self._remakeDue():
+			# Removed (rm, a log rotation): memory is the only copy, so the file is made again from it, as a rewrite
+			# makes it, not begun with these rows alone (the next read would then drop every other row from memory).
+			# Damaged where every read stops (_remake): made again too; a rewrite refused, these rows are appended.
+			if self._hardMapToFile(sync=True):
+				self._worked('append')
 				return self
-			file = None
+			if missing:
+				return self
+			self.dirty = True  # failed or refused: the rewrite that gets through makes the file again
+		with self.writeLock:
 			try:
 				if self.verbose:
 					self.__teePrintOrNot(f"Commiting {len(self.appendQueue)} records to {self._fileName}")
-					self.__teePrintOrNot(f"Before size of {self._fileName}: {os.path.getsize(self._fileName)}")
 				codec = _fileCodec(self._fileName)
 				_requireCodec(codec)
-				file = self.get_file_obj('a+b')  # the file itself, compressed or not: _appendOpen compresses
-				if file is None:
-					return self  # get_file_obj reported why; the rows stay queued for the next try
-				# The rows stay queued until they are on disk: one whose write fails (a full disk) is written again later,
-				# and while it is queued a merge after a failed rewrite keeps memory's row for its key (_mergeChange), not
-				# what the file holds of it (an append cut short is cut off again, as far as it can be).
+				# The file itself, compressed or not (_appendOpen compresses), created when missing.
+				f = self._openLocked(lambda path: open(path, 'a+b'))
+			except Exception as e:
+				self._failed('append', f"Failed to open file {self._fileName}: {e}", trace=False)
+				self.deSynced = True
+				return self
+			known = None
+			try:
+				known = None if self._changedSince(f) else self._known
+				if known is None and codec and not self._damaged and self.monitor_external_changes:
+					# Every read stops at damage in a compressed file (L5): rows appended after it would be read by no
+					# one. What another process appended after the bytes this store knows is looked at; damaged (or
+					# not after them), the file is read now, under the lock, and made again from memory (_remakeDue).
+					found = _readAfter(f, self._known)
+					if found is None or _decodeMembers(codec, found[0])[1]:
+						try:
+							self._syncFrom(f, True)
+						except Exception as e:  # the rows are appended all the same
+							self._failed('sync', f"Failed to read {self._fileName}: {e}", trace=False)
+						if self._remakeDue():
+							return 'remake'  # the lock is let go of first (finally)
+						known = None if self._changedSince(f) else self._known
+				if self._remake and not self._damaged and not self._refusalPending():
+					# Appended after damage every read stops at, the file not made again (that failed, or waits out its
+					# back-off): memory holds the only good copy, as after a rewrite that fails part way (the merge rule).
+					self.dirty = self.deSynced = True
+					self._damaged, self._unseen = True, False
+				elif self._remake:
+					self.dirty = True  # appended after the damage while a remake is refused: the next rewrite makes it again
+				if known is None and not self._damaged:
+					# Another process's change is not known until it is read: the next tick reads all of it, whatever
+					# the file's time says (a time that ticks coarsely may not have moved).
+					self._unseen, self.externalFileUpdateTime = True, 0
 				with self._memLock:  # a set or delete queues under it: not while the queue is listed
-					count = len(self.appendQueue)
-					rows = list(itertools.islice(self.appendQueue, count))
+					rows = list(self.appendQueue)
 				chunks = []
 				for row in rows:
 					try:
@@ -5794,258 +5837,135 @@ memoryOnly:{self.memoryOnly}
 					# An existing empty file (a rewrite cut short, of this object's or another's) gets the header first,
 					# as creating it writes it; L1: a hand-edited last line is terminated instead of glued onto.
 					reporter = _Reporter(self._fileName, self.teeLogger)
+					written = []
 					try:
-						_appendOpen(file, b''.join(chunks), codec, self._headerLine if any(self.header) else None, 'newline', reporter)
-						_fsync(file.fileno())  # a sync that fails fails the append: the rows stay queued
+						_appendOpen(f, b''.join(chunks), codec, self._headerLine if any(self.header) else None, 'newline',
+									reporter, written=written)
+						_fsync(f.fileno())  # a sync that fails fails the append: the rows stay queued
 					finally:
 						reporter.flush()
+					if known is not None and stat.S_ISREG(os.fstat(f.fileno()).st_mode):  # /dev/null holds none of it
+						# What it wrote, not what the file now holds: another writer's append that lands meanwhile
+						# (one that takes no lock) is still to be read, and one that landed first fails the next look.
+						digest = known[2].copy()
+						digest.update(written[0])
+						self._known = (_fileIdentity(os.fstat(f.fileno())), known[1] + len(written[0]), digest)
+						self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 				with self._memLock:
-					for _ in range(count):
+					for _ in range(len(rows)):
 						self.appendQueue.popleft()  # only those listed: rows queued since stay
-				self.release_file_obj(file, synced=True)
-				if not chunks:
-					return self
-				self._worked('append')
-				if self.verbose:
-					self.__teePrintOrNot(f"Records commited to {self._fileName}")
-					self.__teePrintOrNot(f"After size of {self._fileName}: {os.path.getsize(self._fileName)}")
+				if chunks:
+					self._worked('append')
+					if self.verbose:
+						self.__teePrintOrNot(f"Records commited to {self._fileName}")
 			except Exception as e:
-				self.release_file_obj(file)
+				if known is not None and os.fstat(f.fileno()).st_size == known[1]:
+					# The append was cut off again (_appendOpen): the file holds what it did, and its time is this
+					# store's own, not another process's change.
+					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 				self._failed('append', f"Failed to write at commitAppendToFile to {self._fileName}: {e}")
 				self.deSynced = True
+			finally:
+				_unlockFile(f)
+				f.close()
 		return self
 	
 	def stopAppendThread(self):
 		try:
-			if self.shutdownEvent.is_set():
-				# if self.verbose:
-				#     self.__teePrintOrNot(f"Append thread for {self._fileName} already stopped")
-				return
-			if self._spec:
-				self._specSync()
-			else:
-				self.rewrite(force=self.rewrite_on_exit)  # Ensure any final sync operations are performed
-			# self.appendEvent.set()
-			self.shutdownEvent.set()  # Signal the append thread to shut down
-			self.appendThread.join()  # Wait for the append thread to complete 
+			if not self.shutdownEvent.is_set():
+				if self._spec:
+					self._specSync()
+				else:
+					self._closing = True
+					self._reported = {}  # a failure that lasts to the end is reported once more: nothing tries after it
+					try:
+						# A damaged file, or one another writer left damaged that rows went after (_remake and dirty), is
+						# tried once more, however lately a rewrite was refused (no failed one's back-off is waited out
+						# here either): memory holds the only good copy, and goes with the store.
+						self.rewrite(force=self.rewrite_on_exit or self._damaged or self._remake)  # Ensure any final sync operations are performed
+					except BaseException:
+						self._closing = self._exiting  # a Ctrl-C stopped the wait: the store runs on, but not at exit
+						raise
+			self._finish()
 			if self.verbose:
 				self.__teePrintOrNot(f"Append thread for {self._fileName} stopped")
 		except Exception as e:
 			self.__teePrintOrNot(f"Failed to stop append thread for {self._fileName}: {e}",'error')
 			import traceback
 			self.__teePrintOrNot(traceback.format_exc(),'error')
+
+	def _finish(self):
+		"""Stop the writer thread once it has done its jobs and appended the queue; forget the store (_LIVE_STORES)."""
+		self.shutdownEvent.set()
+		self._wake.set()
+		thread = self.appendThread
+		if thread is not threading.current_thread():
+			while thread.is_alive():
+				thread.join(0.1)  # in steps: a Ctrl-C stops the wait on every platform
+		_LIVE_STORES.pop(id(self), None)
+
+	def _atExit(self):
+		"""What _stopLiveStores does with a store left running at exit."""
+		self._exiting = True
+		return self.stopAppendThread()
 	
-	def get_file_obj(self,modes = 'ab',locked = False,empty = True):
-		"""Take ``writeLock`` (unless ``locked``: the caller holds it already), open the file and lock it.
-
-		'wb' opens the file as it is (created when missing) and empties it only once it is locked; a compressed
-		one is then written through its codec. With ``empty=False`` it is handed out locked and not
-		yet emptied, as it is: _writeRewrite looks for another process's change first, and empties it itself.
-
-		On failure the error is reported, a file this opened is closed and None is returned. writeLock is then let
-		go only when this call took it: a caller that holds it keeps it, and lets go of it itself. A KeyboardInterrupt
-		does the same, and is raised.
-		"""
-		if not locked:
-			self.writeLock.acquire()
+	def get_file_obj(self,modes = 'ab'):
+		"""The store's file opened in ``modes`` and locked, with writeLock held until release_file_obj() (3.39 API; the
+		store's own writes do not use it). 'wb' empties it once locked, a compressed one then written through its
+		codec. None when it cannot be opened or locked (reported)."""
+		self.writeLock.acquire()
 		file = None
-		emptied = False
 		try:
-			if not self.encoding:
-				self.encoding = 'utf8'
 			if 'w' in modes:
-				# Opened as it is and emptied once locked: 'wb' would empty it before the lock is taken, under
-				# another writer that holds it, and for good when the lock then fails or is interrupted.
 				_requireCodec(_fileCodec(self._fileName))
 				file = _openUntruncated(self._fileName)
 			elif modes == 'a+b':
-				file = open(self._fileName, 'a+b')  # the file itself, also a compressed one (commitAppendToFile)
+				file = open(self._fileName, 'a+b')
 			else:
-				file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding,teeLogger=self.teeLogger)
-			_lockFile(file)  # the whole file, on POSIX and Windows
-			if 'w' in modes and empty:
+				file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding, teeLogger=self.teeLogger)
+			_lockFile(file)
+			if 'w' in modes:
 				file.truncate(0)
-				emptied = True  # only once it is: a truncate that fails changed nothing of another process's
 				file = _compressedWriter(self._fileName, file) or file
-			# An append that finds another process's change not yet seen must not mark it seen (release_file_obj
-			# notes the time after it): the next check still reloads it. A rewrite replaces the file, so it does.
-			# Looked at once the file is locked: another writer may append until then.
-			self._keepFileTime = modes in ('ab', 'a+b') and self.externalFileUpdateTime < getFileUpdateTimeNs(self._fileName)
 			if self.verbose:
 				self.__teePrintOrNot(f"File {self._fileName} locked with mode {modes}")
 			return file
 		except BaseException as e:
-			if isinstance(e, Exception):
-				self._failed('append' if modes in ('ab', 'a+b') else 'rewrite', f"Failed to open file {self._fileName}: {e}", trace=False)
 			if file is not None:
 				try:
-					_closeFile(file)  # an unlocked file is never handed out
+					file.close()  # an unlocked file is never handed out
 				except Exception:
 					pass
-				if emptied:
-					# It was emptied under the lock: that change is this object's own, not another process's.
-					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
-			if not locked:
-				self.writeLock.release()
+			self.writeLock.release()
 			if not isinstance(e, Exception):
 				raise
+			self._failed('append' if 'a' in modes else 'rewrite', f"Failed to open file {self._fileName}: {e}", trace=False)
 			return None
 
-	def release_file_obj(self,file,synced=False):
-		"""Unlock and close ``file``, note the file's modification time as this object's own, and let go of writeLock.
-
-		``file`` is flushed and synced first, unless ``synced``: the caller did that itself and learnt whether it
-		failed (an error here is reported, not raised)."""
-		# if write lock is already released, return
-		if not self.writeLock.locked():
+	def release_file_obj(self,file):
+		"""Flush, sync, unlock and close ``file`` from get_file_obj(), note the file's time as this object's own (what was
+		written through it is not known: _known), and let go of writeLock."""
+		if file is None or not self.writeLock.locked():
 			return
-		if file is None:
-			return
-		noted = False
+		raw = getattr(file, '_tsvzRaw', file)
 		try:
-			if not synced:
-				file.flush()  # Ensure the file is flushed before unlocking
-				_fsync(file.fileno())  # Ensure the file is synced to disk before unlocking
-			if not file.closed:
-				plain = not _isCompressedFile(self._fileName) or isinstance(file, (io.BufferedRandom, io.BufferedWriter))
-				if not self._keepFileTime and plain:
-					# Noted while the file is still locked: another writer appending right after the unlock
-					# must not have its change taken for this one's (written through a codec's writer, a compressed
-					# file is complete only once closed; commitAppendToFile writes whole members into the file itself).
-					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
-					noted = True
-				_unlockFile(file)  # on POSIX and Windows
-				_closeFile(file)  # Ensure file is closed after unlocking
-			if self.verbose:
-				self.__teePrintOrNot(f"File {self._fileName} unlocked / released")
+			if raw is not file:
+				file.close()  # the codec's writer writes all it holds, and its trailer, into the file
+			raw.flush()
+			_fsync(raw.fileno())
 		except Exception as e:
-			# Unlocked and closed all the same (closing gives up what cannot be flushed): a file left open keeps its
-			# lock, and the next rewrite, hardMapToFile() right after a failed mapToFile() among them, waits for it for good.
-			if not file.closed:
-				_unlockFile(file)  # never raises
-			try:
-				_closeFile(file)
-			except Exception:
-				pass
-			try:
-				self.writeLock.release()  # Ensure the thread lock is always released
-			except Exception as e:
-				self.__teePrintOrNot(f"Failed to release writeLock for {self._fileName}: {e}",'error')
 			self.__teePrintOrNot(f"Failed to release file {self._fileName}: {e}",'error')
-			import traceback
-			self.__teePrintOrNot(traceback.format_exc(),'error')
-		# release the write lock if not already released
-		if self.writeLock.locked():
-			if not self._keepFileTime and not noted:
-				self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # before the lock is let go: see _externalChange()
-			self._keepFileTime = False
+		finally:
+			self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # noted before the unlock
+			self._known = None
+			_unlockFile(raw)
 			try:
-				self.writeLock.release()  # Ensure the thread lock is always released
-			except Exception as e:
-				self.__teePrintOrNot(f"Failed to release writeLock for {self._fileName}: {e}",'error')
+				_closeUnflushed(raw)
+			finally:
+				self.writeLock.release()
+		if self.verbose:
+			self.__teePrintOrNot(f"File {self._fileName} unlocked / released")
 
-	def _releaseRewrite(self, rw):
-		"""Let go of the file a rewrite opened, from where ``rw`` (a _Rewrite) says it is: safe to call again.
-
-		Each step is made once, and ``rw`` notes it done:
-
-		1. the codec's writer is closed: into the file when all of it was written (its trailer, and for bz2 and xz
-		   all it holds), else pointed at nothing first (_discardWriter): nothing more reaches the file, now or
-		   when it is collected;
-		2. when all of it was written, the file is flushed and synced: it reached the disk;
-		3. when the rewrite started, the file's time is noted as this object's own, under writeLock and before
-		   the unlock (see _externalChange; a write that fails on a full disk changes it too). Once it reached the
-		   disk, ``dirty``, ``deSynced`` and ``_damage`` are cleared; else ``dirty`` and ``deSynced`` stay set
-		   (the next rewrite() makes it again from memory) and ``_damage`` is what the file now holds, read
-		   through its own descriptor, which another process's appends are merged after (_mergeChange). It is
-		   read once: made again after a KeyboardInterrupt, the release keeps what the first one read, and
-		   when the Ctrl-C stopped that read the damage is unknown (a change another process makes before the
-		   next rewrite is then overwritten, with a warning, instead of merged);
-		4. the file is unlocked and closed, unflushed unless it reached the disk: a buffer that could not be
-		   written is dropped, not written by a close after its time was noted.
-
-		An error in a step (``rw.failed``) makes the next ones let go of a failed rewrite; it is raised at the end
-		when all of it had been written (the caller's failure path makes the rewrite again), not when the write
-		itself failed (the caller raises that). A KeyboardInterrupt stops it where it lands: _writeRewrite calls
-		it again, with ``written`` cleared. The caller holds writeLock and lets go of it after this.
-		"""
-		raw = rw.raw
-		if rw.writer is not None:
-			if rw.written and not rw.failed:
-				try:
-					rw.writer.close()
-				except Exception as e:
-					rw.fail(e)
-			if not rw.written or rw.failed:
-				_discardWriter(rw.writer)
-			rw.writer = None
-		if rw.written and not rw.failed and not rw.reached:
-			try:
-				raw.flush()
-				_fsync(raw.fileno())
-				rw.reached = True
-			except Exception as e:
-				rw.fail(e)
-		if rw.started and not rw.noted:
-			self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # under writeLock: see _externalChange()
-			if rw.reached:  # once its time is noted: until then the file is not reloaded over memory
-				self._damage = None
-				self.dirty = self.deSynced = False  # memory is the file again
-			else:
-				self.dirty = self.deSynced = True
-				if raw is None:
-					self._mergeBase = None
-					self._damage, self._damageAt = _DAMAGE_EMPTY, None  # the file was missing, and could not be made again
-				else:
-					self._mergeBase = None
-					if rw.damage is None:
-						if rw.hashing:
-							# A KeyboardInterrupt stopped the read: it is not made again (after a Ctrl-C nothing waits
-							# out a slow step). The cost: the next merge cannot tell another process's appends from
-							# the damage, and overwrites a change made meanwhile, with a warning.
-							rw.damage = (_DAMAGE_UNKNOWN, None)
-						else:
-							rw.hashing = True
-							try:
-								# What it left, and which file it is: another process's appends to it are merged.
-								at = _fileStamp(os.fstat(raw.fileno()))
-								rw.damage = (_fileDigest(raw.fileno(), at[2]), at)  # what it held at the stamp
-							except Exception:
-								rw.damage = (_DAMAGE_UNKNOWN, None)
-					self._damage, self._damageAt = rw.damage  # the same when made again
-			rw.noted = True
-		if rw.reached and rw.queued:
-			# The queued rows the rewrite wrote are dropped, not appended again after it (that undid another process's
-			# later change of their key, and a merge skipped such a key as still queued); only those that hold what
-			# they held at the snapshot: a row changed in place since (set() queues the list memory holds) was not
-			# written so, and stays queued, but only while memory still holds it for its key: a row that left memory
-			# (replaced or popped) and was changed after, by a caller that kept it, is dropped: appended, it would
-			# override the newer row or the tombstone on disk. The queue is replaced whole, under _memLock: a second
-			# call after a KeyboardInterrupt drops them only once.
-			with self._memLock:
-				if self.appendQueue is not rw.kept:
-					count = len(rw.queued)
-					kept = deque(row for row, seen in zip(itertools.islice(self.appendQueue, count), rw.queued)
-								 if (seen == -1 or _rowHash(row) != seen) and row and _heldRow(self, row[0]) is row)
-					kept.extend(itertools.islice(self.appendQueue, count, None))
-					rw.kept = self.appendQueue = kept
-		if raw is not None and not raw.closed:
-			_unlockFile(raw)  # never raises
-			try:
-				if rw.reached:
-					raw.close()
-				else:
-					_closeUnflushed(raw)
-			except Exception as e:
-				if rw.reached:
-					self._damage = _DAMAGE_UNKNOWN  # what close() wrote last did not reach the file
-					self.dirty = self.deSynced = True
-				rw.fail(e)
-			if self.verbose:
-				self.__teePrintOrNot(f"File {self._fileName} unlocked / released")
-		if rw.failed and rw.written:
-			rw.written = False  # raised once
-			raise rw.error
 
 class TSVZedLite(MutableMapping):
 	"""
@@ -6199,7 +6119,7 @@ class TSVZedLite(MutableMapping):
 				self.fileObj = None if self._inMemoryRows else open(self._fileName,'r+b')
 			else:
 				self.fileObj = fileObj
-		atexit.register(self.close)
+		_LIVE_STORES[id(self)] = self  # closed at exit
 		self._constructed = True
 
 	# Implement custom methods just for TSVZedLite
@@ -6327,16 +6247,11 @@ class TSVZedLite(MutableMapping):
 		return segments
 
 	def _specSetItem(self, key, value):
-		"""__setitem__ for .tsvz: same normalisation as TSVZed, written immediately."""
-		key = str(key).rstrip()
+		"""__setitem__ for .tsvz: as TSVZed's, written immediately."""
+		key, value = _specCells(key, value, self.delimiter)
 		if not key:
 			eprint('Error: Key cannot be empty')
 			return
-		if isinstance(value,str):
-			value = value.split(self.delimiter)
-		value = [str(s).rstrip() if s else '' for s in value]
-		if not value or value[0] != key:
-			value = [key]+value
 		if _MARKER_RE.match(key):
 			self._specWriteMarker(key, value)
 			return
@@ -6347,20 +6262,10 @@ class TSVZedLite(MutableMapping):
 		if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
 			eprint(f"Error: Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...")
 			return
-		defaults = self.defaults
-		for i in range(1, min(len(value), len(defaults))):
-			if not value[i] and defaults[i]:
-				value[i] = defaults[i]
-		if self.correctColumnNum <= 0:
-			# Mirror _specLoad's width rule so memory and reads equal a reload.
-			self.correctColumnNum = len(defaults) if len(defaults) > 1 else len(value)
+		_specFill(value, self.defaults)
 		offset = self._specWrite(_specFormatRecord(value, self.delimiter))
-		if offset is None:
-			target = max(self.correctColumnNum, len(defaults))
-			value += [defaults[j] if j < len(defaults) else '' for j in range(len(value), target)]
-			self.indexes[key] = value
-		else:
-			self.indexes[key] = offset
+		self.correctColumnNum = _specPadRow(value, self._specState, self.correctColumnNum if self.correctColumnNum > 0 else -1)
+		self.indexes[key] = value if offset is None else offset  # a row of a compressed part is held, as a read holds it
 
 	def _specWriteMarker(self, key, value):
 		_checkRow(value, self.delimiter, self.encoding, self.errors, self.header,
@@ -6378,61 +6283,21 @@ class TSVZedLite(MutableMapping):
 	def _specWrite(self, line):
 		"""Append one record (or lines written together) to the active part; return its offset, or None for a compressed part."""
 		data = _encodeText(line + '\n', 'utf-8', self.errors)
-		if self.fileObj is None:
-			reporter = _Reporter(self._activePath)
-			try:
+		reporter = _Reporter(self._activePath)
+		try:
+			if self.fileObj is None:
 				_specAppendPayload(self._activePath, data, reporter, memberSize=self._specState.memberSize)
-			finally:
-				reporter.flush()
-			return None
-		f = self.fileObj
-		with _pathLock(self._activePath):
-			# The 3.39 exclusive lockf, as every other writer takes: under it an
-			# unterminated tail really is uncommitted, and the end cannot move.
-			_seekRawStart(f)  # msvcrt locks from the raw position: lock and unlock the same range
-			_lockFile(f)
-			try:
-				size = f.seek(0, os.SEEK_END)
-				if size:
-					f.seek(size - 1)
-					if f.read(1) != b'\n':
-						keep = _lastNewlineEnd(f, size)
-						f.seek(keep)
-						tail = f.read(size - keep)
-						f.truncate(keep)
-						size = keep
-						_warn(f'TSVZ warning: {self._activePath}: removed uncommitted tail {tail[:80]!r} before appending')
-				f.seek(size)
-				f.write(data)
-				f.flush()
-			finally:
-				try:
-					_seekRawStart(f)
-				except Exception:
-					pass  # a failed write is already propagating; the lock must still be released
-				_unlockFile(f)
+				return None
+			size = _specAppendTo(self.fileObj, self._activePath, data, reporter)[0]
+		finally:
+			reporter.flush()
 		if not self._transStates or self._specState.rowState is not self._transStates[-1]:
 			self._transOffsets.append(size)
 			self._transStates.append(self._specState.rowState)
 		return size
 
 	def setDefaults(self,defaults):
-		if not defaults:
-			defaults = []
-		if isinstance(defaults,str):
-			defaults = defaults.split(self.delimiter)
-		elif not isinstance(defaults,list):
-			try:
-				defaults = list(defaults)
-			except Exception:
-				if self.verbose:
-					eprint('Error: Invalid defaults, setting defaults to empty.')
-				defaults = []
-		defaults = [str(s).rstrip() if s else '' for s in defaults]
-		if not any(defaults):
-			defaults = []
-		if not defaults or defaults[0] != DEFAULTS_INDICATOR_KEY:
-			defaults = [DEFAULTS_INDICATOR_KEY]+defaults
+		defaults = _normalizeDefaults(defaults, self.delimiter)
 		_checkRow(defaults, self.delimiter, self.encoding, self.errors, what='defaults')
 		if self._spec and self._constructed:
 			# Spec rows are written sparse and read back under the file's
@@ -6554,12 +6419,11 @@ class TSVZedLite(MutableMapping):
 		return write_at
 
 	def _checkDelete(self, key):
-		"""Raise ``TSVZEncodeError`` now when the tombstone of ``key`` could not be written, before memory changes."""
-		if not _mayRaise(self.errors):
-			return
-		if self._spec:
-			_encodeText(_specTombstoneLines(key, self.delimiter, self._specState.strip) + '\n', 'utf-8', self.errors)
-		elif key == DEFAULTS_INDICATOR_KEY or not key.startswith('#'):
+		"""Raise ``TSVZEncodeError`` now when the tombstone of ``key`` could not be written, before memory changes.
+
+		A .tsvz key was checked when it was set, or decoded from UTF-8: its tombstone can always be written.
+		"""
+		if not self._spec and _mayRaise(self.errors) and (key == DEFAULTS_INDICATOR_KEY or not key.startswith('#')):
 			_checkRow([key], self.delimiter, self.encoding, self.errors, self.header)
 
 	def __mapDeleteToFile(self,key):
@@ -6747,39 +6611,20 @@ class TSVZedLite(MutableMapping):
 		return self
 
 	def popitem(self, last=True,return_pos = False):
-		popped = None
-		if self.indexes and _mayRaise(self.errors):
-			# Refuse before anything changes, without a pass over the keys: the key of the tombstone is the next
-			# one, or, where a dict cannot be reversed (before Python 3.8) and is plain, the one popped, which
-			# is put back if its tombstone is refused.
-			if not last:
-				self._checkDelete(next(iter(self.indexes)))
-			else:
-				try:
-					lastKey = next(reversed(self.indexes))
-				except TypeError:
-					lastKey = None
-				if lastKey is not None:
-					self._checkDelete(lastKey)
-				elif type(self.indexes) is dict:
-					popped = self.indexes.popitem()
-					try:
-						self._checkDelete(popped[0])
-					except BaseException:
-						self.indexes[popped[0]] = popped[1]
-						raise
-				else:
-					self._checkDelete(list(self.indexes)[-1])
-		if popped is not None:
-			key, pos = popped
-		elif last:
+		if last:
 			key, pos = self.indexes.popitem()
+			try:
+				self._checkDelete(key)
+			except BaseException:
+				self.indexes[key] = pos  # back at the end, where it was
+				raise
 		else:
 			try:
 				key = next(iter(self.indexes))
-				pos = self.indexes.pop(key)
 			except StopIteration:
 				raise KeyError("popitem(): dictionary is empty")
+			self._checkDelete(key)
+			pos = self.indexes.pop(key)
 		if return_pos or isinstance(pos, list):
 			value = pos
 		else:
@@ -6903,6 +6748,8 @@ file_descriptor:{self.fileObj.fileno() if self.fileObj is not None else None}
 			self.fileObj.close()
 		return self
 
+	_atExit = _finish = close  # what _stopLiveStores does with a store left open at exit
+
 	def __exit__(self,exc_type,exc_value,traceback):
 		return self.close()
 
@@ -7007,6 +6854,7 @@ class _ServeWriter(object):
 			self.cond.notify_all()
 		self.thread.join()
 		_SERVE_OPEN_WRITERS.discard(self)
+		self.store = None  # no cycle: a closed store's rows are freed now, not by the collector at exit
 
 	def _run(self):
 		while True:
@@ -7053,10 +6901,14 @@ class _ServeStore(object):
 	writer's. ``sync()`` replays the newly committed bytes of the active part
 	and reloads everything when anything else changed. Every public method
 	takes ``self.lock``; ``log`` is the teeLogger its messages go to.
+
+	``header`` and ``createDefaults`` (default ``defaults``) are what a missing store is created with
+	(``create``). ``checkHeader``: writes and ``clear`` also check ``header`` as 3.39 did (the CLI's
+	``--x-header``). ``lazy``: the store is read at the first request that needs it, not here.
 	"""
 
 	def __init__(self, fileName, delimiter=..., header='', defaults=None, strict=False, teeLogger=None,
-				 verbose=False, create=False, createDefaults=None):
+				 verbose=False, create=False, createDefaults=None, checkHeader=False, lazy=False):
 		self.path = fileName
 		self.spec = _isSpecPath(fileName)
 		if self.spec:
@@ -7068,12 +6920,16 @@ class _ServeStore(object):
 		self.teeLogger = teeLogger
 		self.verbose = verbose
 		self.lock = threading.RLock()
-		self.data = OrderedDict()
+		self.mapping = dict if lazy else OrderedDict  # a one-shot read fills a dict faster; popitem reverses either
+		self.data = self.mapping()
 		self.unreadable = False
 		self.stopped = False
+		self.parts = self.state = None  # not read yet
+		self.header = _formatHeader(header, teeLogger=teeLogger, delimiter=self.delimiter) if checkHeader else ['']
 		if create:
 			self._create(header, self.defaults if createDefaults is None else createDefaults)
-		self.reload(teeLogger)
+		if not lazy:
+			self.reload(teeLogger)
 		self.writer = _ServeWriter(self)
 
 	def _create(self, header, defaults):
@@ -7118,7 +6974,7 @@ class _ServeStore(object):
 		self.parts = _storeParts(self.path)[0]
 		before = self._stamps(self.parts)
 		load = _specLoad(self.path, self.delimiter, defaults=_normalizeDefaults(self.defaults, self.delimiter),
-						 strict=self.strict, taskDic=OrderedDict(), reporter=reporter, teeLogger=log,
+						 strict=self.strict, taskDic=self.mapping(), reporter=reporter, teeLogger=log,
 						 verbose=self.verbose)
 		self.data, self.state, self.width = load.data, load.state, load.correctColumnNum
 		if load.parts != self.parts or reporter.has('torn'):
@@ -7141,10 +6997,11 @@ class _ServeStore(object):
 	def _loadLegacy(self, reporter):
 		self.parts = [self.path] if os.path.isfile(self.path) else []
 		self.stamps = self._stamps(self.parts)
-		self.data = OrderedDict()
+		self.data = self.mapping()
 		self.legacyDefaults = list(self.defaults)
 		self.width, self.offset, self.lineNo, self.tailSeen = -1, 0, 0, b''
-		if self.parts:
+		# A compressed file with no byte, or only empty streams, is an empty store, as readTabularFile reads it.
+		if self.parts and not (_isCompressedFile(self.path) and _fileHoldsNothing(self.path)):
 			try:
 				with openFileAsCompressed(self.path, mode='rb', teeLogger=self.teeLogger) as f:
 					self.width, self.offset, self.lineNo = _legacyReadLoop(
@@ -7170,6 +7027,8 @@ class _ServeStore(object):
 	def sync(self, log):
 		"""Bring the view up to date with the files: follow appends, reload on anything else."""
 		with self.lock:
+			if self.parts is None:
+				return self.reload(log)
 			dirMtime = _dirMtimeNs(self.path)
 			if dirMtime != self.dirMtime or self.dirRacy:
 				parts = _storeParts(self.path)[0] if self.spec else ([self.path] if os.path.isfile(self.path) else [])
@@ -7205,9 +7064,11 @@ class _ServeStore(object):
 			return False  # 3.39 reads an unterminated last line as a record; a reload does too
 		reporter = _Reporter(self.path, log)
 		try:
-			if end:
-				for i, raw in enumerate(data[:end].split(b'\n')[:-1]):
-					self._apply(raw + b'\n', reporter, atStart=self.offset == 0 and i == 0)
+			if end and self.spec:
+				self._replay(data[:end], path, reporter)
+			elif end:
+				for raw in data[:end].split(b'\n')[:-1]:
+					self._apply(raw + b'\n', reporter)
 			tail = data[end:]
 			if tail and tail != self.tailSeen:
 				reporter.note('tail', None, 'ignored uncommitted bytes after the last newline: {!r}'.format(tail[:80]))
@@ -7219,33 +7080,42 @@ class _ServeStore(object):
 		self.stamps[path] = stamp[:1] + (self.offset + len(data) - end,) + stamp[2:]
 		return True
 
-	def _apply(self, raw, reporter, atStart=False):
-		"""Replay one appended committed line of the active part into the view; ``atStart``: it begins the part."""
+	def _apply(self, raw, reporter):
+		"""Replay one line appended to a loose file into the view, as a 3.39 read does."""
 		self.lineNo += 1
-		if not self.spec:
-			try:
-				text = raw.decode('utf8')
-			except UnicodeDecodeError:
-				text = raw.decode('utf8', errors='replace')
-				reporter.note('decode', 'line {}'.format(self.lineNo), 'invalid utf8 replaced with U+FFFD')
-			self.width, _ = _processLine(text, self.data, self.width, strict=self.strict, delimiter=self.delimiter,
-										 defaults=self.legacyDefaults, reporter=reporter)
-			return
+		try:
+			text = raw.decode('utf8')
+		except UnicodeDecodeError:
+			text = raw.decode('utf8', errors='replace')
+			reporter.note('decode', 'line {}'.format(self.lineNo), 'invalid utf8 replaced with U+FFFD')
+		self.width, _ = _processLine(text, self.data, self.width, strict=self.strict, delimiter=self.delimiter,
+									 defaults=self.legacyDefaults, reporter=reporter)
+
+	def _replay(self, data, path, reporter):
+		"""Replay the committed lines ``data`` appended to the active part ``path`` into the view (spec §7)."""
 		if self.stopped:
 			return  # a stop policy ended the read: nothing after it is read (spec §4.10)
-		replayed = _specReplayLine(raw, self.lineNo, self.label, self.parts[-1], self.state, self.delimiter,
-								   reporter, atStart)
-		if replayed is _STOP:
+		lines = []
+		offset = self.offset
+		for raw in data.split(b'\n')[:-1]:
+			lines.append((raw + b'\n', offset))
+			offset += len(raw) + 1
+		if self.offset == 0 and lines[0][0].startswith(b'\xef\xbb\xbf'):  # only at the start of a part (spec §4.7)
+			lines[0] = (lines[0][0][3:], 3)
+			reporter.note('bom', '{}line {}'.format(self.label, self.lineNo + 1), 'stripped a UTF-8 byte order mark')
+		info = _PartInfo(path, '')  # a follower follows plain parts only
+		for _, _, _, record in _specReplayLines(lines, info, self.label, self.state, self.delimiter, reporter, self.lineNo):
+			if record is None:
+				continue
+			key, row = record
+			if row is None:
+				self.data.pop(key, None)
+			else:
+				self.width = _specPadRow(row, self.state, self.width)
+				self.data[key] = row
+		self.lineNo = info.lines
+		if info.stopped:
 			self.stopped = self.unreadable = True
-			return
-		if replayed is None or replayed[1] is None:
-			return
-		key, row = replayed[1]
-		if row is None:
-			self.data.pop(key, None)
-			return
-		self.width = _specPadRow(row, self.state, self.width)
-		self.data[key] = row
 
 	def _fresh(self, log):
 		"""Read-your-writes (spec §21.8): wait for queued writes, then follow the files."""
@@ -7254,10 +7124,10 @@ class _ServeStore(object):
 
 	# -- reads ----------------------------------------------------------------
 	def missing(self, log):
-		"""True when the store has no part (spec §20.2.2)."""
+		"""True when the store has no part (spec §20.2.2); the store is not read for it."""
 		with self.lock:
-			self._fresh(log)
-			return not self.parts
+			self.writer.barrier()
+			return not (_storeParts(self.path)[0] if self.spec else os.path.isfile(self.path))
 
 	def resolve(self, key):
 		"""The key a requested key names (spec §20.2.7; 3.39 rstrip for loose files)."""
@@ -7268,7 +7138,7 @@ class _ServeStore(object):
 	def read(self, log):
 		with self.lock:
 			self._fresh(log)
-			return [list(row) for row in self.data.values()]
+			return list(self.data.values())  # a row is replaced, never changed, once it is in ``data``
 
 	def get(self, keys, log):
 		"""Rows for ``keys`` and whether one was missing (spec §20.2 ``get``, §14.5)."""
@@ -7329,16 +7199,20 @@ class _ServeStore(object):
 	def _payload(self, rows, log):
 		"""Bytes for ``rows`` (``[(cells, marker), ...]``), formatted as the direct writers format them."""
 		if self.spec:
+			if rows and any(self.header):
+				_specCheckHeader(self.path, self.header, self.delimiter, self.strict, self.verbose, log)
 			return _specFormatRecords(rows, self.delimiter).encode('utf-8')
-		return _legacyFormatPayload(self.path, [cells for cells, marker in rows], log, [''], True, self.verbose,
-									'utf8', self.strict, self.delimiter)[0]
+		# Rows for a file that holds nothing yet are fitted to the header it is about to begin with.
+		assume = self.header if any(self.header) and _fileHoldsNothing(self.path) else None
+		return _legacyFormatPayload(self.path, [cells for cells, marker in rows], log, self.header, True, self.verbose,
+									'utf8', self.strict, self.delimiter, assume=assume)[0]
 
 	def _tombstone(self, key):
 		"""Rows that delete ``key``: written with stripping off when it would strip ``key`` (spec §9.6)."""
 		return _specTombstones([key], self.delimiter, self.state.strip) if self.spec else [([key], False)]
 
 	def _durable(self, sync):
-		return sync or (self.spec and self.state.writeAck == 'disk')
+		return sync or (self.spec and self.state is not None and self.state.writeAck == 'disk')
 
 	def _submit(self, rows, sync, log):
 		"""Queue ``rows`` (caller holds the lock); return ``(seq, durable)`` or None when there is nothing to write."""
@@ -7362,6 +7236,11 @@ class _ServeStore(object):
 		with self.lock:
 			queued = self._submit(rows, sync, log)
 		self._ack(queued, written)
+		self._wrote(rows, log)
+
+	def _wrote(self, rows, log):
+		if self.verbose and log is not None:  # as the direct writers report it
+			log.teelog('Appended {} lines to {}'.format(len(rows), self.path) if rows else 'No lines to append to ' + self.path)
 
 	def delete(self, rows, sync, log, written=False):
 		"""Append the tombstones of ``delete`` (``[(cells, marker), ...]``) as one batch (spec §20.2.7).
@@ -7378,6 +7257,7 @@ class _ServeStore(object):
 				rows = _specDeleteRows(rows, self.delimiter, self.state.strip, self.data)
 			queued = self._submit(rows, sync, log)
 		self._ack(queued, written)
+		self._wrote(rows, log)
 		return True
 
 	def pop(self, key, sync, log):
@@ -7403,7 +7283,10 @@ class _ServeStore(object):
 				return _SERVE_PARTIAL
 			if not self.data:
 				return None
-			key = next(reversed(self.data)) if last else next(iter(self.data))
+			if not last:
+				key = next(iter(self.data))
+			else:  # a dict is reversible from Python 3.8
+				key = next(reversed(self.data)) if hasattr(self.data, '__reversed__') else list(self.data)[-1]
 			row = list(self.data[key])
 			queued = self._submit(self._tombstone(key), sync, log)
 		self._ack(queued, written=True)
@@ -7433,13 +7316,11 @@ class _ServeStore(object):
 		with self.lock:
 			self.writer.barrier()
 			try:
-				if self.spec:
-					return _specClearTabularFile(self.path, teeLogger=log, verbose=self.verbose,
-												 delimiter=self.delimiter)
-				clearTabularFile(self.path, teeLogger=log, verbose=self.verbose, delimiter=self.delimiter)
-				return True
+				clear = _specClearTabularFile if self.spec else clearTabularFile
+				return clear(self.path, teeLogger=log, header=self.header, verifyHeader=self.strict,
+							 verbose=self.verbose, delimiter=self.delimiter) is not False
 			finally:
-				self.reload(log)
+				self.parts = None  # read again at the next request
 
 	def scrub(self, log):
 		"""``scrub`` (spec §20.2) through the library; True when done, False when refused, None when the read
@@ -7454,7 +7335,7 @@ class _ServeStore(object):
 								 strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)
 				return True
 			finally:
-				self.reload(log)
+				self.parts = None  # read again at the next request
 
 	def flush(self):
 		"""Write and fsync everything submitted so far (``stop``, spec §21.9)."""
@@ -7472,11 +7353,15 @@ class _ServeStore(object):
 		try:
 			if self.spec:
 				_specAppendPayload(_storeParts(self.path)[1], payload, reporter, fsync=fsync,
-								   memberSize=getattr(getattr(self, 'state', None), 'memberSize', None))
+								   memberSize=getattr(self.state, 'memberSize', None))
 			else:
 				codec = _fileCodec(self.path)
 				_requireCodec(codec)
-				_lockedAppend(self.path, payload, 'newline', reporter, fsync=fsync, codec=codec)
+				header = None  # a file that holds nothing gets the header first (_appendOpen)
+				if any(self.header):
+					header = functools.partial(_encodeRow, _sanitize(self.header, delimiter=self.delimiter),
+											   self.delimiter, 'utf8', 'strict', what='header')
+				_lockedAppend(self.path, payload, 'newline', reporter, fsync=fsync, header=header, codec=codec)
 		finally:
 			reporter.flush()
 
@@ -7524,11 +7409,6 @@ def _serveRecordLine(cells, marker):
 	return _specFormatRecord(cells, '\t')
 
 
-def _serveFieldsLine(fields):
-	"""An output line of plain fields (``verify``, ``parts``): §13 with TAB, a leading '#' as ``<#>``."""
-	return '\t'.join([_specEncodeField(str(fields[0]), '\t', isKey=True)] + [_serveEncode(str(field)) for field in fields[1:]])
-
-
 def _serveDecodeLine(line):
 	"""The fields of a protocol record line, decoded per §13."""
 	return [_specDecodeField(field, '\t') for field in line.split('\t')]
@@ -7569,7 +7449,10 @@ class _ServeLog(object):
 
 
 def _serveDispatch(store, line, bulk, log):
-	"""Run one request against ``store`` (spec §21.7); return ``(status, lines, message)``."""
+	"""Run one request against ``store`` (spec §21.7); return ``(status, rows, message)``.
+
+	``rows`` hold the output's fields: each is one output line, as ``_specFormatRecord`` with TAB writes it.
+	"""
 	options, operation, args, raw = _serveParseRequest(line)
 	for option in options:
 		if option not in ('--sync', '--x-written'):
@@ -7588,33 +7471,24 @@ def _serveDispatch(store, line, bulk, log):
 		raise _ServeUsage('a KEY must not be empty')
 	if operation in _SERVE_NEED_STORE and store.missing(log):
 		return 1, [], 'no such store'  # spec §20.2.2
-	unreadable = (1, _SERVE_UNREADABLE)
-	# Each read takes its status under the store lock it read under: another request's reload may
-	# change ``unreadable`` once the lock is free.
-	if operation == 'read':
+	if operation in ('read', 'get', 'has', 'len', 'keys'):
+		# The status is taken under the store lock the read ran under: another request's reload may change
+		# ``unreadable`` once the lock is free.
 		with store.lock:
-			rows = store.read(log)
-			status = unreadable if store.unreadable else (0, '')
-		return status[0], [_specFormatRecord(row, '\t') for row in rows], status[1]
-	if operation == 'get':
-		with store.lock:
-			rows, missing = store.get(args, log)
-			status = unreadable if store.unreadable else (3 if missing else 0, '')
-		return status[0], [_specFormatRecord(row, '\t') for row in rows], status[1]
-	if operation == 'has':
-		with store.lock:
-			found = store.has(args[0], log)
-			return (1, [], _SERVE_UNREADABLE) if store.unreadable else (0 if found else 3, [], '')
-	if operation == 'len':
-		with store.lock:
-			count = store.length(log)
-			status = unreadable if store.unreadable else (0, '')  # spec §4.10, §20.6: a stopped read failed
-		return status[0], [str(count)], status[1]
-	if operation == 'keys':
-		with store.lock:
-			keys = store.keys(log)
-			status = unreadable if store.unreadable else (0, '')
-		return status[0], [_specEncodeField(key, '\t', isKey=True) for key in keys], status[1]
+			missing = False
+			if operation == 'read':
+				rows = store.read(log)
+			elif operation == 'get':
+				rows, missing = store.get(args, log)
+			elif operation == 'has':
+				rows, missing = [], not store.has(args[0], log)
+			elif operation == 'len':
+				rows = [[str(store.length(log))]]
+			else:
+				rows = [[key] for key in store.keys(log)]
+			if store.unreadable:  # what could be read, and status 1 (spec §4.10, §21.8.5)
+				return 1, rows, _SERVE_UNREADABLE
+		return (3 if missing else 0), rows, ''
 	if operation in ('set', 'append', 'delete'):
 		keysOnly = operation == 'delete'
 		if isBulk:
@@ -7641,25 +7515,26 @@ def _serveDispatch(store, line, bulk, log):
 			row = store.popitem(not args or args[0] == 'last', sync, log)
 		if row is _SERVE_PARTIAL:
 			return 1, [], _SERVE_UNREADABLE
-		return (3, [], '') if row is None else (0, [_specFormatRecord(row, '\t')], '')
+		return (3, [], '') if row is None else (0, [row], '')
 	if operation == 'setdefault':
 		if _MARKER_RE.match(raw[0]):
 			raise _ServeUsage('setdefault takes a data KEY, not a marker')
 		row = store.setdefault(args, sync, log)
 		if row is _SERVE_PARTIAL:
 			return 1, [], _SERVE_UNREADABLE
-		return (3, [], '') if row is None else (0, [_specFormatRecord(row, '\t')], '')
+		return (3, [], '') if row is None else (0, [row], '')
 	if operation in ('clear', 'scrub'):
 		done = store.clear(log) if operation == 'clear' else store.scrub(log)
 		if done is None:  # spec §4.10: rewritten from a read that stopped at damaged data
-			return 1, [], 'the read stopped at damaged data; the store was rewritten from what was read, the original kept'
+			return 1, [], ('the read stopped at damaged data (#_on_corruption_# stop); the store was rewritten from what '
+						   'was read, and the original part was kept as a .damaged- copy')
 		return (0, [], '') if done else (1, [], '{} refused; nothing was written'.format(operation))
 	if operation == 'verify':
 		mismatches, readable = store.verify(log)
-		lines = [_serveFieldsLine(entry) for entry in mismatches]
-		return (1 if not readable else 4 if lines else 0), lines, '' if readable else _SERVE_UNREADABLE
+		rows = [[str(field) for field in entry] for entry in mismatches]
+		return (1 if not readable else 4 if rows else 0), rows, '' if readable else _SERVE_UNREADABLE
 	if operation == 'parts':
-		return 0, [_serveFieldsLine(row) for row in store.partRows(log)], ''
+		return 0, store.partRows(log), ''
 	return 1, [], 'not served by a handler'  # stop, sent to an in-process store
 
 
@@ -7667,18 +7542,18 @@ def _serveRespond(store, line, bulk=None, logger=None):
 	"""The response to one request (spec §21.6), as lines without their '\\n'."""
 	log = _ServeLog(logger)
 	try:
-		status, lines, message = _serveDispatch(store, line, bulk, log)
+		status, rows, message = _serveDispatch(store, line, bulk, log)
 	except _ServeUsage as e:
-		status, lines, message = 2, [], str(e)
+		status, rows, message = 2, [], str(e)
 	except Exception as e:
-		status, lines, message = 1, [], str(e) or type(e).__name__
+		status, rows, message = 1, [], str(e) or type(e).__name__
 		if logger is not None:
 			logger.teelog('tsvz: {}: request {!r} failed: {}'.format(store.path, line[:80], message), 'error')
 	failing = store.writer.failing
 	if failing:
 		log.lines.append('TSVZ warning: {}: writes are failing ({}); writes acknowledged before they were written '
 						 'may be lost'.format(store.path, failing))
-	response = ['#!\t' + _serveEncode(text) for text in log.lines] + list(lines)
+	response = ['#!\t' + _serveEncode(text) for text in log.lines] + [_specFormatRecord(row, '\t') for row in rows]
 	response.append('#{}\t{}'.format(status, _serveEncode(message)) if message else '#{}'.format(status))
 	return response
 
@@ -7745,7 +7620,6 @@ def _serveReadPointer(path):
 	``fields`` is None when there is no pointer file or it does not parse;
 	``problem`` says why a file there cannot be a pointer file.
 	"""
-	import stat
 	try:
 		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
 	except FileNotFoundError:
@@ -7815,6 +7689,8 @@ def _serveLookup(store):
 	address = fields['address']
 	if not address.startswith('unix:'):
 		return None, '{} names {}, which is not a Unix-domain socket'.format(path, address)
+	if 'x-delimiter' in fields:  # written with backslash escapes, so that a TAB or NUL is no control character
+		fields['x-delimiter'] = codecs.decode(fields['x-delimiter'], 'unicode_escape')
 	fields['owner'] = getattr(st, 'st_uid', None)
 	return fields, None
 
@@ -7848,7 +7724,6 @@ class _ServeConnection(object):
 	@staticmethod
 	def _connectUnix(socket, path, owner):
 		"""Connect to the Unix socket ``path``, which must belong to ``owner`` (spec §21.2.4)."""
-		import stat
 		st = os.lstat(path)
 		if not stat.S_ISSOCK(st.st_mode):
 			raise _ServeUnreachable('{} is not a socket'.format(path))
@@ -7930,8 +7805,7 @@ def _serveClasses():
 
 def _serveSupported():
 	"""True when this Python can serve: it has Unix-domain sockets (spec §21.3)."""
-	import socket
-	return hasattr(socket, 'AF_UNIX') and 'unix' in _serveClasses()
+	return 'unix' in _serveClasses()
 
 
 def _serveGroup(group):
@@ -7988,7 +7862,6 @@ class _ServeHandle(object):
 		then creates its own with O_EXCL, without following symbolic links.
 		Errors other than "busy" (a file system without locks) raise OSError.
 		"""
-		import stat
 		try:
 			fd = os.open(self.pointer, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
 		except FileNotFoundError:
@@ -8046,8 +7919,6 @@ class _ServeHandle(object):
 		gid = _serveGroup(self.group)
 		mode = self.mode if self.mode is not None else (0o660 if gid is not None else 0o600)
 		shared = self.group is not None or self.mode is not None
-		if 'unix' not in classes:
-			raise OSError('tsvz serve needs Unix-domain sockets, which Python does not provide on this platform')
 		base = os.environ.get('XDG_RUNTIME_DIR', '')
 		if shared or not base or not os.path.isdir(base) or not os.access(base, os.W_OK):
 			base = tempfile.gettempdir()  # others cannot enter a private runtime directory
@@ -8064,7 +7935,7 @@ class _ServeHandle(object):
 		lines = ['tsvz-handler\t{}'.format(_SERVE_PROTOCOL_VERSION), 'address\t' + _serveEncode(self.address),
 				 'host\t' + _serveEncode(socket.gethostname()), 'pid\t{}'.format(os.getpid())]
 		if not store.spec:
-			lines.append('x-delimiter\t' + _serveEncode(store.delimiter))
+			lines.append('x-delimiter\t' + _serveEncode(store.delimiter.encode('unicode_escape').decode('ascii')))
 		f = self.pointerFile
 		if hasattr(os, 'fchmod'):
 			os.fchmod(f.fileno(), 0o644)  # readable by all, writable by its owner only
@@ -8241,10 +8112,7 @@ class TSVZClient(MutableMapping):
 		self._timeout = timeout
 		self.teeLogger = teeLogger
 		self._spec = _isSpecPath(fileName)
-		if self._spec:
-			self.delimiter = _EXTENSION_DELIMITERS[_parsePartName(fileName).ext]
-		else:
-			self.delimiter = get_delimiter(..., file_name=fileName)
+		self.delimiter = get_delimiter(..., file_name=fileName)
 		self._backend = None
 		self._lock = threading.RLock()
 		self._connect()
@@ -8255,6 +8123,7 @@ class TSVZClient(MutableMapping):
 		if info is not None:
 			try:
 				self._backend = _ServeConnection(info, self._timeout)
+				self.delimiter = info.get('x-delimiter', self.delimiter)  # a loose store's, as its handler splits it
 				return
 			except _ServeUnreachable as e:
 				reason = 'its handler cannot be used ({})'.format(e)
@@ -8842,92 +8711,6 @@ def _cliStoreExists(store):
 	return os.path.isfile(store)
 
 
-def _cliWritten(args, logger):
-	"""Exit status after a write: 1, with an error, when STORE still does not exist (it could not be created)."""
-	if _cliStoreExists(args.store):
-		return 0
-	logger.teelog('tsvz: {}: the store could not be created; nothing was written'.format(args.store), 'error')
-	return 1
-
-
-def _cliSpecLoad(args, delimiter, logger):
-	"""Load a spec store for ``read`` / ``get``; return ``(load, readable)``.
-
-	``readable`` is False when a part could not be opened or read to its end;
-	the rows of the other parts are still loaded.
-	"""
-	reporter = _Reporter(args.store, logger)
-	try:
-		load = _specLoad(args.store, delimiter, defaults=_normalizeDefaults(args.defaults, delimiter),
-						 strict=args.strict, reporter=reporter, teeLogger=logger, verbose=args.verbose)
-		readable = not reporter.incomplete()
-	finally:
-		reporter.flush()
-	return load, readable
-
-
-def _cliUnreadable(args, logger):
-	"""Exit status 1, with an error that -q keeps, for a store with a part that could not be read."""
-	logger.teelog('tsvz: {}: could not read every part of the store'.format(args.store), 'error')
-	return 1
-
-
-def _cliRead(args, delimiter, logger, stdin, stdout):
-	"""``read STORE`` (spec §20.2): every live row, in first-appearance order.
-
-	Exit 1 when a part could not be read; the rows of the other parts are printed.
-	"""
-	if not _cliStoreExists(args.store):
-		raise _CliStoreMissing()
-	if not _isSpecPath(args.store):
-		data = readTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
-							   strict=args.strict, delimiter=delimiter, defaults=args.defaults)
-		_cliEmitRows(list(data.values()), args, stdout, False, delimiter, headerRow=True)
-		return 0
-	load, readable = _cliSpecLoad(args, delimiter, logger)
-	_cliEmitRows(list(load.data.values()), args, stdout, True, delimiter)
-	return 0 if readable else _cliUnreadable(args, logger)
-
-
-def _cliGet(args, delimiter, logger, stdin, stdout):
-	"""``get STORE KEY ...`` (spec §20.2): each KEY's row in argument order; exit 3 when one is missing.
-
-	Each KEY names a key as §20.2.7 says. For a missing key of a
-	spec store this prints what ``TSVZed`` returns for it (§14.5): the key and
-	the active defaults while ``#_return_defaults_when_missing_#`` is true,
-	else nothing. A missing key of a loose file prints nothing.
-	"""
-	if not _cliStoreExists(args.store):
-		raise _CliStoreMissing()
-	spec = _isSpecPath(args.store)
-	readable = True
-	if spec:
-		load, readable = _cliSpecLoad(args, delimiter, logger)
-		data, state = load.data, load.state
-	else:
-		data = readTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
-							   strict=args.strict, delimiter=delimiter, defaults=args.defaults)
-	rows = []
-	missing = False
-	for key in args.args:
-		if spec:
-			key = _specNameKey(key, delimiter, state.strip, data)
-		else:
-			key = key.rstrip()
-		row = data.get(key)
-		if row is None:
-			missing = True
-			if not (spec and state.returnDefaults):
-				continue
-			row = [key] + list(state.defaults[1:])
-			row += [''] * (load.correctColumnNum - len(row))
-		rows.append(row)
-	_cliEmitRows(rows, args, stdout, spec, delimiter)
-	if not readable:
-		return _cliUnreadable(args, logger)
-	return 3 if missing else 0
-
-
 def _cliStdinLines(stdin, reporter):
 	"""The committed lines of ``stdin`` (spec §4.3, §20.3), decoded as UTF-8, without terminators.
 
@@ -8945,32 +8728,6 @@ def _cliStdinLines(stdin, reporter):
 	if lines and lines[0].startswith(b'\xef\xbb\xbf'):
 		lines[0] = lines[0][3:]
 	return [_decodeLine(raw, reporter, 'line {}'.format(lineNo)) for lineNo, raw in enumerate(lines, 1)]
-
-
-def _cliStdinBatch(args, delimiter, logger, stdin, keysOnly):
-	"""Turn standard input into one batch for ``set STORE -`` / ``delete STORE -`` (spec §20.3).
-
-	A spec store gets formatted records: a data line's fields are decoded
-	(§13) and written again as ``set`` writes them, and a line whose first
-	field matches the reserved pattern is a marker line, written as given. A
-	loose file gets 3.39 rows. Comment lines and empty lines are skipped, and
-	so is a line with an empty key (reported). ``keysOnly`` keeps the first
-	field only: a tombstone, or a marker reset.
-	"""
-	rows = _cliStdinRows(args, delimiter, logger, stdin, keysOnly)
-	if not _isSpecPath(args.store):
-		return [cells for cells, marker in rows]
-	return [_specFormatRecord(cells, delimiter, marker=marker) for cells, marker in rows]
-
-
-def _cliStdinRows(args, delimiter, logger, stdin, keysOnly):
-	"""Standard input for ``set STORE -`` / ``delete STORE -`` as ``[(cells, marker), ...]`` (spec §20.3)."""
-	source = _Reporter('<stdin>', logger)
-	try:
-		return _parseRecordLines(_cliStdinLines(stdin, source), delimiter, _isSpecPath(args.store), keysOnly,
-								 source)
-	finally:
-		source.flush()
 
 
 def _parseRecordLines(texts, delimiter, spec, keysOnly, reporter):
@@ -9003,183 +8760,30 @@ def _parseRecordLines(texts, delimiter, spec, keysOnly, reporter):
 	return rows
 
 
-def _cliAppendBatch(args, delimiter, logger, batch):
-	"""Append ``batch`` from ``_cliStdinBatch`` to STORE in one write, creating STORE if needed."""
-	if not _isSpecPath(args.store):
-		appendLinesTabularFile(args.store, batch, teeLogger=logger, header=args.header, createIfNotExist=True,
-							   verbose=args.verbose, strict=args.strict, delimiter=delimiter)
-		return
-	reporter = _Reporter(args.store, logger)
-	try:
-		_specAppendRecords(args.store, batch, reporter, teeLogger=logger,
-						   header=_formatHeader(args.header, delimiter=delimiter), createIfNotExist=True,
-						   verbose=args.verbose, strict=args.strict, delimiter=delimiter)
-	finally:
-		reporter.flush()
-
-
-def _cliSet(args, delimiter, logger, stdin, stdout):
-	"""``set`` / ``append STORE KEY [VALUE ...]`` (spec §20.2): one record; a lone KEY is a tombstone.
-
-	``set STORE -`` appends every record on standard input in one write (§20.3).
-	"""
-	if args.args == ['-']:
-		_cliAppendBatch(args, delimiter, logger, _cliStdinBatch(args, delimiter, logger, stdin, keysOnly=False))
-		return _cliWritten(args, logger)
-	appendTabularFile(args.store, args.args, teeLogger=logger, header=args.header, createIfNotExist=True,
-					  verbose=args.verbose, strict=args.strict, delimiter=delimiter)
-	return _cliWritten(args, logger)
-
-
-def _cliDelete(args, delimiter, logger, stdin, stdout):
-	"""``delete STORE KEY [KEY ...]`` (spec §20.2): one tombstone per KEY, appended in one write.
-
-	``delete STORE -`` deletes the first field of every line on standard input (§20.3).
-	A key that a reader would strip names a key of the store (§20.2.7), so the
-	store is read first; when it cannot be read whole nothing is written and
-	the exit status is 1.
-	"""
-	if not _isSpecPath(args.store):
-		if args.args == ['-']:
-			_cliAppendBatch(args, delimiter, logger, _cliStdinBatch(args, delimiter, logger, stdin, keysOnly=True))
-		else:
-			appendLinesTabularFile(args.store, [[key] for key in args.args], teeLogger=logger, header=args.header,
-								   createIfNotExist=True, verbose=args.verbose, strict=args.strict,
-								   delimiter=delimiter)
-		return _cliWritten(args, logger)
-	if args.args == ['-']:
-		rows = _cliStdinRows(args, delimiter, logger, stdin, keysOnly=True)
-	else:
-		rows = [([key], bool(_MARKER_RE.match(key))) for key in args.args]
-	if _specNamesKeys(rows, delimiter):
-		strip, live = True, {}  # a store delete creates starts with stripping on (spec §10.3)
-		if _cliStoreExists(args.store):
-			load, readable = _cliSpecLoad(args, delimiter, logger)
-			if not readable:
-				logger.teelog('tsvz: {}: could not read every part of the store; nothing was written'.format(
-					args.store), 'error')
-				return 1
-			strip, live = load.state.strip, load.data
-		rows = _specDeleteRows(rows, delimiter, strip, live)
-	_cliAppendBatch(args, delimiter, logger, [_specFormatRecord(cells, delimiter, marker=marker) for cells, marker in rows])
-	return _cliWritten(args, logger)
-
-
-def _cliClear(args, delimiter, logger, stdin, stdout):
-	"""``clear STORE`` (spec §20.2); exit 1 when it was refused and nothing was written."""
-	if not _isSpecPath(args.store):
-		clearTabularFile(args.store, teeLogger=logger, header=args.header, verifyHeader=args.strict,
-						 verbose=args.verbose, delimiter=delimiter)
-		return 0
-	if _specClearTabularFile(args.store, teeLogger=logger, header=args.header, verifyHeader=args.strict,
-							 verbose=args.verbose, delimiter=delimiter):
-		return 0
-	logger.teelog('tsvz: {}: clear refused; nothing was written'.format(args.store), 'error')
-	return 1
-
-
-def _cliScrub(args, delimiter, logger, stdin, stdout):
-	"""``scrub STORE`` (spec §20.2): compact a single-part store in place; exit 1 when refused."""
-	if not _cliStoreExists(args.store):
-		raise _CliStoreMissing()
-	if not _isSpecPath(args.store):
-		scrubTabularFile(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
-						 strict=args.strict, delimiter=delimiter, defaults=args.defaults)
-		return 0
-	_, done = _specScrub(args.store, teeLogger=logger, verifyHeader=False, verbose=args.verbose,
-						 strict=args.strict, delimiter=delimiter, defaults=args.defaults)
-	if done:
-		return 0
-	if done is None:
-		logger.teelog('tsvz: {}: the read stopped at damaged data (#_on_corruption_# stop); the store was rewritten '
-					  'from what was read, and the original part was kept as a .damaged- copy'.format(args.store), 'error')
-		return 1
-	logger.teelog('tsvz: {}: scrub refused; nothing was written'.format(args.store), 'error')
-	return 1
-
-
-def _cliVerify(args, delimiter, logger, stdin, stdout):
-	"""``verify STORE`` (spec §20.2): one line per checksum mismatch; exit 4 when there is one."""
-	if not _cliStoreExists(args.store):
-		raise _CliStoreMissing()
-	if not _isSpecPath(args.store):
-		return 0  # a loose file has no checksums (spec §20.2.4)
-	reporter = _Reporter(args.store, logger)
-	try:
-		mismatches = _specVerify(args.store, delimiter, reporter)
-		readable = not reporter.incomplete()
-	finally:
-		reporter.flush()
-	rows = [[path, str(lineNo), algo, expected, computed] for path, lineNo, algo, expected, computed in mismatches]
-	_cliEmitFields(rows, ['path', 'line', 'algorithm', 'expected', 'computed'], args, stdout)
-	if not readable:
-		return _cliUnreadable(args, logger)  # not every segment could be checked
-	return 4 if rows else 0
-
-
-def _cliParts(args, delimiter, logger, stdin, stdout):
-	"""``parts STORE`` (spec §20.2): index, hexadecimal ordinal, path and flags of each part, in replay order."""
-	if not _cliStoreExists(args.store):
-		raise _CliStoreMissing()
-	reporter = _Reporter(args.store, logger)
-	try:
-		rows = _partRows(args.store, reporter)
-	finally:
-		reporter.flush()
-	_cliEmitFields(rows, ['index', 'ordinal', 'path', 'flags'], args, stdout)
-	return 0
-
-
 def _cliRequestLine(args):
 	"""The protocol request (spec §21.5) for a parsed command line: its arguments are literal."""
 	return '\t'.join([args.operation] + [_serveEncode(arg) for arg in args.args])
 
 
 def _cliEmitServed(args, delimiter, logger, stdout, response):
-	"""Print a response (spec §21.6) as the operation prints on the files (§20.8); return the exit status."""
-	lines, diagnostics, status, message = response
+	"""Print a response (``(rows, diagnostics, status, message)``) as the operation prints on the files (§20.8);
+	return the exit status."""
+	rows, diagnostics, status, message = response
 	for text in diagnostics:
 		logger.teelog(text, 'warning')
 	spec = _isSpecPath(args.store)
 	operation = args.operation
-	if operation in ('read', 'get', 'pop', 'popitem', 'setdefault'):
-		_cliEmitRows([_serveDecodeLine(line) for line in lines], args, stdout, spec, delimiter,
-					 headerRow=operation == 'read' and not spec)
-	elif operation == 'keys':
-		_cliEmitRows([[_specDecodeField(line, '\t')] for line in lines], args, stdout, spec, delimiter)
+	if operation in ('read', 'get', 'keys', 'pop', 'popitem', 'setdefault'):
+		_cliEmitRows(rows, args, stdout, spec, delimiter, headerRow=operation == 'read' and not spec)
 	elif operation == 'len':
-		_cliWrite(stdout, ''.join(line + '\n' for line in lines))
+		_cliWrite(stdout, ''.join(row[0] + '\n' for row in rows))
 	elif operation == 'verify':
-		_cliEmitFields([_serveDecodeLine(line) for line in lines], ['path', 'line', 'algorithm', 'expected', 'computed'],
-					   args, stdout)
+		_cliEmitFields(rows, ['path', 'line', 'algorithm', 'expected', 'computed'], args, stdout)
 	elif operation == 'parts':
-		_cliEmitFields([_serveDecodeLine(line) for line in lines], ['index', 'ordinal', 'path', 'flags'], args, stdout)
+		_cliEmitFields(rows, ['index', 'ordinal', 'path', 'flags'], args, stdout)
 	if message and status in (1, 2):
 		logger.teelog('tsvz: {}: {}'.format(args.store, message), 'error')
 	return status
-
-
-def _cliSetdefaultArgs(args, delimiter, creating):
-	"""Refuse, before a store is created or written, what a ``setdefault`` would have to write and cannot.
-
-	A header or defaults written to a store this creates is looked at. Arguments that hold a byte that is not
-	UTF-8 (``args.writeArgs``) are refused here when the store does not exist: KEY is not live, so they would
-	have to be written. When it exists, see ``_cliSetdefaultLookup``.
-	"""
-	if creating:
-		header = _formatHeader(args.header, delimiter=delimiter)
-		if any(header):
-			_checkRow(header, delimiter, 'utf8', 'strict', what='header')
-		if args.defaults and len(args.defaults) > 1:
-			_checkRow(args.defaults, delimiter, 'utf8', 'strict', what='defaults')
-		if args.writeArgs is not None:
-			_cliRefuseSetdefault(args, delimiter)
-
-
-def _cliRefuseSetdefault(args, delimiter):
-	"""Raise the ``TSVZEncodeError`` a write of ``args.writeArgs`` meets: they hold a byte that is not UTF-8."""
-	_checkRow(_sanitize(args.writeArgs, delimiter=delimiter), delimiter, 'utf8', 'strict', None)
-	raise TSVZEncodeError('cannot write {} as UTF-8'.format(ascii(args.writeArgs)))  # not reached: they cannot be encoded
 
 
 def _cliSetdefaultLookup(args, delimiter, logger, stdout, request):
@@ -9190,46 +8794,69 @@ def _cliSetdefaultLookup(args, delimiter, logger, stdout, request):
 	with one ``get`` request (``request``): through a handler that is the handler's own view, in one request, never
 	a write with the byte replaced; on the files it is the in-process engine's.
 	"""
-	lines, diagnostics, status, message = request('\t'.join(['get', _serveEncode(args.args[0])]))
+	rows, diagnostics, status, message = request('\t'.join(['get', _serveEncode(args.args[0])]))
 	if status == 3:
 		for text in diagnostics:
 			logger.teelog(text, 'warning')
-		_cliRefuseSetdefault(args, delimiter)
-	return _cliEmitServed(args, delimiter, logger, stdout, (lines[:1] if status == 0 else [], diagnostics, status, message))
+		_checkRow(_sanitize(args.writeArgs, delimiter=delimiter), delimiter, 'utf8', 'strict', None)  # raises
+	return _cliEmitServed(args, delimiter, logger, stdout, (rows[:1] if status == 0 else [], diagnostics, status, message))
+
+
+def _cliBulk(args, delimiter, logger, stdin):
+	"""The record lines ``set -`` / ``delete -`` read from standard input (spec §20.3), else None."""
+	if args.operation not in ('set', 'append', 'delete') or args.args != ['-']:
+		return None
+	source = _Reporter('<stdin>', logger)
+	try:
+		rows = _parseRecordLines(_cliStdinLines(stdin, source), delimiter, _isSpecPath(args.store),
+								 args.operation == 'delete', source)
+	finally:
+		source.flush()
+	return [_serveRecordLine(cells, marker) for cells, marker in rows]
 
 
 def _cliEngineOp(args, delimiter, logger, stdin, stdout):
-	"""``has``, ``len``, ``keys``, ``pop``, ``popitem``, ``setdefault`` (spec §20.2) on the files.
+	"""Every operation but ``serve`` and ``stop``, on the files (spec §20.2).
 
-	They run through an in-process write-handler engine, so they behave as
-	they do through a handler, except that ``pop``, ``popitem`` and
-	``setdefault`` are not atomic against other writers.
+	It is one request to an in-process write-handler engine, so it behaves as it does through a handler
+	(§20.8), except that ``pop``, ``popitem``, ``setdefault`` and a ``delete`` that reads the store are not
+	atomic against other writers (§20.2.5).
 	"""
-	create = args.operation == 'setdefault'
+	operation = args.operation
 	exists = _cliStoreExists(args.store)
-	if not create and not exists:
+	if not exists and operation not in _CLI_CREATES:
 		raise _CliStoreMissing()
+	if operation == 'setdefault' and not exists:
+		# What a refused setdefault would write is looked at before the store is created, so it creates nothing.
+		header = _formatHeader(args.header, delimiter=delimiter)
+		if any(header):
+			_checkRow(header, delimiter, 'utf8', 'strict', what='header')
+		if args.defaults and len(args.defaults) > 1:
+			_checkRow(args.defaults, delimiter, 'utf8', 'strict', what='defaults')
+		if args.writeArgs is not None:
+			_checkRow(_sanitize(args.writeArgs, delimiter=delimiter), delimiter, 'utf8', 'strict', None)  # raises
+	bulk = _cliBulk(args, delimiter, logger, stdin)
+	store = _ServeStore(args.store, delimiter=delimiter, header=args.header, defaults=args.defaults,
+						strict=args.strict, teeLogger=logger, verbose=args.verbose,
+						create=not exists and operation != 'clear',  # clear creates the store itself
+						createDefaults=None if operation == 'setdefault' else [],
+						checkHeader=operation in ('set', 'append', 'delete', 'clear'), lazy=True)  # as 3.39 did
 
-	def openStore(creating):
-		return _ServeStore(args.store, delimiter=delimiter, header=args.header, defaults=args.defaults,
-						   strict=args.strict, teeLogger=logger, verbose=args.verbose, create=creating)
-	store = openStore(False) if exists else None
+	def request(line, bulk=None):
+		"""The response to ``line``; the engine's messages go to stderr as they come, at their own level."""
+		try:
+			status, rows, message = _serveDispatch(store, line, bulk, logger)
+		except _ServeUsage as e:
+			status, rows, message = 2, [], str(e)
+		return rows, [], status, message
 	try:
-		if create:
-			# Before a missing store is created: a setdefault that will be refused creates nothing.
-			_cliSetdefaultArgs(args, delimiter, not exists)
-			if args.writeArgs is not None:
-				return _cliSetdefaultLookup(args, delimiter, logger, stdout, _ServeLocal(store).request)
-			if store is None:
-				store = openStore(True)
-		response = _ServeLocal(store).request(_cliRequestLine(args))
+		if args.writeArgs is not None:
+			return _cliSetdefaultLookup(args, delimiter, logger, stdout, request)
+		written = ['--x-written'] if operation in ('set', 'append', 'delete') else []  # a failed write fails
+		response = request('\t'.join(written + [_cliRequestLine(args)]), bulk)
 	finally:
-		if store is not None:
-			store.close()
-	status = _cliEmitServed(args, delimiter, logger, stdout, response)
-	if store.writer.failures:
-		return 1  # the write was not made; the writer reported why
-	return status
+		store.close()
+	return _cliEmitServed(args, delimiter, logger, stdout, response)
 
 
 def _cliServe(args, delimiter, logger, stdin, stdout):
@@ -9301,6 +8928,7 @@ def _cliStop(args, delimiter, logger, stdin, stdout):
 
 
 _CLI_WRITES_HEADER = ('set', 'append', 'setdefault', 'clear', 'delete', 'scrub', 'serve')
+_CLI_CREATES = ('set', 'append', 'delete', 'clear', 'setdefault')  # a missing store (spec §20.2.2)
 _CLI_READ_ONLY = ('read', 'get', 'has', 'len', 'keys', 'verify', 'parts')
 
 
@@ -9338,44 +8966,29 @@ def _cliHandler(args, delimiter, logger):
 
 def _cliRouted(connection, args, delimiter, logger, stdin, stdout):
 	"""Run a command line through STORE's handler; print the response as the files would give it (§20.8)."""
-	bulk = None
-	if args.operation in ('set', 'append', 'delete') and args.args == ['-']:
-		source = _Reporter('<stdin>', logger)
+	def request(line, bulk=None):
+		lines, diagnostics, status, message = connection.request(line, bulk)
+		return [_serveDecodeLine(line) for line in lines], diagnostics, status, message
+	if args.writeArgs is not None:
 		try:
-			rows = _parseRecordLines(_cliStdinLines(stdin, source), delimiter, _isSpecPath(args.store),
-									 args.operation == 'delete', source)
-		finally:
-			source.flush()
-		bulk = [_serveRecordLine(cells, marker) for cells, marker in rows]
-	elif args.operation == 'setdefault' and args.writeArgs is not None:
-		try:
-			return _cliSetdefaultLookup(args, delimiter, logger, stdout, connection.request)
+			return _cliSetdefaultLookup(args, delimiter, logger, stdout, request)
 		except _ServeLost as e:  # a lookup only: the files answer it as well
 			logger.teelog('TSVZ warning: {}: lost the handler ({}); using the files directly'.format(args.store, e),
 						  'warning')
-			return _CLI_HANDLERS[args.operation](args, delimiter, logger, stdin, stdout)
-	elif args.operation in ('set', 'append') and len(args.args) > 1:
-		# Checked as the files are, naming the cell, before anything is sent: a request cannot carry
-		# text that is not UTF-8 (and would be quoted whole).
-		_checkRow(_sanitize(args.args, delimiter=delimiter), delimiter, 'utf8', 'strict', None)
+			return _cliEngineOp(args, delimiter, logger, stdin, stdout)
+	bulk = _cliBulk(args, delimiter, logger, stdin)
 	try:
 		written = ['--x-written'] if args.operation in ('set', 'append', 'delete') else []
-		response = connection.request('\t'.join(written + [_cliRequestLine(args)]), bulk)
+		response = request('\t'.join(written + [_cliRequestLine(args)]), bulk)
 	except _ServeLost as e:
 		if args.operation in _CLI_READ_ONLY:
 			logger.teelog('TSVZ warning: {}: lost the handler ({}); using the files directly'.format(args.store, e),
 						  'warning')
-			return _CLI_HANDLERS[args.operation](args, delimiter, logger, stdin, stdout)
+			return _cliEngineOp(args, delimiter, logger, stdin, stdout)
 		logger.teelog('tsvz: {}: lost the handler ({}); the {} may or may not have been applied'.format(
 			args.store, e, args.operation), 'error')
 		return 1
 	return _cliEmitServed(args, delimiter, logger, stdout, response)
-
-
-_CLI_HANDLERS = {'read': _cliRead, 'get': _cliGet, 'set': _cliSet, 'append': _cliSet, 'delete': _cliDelete,
-				 'clear': _cliClear, 'scrub': _cliScrub, 'verify': _cliVerify, 'parts': _cliParts,
-				 'has': _cliEngineOp, 'len': _cliEngineOp, 'keys': _cliEngineOp, 'pop': _cliEngineOp,
-				 'popitem': _cliEngineOp, 'setdefault': _cliEngineOp, 'serve': _cliServe, 'stop': _cliStop}
 
 
 def _cliMain(argv, stdin=None, stdout=None, stderr=None):
@@ -9426,13 +9039,19 @@ def _cliMain(argv, stdin=None, stdout=None, stderr=None):
 				args.defaults = [DEFAULTS_INDICATOR_KEY] + values[1:]
 			else:
 				args.defaults = []
+			if args.operation in ('set', 'append') and len(args.args) > 1:
+				# A value that is not UTF-8 is refused, naming the cell, before a store is created or a request
+				# (which cannot carry it) is sent.
+				_checkRow(_sanitize(args.args, delimiter=delimiter), delimiter, 'utf8', 'strict',
+						  _formatHeader(args.header, delimiter=delimiter))
 			connection = _cliHandler(args, delimiter, logger)
 			if connection is not None:
 				try:
 					return _cliRouted(connection, args, delimiter, logger, stdin, stdout)
 				finally:
 					connection.close()
-			return _CLI_HANDLERS[args.operation](args, delimiter, logger, stdin, stdout)
+			run = {'serve': _cliServe, 'stop': _cliStop}.get(args.operation, _cliEngineOp)
+			return run(args, delimiter, logger, stdin, stdout)
 	except _CliUsageError as e:
 		_cliWrite(stderr, 'tsvz: {}\n{}\n'.format(e, _CLI_USAGE))
 		return 2
