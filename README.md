@@ -228,7 +228,8 @@ again from memory by the store's next write, an append included. So is a compres
 file another writer left damaged (L5: every read stops at the damage, so rows
 appended after it would be read by no one); the bytes after the damage go. While that
 rewrite fails, the rows are appended after the damage and memory keeps them for the
-next rewrite that gets through; while it is refused (a row changed in place to text
+next rewrite that gets through (`close()` tries one more, whatever `rewrite_on_exit`
+says); while it is refused (a row changed in place to text
 the encoding cannot hold), they are appended after it as in 4.9, and the next read
 drops them. Appends that do not read the store first (`tsvz set`,
 `appendTabularFile`, `TSVZedLite`, and a `TSVZed` with `monitor_external_changes=False`

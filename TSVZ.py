@@ -5194,16 +5194,14 @@ memoryOnly:{self.memoryOnly}
 		"""Remember that a rewrite was refused with ``error``; raise it for an ``explicit`` call, else report it once.
 
 		mapToFile() and hardMapToFile() called by the program raise it, as a refused set does: the caller learns
-		that nothing was written. The rewrites TSVZed makes itself report it, once for each different refusal
-		until a rewrite goes through, clear() or reload() (no traceback: it is not a bug).
+		that nothing was written. The rewrites TSVZed makes itself report it, once for each different refusal, and
+		again when what follows it changes (close() tries none again), until a rewrite goes through, clear() or
+		reload() (no traceback: it is not a bug).
 		"""
 		self._refusedAt = _specClock()
 		if explicit:
 			raise error
 		message = str(error)
-		if self._refusalReported == message:
-			return
-		self._refusalReported = message
 		if self._closing or not self.appendThread.is_alive():
 			retry = "None is tried again on its own: this store's writer thread is stopping or stopped (close())."
 		elif self.rewrite_interval or self.deSynced:  # deSynced: the file is to be made again, at any interval
@@ -5212,6 +5210,9 @@ memoryOnly:{self.memoryOnly}
 			retry = ("With rewrite_interval=0 none is tried again on its own, only one asked for (mapToFile(), "
 					 "rewrite(force=True), rewrite_on_exit), one made after another process changes the file, or, while "
 					 "damage another writer left is to be made good, one at a later append.")
+		if self._refusalReported == (message, retry):
+			return
+		self._refusalReported = (message, retry)
 		damaged = (" The file is damaged (a rewrite of this object's failed) or was removed: until a rewrite gets "
 				   "through, memory holds the only good copy." if self._damaged else "")
 		self.__teePrintOrNot(f"Refused at {where} to {self._fileName}: {message}. The file is left as it is, and rows that can "
@@ -5871,7 +5872,9 @@ memoryOnly:{self.memoryOnly}
 					self._specSync()
 				else:
 					self._closing = True
-					self.rewrite(force=self.rewrite_on_exit)  # Ensure any final sync operations are performed
+					# A damaged file is tried once more, however lately a rewrite was refused or failed: memory holds the
+					# only good copy, and goes with the store.
+					self.rewrite(force=self.rewrite_on_exit or self._damaged)  # Ensure any final sync operations are performed
 			self._finish()
 			if self.verbose:
 				self.__teePrintOrNot(f"Append thread for {self._fileName} stopped")

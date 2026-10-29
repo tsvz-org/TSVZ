@@ -9857,6 +9857,38 @@ def test_tsvzed_legacy_refusal_at_close_says_none_is_tried_again(tmp_path, capsy
 	assert 'at most every' not in refused[0] and _bytes(p) == LEGACY_KEY_ROW
 
 
+def test_tsvzed_legacy_refusal_reported_while_running_is_reported_again_at_close(tmp_path, capsys):
+	# The same refusal is reported once while the store runs ("tried again"), and once more by close(): it tries a
+	# damaged file once more (rewrite_on_exit or not, however lately one was refused) and none after, and memory, the
+	# only good copy, goes with the store.
+	p = str(tmp_path / 'twice.tsv')
+	_touch(p, LEGACY_KEY_ROW)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, append_check_delay=0.01)
+	t.dirty = t.deSynced = t._damaged = True  # as a rewrite that failed part way leaves it
+	refused = []
+	assert _wait_for(lambda: refused.extend(_refusals(capsys)) or refused)
+	first = t._refusedAt
+	assert _wait_for(lambda: t._refusedAt != first)  # tried again: not reported again
+	t.close()
+	refused += _refusals(capsys)
+	assert len(refused) == 2, refused
+	assert 'tried again at most every 1 s' in refused[0] and 'None is tried again on its own' in refused[1]
+	assert 'memory holds the only good copy' in refused[1] and _bytes(p) == LEGACY_KEY_ROW
+
+
+def test_tsvzed_legacy_close_makes_a_damaged_file_again_however_lately_a_rewrite_was_refused(tmp_path, monkeypatch):
+	monkeypatch.setattr(TSVZ, '_REFUSED_RETRY_SECONDS', 60.0)  # no retry of the background writer's in between
+	p = str(tmp_path / 'last.tsv')
+	_touch(p, LEGACY_CELL_ROW)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	t.dirty = t.deSynced = t._damaged = True  # as a rewrite that failed part way leaves it
+	assert _wait_for(lambda: t._refusedAt is not None)
+	t['k'] = ['k', 'fixed']
+	t.close()
+	assert b'ok\t1' not in _bytes(p) and not t._damaged  # made again, not the fixed row appended after the old ones
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False) == {'k': ['k', 'fixed'], 'ok': ['ok', '2']}
+
+
 def test_tsvzed_legacy_removed_file_whose_remake_is_refused_is_made_again_once_the_row_is_fixed(tmp_path, capsys):
 	# A removed file is made again from memory at the next write; refused (a row changed in place to text ASCII cannot
 	# hold), it is tried again at every tick at rewrite_interval=0 too, and goes through once the row is fixed. Before,
