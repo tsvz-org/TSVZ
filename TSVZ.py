@@ -1657,13 +1657,14 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 				data = _compressBytes(codec, headerBytes + b'\n') if codec else headerBytes + b'\n'  # before: no gap
 				# Not over a file another writer made since it was looked for ('xb'), nor a link (its target is made),
 				# and under the lock, as every writer writes: an append that took it first has written the header.
-				with open(os.path.realpath(fileName), 'xb') as file:
+				with _pathLock(fileName), open(os.path.realpath(fileName), 'xb') as file:  # lockf excludes no thread
 					_lockFile(file)
 					try:
 						if not os.fstat(file.fileno()).st_size:
 							file.write(data)
 							file.flush()
 					finally:
+						_seekRawStart(file)  # msvcrt unlocks from the raw position: the range it locked
 						_unlockFile(file)
 				__teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
 				return True
@@ -5324,9 +5325,6 @@ memoryOnly:{self.memoryOnly}
 			except Exception as e:
 				self._failed('rewrite', f"Failed to open file {self._fileName}: {e}", trace=False)
 				self.deSynced = True
-				if self._remake:  # damage another writer left: memory holds the only good copy (the merge rule)
-					self.dirty = True
-					self._damaged, self._unseen = True, False
 				return False
 			started = False
 			end = None
@@ -5776,8 +5774,6 @@ memoryOnly:{self.memoryOnly}
 			if missing:
 				return self
 			self.dirty = True  # failed or refused: the rewrite that gets through makes the file again
-			if not self._refusalPending():  # failed: memory holds the only good copy (the merge rule), as when one
-				self._damaged, self._unseen = True, False  # fails part way; what follows the bytes known is merged
 		with self.writeLock:
 			try:
 				if self.verbose:
@@ -5806,6 +5802,11 @@ memoryOnly:{self.memoryOnly}
 						if self._remakeDue():
 							return 'remake'  # the lock is let go of first (finally)
 						known = None if self._changedSince(f) else self._known
+				if self._remake and not self._damaged and not self._refusalPending():
+					# Appended after damage every read stops at, the file not made again (that failed, or waits out its
+					# back-off): memory holds the only good copy, as after a rewrite that fails part way (the merge rule).
+					self.dirty = self.deSynced = True
+					self._damaged, self._unseen = True, False
 				if known is None and not self._damaged:
 					# Another process's change is not known until it is read: the next tick reads all of it, whatever
 					# the file's time says (a time that ticks coarsely may not have moved).

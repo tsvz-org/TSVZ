@@ -9729,5 +9729,42 @@ def test_a_directory_at_the_store_path_is_reported_as_not_made(tmp_path):
 		TSVZ.readTabularFile(str(d), header='key\tval', createIfNotExist=True, strict=True, verbose=False)
 
 
+@pytest.mark.parametrize('suffix', ['tsv.gz', 'tsv.xz'])
+def test_an_append_that_takes_the_lock_first_writes_the_only_header(tmp_path, monkeypatch, suffix):
+	# A file made new had its header written without the lock: an append from another program that found it empty
+	# first wrote the header too, and the store read a phantom row 'key' (or a damaged stream).
+	p = str(tmp_path / ('new.' + suffix))
+	real = TSVZ._lockFile
+
+	def locking(f):
+		if getattr(f, 'mode', '') == 'xb':  # the maker, between making the file and taking the lock
+			monkeypatch.setattr(TSVZ, '_lockFile', real)
+			TSVZ.appendTabularFile(p, ['a1', 'A'], header='key\tval', verbose=False)
+		return real(f)
+
+	monkeypatch.setattr(TSVZ, '_lockFile', locking)
+	assert TSVZ._verifyFileExistence(p, header=['key', 'val'])
+	assert _back(p) == {'a1': ['a1', 'A']}
+
+
+def test_tsvzed_legacy_commit_after_damage_while_a_rewrite_waits_out_its_back_off_keeps_its_row(tmp_path, monkeypatch, capsys):
+	# A store whose last rewrite had failed (it waits out its back-off) read another writer's damage at a commit: it
+	# could not make the file again, appended after the damage and stayed undamaged, so when another store made the
+	# file again its next read dropped the row, silently.
+	p = str(tmp_path / 'damaged.tsv.gz')
+	_touch(p, TSVZ._compressBytes('gzip', b'key\tval\na0\tA\n'))
+	monkeypatch.setattr(TSVZ, '_FAILURE_RETRY_FIRST', float('inf'))
+	s, b = _stopped(p), _stopped(p)
+	s._failed('rewrite', 'a rewrite that failed before', trace=False)  # its back-off runs
+	torn = TSVZ._compressBytes('gzip', b''.join(b'n%d\tN\n' % i for i in range(300)))
+	_append_external(p, torn[:len(torn) // 2])  # a writer killed part way
+	s['x'] = ['x', 'X']
+	s.commitAppendToFile()
+	b['b1'] = ['b1', 'B']
+	b.commitAppendToFile()
+	s.rewrite()
+	assert 'x' in s and 'x' in _back(p) and 'Overwriting external changes' in capsys.readouterr().out
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
