@@ -5723,7 +5723,19 @@ memoryOnly:{self.memoryOnly}
 	def _commit(self):
 		"""commitAppendToFile() for a legacy file, under writeLock and the file lock. The rows stay queued until they are
 		on disk (a merge keeps memory's row for a queued key). When the file held what _known says, what it appended
-		is known too and its time noted; else another process's change is still to be taken in."""
+		is known too and its time noted; else another process's change is still to be taken in (a compressed file's at
+		once, under the lock: if it is damage every read stops at, the file is made again from memory instead)."""
+		if self._commitOnce() == 'remake':
+			self._commitOnce()  # the lock let go of: the file is made again from memory
+		return self
+
+	def _remakeDue(self):
+		"""True when the next commit makes the file again from memory (_remake), not while a rewrite was refused or
+		failed lately (the background writer's back-off)."""
+		return self._remake and not self._refusalPending() and not self._failing('rewrite')
+
+	def _commitOnce(self):
+		"""_commit(), once: 'remake' when another writer's change it read under the lock is damage (_remakeDue)."""
 		if not self.appendQueue:
 			return self
 		if self.memoryOnly:
@@ -5732,7 +5744,7 @@ memoryOnly:{self.memoryOnly}
 				self.__teePrintOrNot("Memory only mode. Append queue cleared.")
 			return self
 		missing = not os.path.exists(self._fileName)
-		if missing or (self._remake and not self._refusalPending()):
+		if missing or self._remakeDue():
 			# Removed (rm, a log rotation): memory is the only copy, so the file is made again from it, as a rewrite
 			# makes it, not begun with these rows alone (the next read would then drop every other row from memory).
 			# Damaged where every read stops (_remake): made again too; a rewrite refused, these rows are appended.
@@ -5756,6 +5768,12 @@ memoryOnly:{self.memoryOnly}
 			known = None
 			try:
 				known = None if self._changedSince(f) else self._known
+				if known is None and codec and not self._damaged:
+					# Read before these rows go after it: every read stops at damage in a compressed file (L5).
+					self._syncFrom(f, True)
+					if self._remakeDue():
+						return 'remake'  # the lock is let go of first (finally)
+					known = None if self._changedSince(f) else self._known
 				if known is None and not self._damaged:
 					# Another process's change is not known until it is read: the next tick reads all of it, whatever
 					# the file's time says (a time that ticks coarsely may not have moved).
@@ -7546,7 +7564,6 @@ def _serveReadPointer(path):
 	``fields`` is None when there is no pointer file or it does not parse;
 	``problem`` says why a file there cannot be a pointer file.
 	"""
-	import stat
 	try:
 		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
 	except FileNotFoundError:
@@ -7651,7 +7668,6 @@ class _ServeConnection(object):
 	@staticmethod
 	def _connectUnix(socket, path, owner):
 		"""Connect to the Unix socket ``path``, which must belong to ``owner`` (spec §21.2.4)."""
-		import stat
 		st = os.lstat(path)
 		if not stat.S_ISSOCK(st.st_mode):
 			raise _ServeUnreachable('{} is not a socket'.format(path))
@@ -7790,7 +7806,6 @@ class _ServeHandle(object):
 		then creates its own with O_EXCL, without following symbolic links.
 		Errors other than "busy" (a file system without locks) raise OSError.
 		"""
-		import stat
 		try:
 			fd = os.open(self.pointer, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
 		except FileNotFoundError:

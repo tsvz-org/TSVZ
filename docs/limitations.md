@@ -85,8 +85,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: a writer killed part way through an append to a `.tsv.gz` (more rarely `.xz`) leaves a
   member cut short; once another member is appended after it, Python's GzipFile decodes some of that member's bytes
   as the rest of the cut line before it fails at the damage. A read then holds that one row with a garbage value
-  (in 72 of 200 random cases on gzip, 2 of 200 on xz, none on bz2; 4.9 and main do the same), and a `TSVZed`
-  opened with its defaults writes it back.
+  (in 72 of 200 random cases on gzip, 2 of 200 on xz, none on bz2; 4.9 and main do the same), and the first write
+  of a `TSVZed` that read it (a rewrite, or its first append, which makes the damaged file again) writes it back.
 - Why: the fix is a reader of its own for compressed full reads (`readTabularFile`, `TSVZed`, the CLI) that
   decodes member by member, uses a member only once it checks out and keeps only the whole lines of a cut one,
   holding each member's text until it is checked: a reader redesign of its own.

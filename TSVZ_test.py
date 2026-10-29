@@ -7059,7 +7059,10 @@ def test_tsvzed_legacy_write_looks_for_external_changes_once_the_file_is_locked(
 	if how == 'append':
 		t.commitAppendToFile()
 		monkeypatch.undo()
-		assert t._externalChange()
+		if TSVZ._isCompressedFile(p):  # read under the lock: it could be damage every read stops at (L5)
+			assert t['ext'] == ['ext', 'B'] and not t._externalChange()
+		else:  # left for the next tick
+			assert t._externalChange()
 	else:
 		t._mapToFile(sync=True)  # the rewrite rewrite() makes
 		monkeypatch.undo()
@@ -9473,6 +9476,44 @@ def test_tsvzed_legacy_rewrite_of_a_store_on_dev_null_succeeds(capsys):
 	t['a'] = ['a', '2']
 	t.rewrite(force=True)
 	assert t['a'] == ['a', '2'] and not t.dirty and 'Failed' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('suffix', ['tsv.gz', 'tsv.bz2', 'tsv.xz'])
+def test_tsvzed_legacy_row_committed_before_the_store_read_another_writer_damage_is_kept(tmp_path, suffix):
+	# Another writer's append was killed part way, and this store committed a row before its next read: the row went
+	# after the damage, the next read stopped there and dropped it from memory, and no read of the file had it.
+	p = str(tmp_path / ('torn.' + suffix))
+	codec = suffix.rpartition('.')[2]
+	_touch(p, TSVZ._compressBytes(codec, b'key\tval\n' + b''.join(b'k%d\tv\n' % i for i in range(50))))
+	t = _stopped(p)
+	rng = random.Random(7)
+	torn = TSVZ._compressBytes(codec, b''.join(b'n%d\t%032x\n' % (i, rng.getrandbits(128)) for i in range(500)))
+	_append_external(p, torn[:len(torn) // 2])
+	t['mine'] = ['mine', 'M']
+	t.commitAppendToFile()  # before the next tick's read: an explicit commit, or close()'s
+	t.checkExternalChanges()
+	t.rewrite()
+	assert t['mine'] == ['mine', 'M'] and _back(p)['mine'] == ['mine', 'M'] and len(_back(p)) >= 51
+
+
+def test_tsvzed_legacy_remake_of_a_damaged_file_waits_out_a_failing_rewrite(tmp_path, monkeypatch):
+	# A rewrite that keeps failing (a full copy-on-write disk, which an append still fits on) was tried again at every
+	# commit, the whole file encoded each time, not on the background writer's back-off.
+	p = str(tmp_path / 'full.tsv.gz')
+	_touch(p, TSVZ._compressBytes('gzip', b'key\tval\na\t1\n') + b'garbage echoed\n')
+	t = _stopped(p)
+	assert t._remake
+	tries = []
+
+	def failing(*args, **kwargs):
+		tries.append(1)
+		raise OSError(errno.ENOSPC, 'No space left on device')
+
+	monkeypatch.setattr(TSVZ, '_writeLines', failing)
+	for i in range(10):
+		t['k%d' % i] = ['k%d' % i, 'v']
+		t.commitAppendToFile()
+	assert len(tries) == 1 and not t.appendQueue
 
 
 if __name__ == '__main__':
