@@ -228,9 +228,9 @@ again from memory by the store's next write, an append included.
 
 It knows the size and SHA-256 of the bytes it last read or wrote. When another process
 has changed the file, and it is the same file (device and inode) and still begins with
-those bytes, only what follows is read and applied to memory, as a read of the file
-applies it (a key whose own change is still queued keeps memory's row): memory keeps an
-order set by `move_to_end`, and its `#` keys. Any other change reloads the file,
+those bytes, and nothing this store set is still waiting to be written, only what
+follows is read and applied to memory, as a read of the file applies it: memory keeps
+an order set by `move_to_end`, and its `#` keys. Any other change reloads the file,
 changing memory in place, so a live key is never missing meanwhile.
 
 A rewrite that fails part way (a full disk, an I/O error), or that cannot make again a

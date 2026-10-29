@@ -4411,7 +4411,12 @@ class TSVZed(OrderedDict):
 			# #_defaults_#, so new defaults are written as that marker.
 			self._specSetMarker(DEFAULTS_INDICATOR_KEY, defaults)
 			return
-		self.defaults = defaults
+		if not self._constructed:
+			self.defaults = defaults
+			return
+		with self.writeLock:  # memory's defaults now differ from the file's: another process's change is read whole
+			self.defaults = defaults
+			self._known = None
 
 	def load(self):
 		self.reload()
@@ -4441,10 +4446,12 @@ class TSVZed(OrderedDict):
 			if not os.path.isfile(self._fileName) and not _verifyFileExistence(
 					self._fileName, createIfNotExist=self.createIfNotExist, teeLogger=self.teeLogger, header=self.header,
 					encoding=self.encoding, strict=self.strict, delimiter=self.delimiter, errors=self.errors):
-				self._readFrom(None)  # missing and not made: empty, until an append makes it
+				self._readFrom(None, True)  # missing and not made: empty, until an append makes it
 			else:
 				with open(self._fileName, 'rb') as f:
-					self._readFrom(f)
+					cut = self._readFrom(f, False)
+				if cut:
+					self._readLocked(lambda f: self._readFrom(f, True))
 		if self.verbose:
 			self.__teePrintOrNot(f"Loaded {len(self)} records from {self._fileName}")
 			self.__teePrintOrNot(f"correctColumnNum: {self.correctColumnNum}")
@@ -5096,7 +5103,6 @@ memoryOnly:{self.memoryOnly}
 			# Not while a failed rewrite of this store's has left the file damaged: memory holds the only good copy,
 			# and the rewrite below makes the file again from it, merging what another process appended.
 			if reloadInternalFromFile and not self._damaged and self._externalChange():
-				self._commit()  # what is queued goes after the change in the file, so it goes after it in memory too
 				self._syncFile()
 			self._worked('sync')
 			if self.memoryOnly:
@@ -5133,7 +5139,6 @@ memoryOnly:{self.memoryOnly}
 
 	# ``(identity, size, sha256)`` of the bytes this store last read or wrote in its legacy file; None when not known.
 	_known = None
-	_knownDefaults = None  # the defaults in force where those bytes end (a read of what follows starts from them)
 	# True from when a rewrite starts changing the file until all of it is on disk. While a failed one leaves it True,
 	# memory holds the only good copy: the file is never read over it, and the next rewrite makes it again, merging
 	# another process's appends (the merge rule, _syncFrom); _known is then what the file held when it stopped.
@@ -5231,7 +5236,6 @@ memoryOnly:{self.memoryOnly}
 				# full rewrite -- it is not a regular mapping key.
 				first.append(_encodeRow(_sanitize(defaults,delimiter=delimiter),delimiter,encoding,errors,what='defaults'))
 			rows = _RewriteRows(first, values, delimiter, encoding, errors, self.header)
-			rows.defaults = defaults  # in force in the file it writes
 			del values  # the snapshot holds the cells
 			rows.check()
 		except BaseException:
@@ -5271,7 +5275,7 @@ memoryOnly:{self.memoryOnly}
 				# Removed (rm, a log rotation): memory is the only copy. Made again whole; what another process writes
 				# there meanwhile is merged, whatever file it is.
 				self.dirty = self._damaged = True
-				self._known, self._knownDefaults = _KNOWN_NOTHING, None
+				self._known = _KNOWN_NOTHING
 				whole = True
 			try:
 				f = self._openLocked(_openUntruncated)
@@ -5284,7 +5288,7 @@ memoryOnly:{self.memoryOnly}
 			try:
 				for attempt in range(3):
 					if sync is not None and (self._damaged or (sync and self._changedSince(f))):
-						self._syncFrom(f)
+						self._syncFrom(f, True)
 					elif sync is False and self._externalChange():
 						self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
 					header, lines, queued = (snapshot or self._snapshotForRewrite)()
@@ -5298,8 +5302,10 @@ memoryOnly:{self.memoryOnly}
 				self.dirty = self._damaged = True
 				f.seek(0)
 				if whole:
-					f.truncate()
+					# Written over what the file holds, then cut to its end (spec §19.8): a reader that takes no lock
+					# never meets it emptied, and a write cut short leaves the old bytes after the new ones.
 					_writeLines(f, header, lines, codec=_fileCodec(self._fileName))
+					f.truncate()
 				else:
 					self._writeInPlace(f, header, lines)
 				f.flush()
@@ -5319,7 +5325,6 @@ memoryOnly:{self.memoryOnly}
 						# What it wrote, or what stopping it left (the damage): read through the descriptor, before the
 						# file is let go of. Its time is noted as this object's own.
 						self._known = _fileKnown(f.fileno(), None if self._damaged else end)
-						self._knownDefaults = list(getattr(lines, 'defaults', self.defaults))  # a clear writes none
 						self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 				except Exception:
 					self._known = None
@@ -5332,45 +5337,61 @@ memoryOnly:{self.memoryOnly}
 		"""Take in another process's change to the legacy file (_syncFrom), reading it as reload() does: not locked."""
 		with self.writeLock:
 			with open(self._fileName, 'rb') as f:
-				self._syncFrom(f)
+				cut = self._syncFrom(f, False)
+			if cut:
+				self._readLocked(lambda f: self._syncFrom(f, True))
 
-	def _syncFrom(self, f):
+	def _readLocked(self, read):
+		"""``read(f)`` again with the file open and locked. A read cut short by damage without the lock may have met
+		another writer's write in progress, which every writer finishes under the lock; damage still there under it
+		stays, and what that read took is known. Not when the file cannot be opened for writing (read-only)."""
+		try:
+			f = self._openLocked(_openUntruncated)
+		except OSError:
+			return
+		try:
+			read(f)
+		finally:
+			_unlockFile(f)
+			f.close()
+
+	def _syncFrom(self, f, locked):
 		"""Take in what another process changed in the open legacy file ``f``: when it is the same file and still begins
 		with the bytes _known says, only what follows is read and applied (_applyAppended), else it is read whole
 		(_readFrom). While the file is damaged (the merge rule), any other change is left to the rewrite about to
-		start to overwrite, with a warning: memory holds the only good copy."""
+		start to overwrite, with a warning: memory holds the only good copy. True when, not ``locked``, the read was
+		cut short by damage: nothing of it is known, and the caller reads it again under the lock (_readLocked)."""
 		seen = getFileUpdateTimeNs(self._fileName)  # before the read: a write landing after it is not noted as seen
 		found = _readAfter(f, self._known)
-		header = None
+		header = None  # True: a row was queued while what follows was read
 		# A last line with no newline is read again: what is appended may complete it (a compressed file's appends
-		# are members of their own).
-		# Not while rows are queued (unless the file is damaged): what follows would go after them in memory, where the
-		# file will hold them after it.
+		# are members of their own). Not while rows are queued (unless the file is damaged): what follows would go after
+		# them in memory, where the file will hold them after it.
 		if (found is not None and (found[2] or self._damaged or _isCompressedFile(self._fileName))
 				and (self._damaged or not self.appendQueue)):
 			rest, known, _ = found
-			header, torn, defaults = self._applyAppended(f, rest, self._known[1])
+			header, torn = self._applyAppended(f, rest, self._known[1])
 			if header is None:
-				# A member cut short (an append still being written) is not known: the next change reads it whole.
-				self._known, self._knownDefaults = (None, None) if torn else (known, defaults)
+				cut = torn and not locked  # a member cut short may be an append still being written
+				self._known = None if cut else known
 				self.externalFileUpdateTime = seen
-				return
+				return cut
 		if self._damaged:
 			why = ("another process made it again with a first line that is not this store's header ({!r})".format(header)
-				   if header is not None else "and they do not follow what it left")
+				   if isinstance(header, str) else "and they do not follow what it left")
 			self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}: they were made after a rewrite of "
 								 f"this object's failed and left the file damaged, {why}; memory holds what the rewrite was "
 								 f"writing",'warning')
-			return
-		self._readFrom(f)
+			return False
+		return self._readFrom(f, locked)
 
 	def _applyAppended(self, f, rest, size):
 		"""Apply ``rest``, what follows the first ``size`` bytes of the open legacy file ``f`` (a compressed one read member
 		by member), to memory as a read of the file applies it: the last change of a key wins, a key deleted and set
-		again moves to the end, a key still queued keeps memory's row, and empty cells take the defaults in force where
-		the known bytes end. Returns ``(header, torn, defaults)``: ``header`` None when applied, else, after bytes that
-		hold nothing, their first line, which is not this store's header (an append to an empty file writes it first);
-		``torn`` when a compressed member is cut short or does not decode; ``defaults`` those in force after ``rest``."""
+		again moves to the end, a key still queued keeps memory's row. Returns ``(header, torn)``: ``header`` None when
+		applied; else, after bytes that hold nothing, their first line, which is not this store's header (an append to
+		an empty file writes it first), or True when a row was queued meanwhile (not while the file is damaged): what
+		follows would go before it in memory. ``torn`` when a compressed member is cut short or does not decode."""
 		codec = _fileCodec(self._fileName)
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		damage = None
@@ -5384,8 +5405,8 @@ memoryOnly:{self.memoryOnly}
 				first, _, rest = rest.partition(b'\n')
 				line = first.decode(self.encoding or 'utf8', errors='replace').rstrip()
 				if first and not _headerMatches(self.header, line, self.delimiter):
-					return line, False, None
-			defaults = list(self.defaults if self._knownDefaults is None else self._knownDefaults)
+					return line, False
+			defaults = list(self.defaults)
 			changes = _TSVZedMerge(self, self.correctColumnNum, list(defaults))
 			_legacyReadLoop(io.BytesIO(rest), '', changes, self.correctColumnNum, 0, self.strict, self.delimiter,
 							changes.defaults, False, self.encoding, reporter)
@@ -5393,6 +5414,8 @@ memoryOnly:{self.memoryOnly}
 			reporter.flush()
 		with self._memLock:
 			# No set or delete is half done: each holds _memLock from its change of memory to its queueing.
+			if self.appendQueue and not self._damaged:
+				return True, False
 			queued = set(row[0] for row in self.appendQueue if row)
 			for key, (row, readded) in changes.items():
 				if key in queued:
@@ -5414,9 +5437,9 @@ memoryOnly:{self.memoryOnly}
 				self.correctColumnNum = len(self[next(iter(self))])
 		if self.verbose:
 			self.__teePrintOrNot(f"Read what another process appended to {self._fileName}: {len(self)} records")
-		return None, bool(damage), changes.defaults
+		return None, bool(damage)
 
-	def _readFrom(self, f):
+	def _readFrom(self, f, locked):
 		"""Make memory what the open legacy file ``f`` holds (None: no file), with the queued rows replayed on it. It is
 		read apart from memory, then memory is changed in place under _memLock, never emptied (a key the file still
 		holds is never missing for another thread) and takes the file's order. _known is then the bytes read."""
@@ -5444,12 +5467,15 @@ memoryOnly:{self.memoryOnly}
 					finally:
 						if codec:
 							stream.close()
-				# Read up to damage (or a whole rewrite still being written): not all of what it hashed was applied.
-				torn = reporter.has('damaged')
+				# Read up to damage without the lock: maybe a whole rewrite still being written, so not known. Under it,
+				# the damage stays: the bytes after it are known as they are (what follows them is read on from there).
+				cut = not locked and reporter.has('damaged')
+				if locked and reporter.has('damaged'):
+					while reader.read(1 << 20):
+						pass
 			finally:
 				reporter.flush()
-			known = None if torn else (_fileIdentity(os.fstat(f.fileno())), reader.size, reader.digest)
-		fileDefaults = list(loaded.defaults)  # in force where the file ends, before the queue is replayed on them
+			known = None if cut else (_fileIdentity(os.fstat(f.fileno())), reader.size, reader.digest)
 		with self._memLock:
 			# No set or delete is half done: each holds _memLock from its change of memory to its queueing. What is
 			# queued is not in the file (appends take writeLock, held here): replayed on what was read, as reading it
@@ -5465,10 +5491,11 @@ memoryOnly:{self.memoryOnly}
 				self.correctColumnNum = len(self[next(iter(self))])
 			else:
 				self.correctColumnNum = -1
-		self._known, self._knownDefaults = known, fileDefaults
+		self._known = known
 		self._damaged = False  # memory is what the file holds, damaged or not
 		self.externalFileUpdateTime = self.lastUpdateTime = seen
 		self.deSynced = False  # memory is the file again: a change seen before needs no rewrite
+		return known is None and f is not None
 
 	def _replaceRows(self, rows):
 		"""Make memory hold the mapping ``rows`` in its order, changed in place, never emptied: a key both hold is never
@@ -5676,15 +5703,11 @@ memoryOnly:{self.memoryOnly}
 			if self.verbose:
 				self.__teePrintOrNot("Memory only mode. Append queue cleared.")
 			return self
-		if not os.path.isfile(self._fileName):
+		if not os.path.exists(self._fileName):
 			# Removed (rm, a log rotation): memory is the only copy, so the file is made again from it, as a rewrite
 			# makes it, not begun with these rows alone (the next read would then drop every other row from memory).
-			try:
-				if self._writeFile(whole=True):
-					self._worked('append')
-			except Exception as e:
-				self._failed('rewrite', f"Failed to write at commitAppendToFile to {self._fileName}: {e}")
-				self.deSynced = True
+			if self._hardMapToFile(sync=True):
+				self._worked('append')
 			return self
 		with self.writeLock:
 			try:
@@ -5701,7 +5724,9 @@ memoryOnly:{self.memoryOnly}
 			try:
 				known = None if self._changedSince(f) else self._known
 				if known is None and not self._damaged:
-					self._known = None  # another process's change is not known until it is read: the next sync reads all
+					# Another process's change is not known until it is read: the next tick reads all of it, whatever
+					# the file's time says (a time that ticks coarsely may not have moved).
+					self._known, self.externalFileUpdateTime = None, 0
 				with self._memLock:  # a set or delete queues under it: not while the queue is listed
 					rows = list(self.appendQueue)
 				chunks = []
@@ -5730,9 +5755,6 @@ memoryOnly:{self.memoryOnly}
 						digest = known[2].copy()
 						digest.update(written[0])
 						self._known = (_fileIdentity(os.fstat(f.fileno())), known[1] + len(written[0]), digest)
-						for row in rows:  # a defaults line it wrote is in force after it, as a read takes it
-							if row and row[0] == DEFAULTS_INDICATOR_KEY:
-								self._knownDefaults = list(row) if any(row[1:]) else [DEFAULTS_INDICATOR_KEY]
 						self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 				with self._memLock:
 					for _ in range(len(rows)):

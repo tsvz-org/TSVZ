@@ -8935,7 +8935,7 @@ def test_tsvzed_legacy_another_process_append_is_read_from_where_the_store_left_
 	t.move_to_end('a')  # an order only memory holds
 	reads = []
 	real = TSVZ.TSVZed._readFrom
-	monkeypatch.setattr(TSVZ.TSVZed, '_readFrom', lambda self, f: reads.append(1) or real(self, f))
+	monkeypatch.setattr(TSVZ.TSVZed, '_readFrom', lambda self, f, locked: reads.append(1) or real(self, f, locked))
 	_append_external(p, _compressedAs(suffix, b'c\t1\nb\t2\n'))  # another process sets c and updates b
 	t.checkExternalChanges()
 	t.rewrite()  # what the background writer makes at its next tick
@@ -8973,17 +8973,15 @@ def test_tsvzed_legacy_another_process_append_keeps_the_file_order_of_a_queued_r
 	assert list(t) == _fresh_keys(p) == ['a', 'y', 'x']
 
 
-def test_tsvzed_legacy_row_cleared_by_another_process_does_not_come_back(tmp_path, monkeypatch):
+def test_tsvzed_legacy_row_cleared_by_another_process_does_not_come_back(tmp_path):
 	# This store appended a row while the file held another process's row it had not read: the bytes it knew no
 	# longer ended where the file did. A clear by a third process then looked like nothing appended, memory kept the
 	# cleared row, and the next rewrite wrote it back.
 	p = str(tmp_path / 'clear.tsv')
 	t = _stopped(p)
 	_append_external(p, b'k1\t1\n')
-	monkeypatch.setattr(t, '_syncFile', lambda: None)  # the row is not read before the append below
 	t['x'] = ['x', '9']
-	t.commitAppendToFile()
-	monkeypatch.undo()
+	t.commitAppendToFile()  # k1 is not read before this append
 	other = _stopped(p)
 	other.clear()
 	other.close()
@@ -9062,9 +9060,10 @@ def test_tsvzed_legacy_compressed_append_read_while_it_is_written_loses_no_row(t
 	t.rewrite()
 	with open(p, 'ab') as f:
 		f.write(batch[len(batch) // 2:])
-	t['k0'] = ['k0', 'updated']
-	t.commitAppendToFile()
 	t.checkExternalChanges()
+	t.rewrite()  # nothing queued: what follows the bytes the store knows is read
+	assert sum(1 for k in t if k.startswith('n')) == 3000
+	t['k0'] = ['k0', 'updated']
 	t.rewrite(force=True)
 	back = _back(p)
 	assert sum(1 for k in back if k.startswith('n')) == 3000 and back['k0'] == ['k0', 'updated']
@@ -9072,7 +9071,8 @@ def test_tsvzed_legacy_compressed_append_read_while_it_is_written_loses_no_row(t
 
 def test_tsvzed_legacy_another_process_row_takes_the_defaults_of_the_file(tmp_path):
 	# What another process appended was filled with this store's defaults (set in memory only by setDefaults()),
-	# not with the file's, as every read of the file fills it.
+	# not with the file's, as every read of the file fills it. Such a change is now read whole, as 4.9 read every
+	# change: memory then has the file's defaults again.
 	p = str(tmp_path / 'defaults.tsv')
 	_touch(p, b'key\tval\tx\n#_defaults_#\tOLD\tOLDX\na\t1\t2\n')
 	t = _stopped(p, header='key\tval\tx')
@@ -9081,7 +9081,43 @@ def test_tsvzed_legacy_another_process_row_takes_the_defaults_of_the_file(tmp_pa
 	t.checkExternalChanges()
 	t.rewrite()
 	assert t['theirs'] == TSVZ.readTabularFile(p, header='key\tval\tx')['theirs'] == ['theirs', 'OLD', 'T']
-	assert t.defaults == ['#_defaults_#', 'NEW', 'NEWX']  # memory's own defaults stay
+	assert t.defaults == ['#_defaults_#', 'OLD', 'OLDX']
+
+
+def test_tsvzed_legacy_another_process_row_takes_the_defaults_this_store_wrote(tmp_path):
+	# Defaults this store set as a row and wrote are the file's: another process's row after them takes them.
+	p = str(tmp_path / 'written.tsv')
+	_touch(p, b'key\tval\tx\n#_defaults_#\tOLD\tOLDX\na\t1\t2\n')
+	t = _stopped(p, header='key\tval\tx')
+	t['#_defaults_#'] = ['#_defaults_#', 'NEW', 'NEWX']
+	t.commitAppendToFile()
+	_append_external(p, b'theirs\t\tT\n')
+	t.checkExternalChanges()
+	t.rewrite()
+	assert t['theirs'] == TSVZ.readTabularFile(p, header='key\tval\tx')['theirs'] == ['theirs', 'NEW', 'T']
+
+
+def test_tsvzed_legacy_row_set_while_another_process_append_is_read_keeps_the_file_order(tmp_path, monkeypatch):
+	# A row set while another process's appended rows were being read, after the store had looked at its queue, sat
+	# before them in memory and after them in the file.
+	p = str(tmp_path / 'race.tsv')
+	t = _stopped(p)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	_append_external(p, b'y\t8\n')
+	real = TSVZ._legacyReadLoop
+
+	def readLoop(file, fileName, *args):
+		if fileName == '':  # the read of what another process appended
+			monkeypatch.setattr(TSVZ, '_legacyReadLoop', real)
+			t['x'] = ['x', '9']
+		return real(file, fileName, *args)
+
+	monkeypatch.setattr(TSVZ, '_legacyReadLoop', readLoop)
+	t.checkExternalChanges()
+	t.rewrite()
+	t.commitAppendToFile()
+	assert list(t) == _fresh_keys(p) == ['a', 'y', 'x']
 
 
 def test_tsvzed_legacy_set_after_the_file_was_removed_keeps_every_row(tmp_path):
