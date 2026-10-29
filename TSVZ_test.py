@@ -9955,8 +9955,8 @@ def test_tsvzed_legacy_rewrite_failure_that_lasts_to_close_is_reported_again(tmp
 
 
 def test_tsvzed_legacy_close_interrupted_leaves_a_store_that_runs_on(tmp_path, monkeypatch):
-	# A Ctrl-C that stops close()'s wait leaves the store running (its writer finishes the job): it is not closing,
-	# and a later refusal says it is tried again.
+	# A Ctrl-C that stops close()'s wait leaves the store running (its writer finishes the job): it is not closing, so
+	# a later refusal's report says it is tried again.
 	t = TSVZ.TSVZed(str(tmp_path / 'on.tsv'), header='key\tval', append_check_delay=0.01)
 
 	def interrupted(*args, **kwargs):
@@ -9968,6 +9968,21 @@ def test_tsvzed_legacy_close_interrupted_leaves_a_store_that_runs_on(tmp_path, m
 	assert not t._closing and t.appendThread.is_alive()
 	monkeypatch.undo()
 	t.close()
+
+
+def test_tsvzed_legacy_ctrl_c_during_the_exit_hooks_rewrite_leaves_the_store_closing(tmp_path, monkeypatch):
+	# At exit a Ctrl-C there only stops the wait: _stopLiveStores finishes the store, which does not run on, so a
+	# refusal of that last rewrite still says none is tried after it.
+	t = TSVZ.TSVZed(str(tmp_path / 'exit.tsv'), header='key\tval', append_check_delay=0.01)
+
+	def interrupted(*args, **kwargs):
+		raise KeyboardInterrupt
+
+	monkeypatch.setattr(t, 'rewrite', interrupted)
+	with pytest.raises(KeyboardInterrupt):
+		t._atExit()
+	assert t._closing
+	t._finish()
 
 
 def test_tsvzed_legacy_close_makes_a_damaged_file_again_however_lately_a_rewrite_was_refused(tmp_path, monkeypatch):

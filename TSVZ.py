@@ -5189,6 +5189,7 @@ memoryOnly:{self.memoryOnly}
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
 	_closing = False  # stopAppendThread() makes its last rewrite: none is tried after it
+	_exiting = False  # _stopLiveStores stops it at exit: a Ctrl-C there finishes the store, which does not run on
 
 	def _refuse(self, where, error, explicit=False):
 		"""Remember that a rewrite was refused with ``error``; raise it for an ``explicit`` call, else report it once.
@@ -5881,7 +5882,7 @@ memoryOnly:{self.memoryOnly}
 						# only good copy, and goes with the store.
 						self.rewrite(force=self.rewrite_on_exit or self._damaged or self._remake)  # Ensure any final sync operations are performed
 					except BaseException:
-						self._closing = False  # a Ctrl-C stopped the wait: the store runs on
+						self._closing = self._exiting  # a Ctrl-C stopped the wait: the store runs on, but not at exit
 						raise
 			self._finish()
 			if self.verbose:
@@ -5901,7 +5902,10 @@ memoryOnly:{self.memoryOnly}
 				thread.join(0.1)  # in steps: a Ctrl-C stops the wait on every platform
 		_LIVE_STORES.pop(id(self), None)
 
-	_atExit = stopAppendThread  # what _stopLiveStores does with a store left running at exit
+	def _atExit(self):
+		"""What _stopLiveStores does with a store left running at exit."""
+		self._exiting = True
+		return self.stopAppendThread()
 	
 	def get_file_obj(self,modes = 'ab'):
 		"""The store's file opened in ``modes`` and locked, with writeLock held until release_file_obj() (3.39 API; the
