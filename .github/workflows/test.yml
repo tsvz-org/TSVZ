@@ -25,8 +25,12 @@ jobs:
   pytest-py36:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
-    # python:3.6 manifest list, pinned by digest
-    container: python:3.6@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc
+    container:
+      # python:3.6 manifest list, pinned by digest
+      image: python:3.6@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc
+      # an init as PID 1 reaps the children the kill tests leave (the default `tail -f /dev/null` does not, so a
+      # killed child stays a zombie that os.kill(pid, 0) still finds)
+      options: --init
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python -m pip install "pytest<7.1"
