@@ -5167,6 +5167,9 @@ memoryOnly:{self.memoryOnly}
 	# A read under the file lock met damage another writer left (a compressed file: every read of it stops there, L5).
 	# Rows appended after it would be lost to the next read, so the next commit makes the file again from memory.
 	_remake = False
+	# A commit appended after another process's change it has not read: the file holds unread bytes after _known, so
+	# the next read is whole. _known still says how the file begins (a commit looks for damage after it).
+	_unseen = False
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
 
@@ -5349,7 +5352,7 @@ memoryOnly:{self.memoryOnly}
 					if started:
 						# What it wrote, or what stopping it left (the damage): read through the descriptor, before the
 						# file is let go of. Its time is noted as this object's own.
-						self._known = _fileKnown(f.fileno(), None if self._damaged else end)
+						self._known, self._unseen = _fileKnown(f.fileno(), None if self._damaged else end), False
 						self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 				except Exception:
 					self._known = None
@@ -5387,7 +5390,7 @@ memoryOnly:{self.memoryOnly}
 		start to overwrite, with a warning: memory holds the only good copy. True when, not ``locked``, the read was
 		cut short by damage: nothing of it is known, and the caller reads it again under the lock (_readLocked)."""
 		seen = getFileUpdateTimeNs(self._fileName)  # before the read: a write landing after it is not noted as seen
-		found = _readAfter(f, self._known)
+		found = None if self._unseen else _readAfter(f, self._known)
 		header = None  # True: a row was queued while what follows was read
 		# A last line with no newline is read again: what is appended may complete it (a compressed file's appends
 		# are members of their own). Not while rows are queued (unless the file is damaged): what follows would go after
@@ -5469,7 +5472,6 @@ memoryOnly:{self.memoryOnly}
 		read apart from memory, then memory is changed in place under _memLock, never emptied (a key the file still
 		holds is never missing for another thread) and takes the file's order. _known is then the bytes read."""
 		seen = getFileUpdateTimeNs(self._fileName)  # before the read: a change during or after it is seen by the next check
-		self._readWhole = False  # the read gives memory the file's defaults
 		loaded = _TSVZedLoad(self, self.correctColumnNum, list(self.defaults))
 		known = _KNOWN_NOTHING
 		damaged = False
@@ -5511,6 +5513,7 @@ memoryOnly:{self.memoryOnly}
 			loaded.replay(list(self.appendQueue))
 			self._replaceRows(loaded)
 			self.defaults = loaded.defaults
+			self._readWhole = False
 			if loaded.dirty:
 				self.dirty = True  # a key the file holds twice
 			if self.header and any(self.header) and self.verifyHeader:
@@ -5519,7 +5522,7 @@ memoryOnly:{self.memoryOnly}
 				self.correctColumnNum = len(self[next(iter(self))])
 			else:
 				self.correctColumnNum = -1
-		self._known = known
+		self._known, self._unseen = known, False
 		self._damaged = False  # memory is what the file holds, damaged or not
 		self._remake = locked and damaged
 		self.externalFileUpdateTime = self.lastUpdateTime = seen
@@ -5769,16 +5772,23 @@ memoryOnly:{self.memoryOnly}
 			known = None
 			try:
 				known = None if self._changedSince(f) else self._known
-				if known is None and codec and not self._damaged:
-					# Read before these rows go after it: every read stops at damage in a compressed file (L5).
-					self._syncFrom(f, True)
-					if self._remakeDue():
-						return 'remake'  # the lock is let go of first (finally)
-					known = None if self._changedSince(f) else self._known
+				if known is None and codec and not self._damaged and self.monitor_external_changes:
+					# Every read stops at damage in a compressed file (L5): rows appended after it would be read by no
+					# one. What another process appended after the bytes this store knows is looked at; damaged (or
+					# not after them), the file is read now, under the lock, and made again from memory (_remakeDue).
+					found = _readAfter(f, self._known)
+					if found is None or _decodeMembers(codec, found[0])[1]:
+						try:
+							self._syncFrom(f, True)
+						except Exception as e:  # the rows are appended all the same
+							self._failed('sync', f"Failed to read {self._fileName}: {e}", trace=False)
+						if self._remakeDue():
+							return 'remake'  # the lock is let go of first (finally)
+						known = None if self._changedSince(f) else self._known
 				if known is None and not self._damaged:
 					# Another process's change is not known until it is read: the next tick reads all of it, whatever
 					# the file's time says (a time that ticks coarsely may not have moved).
-					self._known, self.externalFileUpdateTime = None, 0
+					self._unseen, self.externalFileUpdateTime = True, 0
 				with self._memLock:  # a set or delete queues under it: not while the queue is listed
 					rows = list(self.appendQueue)
 				chunks = []

@@ -96,8 +96,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### Appends that do not read the store first land after damage, where reads do not reach them
 - Kind: known limitation
 - What the operator sees: once another writer has left a compressed `.tsv` file damaged, every read stops at the
-  damage (L5). A running `TSVZed` makes the file again from memory at its next write, so its rows stay readable,
-  but a one-shot `tsvz set`, `appendTabularFile()` or a `TSVZedLite` appends without reading the file first, so its
+  damage (L5). A running `TSVZed` makes the file again from memory at its next write, so its rows stay readable
+  (not while that rewrite is refused: see the README's fault tolerance), but a one-shot `tsvz set`, `appendTabularFile()` or a `TSVZedLite` appends without reading the file first, so its
   rows land after the damage, where no read reaches them, and the next `TSVZed` or scrub that makes the file again
   drops them. 4.9 and main do the same.
 - Why: covering them would make every such append read the whole file first; today `tsvz set` is one append.

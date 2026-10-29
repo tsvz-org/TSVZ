@@ -7059,10 +7059,7 @@ def test_tsvzed_legacy_write_looks_for_external_changes_once_the_file_is_locked(
 	if how == 'append':
 		t.commitAppendToFile()
 		monkeypatch.undo()
-		if TSVZ._isCompressedFile(p):  # read under the lock: it could be damage every read stops at (L5)
-			assert t['ext'] == ['ext', 'B'] and not t._externalChange()
-		else:  # left for the next tick
-			assert t._externalChange()
+		assert t._externalChange()  # left for the next tick
 	else:
 		t._mapToFile(sync=True)  # the rewrite rewrite() makes
 		monkeypatch.undo()
@@ -9510,10 +9507,74 @@ def test_tsvzed_legacy_remake_of_a_damaged_file_waits_out_a_failing_rewrite(tmp_
 		raise OSError(errno.ENOSPC, 'No space left on device')
 
 	monkeypatch.setattr(TSVZ, '_writeLines', failing)
+	monkeypatch.setattr(TSVZ, '_FAILURE_RETRY_FIRST', float('inf'))  # however slow the commits are
 	for i in range(10):
 		t['k%d' % i] = ['k%d' % i, 'v']
 		t.commitAppendToFile()
 	assert len(tries) == 1 and not t.appendQueue
+
+
+def test_tsvzed_legacy_commits_after_another_process_clean_append_read_nothing_whole(tmp_path, monkeypatch):
+	# Each commit read the whole compressed file under the lock when another process had appended: two processes that
+	# commit every row read it whole at every commit, in lockstep (30 to 100 times slower). Only what was appended is
+	# looked at for damage; the next tick reads it, once.
+	p = str(tmp_path / 'two.tsv.gz')
+	_touch(p, TSVZ._compressBytes('gzip', b'key\tval\n' + b''.join(b'k%d\tv\n' % i for i in range(100))))
+	t = _stopped(p)
+	reads = []
+	real = TSVZ.TSVZed._readFrom
+	monkeypatch.setattr(TSVZ.TSVZed, '_readFrom', lambda self, f, locked: reads.append(locked) or real(self, f, locked))
+	for i in range(5):
+		_append_external(p, TSVZ._compressBytes('gzip', b'ext%d\tE\n' % i))
+		t['mine%d' % i] = ['mine%d' % i, 'M']
+		t.commitAppendToFile()
+	assert reads == []
+	t.checkExternalChanges()
+	t.rewrite()
+	assert len(reads) == 1 and list(t)[100:] == _fresh_keys(p)[100:] and len(t) == 110
+
+
+def test_tsvzed_legacy_store_that_does_not_monitor_the_file_reads_nothing_at_a_commit(tmp_path):
+	# A store with monitor_external_changes=False took in another process's change to a compressed file at its commit.
+	p = str(tmp_path / 'blind.tsv.gz')
+	t = _stopped(p, monitor_external_changes=False)
+	t['x'] = ['x', 'mine']
+	t.commitAppendToFile()
+	torn = TSVZ._compressBytes('gzip', b''.join(b'n%d\tN\n' % i for i in range(300)))
+	_append_external(p, TSVZ._compressBytes('gzip', b'x\ttheirs\ny\ttheirs\n') + torn[:len(torn) // 2])
+	t['z'] = ['z', 'Z']
+	t.commitAppendToFile()
+	assert dict(t) == {'x': ['x', 'mine'], 'z': ['z', 'Z']}
+
+
+def test_tsvzed_legacy_commit_whose_read_of_another_process_change_fails_still_appends(tmp_path, capsys):
+	# The read a commit makes of a compressed file another program wrote again (here with another header, which a strict
+	# store refuses) raised inside the append: the row stayed queued at every commit and was gone at close().
+	p = str(tmp_path / 'strict.tsv.gz')
+	t = _stopped(p, strict=True)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	_touch(p, TSVZ._compressBytes('gzip', b'key\tval\tnote\nb\t2\tn\n'))
+	t['mine'] = ['mine', 'M']
+	t.commitAppendToFile()
+	assert not t.appendQueue and b'mine\tM\n' in gzip.decompress(open(p, 'rb').read())
+
+
+def test_tsvzed_legacy_read_that_fails_keeps_set_defaults_reading_the_next_change_whole(tmp_path, monkeypatch):
+	# A read cleared setDefaults()'s rule (another process's next change is read whole) before it read: one that
+	# failed left memory's defaults on the incremental path.
+	p = str(tmp_path / 'defaults.tsv')
+	_touch(p, b'key\tval\tx\n#_defaults_#\tOLD\tOLDX\na\t1\t2\n')
+	t = _stopped(p, header='key\tval\tx')
+	t.setDefaults(['NEW', 'NEWX'])
+
+	def failing(*args):
+		raise OSError(errno.EIO, 'Input/output error')
+
+	monkeypatch.setattr(TSVZ, '_legacyReadLoop', failing)
+	with pytest.raises(OSError):
+		t._readFrom(open(p, 'rb'), False)
+	assert t._readWhole
 
 
 if __name__ == '__main__':
