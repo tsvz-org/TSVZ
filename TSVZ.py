@@ -5721,6 +5721,7 @@ memoryOnly:{self.memoryOnly}
 				self._failed('append', f"Failed to open file {self._fileName}: {e}", trace=False)
 				self.deSynced = True
 				return self
+			known = None
 			try:
 				known = None if self._changedSince(f) else self._known
 				if known is None and not self._damaged:
@@ -5764,6 +5765,10 @@ memoryOnly:{self.memoryOnly}
 					if self.verbose:
 						self.__teePrintOrNot(f"Records commited to {self._fileName}")
 			except Exception as e:
+				if known is not None and os.fstat(f.fileno()).st_size == known[1]:
+					# The append was cut off again (_appendOpen): the file holds what it did, and its time is this
+					# store's own, not another process's change.
+					self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 				self._failed('append', f"Failed to write at commitAppendToFile to {self._fileName}: {e}")
 				self.deSynced = True
 			finally:

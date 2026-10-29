@@ -7368,10 +7368,12 @@ for i in range(20):
 t.commitAppendToFile()
 t['k1'] = ['k1', 'upd']
 t.commitAppendToFile()
+for i in range(20, 2000):  # queued: the rewrite needs pages the file it writes over does not have
+	t['k%d' % i] = ['k%d' % i, os.urandom(8).hex()]
 rows = dict(t)
 real = TSVZ._writeLines
 
-def filling(*args, **kwargs):  # right after the rewrite emptied the file: another writer fills the disk
+def filling(*args, **kwargs):  # as the rewrite starts: another writer fills the disk
 	with open(filler, 'wb') as f:
 		try:
 			while True:
@@ -8100,10 +8102,12 @@ for i in range(3000):
 t.commitAppendToFile()
 t['k1'] = ['k1', 'upd']
 t.commitAppendToFile()
+for i in range(3000, 6000):  # queued: the rewrite needs pages the file it writes over does not have
+	t['k%d' % i] = ['k%d' % i, '%x' % rng.getrandbits(64)]
 rows = dict(t)
 real = TSVZ._writeLines
 
-def filling(*args, **kwargs):  # once the rewrite emptied the file, another writer fills the disk but for 3 pages
+def filling(*args, **kwargs):  # as the rewrite starts, another writer fills the disk but for 3 pages
 	with open(filler, 'wb', buffering=0) as f:  # unbuffered: nothing is left for its close to fail on
 		try:
 			while True:
