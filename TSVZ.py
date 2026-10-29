@@ -5188,6 +5188,7 @@ memoryOnly:{self.memoryOnly}
 	_unseen = False
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
+	_closing = False  # stopAppendThread() makes its last rewrite: none is tried after it
 
 	def _refuse(self, where, error, explicit=False):
 		"""Remember that a rewrite was refused with ``error``; raise it for an ``explicit`` call, else report it once.
@@ -5203,13 +5204,16 @@ memoryOnly:{self.memoryOnly}
 		if self._refusalReported == message:
 			return
 		self._refusalReported = message
-		if self.rewrite_interval or self.deSynced:  # deSynced: the file is to be made again (a rewrite failed), at any interval
+		if self._closing or not self.appendThread.is_alive():
+			retry = "None is tried again on its own: this store's writer thread is stopping or stopped (close())."
+		elif self.rewrite_interval or self.deSynced:  # deSynced: the file is to be made again, at any interval
 			retry = f"A rewrite is tried again at most every {max(self.rewrite_interval, _REFUSED_RETRY_SECONDS):g} s."
 		else:
 			retry = ("With rewrite_interval=0 none is tried again on its own, only one asked for (mapToFile(), "
-					 "rewrite(force=True), rewrite_on_exit) or one made after another process changes the file.")
-		damaged = (" A rewrite of this object's failed before this one, and the file is damaged: until one gets through, "
-				   "memory holds the only good copy." if self._damaged else "")
+					 "rewrite(force=True), rewrite_on_exit), one made after another process changes the file, or, while "
+					 "damage another writer left is to be made good, one at a later append.")
+		damaged = (" The file is damaged (a rewrite of this object's failed) or was removed: until a rewrite gets "
+				   "through, memory holds the only good copy." if self._damaged else "")
 		self.__teePrintOrNot(f"Refused at {where} to {self._fileName}: {message}. The file is left as it is, and rows that can "
 							 f"be written are still appended.{damaged} It is rewritten once every row can be written: set or delete the row; "
 							 f"a key that cannot be written cannot be deleted either, so for one, edit the file, clear() the store "
@@ -5316,8 +5320,9 @@ memoryOnly:{self.memoryOnly}
 		with self.writeLock:
 			if not os.path.isfile(self._fileName):
 				# Removed (rm, a log rotation): memory is the only copy. Made again whole; what another process writes
-				# there meanwhile is merged, whatever file it is.
-				self.dirty = self._damaged = True
+				# there meanwhile is merged, whatever file it is. deSynced: tried again at every tick if this one is
+				# refused, whatever rewrite_interval is.
+				self.dirty = self.deSynced = self._damaged = True
 				self._known, self._unseen = _KNOWN_NOTHING, False  # merged whatever is there, whichever file it is
 				whole = True
 			try:
@@ -5865,6 +5870,7 @@ memoryOnly:{self.memoryOnly}
 				if self._spec:
 					self._specSync()
 				else:
+					self._closing = True
 					self.rewrite(force=self.rewrite_on_exit)  # Ensure any final sync operations are performed
 			self._finish()
 			if self.verbose:

@@ -7195,6 +7195,7 @@ def test_tsvzed_legacy_refusal_says_what_the_user_can_do_and_when_it_is_tried_ag
 		assert 'tried again at most every 1 s' in message
 	else:
 		assert 'at most every' not in message and 'rewrite_interval=0 none is tried again on its own' in message
+		assert 'while damage another writer left is to be made good, one at a later append' in message
 
 
 def test_unencodable_fffd_error_does_not_advise_replacing_it_with_a_question_mark():
@@ -8011,7 +8012,7 @@ def test_tsvzed_legacy_damaged_store_whose_rewrite_is_refused_still_appends_its_
 	assert _wait_for(lambda: 'x' in t, 5)
 	assert _wait_for(lambda: t._refusedAt is not None, 5)
 	out = capsys.readouterr().out
-	assert 'Refused at' in out and 'still appended. A rewrite of this object\'s failed' in out, out
+	assert 'Refused at' in out and 'still appended. The file is damaged (a rewrite of this object\'s failed)' in out, out
 	t['new'] = ['new', 'N']
 	assert _wait_for(lambda: not t.appendQueue and b'new\tN' in _bytes(p), 5), 'the row was held'
 	t.shutdownEvent.set()
@@ -9834,10 +9835,47 @@ def test_tsvzed_legacy_refusal_of_a_store_to_make_again_says_it_is_tried_again_a
 	t.dirty = t.deSynced = True  # as a rewrite that failed leaves it
 	refused = []
 	assert _wait_for(lambda: refused.extend(_refusals(capsys)) or refused)
+	first = t._refusedAt
+	assert _wait_for(lambda: t._refusedAt != first)  # tried again on its own
 	_stop(t)
 	assert len(refused) == 1 and 'tried again at most every 1 s' in refused[0], refused
 	assert 'none is tried again on its own' not in refused[0]
 	assert _bytes(p) == LEGACY_KEY_ROW
+
+
+@pytest.mark.parametrize('interval', [0, 60])
+def test_tsvzed_legacy_refusal_at_close_says_none_is_tried_again(tmp_path, capsys, interval):
+	# close()'s rewrite is the last: its report promises no retry, at any interval.
+	p = str(tmp_path / 'close.tsv')
+	_touch(p, LEGACY_KEY_ROW)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, rewrite_interval=interval,
+					rewrite_on_exit=True, append_check_delay=60)
+	t.dirty = t.deSynced = True  # as a rewrite that failed leaves it
+	t.close()
+	refused = _refusals(capsys)
+	assert len(refused) == 1 and "None is tried again on its own: this store's writer thread is stopping" in refused[0]
+	assert 'at most every' not in refused[0] and _bytes(p) == LEGACY_KEY_ROW
+
+
+def test_tsvzed_legacy_removed_file_whose_remake_is_refused_is_made_again_once_the_row_is_fixed(tmp_path, capsys):
+	# A removed file is made again from memory at the next write; refused (a row changed in place to text ASCII cannot
+	# hold), it is tried again at every tick at rewrite_interval=0 too, and goes through once the row is fixed. Before,
+	# only the rows set after the removal reached the file, for good.
+	p = str(tmp_path / 'rot.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_interval=0, append_check_delay=0.01)
+	for k in 'abc':
+		t[k] = [k, '1']
+	t.commitAppendToFile()
+	t['a'][1] = 'r\xe9sum\xe9'
+	os.remove(p)
+	t['d'] = ['d', '1']
+	t.commitAppendToFile()
+	assert t._damaged and t.deSynced and 'removed' in ''.join(_refusals(capsys))
+	t['a'] = ['a', '2']
+	assert _wait_for(lambda: not t._damaged, 5)
+	t.close()
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False) == {'a': ['a', '2'], 'b': ['b', '1'], 'c': ['c', '1'],
+																	  'd': ['d', '1']}
 
 
 if __name__ == '__main__':
