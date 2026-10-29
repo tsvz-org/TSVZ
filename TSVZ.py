@@ -1668,12 +1668,14 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 				__teePrintOrNot('Created '+fileName,teeLogger=teeLogger)
 				return True
 			except FileExistsError:
-				return True
+				if not os.path.isdir(fileName):
+					return True  # another writer made it meanwhile
 			except Exception:
-				__teePrintOrNot('Failed to create '+fileName,'error',teeLogger=teeLogger)
-				if strict:
-					raise FileNotFoundError("Failed to create file")
-				return False
+				pass
+			__teePrintOrNot('Failed to create '+fileName,'error',teeLogger=teeLogger)
+			if strict:
+				raise FileNotFoundError("Failed to create file")
+			return False
 		elif strict:
 			__teePrintOrNot('File not found','error',teeLogger=teeLogger)
 			raise FileNotFoundError("File not found")
@@ -5322,6 +5324,9 @@ memoryOnly:{self.memoryOnly}
 			except Exception as e:
 				self._failed('rewrite', f"Failed to open file {self._fileName}: {e}", trace=False)
 				self.deSynced = True
+				if self._remake:  # damage another writer left: memory holds the only good copy (the merge rule)
+					self.dirty = True
+					self._damaged, self._unseen = True, False
 				return False
 			started = False
 			end = None

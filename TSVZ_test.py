@@ -9686,5 +9686,48 @@ def test_a_store_path_that_is_a_link_to_a_missing_file_makes_the_file(tmp_path, 
 	assert os.path.isfile(target) and _back(target) == {'a': ['a', '1']}
 
 
+@pytest.mark.parametrize('how', ['commit', 'rewrite'])
+def test_tsvzed_legacy_remake_that_fails_to_open_keeps_its_rows_when_another_store_remakes_the_file(tmp_path, monkeypatch, capsys, how):
+	# A remake of a damaged file that failed to open it, by a commit or by a rewrite (the tick's, close()'s), left the
+	# store undamaged: another store then made the file again from its memory, and this store's next rewrite read that
+	# file over memory, dropping the row it had appended after the damage, silently. Now the merge rule applies: memory
+	# is kept, and the other store's file is written over with the warning.
+	p = str(tmp_path / 'damaged.tsv.gz')
+	_touch(p, TSVZ._compressBytes('gzip', b'key\tval\na0\tA\n') + b'garbage echoed\n')
+	monkeypatch.setattr(TSVZ, '_FAILURE_RETRY_FIRST', float('inf'))
+	a, b = _stopped(p), _stopped(p)
+	real = TSVZ._openUntruncated
+	tries = []
+
+	def opening(path):
+		if not tries:
+			tries.append(1)
+			raise OSError(errno.EMFILE, 'Too many open files')
+		return real(path)
+
+	monkeypatch.setattr(TSVZ, '_openUntruncated', opening)
+	a['a0'] = ['a0', 'X']
+	if how == 'commit':
+		a.commitAppendToFile()
+	else:
+		a.rewrite(force=True)
+	a['a1'] = ['a1', 'A']
+	a.commitAppendToFile()
+	b['b1'] = ['b1', 'B']
+	b.commitAppendToFile()
+	a.rewrite()
+	assert 'a1' in a and 'a1' in _back(p) and 'Overwriting external changes' in capsys.readouterr().out
+
+
+def test_a_directory_at_the_store_path_is_reported_as_not_made(tmp_path):
+	# Making the file with 'xb' took a directory at the path for a file another writer had made: the read that followed
+	# raised IsADirectoryError even with strict=False, where 4.9 reported that the file could not be made.
+	d = tmp_path / 'store.tsv'
+	d.mkdir()
+	assert TSVZ.readTabularFile(str(d), header='key\tval', createIfNotExist=True, strict=False, verbose=False) == {}
+	with pytest.raises(FileNotFoundError):
+		TSVZ.readTabularFile(str(d), header='key\tval', createIfNotExist=True, strict=True, verbose=False)
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
