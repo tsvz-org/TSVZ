@@ -9776,5 +9776,69 @@ def test_a_link_loop_at_the_store_path_is_reported_as_not_made(tmp_path):
 	assert TSVZ.readTabularFile(a, header='key\tval', createIfNotExist=True, strict=False, verbose=False) == {}
 
 
+def test_two_threads_making_one_file_under_lockf_write_one_header(tmp_path, monkeypatch):
+	# Where the file lock is lockf (macOS), it excludes no thread of the process: a thread that made a new .tsv.gz and
+	# found it empty under its lock wrote the header after another thread's append had written header and row, and the
+	# file read as a damaged stream. Making the file takes the in-process path lock too, as every other writer does.
+	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
+	p = str(tmp_path / 'new.tsv.gz')
+	real, realLock = os.fstat, TSVZ._lockFile
+	maker, appender = [], []
+
+	def locking(f):
+		if getattr(f, 'mode', '') == 'xb':
+			maker.append(f.fileno())
+		return realLock(f)
+
+	def fstat(fd):
+		st = real(fd)
+		if maker and fd == maker[0] and not appender:  # the maker found the file empty under its lock
+			appender.append(threading.Thread(target=TSVZ.appendTabularFile, args=(p, ['a1', 'A']),
+											 kwargs=dict(header='key\tval', verbose=False)))
+			appender[0].start()
+			appender[0].join(0.5)  # it waits for the path lock, or appends now
+		return st
+
+	monkeypatch.setattr(TSVZ, '_lockFile', locking)
+	monkeypatch.setattr(os, 'fstat', fstat)
+	assert TSVZ._verifyFileExistence(p, header=['key', 'val'])
+	monkeypatch.setattr(os, 'fstat', real)
+	appender[0].join()
+	assert _back(p) == {'a1': ['a1', 'A']}
+
+
+def test_a_file_made_new_is_unlocked_from_its_first_byte(tmp_path, monkeypatch):
+	# msvcrt unlocks the bytes from the file's position: the range locked from 0 is unlocked from 0, not from the end
+	# of the header just written.
+	p = str(tmp_path / 'new.tsv')
+	real = TSVZ._unlockFile
+	seen = []
+
+	def unlocking(f):
+		if getattr(f, 'mode', '') == 'xb':
+			seen.append(f.tell())
+		return real(f)
+
+	monkeypatch.setattr(TSVZ, '_unlockFile', unlocking)
+	assert TSVZ._verifyFileExistence(p, header=['key', 'val'])
+	assert seen == [0]
+
+
+def test_tsvzed_legacy_refusal_of_a_store_to_make_again_says_it_is_tried_again_at_interval_0(tmp_path, capsys):
+	# A store whose file is to be made again (a rewrite failed, or it appended after damage) tries a rewrite at every
+	# tick, rewrite_interval=0 or not: a refused one is tried again every second, and the report says so.
+	p = str(tmp_path / 'again.tsv')
+	_touch(p, LEGACY_KEY_ROW)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, rewrite_interval=0,
+					append_check_delay=0.01)
+	t.dirty = t.deSynced = True  # as a rewrite that failed leaves it
+	refused = []
+	assert _wait_for(lambda: refused.extend(_refusals(capsys)) or refused)
+	_stop(t)
+	assert len(refused) == 1 and 'tried again at most every 1 s' in refused[0], refused
+	assert 'none is tried again on its own' not in refused[0]
+	assert _bytes(p) == LEGACY_KEY_ROW
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

@@ -5203,7 +5203,7 @@ memoryOnly:{self.memoryOnly}
 		if self._refusalReported == message:
 			return
 		self._refusalReported = message
-		if self.rewrite_interval:
+		if self.rewrite_interval or self.deSynced:  # deSynced: the file is to be made again (a rewrite failed), at any interval
 			retry = f"A rewrite is tried again at most every {max(self.rewrite_interval, _REFUSED_RETRY_SECONDS):g} s."
 		else:
 			retry = ("With rewrite_interval=0 none is tried again on its own, only one asked for (mapToFile(), "
