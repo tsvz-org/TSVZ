@@ -9887,6 +9887,73 @@ def test_tsvzed_legacy_refusal_of_a_store_whose_writer_thread_is_stopped_says_no
 	assert not t._closing and _bytes(p) == LEGACY_KEY_ROW
 
 
+def test_tsvzed_legacy_refusal_is_not_reported_again_when_only_its_retry_text_would_change(tmp_path, capsys):
+	# At rewrite_interval=0 what follows the report hangs on deSynced, which a whole read clears and an incremental one
+	# leaves: the same refusal is reported once, however often that flips.
+	p = str(tmp_path / 'flip.tsv')
+	_touch(p, LEGACY_KEY_ROW)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, append_check_delay=60)
+	for deSynced in (True, False, True):
+		t.deSynced = deSynced
+		t.rewrite(force=True)
+	t._wake.set()  # out of its 60 s wait
+	_stop(t)
+	assert len(_refusals(capsys)) == 1
+
+
+def test_tsvzed_legacy_refusal_is_reported_again_once_the_file_is_damaged(tmp_path, capsys):
+	# Reported while the file was whole, the same refusal is reported again once the file is damaged (a rewrite that
+	# failed part way, a removed file): memory now holds the only good copy.
+	p = str(tmp_path / 'later.tsv')
+	_touch(p, LEGACY_KEY_ROW)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, rewrite_interval=60,
+					append_check_delay=60)
+	t.rewrite(force=True)
+	t._damaged = t.deSynced = True  # as a rewrite that failed part way leaves it
+	t.rewrite(force=True)
+	t._wake.set()  # out of its 60 s wait
+	_stop(t)
+	refused = _refusals(capsys)
+	assert len(refused) == 2, refused
+	assert 'memory holds the only good copy' not in refused[0] and 'memory holds the only good copy' in refused[1]
+
+
+def test_tsvzed_legacy_close_makes_again_a_file_another_writer_left_damaged_once_the_row_is_fixed(tmp_path):
+	# The commit's remake of a compressed file another writer left damaged is refused (k's value reads as U+FFFD,
+	# which ASCII cannot hold); k, fixed within that second, is appended after the damage, where no read reaches it.
+	# close() tries the remake once more, at rewrite_interval=0 and without rewrite_on_exit.
+	p = str(tmp_path / 'd.tsv.gz')
+	cut = TSVZ._compressBytes('gzip', b'zz\t1\nyy\t1\n' * 50)[:-30]
+	_touch(p, TSVZ._compressBytes('gzip', LEGACY_CELL_ROW) + cut + TSVZ._compressBytes('gzip', b'after\t1\n'))
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	t['a'] = ['a', '1']
+	assert _wait_for(lambda: t._refusedAt is not None)
+	t['k'] = ['k', 'fixed']
+	assert _wait_for(lambda: not t.appendQueue)
+	t.close()
+	back = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
+	assert back['k'] == ['k', 'fixed'] and back['a'] == ['a', '1'] and back['ok'] == ['ok', '2']
+
+
+def test_tsvzed_legacy_rewrite_failure_that_lasts_to_close_is_reported_again(tmp_path, monkeypatch, capsys):
+	# Reported once while the store runs, a failure that lasts to close() is reported once more there, with no promise
+	# of a later report: the damaged file's memory, the only good copy, goes with the store.
+	p = str(tmp_path / 'full.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.01, rewrite_on_load=False)
+	t['k0'] = ['k0', 'v']
+	t['k1'] = ['k1', 'v']
+	t.commitAppendToFile()
+	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tv\n')
+	t.hardMapToFile()
+	assert t._damaged
+	seen = []
+	# the background writer tries it again (mapToFile(), then hardMapToFile()): each failure is reported once
+	assert _wait_for(lambda: seen.append(capsys.readouterr().out) or 'Failed to write at mapToFile()' in ''.join(seen))
+	t.close()
+	out = capsys.readouterr().out
+	assert 'Failed to write at mapToFile()' in out and 'not reported again' not in out, out
+
+
 def test_tsvzed_legacy_close_interrupted_leaves_a_store_that_runs_on(tmp_path, monkeypatch):
 	# A Ctrl-C that stops close()'s wait leaves the store running (its writer finishes the job): it is not closing,
 	# and a later refusal says it is tried again.
