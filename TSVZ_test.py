@@ -6576,14 +6576,15 @@ def _touch_mtime(f):
 
 
 class _FullDiskFile(object):
-	"""A file on a full disk: a write stores its first line and fails, and so does every flush; each changes the time."""
+	"""A file on a full disk: a write stores its first three lines and fails, and so does every flush; each changes the
+	time. (Three, so that a whole rewrite written over the file differs from the old bytes it lands on.)"""
 
 	def __init__(self, f):
 		self._f = f
 
 	def write(self, data):
 		data = bytes(data)
-		self._f.write(data[:data.find(b'\n') + 1])
+		self._f.write(b''.join(data.splitlines(True)[:3]))
 		self._f.flush()
 		_touch_mtime(self._f)
 		raise OSError(errno.ENOSPC, 'No space left on device')
@@ -6661,6 +6662,36 @@ def test_tsvzed_legacy_rewrite_empties_the_file_only_once_it_is_locked(tmp_path,
 	assert not t._externalChange()
 	t.mapToFile()
 	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False) == dict(t)
+
+
+def test_tsvzed_legacy_whole_rewrite_never_shows_a_reader_an_emptied_file(tmp_path, monkeypatch):
+	# A whole rewrite wrote the file from its start after truncating it, so a reader that takes no lock met it empty
+	# (or cut short) until the new content was written. It now writes the new content over the old from offset 0 and
+	# cuts the file to its end last (spec 19.8): at every member it writes, the file is as long as it was.
+	p = str(tmp_path / 'order.tsv.gz')
+	t = _stopped(p)
+	rng = random.Random(3)
+	for i in range(60000):
+		t['k%d' % i] = ['k%d' % i, '%x' % rng.getrandbits(256)]
+	t.commitAppendToFile()
+	for i in range(20000):  # the file keeps their lines and the deletes: it is longer than what a rewrite writes
+		del t['k%d' % i]
+	t.commitAppendToFile()
+	rows = dict(t)
+	old = os.path.getsize(p)
+	seen = []
+	real = TSVZ._compressBytes
+
+	def watching(codec, data):  # called before each member is written
+		seen.append(os.path.getsize(p))
+		return real(codec, data)
+
+	monkeypatch.setattr(TSVZ, '_compressBytes', watching)
+	t.hardMapToFile()
+	monkeypatch.undo()
+	assert len(seen) >= 2, 'the rewrite wrote a single member: the file was not looked at between members'
+	assert seen == [old] * len(seen), (old, seen)
+	assert 0 < os.path.getsize(p) < old and _back(p) == rows and not t.deSynced
 
 
 def test_tsvzed_legacy_append_that_cannot_open_the_file_keeps_the_rows_queued(tmp_path, monkeypatch, capsys):
@@ -7564,11 +7595,12 @@ def test_tsvzed_legacy_write_on_a_file_system_that_cannot_fsync(tmp_path, monkey
 
 
 def _failing_rewrite(monkeypatch, partial=b''):
-	"""Make every rewrite fail with ENOSPC once it has emptied the file and written ``partial`` (as it is)."""
+	"""Make every rewrite fail with ENOSPC, faking one cut short that leaves the file holding exactly ``partial`` (as
+	a full disk leaves it when the new content is longer than the old, and the old bytes after it are gone)."""
 
-	def full(file, *args, **kwargs):  # a whole rewrite, right after the truncate
+	def full(file, *args, **kwargs):  # a whole rewrite, written from the start of the file
 		file.write(partial)
-		file.flush()
+		file.truncate()
 		raise OSError(errno.ENOSPC, 'No space left on device')
 
 	def inplace(self, file, header, lines):
@@ -7582,7 +7614,7 @@ def _failing_rewrite(monkeypatch, partial=b''):
 @pytest.mark.parametrize('suffix', ALL_SUFFIXES)
 @pytest.mark.parametrize('method', ['rewrite', 'hardMapToFile', 'rewrite_on_exit'])
 def test_tsvzed_legacy_change_after_a_failed_rewrite_is_merged_into_memory_not_reloaded_over_it(tmp_path, monkeypatch, capsys, suffix, method):
-	# A rewrite that failed once it had emptied the file (a full disk) leaves memory the only good copy. Another
+	# A rewrite cut short (a full disk) leaves the file damaged and memory the only good copy. Another
 	# process's change then made the next rewrite() reload the damaged file over memory: every row was lost, and
 	# since 73c6b67 the background writer reloads at every tick while the failed rewrite waits. Main 1688d25 lost
 	# them the same way. The rows the other process appended (a set and a delete) are now merged into memory.
@@ -7596,7 +7628,7 @@ def test_tsvzed_legacy_change_after_a_failed_rewrite_is_merged_into_memory_not_r
 		assert not t.rewrite(force=True)
 	monkeypatch.undo()
 	assert dict(t) == rows and t.dirty and t.deSynced
-	assert _back(p) != rows  # damaged: emptied, or half written
+	assert _back(p) != rows  # damaged: half written
 	_append_external(p, _compressedAs(suffix, b'ext\tB\nk2\t\n'))  # space is back; another process sets ext, deletes k2
 	t.checkExternalChanges()  # the next tick
 	if method == 'rewrite_on_exit':
@@ -7632,7 +7664,7 @@ def test_tsvzed_legacy_change_after_a_failed_rewrite_that_cannot_be_merged_keeps
 
 def test_tsvzed_legacy_background_writer_never_reloads_a_file_its_failed_rewrite_damaged(tmp_path, monkeypatch):
 	# 73c6b67: the background writer reloads another process's change at every tick while a failed rewrite waits to
-	# be tried again. When that rewrite had emptied the file, the reload dropped every row; it now merges the change.
+	# be tried again. When that rewrite had left the file empty, the reload dropped every row; it now merges the change.
 	p = str(tmp_path / 'tick.tsv')
 	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.001, teeLogger=_ErrorLog())
 	for i in range(5):
@@ -7640,12 +7672,12 @@ def test_tsvzed_legacy_background_writer_never_reloads_a_file_its_failed_rewrite
 	assert _wait_for(lambda: not t.appendQueue)
 	t['k0'] = ['k0', 'w']
 	rows = dict(t)
-	_failing_rewrite(monkeypatch, partial=b'key\tval\n')  # it emptied the file and wrote the header
+	_failing_rewrite(monkeypatch, partial=b'key\tval\n')  # it left the file holding the header
 	t.deSynced = True  # a tick tries the rewrite, and fails
 	assert _wait_for(lambda: t._failing('rewrite'), 5)
 	for _ in range(10):
 		t._failed('rewrite', 'No space left on device', False)  # it keeps failing: the next try is a minute away
-	assert b'k1' not in _bytes(p), 'the rewrite did not empty the file'  # the queued k0 may be appended to it
+	assert b'k1' not in _bytes(p), 'the rewrite did not damage the file'  # the queued k0 may be appended to it
 	_append_external(p)
 	deadline = time.time() + 0.5
 	while time.time() < deadline:  # many ticks
@@ -7997,7 +8029,9 @@ def _readerStops(codec, data):
 
 class _QuotaFileIO(io.FileIO):
 	"""A file on a disk with room for ``room`` more bytes, as the kernel has it: a write takes what fits (a short
-	write) and the next one fails with ENOSPC. What reached the disk is exactly the first bytes written."""
+	write) and the next one fails with ENOSPC. What reached the disk is exactly the first bytes written; when the write
+	fails, the file is cut there too (as a rewrite of new content longer than the old leaves it, with nothing of the
+	old bytes after it)."""
 
 	def __init__(self, path, room):
 		io.FileIO.__init__(self, os.open(path, os.O_RDWR | os.O_CREAT, 0o666), 'r+', closefd=True)
@@ -8005,6 +8039,7 @@ class _QuotaFileIO(io.FileIO):
 
 	def write(self, data):
 		if not self.room:
+			io.FileIO.truncate(self, self.tell())
 			raise OSError(errno.ENOSPC, 'No space left on device')
 		data = bytes(data)[:self.room]
 		self.room -= len(data)
@@ -8018,7 +8053,8 @@ def test_tsvzed_legacy_compressed_rewrite_cut_short_mid_stream_then_appended_to_
 	# its stream, no end. The damage noted is exactly those bytes, so what another process appends after them (a
 	# whole member of its own) is the tail the merge decodes, from its first byte: a clean member sequence, which
 	# decodes whole, although the file read from its start stops at the cut. (The stub of _failing_rewrite writes
-	# raw bytes as the partial; this is the codec's own writer cut short by the disk.)
+	# raw bytes as the partial; this is the codec's own writer cut short by the disk, and the file cut where it
+	# stopped, as _QuotaFileIO does.)
 	p = str(tmp_path / ('cut.' + suffix))
 	codec = suffix.rpartition('.')[2]
 	t = _stopped(p)
@@ -8191,24 +8227,17 @@ class _FlakyHandler(object):
 
 # --- seventh review round: an append to an empty file, the background writer, a flat snapshot ----------
 @pytest.mark.parametrize('suffix', ALL_SUFFIXES)
-def test_tsvzed_legacy_append_to_an_empty_file_writes_the_header_first(tmp_path, suffix):
-	# A rewrite cut short before its first byte (a full disk, a Ctrl-C) leaves the file empty. Another process's
-	# TSVZed appended its rows there with no header: its own reload took the first one for the header (a mismatch,
-	# the row lost), and the store whose rewrite failed overwrote them, with a warning. Main 1688d25 appended the
-	# same. An append to an empty file now writes the header first, as creating the file does.
+def test_tsvzed_legacy_append_to_an_empty_file_writes_the_header_first(tmp_path, monkeypatch, suffix):
+	# A file left empty (here by a rewrite cut short before its first byte, set up by the stub) holds no header.
+	# Another process's TSVZed appended its rows there with no header: its own reload took the first one for the
+	# header (a mismatch, the row lost), and the store whose rewrite failed overwrote them, with a warning. Main
+	# 1688d25 appended the same. An append to an empty file now writes the header first, as creating the file does.
 	p = str(tmp_path / ('empty.' + suffix))
 	t = _stopped(p)
 	rows = _many(t, 5)
-	real = TSVZ._writeLines
-
-	def full(*args, **kwargs):  # right after the truncate, before the first byte
-		raise OSError(errno.ENOSPC, 'No space left on device')
-
-	TSVZ._writeLines = full
-	try:
-		t.hardMapToFile()
-	finally:
-		TSVZ._writeLines = real
+	_failing_rewrite(monkeypatch)  # leaves the file empty
+	t.hardMapToFile()
+	monkeypatch.undo()
 	assert os.path.getsize(p) == 0 and t._known[1] == 0
 	other = _stopped(p, verbose=False)  # another process's TSVZed on the store
 	other['fromB'] = ['fromB', 'B']
