@@ -125,8 +125,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: when another process removes a `TSVZed`'s `.tsv`-family file, the store's next write
   makes it again from memory, keeping every row. If the removal lands in the microseconds between a rewrite's or
   an append's check that the file exists and its open, the store instead makes a new empty file there and reads
-  it over memory, as it follows a rotation that leaves an empty file in place: memory's rows go, and the store
-  holds only the rows set after it.
+  it over memory, as it follows a rotation that leaves an empty file in place: the rows already in the file go,
+  and the store holds only the rows still waiting to be written when it happened and those set after it.
 - Why: closing the window needs a second way of opening the file, and the failure-injection tests all use that
   open as their seam (a prototype broke 33 of them); the window is microseconds wide and needs a removal by
   another process.

@@ -301,6 +301,13 @@ def _touch(path, content=b''):
 		f.write(content)
 
 
+def _pointer_file(path, content):
+	"""A handler's pointer file as tsvz serve leaves it, writable by its owner only, whatever the umask: a client does
+	not trust one that others can write."""
+	_touch(path, content)
+	os.chmod(path, 0o644)
+
+
 def _tsvz_warnings(capsys):
 	return [line for line in capsys.readouterr().err.splitlines() if line.startswith('TSVZ warning:')]
 
@@ -5065,11 +5072,11 @@ def test_cli_falls_back_to_the_files_when_the_handler_is_gone(tmp_path):
 	import socket
 	p = str(tmp_path / 'f.tsvz')
 	_touch(p, b'a\t1\n')
-	_touch(p + '.serve', 'tsvz-handler\t1\naddress\tunix:{}\nhost\t{}\npid\t1\n'.format(
+	_pointer_file(p + '.serve', 'tsvz-handler\t1\naddress\tunix:{}\nhost\t{}\npid\t1\n'.format(
 		str(tmp_path / 'gone.sock'), socket.gethostname()).encode())
 	status, out, err = _run('get', p, 'a')
 	assert (status, out) == (0, 'a\t1\n') and 'does not answer' in err
-	_touch(p + '.serve', b'tsvz-handler\t1\naddress\tunix:/nowhere\nhost\tsome-other-host\npid\t1\n')
+	_pointer_file(p + '.serve', b'tsvz-handler\t1\naddress\tunix:/nowhere\nhost\tsome-other-host\npid\t1\n')
 	assert _run('get', p, 'a') == (0, 'a\t1\n', '')  # another host's handler: skipped quietly
 	assert _run('stop', p)[0] == 1
 
@@ -5096,7 +5103,7 @@ def test_cli_when_the_handler_drops_the_connection(tmp_path):
 	thread.start()
 	p = str(tmp_path / 'd.tsvz')
 	_touch(p, b'a\t1\n')
-	_touch(p + '.serve', 'tsvz-handler\t1\naddress\tunix:{}\nhost\t{}\npid\t1\n'.format(
+	_pointer_file(p + '.serve', 'tsvz-handler\t1\naddress\tunix:{}\nhost\t{}\npid\t1\n'.format(
 		path, socket.gethostname()).encode())
 	try:
 		status, out, err = _run('read', p)
@@ -7192,7 +7199,7 @@ def test_tsvzed_legacy_refusal_says_what_the_user_can_do_and_when_it_is_tried_ag
 	# errors='replace' would put '?' where the file holds bytes it could not decode: never advised as a way out
 	assert "errors='replace' would write '?'" in message and "or pass errors='replace'" not in message
 	if interval:
-		assert 'tried again after 1 s, the wait doubling at each refusal in a row up to a minute' in message
+		assert 'tried again 1 s from now at the earliest, the wait doubling at each refusal in a row up to a minute' in message
 	else:
 		assert 'doubling' not in message and 'rewrite_interval=0 none is tried again on its own' in message
 		assert 'while damage another writer left is to be made good, one at a later append' in message
@@ -9839,7 +9846,7 @@ def test_tsvzed_legacy_refusal_of_a_store_to_make_again_says_it_is_tried_again_a
 	first = t._refusedAt
 	assert _wait_for(lambda: t._refusedAt != first)  # tried again on its own
 	_stop(t)
-	assert len(refused) == 1 and 'tried again after 1 s, the wait doubling at each refusal in a row up to a minute' in refused[0], refused
+	assert len(refused) == 1 and 'tried again 1 s from now at the earliest, the wait doubling at each refusal in a row up to a minute' in refused[0], refused
 	assert 'none is tried again on its own' not in refused[0]
 	assert _bytes(p) == LEGACY_KEY_ROW
 
@@ -9869,8 +9876,9 @@ def _pending_after(t, clock, seconds):
 		clock[0] -= seconds
 
 
-def test_tsvzed_legacy_refusals_in_a_row_double_the_wait_up_to_a_minute(tmp_path, monkeypatch):
-	t, clock, refuse = _refusing_store(tmp_path, monkeypatch, 'double.tsv')
+@pytest.mark.parametrize('name', ['double.tsv', 'double.tsv.gz'])  # a compressed one counts each refusal once too
+def test_tsvzed_legacy_refusals_in_a_row_double_the_wait_up_to_a_minute(tmp_path, monkeypatch, name):
+	t, clock, refuse = _refusing_store(tmp_path, monkeypatch, name)
 	waits = [1, 2, 4, 8, 16, 32, 60, 60, 60]
 	for wait in waits:
 		refuse()
@@ -9891,11 +9899,31 @@ def test_tsvzed_legacy_refusal_wait_is_never_less_than_rewrite_interval(tmp_path
 	OrderedDict.__setitem__(t, 'a', ['a', BAD_NAME])
 	clock = [1000.0]
 	monkeypatch.setattr(TSVZ, '_specClock', lambda: clock[0])
-	for wait in (3, 3, 4, 8):  # the interval, until the doubling passes it
+	for wait in (3, 6, 12, 24, 48, 60, 60):  # the interval, doubled at each refusal in a row up to a minute
 		with pytest.raises(ValueError):
 			t.mapToFile()
 		assert _pending_after(t, clock, wait - 0.5) and not _pending_after(t, clock, wait + 0.5), wait
 	_stop(t)
+
+
+def test_tsvzed_legacy_close_does_not_wait_out_the_refusal_wait(tmp_path, monkeypatch):
+	# close() of a dirty store (its file neither damaged nor to be made again) whose rewrites were refused four times
+	# in a row, the row fixed in place since: its last try does not wait out the refusal wait (8 s by then), or the
+	# fix would never reach the file.
+	p = str(tmp_path / 'close.tsv')
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, rewrite_interval=0.01, append_check_delay=0.01)
+	_dirty(t)
+	OrderedDict.__setitem__(t, 'a', ['a', BAD_NAME])
+	clock = [1000.0]
+	monkeypatch.setattr(TSVZ, '_specClock', lambda: clock[0])  # stands still: the refusal stays recent
+	for _ in range(4):
+		with pytest.raises(ValueError):
+			t.mapToFile()
+	OrderedDict.__setitem__(t, 'a', ['a', 'fixed'])  # in place: only a rewrite writes it
+	time.sleep(0.05)  # the file has kept still for rewrite_interval
+	assert t._refusalPending()
+	t.close()
+	assert TSVZ.readTabularFile(p, header='key\tval', verbose=False)['a'] == ['a', 'fixed']
 
 
 @pytest.mark.parametrize('how', ['rewrite', 'clear', 'reload'])
@@ -9915,8 +9943,6 @@ def test_tsvzed_legacy_a_rewrite_that_goes_through_starts_the_refusal_wait_again
 		t['a'] = ['a', '1']
 		OrderedDict.__setitem__(t, 'a', ['a', BAD_NAME])
 	else:
-		OrderedDict.__setitem__(t, 'a', ['a', '2'])
-		t.mapToFile()
 		t.reload()
 		OrderedDict.__setitem__(t, 'a', ['a', BAD_NAME])
 	assert not t._refusalPending()
@@ -9954,7 +9980,7 @@ def test_tsvzed_legacy_refusal_reported_while_running_is_reported_again_at_close
 	t.close()
 	refused += _refusals(capsys)
 	assert len(refused) == 2, refused
-	assert 'tried again after 1 s, the wait doubling at each refusal in a row up to a minute' in refused[0] and 'None is tried again on its own' in refused[1]
+	assert 'tried again 1 s from now at the earliest, the wait doubling at each refusal in a row up to a minute' in refused[0] and 'None is tried again on its own' in refused[1]
 	assert 'memory holds the only good copy' in refused[1] and _bytes(p) == LEGACY_KEY_ROW
 
 
