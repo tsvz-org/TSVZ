@@ -4988,7 +4988,7 @@ def test_serve_takes_over_a_stale_pointer(tmp_path, served):
 	"""Review focus 3: the pointer file of a crashed handler is replaced by the next one."""
 	import socket
 	p = str(tmp_path / 's.tsvz')
-	_touch(p + '.serve', 'tsvz-handler\t1\naddress\tunix:/gone\nhost\t{}\npid\t1\n'.format(socket.gethostname()).encode())
+	_pointer_file(p + '.serve', 'tsvz-handler\t1\naddress\tunix:/gone\nhost\t{}\npid\t1\n'.format(socket.gethostname()).encode())
 	assert _run('get', p, 'k')[0] == 1  # no store yet; the stale pointer is reported and skipped
 	handle = served(p)
 	assert TSVZ._serveFind(p)['address'] == handle.address
@@ -9911,11 +9911,16 @@ def test_tsvzed_legacy_close_does_not_wait_out_the_refusal_wait(tmp_path, monkey
 	# in a row, the row fixed in place since: its last try does not wait out the refusal wait (8 s by then), or the
 	# fix would never reach the file.
 	p = str(tmp_path / 'close.tsv')
-	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, rewrite_interval=0.01, append_check_delay=0.01)
-	_dirty(t)
-	OrderedDict.__setitem__(t, 'a', ['a', BAD_NAME])
 	clock = [1000.0]
-	monkeypatch.setattr(TSVZ, '_specClock', lambda: clock[0])  # stands still: the refusal stays recent
+	monkeypatch.setattr(TSVZ, '_specClock', lambda: clock[0])  # stands still: a refusal stays recent
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, rewrite_interval=0.01, append_check_delay=0.01)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	OrderedDict.__setitem__(t, 'a', ['a', BAD_NAME])  # bad before the store is dirty: no background rewrite gets through
+	t['b'] = ['b', '1']
+	t['b'] = ['b', '2']
+	t.commitAppendToFile()
+	assert t.dirty
 	for _ in range(4):
 		with pytest.raises(ValueError):
 			t.mapToFile()
