@@ -815,7 +815,8 @@ def _isSpecPath(path):
 	return _parsePartName(path).ext in STRICT_EXTENSIONS
 
 
-_REFUSED_RETRY_SECONDS = 1.0  # shortest wait before a refused rewrite is tried again
+_REFUSED_RETRY_SECONDS = 1.0  # wait before a refused rewrite is tried again; doubled at each refusal in a row up to
+# _FAILURE_RETRY_MAX (a failed write's back-off, which starts at _FAILURE_RETRY_FIRST)
 _FAILURE_RETRY_FIRST = 0.1  # seconds the background writer waits before it tries a failed legacy write again,
 _FAILURE_RETRY_MAX = 60.0  # doubled at each failure in a row up to this
 
@@ -5188,6 +5189,7 @@ memoryOnly:{self.memoryOnly}
 	_unseen = False
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
+	_refusals = 0  # refusals in a row, since the last _accepted(): each doubles the wait before the next try
 	_closing = False  # stopAppendThread() makes its last rewrite: none is tried after it
 	_exiting = False  # _stopLiveStores stops it at exit: a Ctrl-C there finishes the store, which does not run on
 
@@ -5197,9 +5199,11 @@ memoryOnly:{self.memoryOnly}
 		mapToFile() and hardMapToFile() called by the program raise it, as a refused set does: the caller learns
 		that nothing was written. The rewrites TSVZed makes itself report it, once for each different refusal, and
 		again once the file is damaged or the writer thread stops (close() tries none again), until a rewrite goes
-		through, clear() or reload() (no traceback: it is not a bug).
+		through, clear() or reload() (no traceback: it is not a bug). The wait before a rewrite is tried again starts
+		at a second and doubles at each refusal in a row, up to a minute (_refusalWait()), as a failed write's does.
 		"""
 		self._refusedAt = _specClock()
+		self._refusals += 1
 		if explicit:
 			raise error
 		message = str(error)
@@ -5211,7 +5215,12 @@ memoryOnly:{self.memoryOnly}
 			retry = ("None is tried again on its own: this store's writer thread is stopping or stopped (close(), a "
 					 "forked child).")
 		elif self.rewrite_interval or self.deSynced:  # deSynced: the file is to be made again, at any interval
-			retry = f"A rewrite is tried again at most every {max(self.rewrite_interval, _REFUSED_RETRY_SECONDS):g} s."
+			wait = self._refusalWait()
+			if wait >= _FAILURE_RETRY_MAX:
+				retry = f"A rewrite is tried again every {wait:g} s."
+			else:
+				retry = (f"A rewrite is tried again after {wait:g} s, the wait doubling at each refusal in a row up to a "
+						 f"minute.")
 		else:
 			retry = ("With rewrite_interval=0 none is tried again on its own, only one asked for (mapToFile(), "
 					 "rewrite(force=True), rewrite_on_exit), one made after another process changes the file, or, while "
@@ -5223,13 +5232,22 @@ memoryOnly:{self.memoryOnly}
 							 f"a key that cannot be written cannot be deleted either, so for one, edit the file, clear() the store "
 							 f"or open it with the encoding it was written in. {retry}",'error')
 
+	def _refusalWait(self):
+		"""Seconds to wait after the last refusal before a rewrite is tried again: a second for the first, doubled at
+		each refusal in a row up to a minute, and never less than ``rewrite_interval``."""
+		doublings = min(max(self._refusals - 1, 0), 16)  # capped: a long streak must not overflow the float
+		wait = min(_REFUSED_RETRY_SECONDS * 2 ** doublings, _FAILURE_RETRY_MAX)
+		return max(self.rewrite_interval, wait)
+
 	def _refusalPending(self):
-		"""True while the last rewrite was refused less than ``max(rewrite_interval, 1 s)`` ago."""
-		return self._refusedAt is not None and _specClock() - self._refusedAt < max(self.rewrite_interval, _REFUSED_RETRY_SECONDS)
+		"""True while the last rewrite was refused less than ``_refusalWait()`` ago (a second after the first refusal,
+		twice as long after each further one in a row, up to a minute)."""
+		return self._refusedAt is not None and _specClock() - self._refusedAt < self._refusalWait()
 
 	def _accepted(self):
 		"""A rewrite went through, or memory was emptied or read again: a later refusal is reported again."""
 		self._refusedAt = None
+		self._refusals = 0
 		self._refusalReported = False
 
 	def _failed(self, kind, message, trace=True, retry=True):
@@ -5324,8 +5342,8 @@ memoryOnly:{self.memoryOnly}
 		with self.writeLock:
 			if not os.path.isfile(self._fileName):
 				# Removed (rm, a log rotation): memory is the only copy. Made again whole; what another process writes
-				# there meanwhile is merged, whatever file it is. deSynced: tried again at every tick if this one is
-				# refused, whatever rewrite_interval is.
+				# there meanwhile is merged, whatever file it is. deSynced: tried again, whatever rewrite_interval is, if this
+				# one is refused (after a second, doubling at each refusal in a row up to a minute).
 				self.dirty = self.deSynced = self._damaged = True
 				self._known, self._unseen = _KNOWN_NOTHING, False  # merged whatever is there, whichever file it is
 				whole = True
