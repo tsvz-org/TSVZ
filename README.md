@@ -224,7 +224,8 @@ write (the call still raises `KeyboardInterrupt`). At exit a write in progress i
 finished: a Ctrl-C then says so and keeps waiting, and a second one abandons it. A
 closed store is freed. (`get_file_obj()` and `release_file_obj()`, kept from 3.39,
 hand the locked file to the calling thread.) A file another process removed is made
-again from memory by the store's next write, an append included; while that rewrite
+again from memory by the store's next write, an append included (a removal in the
+microseconds as a write starts is followed as a rotation instead); while that rewrite
 fails or is refused, the rows are appended to a new file there, and memory keeps all of
 them for the rewrite that gets through. A compressed file another writer left damaged
 is made again too (L5: every read stops at the damage, so rows
@@ -235,8 +236,9 @@ the encoding cannot hold), they are appended after it as in 4.9, and the next re
 drops them. Either way `close()` tries the rewrite once more, whatever
 `rewrite_on_exit` says. Appends that do not read the store first (`tsvz set`,
 `appendTabularFile`, `TSVZedLite`, and a `TSVZed` with `monitor_external_changes=False`
-for damage that lands after it loaded the file) still land after it
-([docs/limitations.md](docs/limitations.md)).
+for damage that lands after it loaded the file) still land after it, and so do a
+`TSVZed`'s rows when a writer that takes no lock leaves the damage between the store's read
+and its append ([docs/limitations.md](docs/limitations.md)).
 
 It knows the size and SHA-256 of the bytes it last read or wrote. When another process
 has changed the file, and it is the same file (device and inode) and still begins with

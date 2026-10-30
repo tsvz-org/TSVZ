@@ -106,3 +106,29 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: covering them would make every such append read the whole file first; today `tsvz set` is one append.
 - Revisit when: someone mixes one-shot appends with crashing writers on one compressed file.
 - Approved: 2026-10-29, the user chose "Known limitation (Recommended)".
+
+### A writer that takes no lock and dies mid-write can hide one append's rows
+- Kind: known limitation
+- What the operator sees: another tool that appends to a compressed `.tsv` file without taking the lock, and is
+  killed part way through a write, leaves the file damaged. When that lands in the moment between a `TSVZed`'s
+  locked read of the file and its append (in stress runs, at the last commit of `close()`), the store does not
+  know of the damage yet: the rows of that append land after it, where no read reaches them, and the next store
+  or scrub that makes the file again drops them. It happened in 2 of 400 stress trials. Every TSVZ writer takes
+  the lock, so TSVZ's own writers never cause it.
+- Why: the store reads and appends under its lock; only a writer that ignores the lock (spec §18.6) can land
+  between the two, and the store cannot see that write until it next reads the file.
+- Revisit when: another tool appends to TSVZ's compressed files without the lock and crashes.
+- Approved: 2026-10-29, the user chose "Record both (Recommended)".
+
+### A file removed just as a write starts is followed as if rotated
+- Kind: known limitation
+- What the operator sees: when another process removes a `TSVZed`'s `.tsv`-family file, the store's next write
+  makes it again from memory, keeping every row. If the removal lands in the microseconds between a rewrite's or
+  an append's check that the file exists and its open, the store instead makes a new empty file there and reads
+  it over memory, as it follows a rotation that leaves an empty file in place: memory's rows go, and the store
+  holds only the rows set after it.
+- Why: closing the window needs a second way of opening the file, and the failure-injection tests all use that
+  open as their seam (a prototype broke 33 of them); the window is microseconds wide and needs a removal by
+  another process.
+- Revisit when: someone removes or rotates store files while they are written and loses rows this way.
+- Approved: 2026-10-29, the user chose "Record both (Recommended)".
