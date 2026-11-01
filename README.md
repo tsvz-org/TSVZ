@@ -292,8 +292,7 @@ damaged file, as asked, and warns.
   merged into it (Fault tolerance).
 - **`.tsvz` stores** see another process's append made right after their load, a
   commit or a clear (4.9 missed it until the next change), keep the rows set while
-  they reload, refuse `#_snapshot_#` (spec §19.10.2), and raise a strict header
-  mismatch at the first read.
+  they reload, and raise a strict header mismatch at the first read.
 - **`.tsv` files:** an append to an existing empty file writes the header first, and
   reading one gives an empty store; see L8 to L14 for the rest.
 - **`tsvz`** runs every operation through the engine `tsvz serve` uses, with the same
@@ -302,8 +301,15 @@ damaged file, as asked, and warns.
   file. The 3.39 warning that a file name does not end in `.tsv` is printed only
   when a command creates such a file, and a write that cannot be made reports the
   operating system's error.
-- **macOS and other systems that lock with `lockf`:** 4.9's close gate is gone, so
-  a read in another thread of the process can drop a write's lock
+- **Running programs keep 4.9.** Long-running programs that import TSVZ, and running
+  `tsvz serve` handlers, keep 4.9 until they are restarted. 5.0's `tsvz stop` cannot
+  stop a 4.9 handler of a `.tsv` (or other tab- or NUL-delimited) file: 4.9 wrote the
+  delimiter into the pointer file's `x-delimiter` as `<sep>`, which 5.0 decodes to the
+  TAB or NUL itself and refuses as a control character. Send that handler SIGTERM
+  instead: its pid is on the `pid` line of its pointer file (`STORE.serve`), and it
+  finishes its writes and exits.
+- **macOS and other systems that lock with `lockf`:** as in 4.9, a read in another
+  thread of the process can still drop a write's lock
   ([docs/limitations.md](docs/limitations.md)).
 
 ## Breaking changes from 3.39
