@@ -139,7 +139,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: deferred
 - What the operator sees: a scrub (`scrubTabularFile`, `tsvz scrub`) of a `.tsv`-family file whose rows were all
   deleted leaves the file as it is: its deletion lines stay, so it does not shrink. Reads are right (an empty
-  store). 3.39 and 5.0 do the same.
+  store). 3.39 and 5.0 do the same. A `.tsvz` store's scrub does compact such a store.
 - Why: the legacy scrub writes nothing when its read finds no live row; making it write the header and the file's
   defaults lines alone needs its own tests. Found in the 5.1 review.
 - Revisit when: the next TSVZ round.
