@@ -275,8 +275,8 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 5.1 writes. Most of the changes are in scrub and clear.
 
 - **Scrub and clear of a `.tsv` write over the file.** `scrubTabularFile`,
-  `clearTabularFile`, `tsvz scrub` and `tsvz clear` (on the command line, through
-  `TSVZClient` or a `tsvz serve` handler) and `TSVZedLite.clear_file()` of a
+  `clearTabularFile`, `tsvz scrub` and `tsvz clear` (on the command line or through a
+  `tsvz serve` handler), `TSVZClient.clear()` and `TSVZedLite.clear_file()` of a
   `.tsv`-family file write the new content over the file and then cut it, as
   `TSVZed`'s rewrites do, so a reader that takes no lock never meets the file emptied.
   They take the file's lock, so they wait while another writer holds it. 5.0 emptied
@@ -294,27 +294,30 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   of the read are written after the rows: the last non-empty defaults line, its empty
   cells filled from the line before it as a reader fills them. An empty defaults line
   that was read (it turns defaults off) is written before the rows, padded to their
-  width. Every row reads as it did. The defaults a caller passes to the scrub are
-  neither written nor changed. 5.0 and 3.39 dropped the lines, so rows appended later
-  got no defaults.
-- **The header stays on line 1.** A scrub given no header (`tsvz scrub` of a `.tsv`
-  without `--x-header`, `scrubTabularFile(path)`) and a `TSVZed` given none, of a file
+  width. Every row reads as it did to a reader given the scrub's defaults and
+  `strict`. Defaults a caller passes still fill the rows' empty cells, as in 5.0, but
+  are not written as a defaults line, and the caller's list is not changed. 5.0 and
+  3.39 dropped the lines, so rows appended later got no defaults.
+- **The header stays on line 1.** A scrub given no header (`tsvz scrub` of a `.tsv`,
+  `scrubTabularFile(path)`) and a `TSVZed` given none, of a file
   that has a header line, keep that line first, with a `TSVZed`'s defaults line right
   after it. 5.0 and 3.39 put an empty line in front of it, so a reader given the header
   read the header as a row. A header-less file keeps the empty first line it begins
   with, and new files and clears given no header still get one, as in 5.0.
-- **Large files and interrupts.** A scrub or clear of either dialect reads only the
-  bytes it overwrites; 5.0's of a `.tsvz` read the whole part into memory first (a
-  clear of a multi-GB part allocated all of it). An interrupt before the file is cut to
-  its new length puts the old bytes back; once the cut is made the rewrite is done and
-  the new content stays (5.0 put the old content of a `.tsvz` part back).
+- **Interrupts.** A scrub or clear of either dialect keeps a copy of only the bytes it
+  overwrites, to put back if it is interrupted before the file is cut to its new
+  length; once the cut is made the rewrite is done and the new content stays. 5.0 kept
+  a copy of the whole `.tsvz` part and put it all back. (A scrub still reads the whole
+  store, and a `.tsvz` clear reads it too, to keep its markers.)
 - **A compressed store cleared to nothing is one empty stream.** A `.tsvz.gz` (or
   `.bz2`, `.xz`, `.zst`) cleared or scrubbed to nothing holds one empty compressed
   stream, which `bzcat`, `xzcat` and Python's `bz2` and `lzma` can read; 5.0 left 0
-  bytes. Clear and scrub of a 0-byte compressed `.tsv` file (another tool's) read it
-  as empty instead of raising.
+  bytes. A clear that checks the header (`verifyHeader=True`, `tsvz clear --x-header H
+  --x-strict`) of a 0-byte `.tsv.bz2` or `.tsv.xz` (another tool's) reads it as empty
+  instead of raising.
 - **`tsvz --help`** says what `clear` keeps: a `.tsvz` its header and markers, a
-  `.tsv` the `--x-header` it is given (with `--x-strict`, the file's own header line).
+  `.tsv` the `--x-header` it is given. (With `--x-strict` too, a `.tsv` clear keeps the
+  file's own header line.)
   `TSVZed`'s message for a refused rewrite lists `hardMapToFile()` among the rewrites
   a program asks for.
 - **Running programs keep 5.0** until they are restarted: long-running programs that
