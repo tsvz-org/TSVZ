@@ -2059,13 +2059,15 @@ def _legacyFirstLine(fileName, encoding, teeLogger):
 		return file.readline().decode(encoding=encoding,errors='replace')
 
 def _legacyKeptHeader(fileName, header, verifyHeader, verbose, teeLogger, encoding, strict, delimiter, warn=True):
-	"""The header ``clearTabularFile`` leaves in the file: the file's own when a header is given and ``verifyHeader``, else
-	``header``; [] when it has no cell: the file is then left with no header line."""
+	"""The header ``clearTabularFile`` leaves in the file: the file's own first line when a header is given and
+	``verifyHeader`` (the header given for a file that holds nothing), else ``header``; [] when it has no cell: the file
+	is then left with no header line."""
 	if any(header) and verifyHeader:
 		line = _legacyFirstLine(fileName, encoding, teeLogger)
-		if warn and not _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
-			__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
-		header = _formatHeader(line,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
+		if line:  # a file that holds nothing ('') is an empty store with any header, as the readers take it: the one given is kept
+			if warn and not _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
+				__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
+			header = _formatHeader(line,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
 	return header if any(header) else []  # no header: no header line (3.39 wrote an empty one, read back as a row)
 
 

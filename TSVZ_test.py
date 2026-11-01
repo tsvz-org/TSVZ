@@ -10468,8 +10468,8 @@ def test_legacy_clear_and_scrub_of_a_0_byte_compressed_file_do_not_raise(tmp_pat
 	p = str(tmp_path / ('z' + _suffix_or_skip(suffix)))
 	_touch(p)
 	assert TSVZ.scrubTabularFile(p, header='id\tv') == {}
-	TSVZ.clearTabularFile(p, header='id\tv', verifyHeader=True)  # (the file's own first line is what is kept)
-	assert TSVZ.readTabularFile(p) == {}
+	TSVZ.clearTabularFile(p, header='id\tv', verifyHeader=True)  # (an empty store with that header: the one given is written)
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=True) == {}
 	_touch(p)
 	TSVZ.appendLinesTabularFile(p, [['a', '1']], header='id\tv')  # (formats the row against the file's first line)
 	assert TSVZ.readTabularFile(p, header='id\tv') == {'a': ['a', '1']}
@@ -11086,6 +11086,53 @@ def test_legacy_scrub_pads_a_shorter_later_defaults_line_to_the_width_of_the_ear
 	assert list(t.defaults) == before
 	t.close()
 	assert _bytes(p).endswith(b'#_defaults_#\tZ\tY\n')
+
+
+# ==========================================================================
+# 5.1 follow-up: a header-checking clear of a file that holds nothing keeps the header given
+# ==========================================================================
+@pytest.mark.parametrize('suffix', _OVERWRITE_SUFFIXES)
+@pytest.mark.parametrize('how', ['library', 'cli'])
+def test_header_checking_clear_of_an_empty_file_writes_the_header_given_and_warns_of_nothing(tmp_path, capsys, suffix, how):
+	# A file with no byte (or a compressed one with only empty streams) reads as an empty store with any header
+	# (README L9). The clear took its empty first line for the file's own header: it wrote a blank line and warned of
+	# a mismatch, and a strict TSVZed given the header then refused the file.
+	p = str(tmp_path / ('e' + _suffix_or_skip(suffix)))
+	_touch(p)
+	if how == 'library':
+		TSVZ.clearTabularFile(p, header='id\tv', verifyHeader=True)
+		status = 0
+	else:
+		status = _run('clear', p, '--x-header', 'id\\tv', '--x-strict')[0]
+	out = capsys.readouterr().out
+	assert status == 0 and 'mismatch' not in out.lower()
+	with TSVZ.openFileAsCompressed(p, 'rb') as f:
+		assert f.read() == b'id\tv\n'
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=True) == {}
+	t = TSVZ.TSVZed(p, header='id\tv', strict=True, verbose=False, rewrite_on_load=False, rewrite_on_exit=False)
+	assert dict(t) == {}
+	t['a'] = ['a', '1']
+	t.close()
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=True) == {'a': ['a', '1']}
+
+
+@pytest.mark.parametrize('suffix', _OVERWRITE_SUFFIXES)
+def test_header_checking_scrub_of_an_empty_file_changes_nothing(tmp_path, capsys, suffix):
+	p = str(tmp_path / ('s' + _suffix_or_skip(suffix)))
+	_touch(p)
+	assert TSVZ.scrubTabularFile(p, header='id\tv') == {}
+	assert 'mismatch' not in capsys.readouterr().out.lower()
+	assert os.path.getsize(p) == 0
+
+
+def test_header_checking_clear_still_keeps_the_files_own_header(tmp_path, capsys):
+	p = str(tmp_path / 'k.tsv')
+	_touch(p, b'id\tv\na\t1\n')
+	TSVZ.clearTabularFile(p, header='key\tvalue', verifyHeader=True)
+	assert _bytes(p) == b'id\tv\n' and 'Header mismatch' in capsys.readouterr().out  # (a header the file has, not the given)
+	_touch(p, b'\na\t1\n')  # a first line that is empty is the file's own: no header to keep
+	TSVZ.clearTabularFile(p, header='key\tvalue', verifyHeader=True)
+	assert _bytes(p) == b'\n'
 
 
 if __name__ == '__main__':
