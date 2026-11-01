@@ -319,14 +319,17 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   tool's), takes it for an empty store with that header, as every reader does (L9), and
   writes H without a "Header mismatch" warning. 5.0 wrote an empty line and warned of a
   mismatch, so a strict `TSVZed` given H then refused the file, and raised on a 0-byte
-  `.bz2` or `.xz`.
+  `.bz2`, `.xz` or `.zst`.
 - **`tsvz --help`** says what `clear` keeps: a `.tsvz` its header and markers, a
   `.tsv` the `--x-header` it is given. (With `--x-strict` too, a `.tsv` clear keeps the
   file's own header line.)
   `TSVZed`'s message for a refused rewrite lists `hardMapToFile()` among the rewrites
   a program asks for.
-- **Known: a scrub of a `.tsv` whose rows were all deleted does not compact it.** It
-  leaves the file as it is, deletion lines included; reads are right, as in 3.39 and 5.0
+- **Known: a scrub of a `.tsv` whose rows were all deleted does not compact it** when
+  the scrub is given the file's header (`scrubTabularFile(path, header=H)`) or the file
+  has no header line: it leaves the file as it is, deletion lines included; reads are
+  right, as in 3.39 and 5.0. (`tsvz scrub` of a headed file reads the header line as a
+  row, so it does compact it.)
   ([limitations](docs/limitations.md#a-scrub-of-a-tsv-whose-rows-were-all-deleted-does-not-compact-it)).
 - **Known: a scrub run with other defaults than the store's program can change how
   early rows read.** In a `.tsv` with an empty `#_defaults_#` line and rows with empty
