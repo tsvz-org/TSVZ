@@ -274,7 +274,9 @@ damaged file, as asked, and warns.
 - **Writes refuse text they cannot encode.** A key, value, header, defaults line or
   marker the file's encoding cannot hold (UTF-8 for `.tsvz`; `encoding=` for a
   `.tsv`), such as the lone surrogate `os.fsdecode` gives for a non-UTF-8 file name,
-  raises `TSVZEncodeError` (a `ValueError`) and writes nothing; 4.9 stored `?`.
+  raises `TSVZEncodeError` (a `ValueError`) and writes nothing; 4.9 stored `?` (its
+  `tsvz` stored U+FFFD for a non-UTF-8 argument, and its `.tsvz` file functions raised
+  `UnicodeEncodeError`).
   `errors='replace'` brings `?` back. Under a non-UTF-8 `encoding=`, a key read as
   U+FFFD cannot be deleted or updated. `tsvz` exits 1 with the message. See Fault
   tolerance.
@@ -304,10 +306,10 @@ damaged file, as asked, and warns.
 - **Running programs keep 4.9.** Long-running programs that import TSVZ, and running
   `tsvz serve` handlers, keep 4.9 until they are restarted. 5.0's `tsvz stop` cannot
   stop a 4.9 handler of a `.tsv` (or other tab- or NUL-delimited) file: 4.9 wrote the
-  delimiter into the pointer file's `x-delimiter` as `<sep>`, which 5.0 decodes to the
-  TAB or NUL itself and refuses as a control character. Send that handler SIGTERM
-  instead: its pid is on the `pid` line of its pointer file (`STORE.serve`), and it
-  finishes its writes and exits.
+  delimiter into the pointer file's `x-delimiter` as `<sep>` (a NUL as `<NUL>`), which
+  5.0 decodes to the TAB or NUL itself and refuses as a control character. Send that
+  handler SIGTERM instead: its pid is on the `pid` line of its pointer file
+  (`STORE.serve`), and it finishes its writes and exits.
 - **macOS and other systems that lock with `lockf`:** as in 4.9, a read in another
   thread of the process can still drop a write's lock
   ([docs/limitations.md](docs/limitations.md)).
