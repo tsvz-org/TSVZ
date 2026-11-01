@@ -134,3 +134,26 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   another process.
 - Revisit when: someone removes or rotates store files while they are written and loses rows this way.
 - Approved: 2026-10-29, the user chose "Record both (Recommended)".
+
+### A scrub of a .tsv whose rows were all deleted does not compact it
+- Kind: deferred
+- What the operator sees: a scrub (`scrubTabularFile`, `tsvz scrub`) of a `.tsv`-family file whose rows were all
+  deleted leaves the file as it is: its deletion lines stay, so it does not shrink. Reads are right (an empty
+  store). 3.39 and 5.0 do the same.
+- Why: the legacy scrub writes nothing when its read finds no live row; making it write the header and the file's
+  defaults lines alone needs its own tests. Found in the 5.1 review.
+- Revisit when: the next TSVZ round.
+- Approved: 2026-11-01, the user chose "Defer (Recommended)".
+
+### A scrub run with other defaults than the store's program can change how early rows read
+- Kind: known limitation
+- What the operator sees: when a `.tsv` holds an empty `#_defaults_#` line (one that turns defaults off) and rows
+  with empty cells before any defaults line, a scrub run with other defaults than the program that reads the store
+  (for example `tsvz scrub f.tsv`, with none, for a program that opens it with constructor defaults) can change how
+  those rows read for that program: before the scrub its own defaults fill their empty cells; after it, the reset
+  line the scrub writes before the rows keeps them empty.
+- Why: a scrub fills rows with its own caller's defaults and does not keep where each row sat relative to a reset;
+  keeping that exactly would mean recording, per row, whether it was read under a reset. Run the scrub with the
+  defaults the store's program uses.
+- Revisit when: an operator hits it.
+- Approved: 2026-11-01, the user chose "Known limitation (Recommended)".

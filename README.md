@@ -312,14 +312,28 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 - **A compressed store cleared to nothing is one empty stream.** A `.tsvz.gz` (or
   `.bz2`, `.xz`, `.zst`) cleared or scrubbed to nothing holds one empty compressed
   stream, which `bzcat`, `xzcat` and Python's `bz2` and `lzma` can read; 5.0 left 0
-  bytes. A clear that checks the header (`verifyHeader=True`, `tsvz clear --x-header H
-  --x-strict`) of a 0-byte `.tsv.bz2` or `.tsv.xz` (another tool's) reads it as empty
-  instead of raising.
+  bytes.
+- **A header-checking clear of an empty file writes the header it was given.** A clear
+  that checks the header (`verifyHeader=True`, `tsvz clear --x-header H --x-strict`) of a
+  0-byte `.tsv`, or of a compressed file with no byte or only empty streams (another
+  tool's), takes it for an empty store with that header, as every reader does (L9), and
+  writes H without a "Header mismatch" warning. 5.0 wrote an empty line and warned of a
+  mismatch, so a strict `TSVZed` given H then refused the file, and raised on a 0-byte
+  `.bz2` or `.xz`.
 - **`tsvz --help`** says what `clear` keeps: a `.tsvz` its header and markers, a
   `.tsv` the `--x-header` it is given. (With `--x-strict` too, a `.tsv` clear keeps the
   file's own header line.)
   `TSVZed`'s message for a refused rewrite lists `hardMapToFile()` among the rewrites
   a program asks for.
+- **Known: a scrub of a `.tsv` whose rows were all deleted does not compact it.** It
+  leaves the file as it is, deletion lines included; reads are right, as in 3.39 and 5.0
+  ([limitations](docs/limitations.md#a-scrub-of-a-tsv-whose-rows-were-all-deleted-does-not-compact-it)).
+- **Known: a scrub run with other defaults than the store's program can change how
+  early rows read.** In a `.tsv` with an empty `#_defaults_#` line and rows with empty
+  cells before any defaults line, the reset line the scrub writes before the rows keeps
+  those cells empty for a program that opens the store with its own defaults; run the
+  scrub with the defaults that program uses
+  ([limitations](docs/limitations.md#a-scrub-run-with-other-defaults-than-the-stores-program-can-change-how-early-rows-read)).
 - **Running programs keep 5.0** until they are restarted: long-running programs that
   import TSVZ, and running `tsvz serve` handlers.
 
