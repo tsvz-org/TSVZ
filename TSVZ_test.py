@@ -267,8 +267,8 @@ def test_basic_roundtrip():
 
 
 def test_version():
-	assert TSVZ.version == '5.0'
-	assert TSVZ.__version__ == '5.0'
+	assert TSVZ.version == '5.1'
+	assert TSVZ.__version__ == '5.1'
 	assert not hasattr(TSVZ, 'WalStore')
 
 

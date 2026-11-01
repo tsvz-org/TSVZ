@@ -61,12 +61,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: while another process rewrites a `.tsv`-family file, a `TSVZed`'s background read takes
   no lock and can see it part way: a key whose line the rewrite has moved may be missing for a moment (an in-place
   rewrite of a plain `.tsv` writes its lines one by one), and a writer that empties the file first (3.39, 4.9,
-  another tool) shows it empty. A `del` of a key in that moment finds no key and writes nothing, so the key is live
-  again once the rewrite ends. 4.9 and main do the same. A 5.0 `TSVZed`'s own whole rewrites write over the file
-  and then cut it, and so do `scrubTabularFile` and `clearTabularFile` (and `tsvz scrub` and `tsvz clear`) of a
-  `.tsv`-family file, so a reader never meets them emptied (it can meet, for a moment, a key's old row after its
-  new one), and a read cut short by damage is read again under the lock when the store can open the file for
-  writing.
+  5.0's scrub and clear, another tool) shows it empty. A `del` of a key in that moment finds no key and writes
+  nothing, so the key is live again once the rewrite ends. 4.9 and main do the same. A `TSVZed`'s own whole
+  rewrites (from 5.0) write over the file and then cut it, and so do (from 5.1) `scrubTabularFile`,
+  `clearTabularFile`, `tsvz scrub`, `tsvz clear` and `TSVZedLite.clear_file()` of a `.tsv`-family file, so a
+  reader never meets them emptied (it can meet, for a moment, a key's old row after its new one), and a read cut
+  short by damage is read again under the lock when the store can open the file for writing.
 - Why: the fix is for reads to take a shared lock and wait out another process's rewrite, which changes how every
   read locks (spec §18.6 asks for such a lock); that is a design change of its own.
 - Revisit when: someone runs two writers that both rewrite the same file.

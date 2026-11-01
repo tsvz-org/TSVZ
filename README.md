@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.0**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.1**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -269,6 +269,57 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
+## Upgrading to 5.1 from 5.0
+
+The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family file
+5.1 writes. Most of the changes are in scrub and clear.
+
+- **Scrub and clear of a `.tsv` write over the file.** `scrubTabularFile`,
+  `clearTabularFile`, `tsvz scrub` and `tsvz clear` (on the command line, through
+  `TSVZClient` or a `tsvz serve` handler) and `TSVZedLite.clear_file()` of a
+  `.tsv`-family file write the new content over the file and then cut it, as
+  `TSVZed`'s rewrites do, so a reader that takes no lock never meets the file emptied.
+  They take the file's lock, so they wait while another writer holds it. 5.0 emptied
+  the file first, with no lock (`TSVZedLite` truncated its own descriptor).
+- **A scrub keeps another process's rows.** A scrub of a `.tsv` writes only if the
+  file is still what its read saw. Otherwise it reads again, up to three times, and if
+  the file kept changing it writes nothing and warns: `tsvz scrub` exits 1 (`scrub
+  refused; nothing was written`), as for a `.tsvz` (C6), and a handler answers refused.
+  `scrubTabularFile` still returns the rows it read. 5.0 wrote over a row appended
+  after its read.
+- **`scrubTabularFile(lastLineOnly=True)` is a read.** It returns the last row and
+  writes nothing, as for a `.tsvz`. 5.0 and 3.39 wrote that row back as deletion lines
+  (`id\tv\na\t\n3\t\n`), and the store was gone.
+- **A scrub keeps the file's `#_defaults_#` lines.** The defaults in effect at the end
+  of the read are written after the rows: the last non-empty defaults line, its empty
+  cells filled from the line before it as a reader fills them. An empty defaults line
+  that was read (it turns defaults off) is written before the rows, padded to their
+  width. Every row reads as it did. The defaults a caller passes to the scrub are
+  neither written nor changed. 5.0 and 3.39 dropped the lines, so rows appended later
+  got no defaults.
+- **The header stays on line 1.** A scrub given no header (`tsvz scrub` of a `.tsv`
+  without `--x-header`, `scrubTabularFile(path)`) and a `TSVZed` given none, of a file
+  that has a header line, keep that line first, with a `TSVZed`'s defaults line right
+  after it. 5.0 and 3.39 put an empty line in front of it, so a reader given the header
+  read the header as a row. A header-less file keeps the empty first line it begins
+  with, and new files and clears given no header still get one, as in 5.0.
+- **Large files and interrupts.** A scrub or clear of either dialect reads only the
+  bytes it overwrites; 5.0's of a `.tsvz` read the whole part into memory first (a
+  clear of a multi-GB part allocated all of it). An interrupt before the file is cut to
+  its new length puts the old bytes back; once the cut is made the rewrite is done and
+  the new content stays (5.0 put the old content of a `.tsvz` part back).
+- **A compressed store cleared to nothing is one empty stream.** A `.tsvz.gz` (or
+  `.bz2`, `.xz`, `.zst`) cleared or scrubbed to nothing holds one empty compressed
+  stream, which `bzcat`, `xzcat` and Python's `bz2` and `lzma` can read; 5.0 left 0
+  bytes. Clear and scrub of a 0-byte compressed `.tsv` file (another tool's) read it
+  as empty instead of raising.
+- **`tsvz --help`** says what `clear` keeps: a `.tsvz` its header and markers, a
+  `.tsv` the `--x-header` it is given (with `--x-strict`, the file's own header line).
+  `TSVZed`'s message for a refused rewrite lists `hardMapToFile()` among the rewrites
+  a program asks for.
+- **Running programs keep 5.0** until they are restarted: long-running programs that
+  import TSVZ, and running `tsvz serve` handlers.
+
 ## Upgrading to 5.0 from 4.9
 
 - **Writes refuse text they cannot encode.** A key, value, header, defaults line or
@@ -334,6 +385,11 @@ damaged file, as asked, and warns.
 | L12 | A rewrite of a file whose header line has no newline writes the rows on lines of their own; 3.39 wrote the first one onto the header line. |
 | L13 | A compressed file is rewritten in members of at most 1 MiB, as appends already were: the bytes differ, the rows read are the same, and 3.39 reads them. |
 | L14 | `TSVZed` opening a compressed file in a codec this Python lacks (zstd before Python 3.14) raises `ImportError` instead of reading the compressed bytes as text. |
+| L15 | `scrubTabularFile`, `clearTabularFile`, `tsvz scrub`, `tsvz clear` and `TSVZedLite.clear_file()` write the new content over the file and then cut it, under the file's lock; 3.39 emptied the file first, with no lock, so a reader could meet it empty. |
+| L16 | A scrub writes only if the file is still what its read saw: it reads again up to three times, then writes nothing, with a warning (`tsvz scrub` exits 1, C6); 3.39 wrote over rows appended after its read. |
+| L17 | `scrubTabularFile(lastLineOnly=True)` returns the last row and writes nothing; 3.39 wrote that row back as deletion lines, and the store was gone. |
+| L18 | A scrub keeps the file's `#_defaults_#` lines (an empty one before the rows, the defaults in effect after them), so every row reads as it did; 3.39 dropped them, so rows appended later got no defaults. |
+| L19 | A scrub given no header, and a `TSVZed` given none, keep a file's header line first; 3.39 put an empty line in front of it, and a reader given the header then read the header as a row. |
 
 ### `.tsvz`, `.csvz`, `.nsvz`, `.psvz`: now tsvz-spec-v1
 
