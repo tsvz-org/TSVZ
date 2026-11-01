@@ -203,8 +203,9 @@ class _RewriteRows(object):
 	in place after the snapshot is written as it was then.
 	"""
 
-	def __init__(self, first, values, delimiter, encoding, errors, header):
+	def __init__(self, first, values, delimiter, encoding, errors, header, later=()):
 		self.first = first
+		self.later = later  # lines written after the first row (or alone, when there is none)
 		cells = []
 		lengths = array.array('I')
 		extend, append = cells.extend, lengths.append
@@ -249,8 +250,14 @@ class _RewriteRows(object):
 		for line in self.first:
 			yield line
 		encode, delimiter = self.encode, self.delimiter
+		later = self.later
 		for row in self._rows():
 			yield encode(_sanitize(row,delimiter=delimiter))
+			for line in later:
+				yield line
+			later = ()
+		for line in later:
+			yield line
 
 
 def _fileIdentity(st):
@@ -1330,6 +1337,7 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,def
 	lineCache = _unsanitize(line.split(delimiter),delimiter)
 	if not lineCache or not lineCache[0]:
 		return correctColumnNum , []
+	asRead = lineCache[:] if lineCache[0] == DEFAULTS_INDICATOR_KEY else None  # (filled and fitted to the columns below)
 	if correctColumnNum == -1:
 		if defaults and len(defaults) > 1:
 			correctColumnNum = len(defaults)
@@ -1345,6 +1353,9 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,def
 			# 	__teePrintOrNot(f"Empty defaults line found: {line}",teeLogger=teeLogger)
 			defaults.clear()
 			defaults[:] = [DEFAULTS_INDICATOR_KEY]
+			if isinstance(defaults, _DefaultsList):
+				defaults.line = [DEFAULTS_INDICATOR_KEY]
+				defaults.reset = True
 		else:
 			# if verbose:
 			# 	__teePrintOrNot(f"Key {lineCache[0]} found with empty value, deleting such key's representaion",teeLogger=teeLogger)
@@ -1373,6 +1384,8 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,def
 		# if verbose:
 		# 	__teePrintOrNot(f"Defaults line found: {line}",teeLogger=teeLogger)
 		defaults[:] = lineCache
+		if isinstance(defaults, _DefaultsList):
+			defaults.line = _chainFill(asRead, defaults.line)
 		return correctColumnNum , []
 	taskDic[lineCache[0]] = lineCache if not storeOffset else offset
 	# if verbose:
@@ -1995,9 +2008,14 @@ def _legacyRows(linesToAppend, delimiter):
 	return formatedLines
 
 
-def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding, strict, delimiter,
-						 errors='strict', rows=None, assume=None):
-	"""Format rows as 3.39's ``appendLinesTabularFile`` writes them; return ``(payload, count)``.
+def _legacyFormatPayload(*args, **kwargs):
+	"""Format rows as 3.39's ``appendLinesTabularFile`` writes them; return ``(payload, count)`` (_legacyFormatRows)."""
+	return _legacyFormatRows(*args, **kwargs)[:2]
+
+def _legacyFormatRows(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding, strict, delimiter,
+					  errors='strict', rows=None, assume=None):
+	"""Format rows as 3.39's ``appendLinesTabularFile`` writes them; return ``(payload, count, columns)``: ``columns``
+	is the column count they are padded or cut to (0 for no row).
 
 	``header`` is a formatted header list and ``delimiter`` a resolved
 	delimiter. Rows are sanitised and padded or cut to the column count: the
@@ -2010,14 +2028,13 @@ def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeade
 	"""
 	formatedLines = _legacyRows(linesToAppend, delimiter) if rows is None else rows
 	if not formatedLines:
-		return b'', 0
+		return b'', 0, 0
 	correctColumnNum = max([len(line) for line in formatedLines])
 	if any(header) and verifyHeader:
 		if assume is not None:
 			line = delimiter.join(assume)
 		else:
-			with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
-				line = file.readline().decode(encoding=encoding,errors='replace')
+			line = _legacyFirstLine(fileName, encoding, teeLogger)
 		if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
 			correctColumnNum = len(header)
 			if verbose:
@@ -2031,17 +2048,25 @@ def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeade
 			line = line[:correctColumnNum]
 		fitted.append(line)
 	payload = b'\n'.join([_encodeRow(line,delimiter,encoding,errors,header) for line in fitted]) + b'\n'
-	return payload, len(fitted)
+	return payload, len(fitted), correctColumnNum
+
+def _legacyFirstLine(fileName, encoding, teeLogger):
+	"""The first line of the legacy file ``fileName`` (which exists) as text; '' for a file that holds nothing: no byte,
+	or, compressed, only empty streams (a 0-byte .bz2 or .xz is no stream to read, as _fileHoldsNothing's readers know)."""
+	if _isCompressedFile(fileName) and _fileHoldsNothing(fileName):
+		return ''
+	with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
+		return file.readline().decode(encoding=encoding,errors='replace')
 
 def _legacyKeptHeader(fileName, header, verifyHeader, verbose, teeLogger, encoding, strict, delimiter, warn=True):
-	"""The header ``clearTabularFile`` leaves in the file: the file's own when a header is given and ``verifyHeader``, else ``header``."""
+	"""The header ``clearTabularFile`` leaves in the file: the file's own when a header is given and ``verifyHeader``, else
+	``header``; [] when it has no cell: the file is then left with no header line."""
 	if any(header) and verifyHeader:
-		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
-			line = file.readline().decode(encoding=encoding,errors='replace')
+		line = _legacyFirstLine(fileName, encoding, teeLogger)
 		if warn and not _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
 			__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
-		return _formatHeader(line,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
-	return header
+		header = _formatHeader(line,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
+	return header if any(header) else []  # no header: no header line (3.39 wrote an empty one, read back as a row)
 
 
 def clearTSV(fileName,teeLogger = None,header = '',verifyHeader = False,verbose = False,encoding = 'utf8',strict = False,delimiter = '\t',errors = 'strict'):
@@ -2082,15 +2107,73 @@ def clearTabularFile(fileName,teeLogger = None,header = '',verifyHeader = False,
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger,delimiter=delimiter)
 	if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = header,encoding = encoding,strict = False,delimiter=delimiter,errors = errors):
 		raise FileNotFoundError("Something catastrophic happened! File still not found after creation")
-	else:
-		header = _legacyKeptHeader(fileName, header, verifyHeader, verbose, teeLogger, encoding, strict, delimiter)
-		# Encode before the file is opened for writing, which empties it.
-		headerBytes = _encodeRow(_sanitize(header,delimiter=delimiter),delimiter,encoding,errors,what='header') if header else None
-		with openFileAsCompressed(fileName, mode ='wb',encoding=encoding,teeLogger=teeLogger) as file:
-			if headerBytes is not None:
-				file.write(headerBytes+b'\n')
+	kept = _legacyKeptHeader(fileName, header, verifyHeader, verbose, teeLogger, encoding, strict, delimiter)
+	# With no header the file keeps the empty first line that stands for it, as 3.39 and 5.0 left it (a reader given a
+	# header the file lacks takes that line for it, rather than a row).
+	_legacyReplace(fileName, kept, True, encoding, delimiter, errors)
 	if verbose:
 		__teePrintOrNot(f"Cleared {fileName}",teeLogger=teeLogger)
+
+def _isRowLine(text, delimiter):
+	"""True when the line ``text`` is a data row to a reader told no header: not what ``_processLine`` skips (empty, a
+	comment, a line with no key) and not a defaults line. A first line that is not one is where a reader given a header
+	the file lacks loses nothing: it takes that line for the header."""
+	line = text.strip('\x00').rstrip('\r\n')
+	if not line or (line.startswith('#') and not line.startswith(DEFAULTS_INDICATOR_KEY)):
+		return False
+	cells = _unsanitize(line.split(delimiter),delimiter)
+	return bool(cells and cells[0] and cells[0] != DEFAULTS_INDICATOR_KEY)
+
+def _legacyBeginsBlank(fileName, encoding, teeLogger, delimiter):
+	"""True when the legacy file ``fileName`` holds nothing, cannot be read, or begins with a line that is not a data row
+	(_isRowLine): then a header-less whole write puts the empty line that stands for a header in front of its rows, as
+	3.39 and 5.0 always do; never in front of a first line that is a row (it would push a header to line 2)."""
+	try:
+		return not _isRowLine(_legacyFirstLine(fileName, encoding, teeLogger), delimiter)
+	except Exception:
+		return True
+
+def _legacyBeginsBlankIn(f, encoding, delimiter):
+	"""_legacyBeginsBlank for the open binary legacy file ``f`` (at its raw level), read through that descriptor and left
+	open: a lockf lock is dropped by closing any descriptor of the file, so a writer that holds one must not open the
+	file again to look. ``f`` is left at offset 0."""
+	codec = _fileCodec(f.name)
+	try:
+		f.flush()
+		if _holdsNothing(f, codec, os.fstat(f.fileno()).st_size):
+			return True
+		f.seek(0)
+		stream = _openStreams(codec, f) if codec else f
+		try:
+			line = stream.readline()
+		finally:
+			if codec:
+				stream.close()
+		return not _isRowLine(line.decode(encoding or 'utf8', errors='replace'), delimiter)
+	except Exception:
+		return True
+	finally:
+		f.seek(0)
+
+def _legacyReplace(fileName, kept, blank, encoding, delimiter, errors, payload=b'', expect=None):
+	"""Make the existing legacy file ``fileName`` hold ``kept``, the header list it keeps (_legacyKeptHeader), and then
+	``payload`` (whole lines): the one write of ``clearTabularFile`` and ``scrubTabularFile``. ``delimiter`` is a
+	resolved delimiter. Where ``kept`` is empty, ``blank`` says whether the file begins with an empty line in its
+	place (never in front of a first line that is a row).
+
+	The new bytes are made whole first, then written over the file from its start and the file is cut there, under
+	its locks (_specRewriteInPlace: spec §18.7 / §19.8, as ``TSVZed``'s whole rewrites do), so a reader that takes no
+	lock never meets the file emptied. A compressed file is written as whole members of at most 1 MiB. Nothing is
+	written when the header cannot be encoded. ``expect``, the ``_specStamp`` of the file as a caller read it: the
+	file is left alone when it no longer matches under the lock (another writer committed since), and None is
+	returned; else the result is not None."""
+	# Encoded before the file is written to, which would leave it cut short.
+	headerBytes = _encodeRow(_sanitize(kept,delimiter=delimiter),delimiter,encoding,errors,what='header') + b'\n' if kept else b'\n' if blank else b''
+	if not stat.S_ISREG(os.stat(fileName).st_mode):
+		with open(fileName, 'wb') as f:  # /dev/null holds nothing to empty, and cannot be cut or given space
+			f.write(headerBytes + payload)
+		return True, None
+	return _specRewriteInPlace(fileName, headerBytes + payload, expect=expect)
 
 def getFileUpdateTimeNs(fileName):
 	# return 0 if the file does not exist
@@ -2179,22 +2262,96 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 									 lastLineOnly=lastLineOnly, verifyHeader=verifyHeader, verbose=verbose,
 									 taskDic=taskDic, encoding=encoding, strict=strict, delimiter=delimiter,
 									 defaults=defaults, correctColumnNum=correctColumnNum, errors=errors)
-	file =  readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,
-							lastLineOnly = lastLineOnly,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
-							encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults,correctColumnNum = correctColumnNum,errors = errors)
-	if file:
-		# Everything that is to be written is looked at, and encoded, before the file is touched: the clear
-		# below empties it, and rows that took the caller's defaults can hold text it cannot write.
+	if lastLineOnly:  # a read option, as for a .tsvz (a scrub of the last line alone would leave the file holding that)
+		return readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,
+							   lastLineOnly = True,verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
+							   encoding = encoding,strict = strict,delimiter = delimiter,defaults=defaults,correctColumnNum = correctColumnNum,errors = errors)
+	return _legacyScrub(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,
+						verbose = verbose,taskDic = taskDic,encoding = encoding,strict = strict,delimiter = delimiter,
+						defaults=defaults,correctColumnNum = correctColumnNum,errors = errors)[0]
+
+
+def _chainFill(line, previous):
+	"""The cells of a ``#_defaults_#`` line as they stand once its empty cells are filled from the line before it in the
+	file (``previous``, None for the first, or after an empty one): the defaults in effect after it."""
+	if not previous or len(previous) < 2:
+		return line
+	cells = list(line) + [''] * (len(previous) - len(line))  # (a shorter line has the empty cells it lacks)
+	return [cell if cell or i == 0 or i >= len(previous) else previous[i] for i, cell in enumerate(cells)]
+
+
+class _DefaultsList(list):
+	"""The defaults list of a read: ``found`` says whether the file's own ``#_defaults_#`` line set it (_processLine
+	replaces its cells in place), not the caller's defaults it began with."""
+	found = False
+	reset = False  # an empty defaults line was read (it stays one whatever follows it)
+	line = None  # the cells of that line as the file has them (``defaults`` holds them filled and fitted to the columns)
+
+	def __setitem__(self, index, value):
+		self.found = True
+		list.__setitem__(self, index, value)
+
+
+def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,
+				 taskDic = None,encoding = 'utf8',strict = False,delimiter = ...,defaults = ...,correctColumnNum = -1,errors = 'strict'):
+	"""Compact a legacy file in place; return ``(taskDic, done)``: the rows read, and whether the file was written (or
+	had nothing to write). ``done`` is False when nothing was written because the file kept changing (the shape of
+	``_specScrub``): it is rewritten only if it is what the read saw (spec §19.8), so a row another process appends
+	after the read is not scrubbed away; the read is made again, up to ``_SPEC_REWRITE_ATTEMPTS`` times.
+
+	The file's own ``#_defaults_#`` lines are written as the defaults in effect at the end of the read: the last
+	non-empty one after the rows (those before it keep their empty cells, those after it were filled when read), so
+	that every row reads as it did and the header, if any, stays on the first line. An empty one that was read is
+	written before the rows (_legacyScrub, ``reset``), as wide as they are. The defaults the caller passed are not
+	written. With no header the file begins with an empty line only if the first line of the file was not a row."""
+	given = list(taskDic.items()) if taskDic else []
+	givenDefaults = list(defaults) if defaults not in (..., None) else []
+	for tries in range(_SPEC_REWRITE_ATTEMPTS):
+		if tries and taskDic is not None:
+			# Read again as the caller passed it.
+			taskDic.clear()
+			taskDic.update(given)
+		readDefaults = _DefaultsList(givenDefaults)
+		# The stamp is taken before the read, and compared under the file lock.
+		stamp = _specFileStamp(fileName)
+		file =  readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,
+								verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
+								encoding = encoding,strict = strict,delimiter = delimiter,defaults=readDefaults,correctColumnNum = correctColumnNum,errors = errors)
+		if not file:
+			return file, True
 		dlm = get_delimiter(delimiter,file_name=fileName)
 		formatted = _formatHeader(header,delimiter=dlm)
-		kept = _legacyKeptHeader(fileName, formatted, verifyHeader, verbose, teeLogger, encoding, strict, dlm, warn=False)
-		if kept:
-			_checkRow(_sanitize(kept,delimiter=dlm), dlm, encoding, errors, what='header')
-		payload, count = _legacyFormatPayload(fileName, file, teeLogger, formatted, verifyHeader, verbose, encoding,
-											  strict, dlm, errors, assume=_sanitize(kept,delimiter=dlm) if kept else [])
-		clearTabularFile(fileName,teeLogger = teeLogger,header = header,verifyHeader = verifyHeader,verbose = verbose,encoding = encoding,strict = strict,delimiter = delimiter,errors = errors)
-		_legacyWritePayload(fileName, payload, count, teeLogger, verbose, encoding)
-	return file
+		if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = formatted,encoding = encoding,strict = False,delimiter=dlm,errors = errors):
+			raise FileNotFoundError("Something catastrophic happened! File still not found after creation")  # (removed since the read: made again)
+		kept = _legacyKeptHeader(fileName, formatted, verifyHeader, verbose, teeLogger, encoding, strict, dlm)
+		# Everything that is to be written is looked at, and encoded, before the file is touched:
+		# rows that took the caller's defaults can hold text it cannot write.
+		payload, count, columns = _legacyFormatRows(fileName, file, teeLogger, formatted, verifyHeader, verbose, encoding,
+													strict, dlm, errors, assume=_sanitize(kept,delimiter=dlm) if kept else [])
+		blank = not kept and _legacyBeginsBlank(fileName, encoding, teeLogger, dlm)
+		if readDefaults.reset and columns > 1:
+			# An empty defaults line was read: no defaults reach the rows that follow it, whoever reads them (the rows
+			# were read with it, and any the caller of that read gave are not written). Written before the rows, so
+			# that none are filled: after the header, or the empty line standing for one, or else the first row (a
+			# header, to the store owning the file); as wide as the rows, which is the column count a reader takes from
+			# the first line it reads, and still an empty defaults line to one that reads it anywhere.
+			reset = _encodeRow([DEFAULTS_INDICATOR_KEY] + [''] * (columns - 1),dlm,encoding,errors,what='defaults') + b'\n'
+			if kept or blank:
+				payload = reset + payload
+			else:
+				first, newline, rest = payload.partition(b'\n')
+				payload = first + newline + reset + rest
+		last = readDefaults.line if readDefaults.found else None
+		if last and len(last) > 1:
+			payload += _encodeRow(_sanitize(last,delimiter=dlm),dlm,encoding,errors,what='defaults') + b'\n'
+		if _legacyReplace(fileName, kept, blank, encoding, dlm, errors, payload, expect=stamp) is None:
+			continue  # another writer changed the file after the read
+		if verbose:
+			__teePrintOrNot(f"Cleared {fileName}",teeLogger=teeLogger)
+			__teePrintOrNot(f"Appended {count} lines to {fileName}" if count else f"No lines to append to {fileName}",teeLogger=teeLogger)
+		return file, True
+	__teePrintOrNot(f'Warning: scrub of {fileName} skipped: the file kept changing while it was being scrubbed; nothing was written','warning',teeLogger)
+	return file, False
 
 # ===========================================================================
 # TSVZ spec v1 dialect (.tsvz / .csvz / .nsvz / .psvz) -- see tsvz-spec-v1.md
@@ -3586,7 +3743,8 @@ def _matchOwner(fd, st):
 
 
 def _specRewriteInPlace(path, content, expect=None, memberSize=None):
-	"""Replace a part's bytes in place (same inode, spec §18.7 / §19.8).
+	"""Replace a part's bytes in place (same inode, spec §18.7 / §19.8): the write of a spec store's scrub and
+	clear, and of a legacy file's (_legacyReplace).
 
 	``content`` is uncompressed; it is compressed for a compressed part. The
 	file is left alone when its bytes already match. Returns ``(written, stamp)``:
@@ -3597,7 +3755,7 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 	"""
 	codec = _parsePartName(path).codec
 	_requireCodec(codec)
-	raw = _compressBytes(codec, content, memberSize=memberSize) if codec and content else content
+	raw = _compressBytes(codec, content, memberSize=memberSize) if codec else content  # (nothing: one empty member)
 	with _pathLock(path):
 		with open(path, 'r+b') as f:
 			_lockFile(f)
@@ -3606,19 +3764,29 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 				if expect is not None and _specStamp(st) != expect:
 					return None
 				fd = f.fileno()
-				# The whole part, for a failed rewrite to put back whenever it fails. Read unbuffered, as
-				# the file is written below: a read-ahead in f would leave it a stale position to close at.
-				old = _readFrom0(fd, st.st_size)
-				if old == raw:
+				# Read unbuffered, as the file is written below: a read-ahead in f would leave it a stale position to
+				# close at. What a failed rewrite puts back is kept: the bytes the write overwrites (from the start to
+				# the shorter end) and the old size to cut back to. A clear of a huge file reads none of it.
+				size = st.st_size
+				old = _readFrom0(fd, min(size, len(raw)))
+				if size == len(raw) and old == raw:
 					return False, _specStamp(st)
 				try:
 					_reserveSpace(fd, len(raw))  # spec §19.8: a full disk refuses the rewrite before any byte changes
 					_writeFrom0(fd, raw)
 				except BaseException as e:
+					# Once the cut is made the rewrite is done: only the cut makes the file shorter, and it follows the
+					# whole write, so the new bytes are complete (what was cut off is not kept to put back).
+					if os.fstat(fd).st_size < size:
+						raise
 					# Put the old bytes back rather than leave a half-rewritten part (or one a failed
-					# reservation lengthened).
+					# reservation lengthened): the write left what it did not overwrite as it was.
 					try:
-						_writeFrom0(fd, old)
+						os.lseek(fd, 0, os.SEEK_SET)
+						view = memoryview(old)
+						while view:
+							view = view[os.write(fd, view):]
+						os.ftruncate(fd, size)
 						os.fsync(fd)
 					except OSError as undo:
 						damaged = '{}: the rewrite failed ({!r}) and the old bytes could not be put back ({}): the part is damaged'.format(
@@ -4970,7 +5138,7 @@ class TSVZed(OrderedDict):
 		"""clear_file() for a legacy file; ``dropRows`` (clear()) also empties memory and drops the queued rows, once the
 		file is open and locked (when it cannot be, nothing changed), under _memLock: no set is half done, and no row
 		set before it is kept or appended after the emptied file. Queued defaults lines are kept: the defaults stay."""
-		header = self._headerLine()
+		header = self._headerLine(None, clearing=True)
 
 		def emptied():
 			if dropRows:
@@ -5224,7 +5392,7 @@ memoryOnly:{self.memoryOnly}
 						 f"in a row up to a minute.")
 		else:
 			retry = ("With rewrite_interval=0 none is tried again on its own, only one asked for (mapToFile(), "
-					 "rewrite(force=True), rewrite_on_exit), one made after another process changes the file, or, while "
+					 "hardMapToFile(), rewrite(force=True), rewrite_on_exit), one made after another process changes the file, or, while "
 					 "damage another writer left is to be made good, one at a later append.")
 		damaged = (" The file is damaged (a rewrite of this object's failed) or was removed (rows are appended to a new "
 				   "one): until a rewrite gets through, memory holds the only good copy." if self._damaged else "")
@@ -5281,31 +5449,38 @@ memoryOnly:{self.memoryOnly}
 		now = _specClock()
 		return any(state is not None and now < state[1] for state in map(self._failures.get, kinds))
 
-	def _headerLine(self):
+	def _headerLine(self, f, clearing=False):
 		"""The header line a legacy file of this store begins with, as bytes without its newline; None for no header.
 
-		Checked by the constructor: it can be written."""
+		Checked by the constructor: it can be written. A store with no header (['']) begins the file with the empty line
+		that stands for one (3.39 and 5.0 did, always) when the file holds nothing or begins with a line that is not a
+		data row, and when it is cleared; it never puts one in front of a first line that is a row. ``f`` is the open,
+		locked file a rewrite is to write: looked at through it (not by name, which would drop a lockf lock)."""
 		if not self.header:
+			return None
+		if not clearing and not any(self.header) and not _legacyBeginsBlankIn(f, self.encoding, self.delimiter):
 			return None
 		return _encodeRow(_sanitize(list(self.header),delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header')
 
-	def _snapshotForRewrite(self):
+	def _snapshotForRewrite(self, f):
 		"""``(header, lines, queued)``: the header line (None for none), the defaults line and the rows (_RewriteRows, a
 		flat snapshot taken under _memLock and checked: a TSVZEncodeError changes nothing), and the queued rows, taken
 		from the queue: memory holds them, so the rewrite writes them; _writeFile puts them back if it stops."""
 		delimiter, encoding, errors = self.delimiter, self.encoding, self.errors
-		header = self._headerLine()
+		header = self._headerLine(f)
 		with self._memLock:
 			values = list(self.values())
 			defaults = list(self.defaults)
 			queued, self.appendQueue = self.appendQueue, deque()
 		try:
-			first = []
+			first = later = []
 			if defaults and len(defaults) > 1:
 				# The defaults line comes right after the header, so it survives a
-				# full rewrite -- it is not a regular mapping key.
-				first.append(_encodeRow(_sanitize(defaults,delimiter=delimiter),delimiter,encoding,errors,what='defaults'))
-			rows = _RewriteRows(first, values, delimiter, encoding, errors, self.header)
+				# full rewrite -- it is not a regular mapping key. With no header line written the first line
+				# is a row (a header, to the store that owns the file): after that.
+				line = _encodeRow(_sanitize(defaults,delimiter=delimiter),delimiter,encoding,errors,what='defaults')
+				first, later = ([line], []) if header is not None else ([], [line])
+			rows = _RewriteRows(first, values, delimiter, encoding, errors, self.header, later)
 			del values  # the snapshot holds the cells
 			rows.check()
 		except BaseException:
@@ -5362,7 +5537,7 @@ memoryOnly:{self.memoryOnly}
 						self._syncFrom(f, True)
 					elif sync is False and self._externalChange():
 						self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
-					header, lines, queued = (snapshot or self._snapshotForRewrite)()
+					header, lines, queued = snapshot() if snapshot else self._snapshotForRewrite(f)
 					if not sync or self._damaged or attempt == 2 or not self._changedSince(f):
 						break
 					# A writer that takes no lock appended while the rows were taken: taken in too, and taken again.
@@ -5857,7 +6032,7 @@ memoryOnly:{self.memoryOnly}
 					reporter = _Reporter(self._fileName, self.teeLogger)
 					written = []
 					try:
-						_appendOpen(f, b''.join(chunks), codec, self._headerLine if any(self.header) else None, 'newline',
+						_appendOpen(f, b''.join(chunks), codec, (lambda: self._headerLine(f)) if any(self.header) else None, 'newline',
 									reporter, written=written)
 						_fsync(f.fileno())  # a sync that fails fails the append: the rows stay queued
 					finally:
@@ -6363,23 +6538,15 @@ class TSVZedLite(MutableMapping):
 			if not cleared:
 				raise OSError('{} was not cleared: the clear was refused (see the warning above)'.format(self._fileName))
 			return self
-		if self.fileObj is None:
-			clearTabularFile(self._fileName, header=self.header, verbose=self.verbose,
-							 encoding=self.encoding, delimiter=self.delimiter, errors=self.errors)
-			return self
 		if self.verbose:
 			eprint(f"Clearing {self._fileName}")
-		self.fileObj.seek(0)
-		self.fileObj.truncate()
-		if self.verbose:
-			eprint(f"File {self._fileName} cleared empty")
-		if self.header:
-			location = self.__writeValues(self.header, headerFirst=False)
-			if self.verbose:
-				eprint(f"Header {self.header} written to {self._fileName}")
-				eprint(f"At {location} size: {self.fileObj.tell()}")
+		# Written over the file and cut under its lock, as TSVZed's rewrites are (the file object stays the file's).
+		clearTabularFile(self._fileName, header=self.header, verbose=self.verbose,
+						 encoding=self.encoding, delimiter=self.delimiter, errors=self.errors)
+		if self.fileObj is not None:
+			self.fileObj.seek(0, os.SEEK_END)  # (and drops what it had read ahead)
 		return self
-	
+
 	def switchFile(self,newFileName,createIfNotExist = ...,verifyHeader = ...):
 		if createIfNotExist is ...:
 			createIfNotExist = self.createIfNotExist
@@ -7349,9 +7516,8 @@ class _ServeStore(object):
 				if self.spec:
 					return _specScrub(self.path, teeLogger=log, verifyHeader=False, verbose=self.verbose,
 									  strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)[1]
-				scrubTabularFile(self.path, teeLogger=log, verifyHeader=False, verbose=self.verbose,
-								 strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)
-				return True
+				return _legacyScrub(self.path, teeLogger=log, verifyHeader=False, verbose=self.verbose,
+									strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)[1]
 			finally:
 				self.parts = None  # read again at the next request
 
@@ -8424,7 +8590,8 @@ operations:
   set STORE KEY [VALUE ...]    write a row; KEY alone deletes it; '-' reads rows from stdin
   append ...                   same as set
   delete STORE KEY [KEY ...]   delete KEYs; '-' reads keys from stdin
-  clear STORE                  empty the store, keeping its header and markers
+  clear STORE                  empty the store; a .tsvz keeps its header and
+                               markers, a .tsv the --x-header it is given
   scrub STORE                  compact the store in place (archival maintenance)
   verify STORE                 check #_checksum_*_# segments (exit 4 on a mismatch)
   parts STORE                  list the parts of a multi-part store
