@@ -11091,21 +11091,39 @@ def test_legacy_scrub_pads_a_shorter_later_defaults_line_to_the_width_of_the_ear
 # ==========================================================================
 # 5.1 follow-up: a header-checking clear of a file that holds nothing keeps the header given
 # ==========================================================================
-@pytest.mark.parametrize('suffix', _OVERWRITE_SUFFIXES)
-@pytest.mark.parametrize('how', ['library', 'cli'])
-def test_header_checking_clear_of_an_empty_file_writes_the_header_given_and_warns_of_nothing(tmp_path, capsys, suffix, how):
+def _holds_nothing(p, kind):
+	"""Make ``p`` a file that holds nothing: no byte ('zero'), or, compressed, only one ('one') or two ('two') empty streams."""
+	if kind == 'zero':
+		_touch(p)
+		return
+	_empty_stream(p)
+	if kind == 'two':
+		with open(p, 'ab') as f:
+			f.write(TSVZ._compressBytes(p.rpartition('.')[2], b''))
+		assert _text(p) == b''
+
+
+_HOLDS_NOTHING = [(suffix, kind) for suffix in _OVERWRITE_SUFFIXES for kind in ('zero', 'one', 'two')
+				  if suffix != '.tsv' or kind == 'zero']
+
+
+@pytest.mark.parametrize('suffix,kind', _HOLDS_NOTHING)
+@pytest.mark.parametrize('how', ['library', 'library-strict', 'cli'])
+def test_header_checking_clear_of_an_empty_file_writes_the_header_given_and_warns_of_nothing(tmp_path, capsys, suffix, kind, how):
 	# A file with no byte (or a compressed one with only empty streams) reads as an empty store with any header
 	# (README L9). The clear took its empty first line for the file's own header: it wrote a blank line and warned of
-	# a mismatch, and a strict TSVZed given the header then refused the file.
+	# a mismatch (a strict clear raised), and a strict TSVZed given the header then refused the file.
 	p = str(tmp_path / ('e' + _suffix_or_skip(suffix)))
-	_touch(p)
-	if how == 'library':
-		TSVZ.clearTabularFile(p, header='id\tv', verifyHeader=True)
-		status = 0
+	_holds_nothing(p, kind)
+	if how == 'cli':
+		# _run puts the CLI's stdout and stderr in its own buffers (its warnings go to stderr), not in capsys.
+		status, out, err = _run('clear', p, '--x-header', 'id\\tv', '--x-strict')
+		out += err
+		assert capsys.readouterr().out == ''
 	else:
-		status = _run('clear', p, '--x-header', 'id\\tv', '--x-strict')[0]
-	out = capsys.readouterr().out
-	assert status == 0 and 'mismatch' not in out.lower()
+		TSVZ.clearTabularFile(p, header='id\tv', verifyHeader=True, strict=(how == 'library-strict'))
+		status, out = 0, capsys.readouterr().out
+	assert status == 0 and 'mismatch' not in out.lower(), out
 	with TSVZ.openFileAsCompressed(p, 'rb') as f:
 		assert f.read() == b'id\tv\n'
 	assert TSVZ.readTabularFile(p, header='id\tv', strict=True) == {}
