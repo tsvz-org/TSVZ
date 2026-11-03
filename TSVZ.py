@@ -2057,18 +2057,18 @@ def _legacyFirstLine(fileName, encoding, teeLogger):
 	or, compressed, only empty streams (a 0-byte .bz2 or .xz is no stream to read, as _fileHoldsNothing's readers know)."""
 	if _isCompressedFile(fileName) and _fileHoldsNothing(fileName):
 		return ''
-	try:
-		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
-			return file.readline().decode(encoding=encoding,errors='replace')
-	except Exception:  # a first line the codec cannot decode (gzip: BadGzipFile, zlib.error; bz2, xz, zstd: their own errors): none to keep
-		return ''
+	with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
+		return file.readline().decode(encoding=encoding,errors='replace')
 
 def _legacyKeptHeader(fileName, header, verifyHeader, verbose, teeLogger, encoding, strict, delimiter, warn=True):
 	"""The header ``clearTabularFile`` leaves in the file: the file's own first line when a header is given and
 	``verifyHeader`` (the header given for a file that holds nothing), else ``header``; [] when it has no cell: the file
 	is then left with no header line."""
 	if any(header) and verifyHeader:
-		line = _legacyFirstLine(fileName, encoding, teeLogger)
+		try:
+			line = _legacyFirstLine(fileName, encoding, teeLogger)
+		except Exception:  # a first line the codec cannot decode (gzip: BadGzipFile, zlib.error; bz2, xz, zstd: their own errors): none to keep
+			line = ''  # (a scrub or clear makes the file again; an append, which calls _legacyFirstLine itself, raises)
 		if line:  # a file that holds nothing ('') is an empty store with any header, as the readers take it: the one given is kept
 			if warn and not _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
 				__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
@@ -2362,8 +2362,8 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 				first, newline, rest = payload.partition(b'\n')
 				payload = first + newline + reset + rest
 		if last:
-			if not count and len(last) < columns:
-				last = list(last) + [''] * (columns - len(last))  # (the same defaults to a reader, now the width of the file)
+			if not count and columns > 1:
+				last = (list(last) + [''] * columns)[:columns]  # (the same defaults to a reader, fitted to the width of the file as it fits a line)
 			payload += _encodeRow(_sanitize(last,delimiter=dlm),dlm,encoding,errors,what='defaults') + b'\n'
 		if _legacyReplace(fileName, kept, blank, encoding, dlm, errors, payload, expect=stamp) is None:
 			continue  # another writer changed the file after the read

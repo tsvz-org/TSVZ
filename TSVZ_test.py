@@ -11257,16 +11257,20 @@ def test_legacy_scrub_of_an_all_deleted_file_of_another_delimiter_keeps_its_head
 # A scrub leaves later appends reading as they would on the file it was not run on (a twin): its defaults lines stay,
 # as wide as the file's lines, and a defaults line is never the first line of a file with no header.
 NO_ROW_NO_HEADER_TWINS = [
-	# (file, the caller's defaults of the scrub and the reads, the row appended, what the scrub leaves, a header of the file's width)
-	(b'\n#_defaults_#\t\t\na\tx\ty\na\t\t\n', ['#_defaults_#', 'D1', 'D2'], ['n', '', '7'], b'\n#_defaults_#\t\t\n', 'id\tv\tw'),  # (a)
-	(b'a\t1\t2\t3\n#_defaults_#\tX\na\t\t\t\n', None, ['b', '1', '', '3'], b'\n#_defaults_#\tX\t\t\n', None),  # (b) (a reader given a header takes the twin's first row for it, and reads it differently)
-	(b'a\t1\t2\n#_defaults_#\tX\tY\na\t\t\n', None, ['n', '', '7'], b'\n#_defaults_#\tX\tY\n', 'id\tv\tw'),  # (c)
-	(b'a\tx\ty\n#_defaults_#\t\t\na\t\t\n', ['#_defaults_#', 'D1', 'D2'], ['n', '', '7'], b'\n#_defaults_#\t\t\n', 'id\tv\tw'),
+	# (file, the caller's defaults of the scrub and the reads, the row appended, what the scrub leaves, a header of the
+	# file's width for one more read, whether the default strict reads are compared)
+	(b'\n#_defaults_#\t\t\na\tx\ty\na\t\t\n', ['#_defaults_#', 'D1', 'D2'], ['n', '', '7'], b'\n#_defaults_#\t\t\n', 'id\tv\tw', True),  # (a)
+	# (b): a reader given a header takes the twin's first row for it, and reads it differently, so no header read
+	(b'a\t1\t2\t3\n#_defaults_#\tX\na\t\t\t\n', None, ['b', '1', '', '3'], b'\n#_defaults_#\tX\t\t\n', None, True),
+	(b'a\t1\t2\n#_defaults_#\tX\tY\na\t\t\n', None, ['n', '', '7'], b'\n#_defaults_#\tX\tY\n', 'id\tv\tw', True),  # (c)
+	(b'a\tx\ty\n#_defaults_#\t\t\na\t\t\n', ['#_defaults_#', 'D1', 'D2'], ['n', '', '7'], b'\n#_defaults_#\t\t\n', 'id\tv\tw', True),
+	# a defaults line wider than the rows is cut to them (a strict read of the twin drops that line, so it is not compared)
+	(b'a\t1\t2\n#_defaults_#\tX\tY\tZ\tW\na\t\t\n', None, ['n', '', '7'], b'\n#_defaults_#\tX\tY\n', None, False),
 ]
 
 
-@pytest.mark.parametrize('before,defaults,row,after,header', NO_ROW_NO_HEADER_TWINS)
-def test_legacy_scrub_of_an_all_deleted_file_with_no_header_reads_later_appends_as_the_unscrubbed_file_does(tmp_path, before, defaults, row, after, header):
+@pytest.mark.parametrize('before,defaults,row,after,header,strict_reads', NO_ROW_NO_HEADER_TWINS)
+def test_legacy_scrub_of_an_all_deleted_file_with_no_header_reads_later_appends_as_the_unscrubbed_file_does(tmp_path, before, defaults, row, after, header, strict_reads):
 	p, twin = str(tmp_path / 's.tsv'), str(tmp_path / 't.tsv')
 	for path in (p, twin):
 		_touch(path, before)
@@ -11275,7 +11279,8 @@ def test_legacy_scrub_of_an_all_deleted_file_with_no_header_reads_later_appends_
 	assert _bytes(p) == after
 	for path in (p, twin):
 		TSVZ.appendTabularFile(path, row)
-	for read in ({}, {'strict': False}, {'strict': True}) + (({'header': header, 'strict': False},) if header else ()):
+	reads = [{'strict': False}] + ([{}, {'strict': True}] if strict_reads else []) + ([{'header': header, 'strict': False}] if header else [])
+	for read in reads:
 		read = dict(read, **kwargs)
 		got, was = TSVZ.readTabularFile(p, **read), TSVZ.readTabularFile(twin, **read)
 		assert dict(got) == dict(was), (read, got, was)
@@ -11320,6 +11325,28 @@ def test_legacy_scrub_of_a_gz_file_whose_first_line_cannot_be_decoded_does_not_r
 	_touch(p, data)
 	assert TSVZ.scrubTabularFile(p, header=header) == {}
 	assert any('compressed stream is damaged' in w for w in _tsvz_warnings(capsys))
+
+
+@pytest.mark.parametrize('strict', [True, False])
+def test_header_checking_append_to_a_gz_file_whose_first_line_cannot_be_decoded_raises_and_writes_nothing(tmp_path, strict):
+	# As in 5.1: the append reads the first line to check the header, and the error is the codec's. (Only a scrub or a
+	# clear, which make the file again, take an undecodable first line for none.)
+	import gzip
+	for name, data in (('plain', b'id\tv\na\t1\n'),
+					   ('cut', gzip.compress(b'id\tv\n' + b''.join(b'k%d\tv\n' % i for i in range(2000)))[:12])):  # (cut inside the gzip header)
+		p = str(tmp_path / (name + '.tsv.gz'))
+		_touch(p, data)
+		with pytest.raises(Exception) as caught:
+			TSVZ.appendTabularFile(p, ['new', '9'], header='id\tv', strict=strict)
+		assert 'mismatch' not in str(caught.value).lower(), caught.value
+		assert _bytes(p) == data
+
+
+def test_cli_set_with_a_header_on_a_gz_file_whose_first_line_cannot_be_decoded_fails_and_writes_nothing(tmp_path):
+	p = str(tmp_path / 'x.tsv.gz')
+	_touch(p, b'id\tv\na\t1\n')  # plain text named .gz
+	status, out, err = _run('set', p, 'new', '9', '--x-header', 'id\\tv')
+	assert status == 1 and _bytes(p) == b'id\tv\na\t1\n'
 
 
 @pytest.mark.parametrize('kind', ['zero', 'one', 'two'])

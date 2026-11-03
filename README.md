@@ -277,14 +277,19 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 - **A scrub of a `.tsv` whose rows were all deleted shrinks it.** `scrubTabularFile`,
   `tsvz scrub` (also through a `tsvz serve` handler) of a `.tsv`-family file (`.tsv`,
   `.csv`, `.nsv` and their compressed forms) in which every key has been deleted
-  leaves the file as an empty store: the header line it has (a file with none keeps its
-  first line as its header, an empty one included, when the scrub checks the header, which
-  is the default, with a "Header mismatch" warning; the header the scrub is given is
-  written only with `verifyHeader=False`),
-  and its `#_defaults_#` lines as a scrub of a file with rows keeps them (an empty one
-  after the header, the last non-empty one after it, both as wide as the file's lines;
-  with no header line they follow an empty first line, which a scrub then writes). A
-  scrub of a path that is not there makes no file and returns `{}`, as in 5.1.
+  leaves the file as an empty store: the header line it has, and its `#_defaults_#`
+  lines as a scrub of a file with rows keeps them (an empty one after the header, the
+  last non-empty one after it, both as wide as the header, or as the column count the
+  read took, which caller defaults set when given). A file with no header line keeps its
+  empty first line, or becomes 0 bytes when its first line was a row, and a defaults line
+  it keeps follows an empty first line, which the scrub then writes. A scrub that is given
+  a header (and checks it, the default) keeps the file's first line as its header, an
+  empty one included, with a "Header mismatch" warning when it differs; the header it is
+  given is written only with `verifyHeader=False`. A scrub of a path that is not there
+  makes no file and returns `{}`, as in 5.1, unless `createIfNotExist=True`. A compressed
+  file whose read decodes no row (plain text named `.gz`, a first member cut short) is
+  made again as an empty store, as a scrub of a damaged file with rows already was in
+  5.1: the bytes after the damage go (see the damaged-stream notes above).
   5.1 and 5.0 left such a file as it was, deletion lines included, so a writer that
   appended keys, deleted them all and scrubbed, over and over, saw the file grow without
   limit (205, 405, 605 bytes, ... for 20 keys a cycle); now it is the same size after
