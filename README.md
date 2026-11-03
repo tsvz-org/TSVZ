@@ -269,6 +269,25 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
+## Upgrading to 5.2 from 5.1
+
+The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family file
+5.2 writes.
+
+- **A scrub of a `.tsv` whose rows were all deleted shrinks it.** `scrubTabularFile`,
+  `tsvz scrub` (also through a `tsvz serve` handler) of a `.tsv`-family file (`.tsv`,
+  `.csv`, `.nsv` and their compressed forms) in which every key has been deleted
+  leaves the file as an empty store: the header line it has (or the one the scrub is
+  given, for a file with none), its `#_defaults_#` lines as a scrub of a file with rows
+  keeps them (an empty one is written after the header, as wide as the header; the
+  last non-empty one after it), and the empty first line a header-less file began with.
+  5.1 and 5.0 left such a file as it was, deletion lines included, so a writer that
+  appended keys, deleted them all and scrubbed, over and over, saw the file grow without
+  limit (205, 405, 605 bytes, ... for 20 keys a cycle); now it is the same size after
+  every scrub. A file with no byte (or a compressed one with only empty streams) is
+  still left alone. A scrub that finds the file changed since its read still reads
+  again and writes nothing if it keeps changing, as for a file with rows.
+
 ## Upgrading to 5.1 from 5.0
 
 The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family file
@@ -325,12 +344,11 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   file's own header line.)
   `TSVZed`'s message for a refused rewrite lists `hardMapToFile()` among the rewrites
   a program asks for.
-- **Known: a scrub of a `.tsv` whose rows were all deleted does not compact it** when
-  the scrub is given the file's header (`scrubTabularFile(path, header=H)`) or the file
-  has no header line: it leaves the file as it is, deletion lines included; reads are
-  right, as in 3.39 and 5.0. (`tsvz scrub` of a headed file reads the header line as a
-  row, so it does compact it.)
-  ([limitations](docs/limitations.md#a-scrub-of-a-tsv-whose-rows-were-all-deleted-does-not-compact-it)).
+- **Known in 5.1, fixed in 5.2: a scrub of a `.tsv` whose rows were all deleted did not
+  compact it** when the scrub was given the file's header (`scrubTabularFile(path, header=H)`)
+  or the file had no header line: it left the file as it was, deletion lines included;
+  reads were right, as in 3.39 and 5.0. (`tsvz scrub` of a headed file read the header
+  line as a row, so it did compact it.)
 - **Known: a scrub run with other defaults than the store's program can change how
   early rows read.** In a `.tsv` with an empty `#_defaults_#` line and rows with empty
   cells before any defaults line, the reset line the scrub writes before the rows keeps
