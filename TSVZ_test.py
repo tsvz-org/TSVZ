@@ -11153,5 +11153,181 @@ def test_header_checking_clear_still_keeps_the_files_own_header(tmp_path, capsys
 	assert _bytes(p) == b'\n'
 
 
+# ==========================================================================
+# 5.2: a scrub of a .tsv whose rows were all deleted compacts it (limitations: "does not compact it", 5.1)
+# ==========================================================================
+def _delete_all_and_scrub_cycles(p, header, cycles=5, writer='append'):
+	"""The writer's loop: append 20 keys, delete them all by appending each with empty values, scrub; the sizes after each scrub."""
+	sizes = []
+	for _ in range(cycles):
+		if writer == 'lite':
+			t = TSVZ.TSVZedLite(p, header=header, createIfNotExist=True)
+			for k in range(20):
+				t['k%d' % k] = ['k%d' % k, 'x']
+			for k in range(20):
+				t['k%d' % k] = ['k%d' % k, '']
+		else:
+			for k in range(20):
+				TSVZ.appendTabularFile(p, ['k%d' % k, 'x'], header=header, createIfNotExist=True)
+			for k in range(20):
+				TSVZ.appendTabularFile(p, ['k%d' % k, ''], header=header)
+		assert TSVZ.scrubTabularFile(p, header=header) == {}
+		sizes.append(os.path.getsize(p))
+	return sizes
+
+
+@pytest.mark.parametrize('suffix', _OVERWRITE_SUFFIXES)
+@pytest.mark.parametrize('header,expected', [(['id', 'v'], b'id\tv\n'), ('', b'\n')], ids=['headed', 'headerless'])
+def test_legacy_scrub_of_an_all_deleted_file_is_the_same_size_after_every_cycle(tmp_path, suffix, header, expected):
+	p = str(tmp_path / ('g' + _suffix_or_skip(suffix)))
+	sizes = _delete_all_and_scrub_cycles(p, header)
+	assert len(set(sizes)) == 1, sizes  # 5.1: 205, 405, 605, ... (headed .tsv)
+	assert _text(p) == expected  # the header, or the empty line that stands for one
+	assert TSVZ.readTabularFile(p, header=header) == {}
+	TSVZ.appendTabularFile(p, ['a', '1'], header=header)  # and the file is still a store to append to
+	assert TSVZ.readTabularFile(p, header=header) == {'a': ['a', '1']}
+
+
+@pytest.mark.parametrize('header,expected', [(['id', 'v'], b'id\tv\n'), ('', b'\n')], ids=['headed', 'headerless'])
+def test_tsvzedlite_deletes_then_scrub_do_not_grow_the_file(tmp_path, header, expected):
+	p = str(tmp_path / 'l.tsv')
+	sizes = _delete_all_and_scrub_cycles(p, header, writer='lite')
+	assert len(set(sizes)) == 1, sizes
+	assert _bytes(p) == expected
+	t = TSVZ.TSVZedLite(p, header=header)  # it opens the compacted file, and appends to it
+	assert len(t) == 0
+	t['a'] = ['a', '1']
+	assert t['a'] == ['a', '1']
+
+
+def test_legacy_scrub_of_an_all_deleted_file_with_no_header_given_and_a_row_first_leaves_nothing(tmp_path):
+	# No header, and no empty line first: the file begins with a row (here a deletion line), which a header-less whole
+	# write does not put an empty line in front of (_isRowLine). Nothing is left to keep.
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'a\t1\nb\t2\na\t\nb\t\n')
+	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b''
+	_touch(p, b'\na\t1\na\t\n')
+	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b'\n'
+	_touch(p, b'#c\n\na\t\n')  # a comment first is no row either
+	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b'\n'
+
+
+ALL_DELETED_DEFAULTS = [
+	# (file as it is, what the scrub leaves)
+	(b'id\tv\tw\n#_defaults_#\tX\tY\na\t\t2\na\t\t\n', b'id\tv\tw\n#_defaults_#\tX\tY\n'),
+	(b'id\tv\tw\na\t\t2\n#_defaults_#\t\t\na\t\t\n', b'id\tv\tw\n#_defaults_#\t\t\n'),
+	(b'id\tv\tw\n#_defaults_#\tX\tY\na\t\t2\n#_defaults_#\t\t\na\t\t\n#_defaults_#\tP\t\n',
+	 b'id\tv\tw\n#_defaults_#\t\t\n#_defaults_#\tP\t\n'),
+	(b'id\tv\tw\n#_defaults_#\tX\tY\na\t\t2\na\t\t\n#_defaults_#\t\tZ\n', b'id\tv\tw\n#_defaults_#\tX\tZ\n'),
+]
+
+
+@pytest.mark.parametrize('suffix', ['.tsv', '.tsv.gz'])
+@pytest.mark.parametrize('before,after', ALL_DELETED_DEFAULTS)
+def test_legacy_scrub_of_an_all_deleted_file_keeps_the_defaults_a_non_empty_scrub_keeps(tmp_path, suffix, before, after):
+	p = str(tmp_path / ('d' + _suffix_or_skip(suffix)))
+	twin = str(tmp_path / ('t' + suffix))  # the same file, not scrubbed
+	for path in (p, twin):
+		with TSVZ.openFileAsCompressed(path, 'wb') as f:
+			f.write(before)
+
+	def read(path):
+		defaults = []
+		assert TSVZ.readTabularFile(path, header='id\tv\tw', strict=True, defaults=defaults) == {}
+		return defaults
+	assert TSVZ.scrubTabularFile(p, header='id\tv\tw') == {}
+	assert _text(p) == after
+	assert read(p) == read(twin)  # reads give the defaults they gave
+	size = os.path.getsize(p)
+	TSVZ.scrubTabularFile(p, header='id\tv\tw')
+	assert _text(p) == after and os.path.getsize(p) == size  # a second scrub changes nothing
+	for path in (p, twin):  # a row appended later reads as it did before the scrub
+		TSVZ.appendTabularFile(path, ['n', '', '7'], header='id\tv\tw')
+	assert TSVZ.readTabularFile(p, header='id\tv\tw') == TSVZ.readTabularFile(twin, header='id\tv\tw')
+
+
+@pytest.mark.parametrize('suffix', ['.csv', '.nsv', '.psv'])
+def test_legacy_scrub_of_an_all_deleted_file_of_another_delimiter_keeps_its_header_in_it(tmp_path, suffix):
+	p = str(tmp_path / ('d' + suffix))
+	sizes = _delete_all_and_scrub_cycles(p, ['id', 'v'])
+	assert len(set(sizes)) == 1, sizes
+	assert _bytes(p) == SUFFIX_DELIMITERS[suffix].join(['id', 'v']).encode() + b'\n'
+
+
+def test_legacy_scrub_of_an_all_deleted_file_and_no_header_writes_no_reset(tmp_path):
+	# A reset is as wide as the rows' first line, which a header-less file with no row does not have.
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'\n#_defaults_#\t\t\na\t\t\n')
+	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b'\n'
+
+
+@pytest.mark.parametrize('kind', ['zero', 'one', 'two'])
+@pytest.mark.parametrize('suffix', [x for x in _OVERWRITE_SUFFIXES if x != '.tsv'] + ['.tsv'])
+def test_legacy_scrub_of_a_file_that_holds_nothing_leaves_it_as_it_is(tmp_path, suffix, kind):
+	if suffix == '.tsv' and kind != 'zero':
+		pytest.skip('only a compressed file holds empty streams')
+	p = str(tmp_path / ('n' + _suffix_or_skip(suffix)))
+	_holds_nothing(p, kind)
+	before = _bytes(p)
+	for header in ('', 'id\tv'):
+		assert TSVZ.scrubTabularFile(p, header=header) == {}
+		assert _bytes(p) == before
+
+
+def test_legacy_scrub_of_an_all_deleted_file_is_given_up_when_the_file_keeps_changing_as_a_non_empty_one_is(tmp_path, monkeypatch, capsys):
+	p = str(tmp_path / 'c.tsv')
+	_touch(p, b'id\tv\na\t1\na\t\n')
+	_append_between_read_and_write(monkeypatch, p, [['y%d' % i, '0'] for i in range(10)])
+	before = _bytes(p)
+	TSVZ.scrubTabularFile(p, header='id\tv')
+	after = _bytes(p)
+	assert after.startswith(before) and after.count(b'\ny') == TSVZ._SPEC_REWRITE_ATTEMPTS  # nothing written; every append is there
+	assert 'kept changing' in capsys.readouterr().out
+
+
+def test_legacy_scrub_of_an_all_deleted_file_reads_again_after_a_row_is_appended_and_keeps_it(tmp_path, monkeypatch):
+	p = str(tmp_path / 'c.tsv')
+	_touch(p, b'id\tv\na\t1\na\t\n')
+	_append_between_read_and_write(monkeypatch, p, [['y', '0']])
+	assert TSVZ.scrubTabularFile(p, header='id\tv') == {'y': ['y', '0']}
+	assert _bytes(p) == b'id\tv\ny\t0\n'
+
+
+def test_legacy_scrub_of_an_all_deleted_file_writes_over_the_file_and_never_empties_it(tmp_path):
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, b'id\tv\na\t1\na\t\n')
+	ino = os.stat(p).st_ino
+	with _truncating_opens(p) as opens:
+		assert TSVZ.scrubTabularFile(p, header='id\tv') == {}
+	assert opens == [] and os.stat(p).st_ino == ino and _bytes(p) == b'id\tv\n'
+
+
+def test_legacy_scrub_of_an_all_deleted_file_with_a_header_it_cannot_encode_writes_nothing(tmp_path):
+	p = str(tmp_path / 'e.tsv')
+	_touch(p, b'a\t1\na\t\n')  # no header line: the one given is kept, and cannot be written
+	before = _bytes(p)
+	with pytest.raises(ValueError):
+		TSVZ.scrubTabularFile(p, header='id\tv\udcff', verifyHeader=False)
+	assert _bytes(p) == before
+
+
+def test_cli_scrub_of_an_all_deleted_file_compacts_it(tmp_path):
+	p = str(tmp_path / 'cli.tsv')
+	_touch(p, b'id\tv\na\t1\na\t\n')
+	assert _run('scrub', p, '--x-header', 'id\\tv')[0] == 0  # given the header
+	assert _bytes(p) == b'id\tv\n'
+	_touch(p, b'\na\t1\na\t\n')  # a file with no header line, given none
+	assert _run('scrub', p)[0] == 0
+	assert _bytes(p) == b'\n'
+
+
+def test_serve_handlers_scrub_of_an_all_deleted_file_compacts_it(tmp_path):
+	p = str(tmp_path / 'srv.tsv')
+	_touch(p, b'\na\t1\na\t\n')
+	store = TSVZ._ServeStore(p, lazy=True)
+	assert store.scrub(None) is True
+	assert _bytes(p) == b'\n'
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

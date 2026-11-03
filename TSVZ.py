@@ -2305,7 +2305,11 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 	non-empty one after the rows (those before it keep their empty cells, those after it were filled when read), so
 	that every row reads as it did and the header, if any, stays on the first line. An empty one that was read is
 	written before the rows (_legacyScrub, ``reset``), as wide as they are. The defaults the caller passed are not
-	written. With no header the file begins with an empty line only if the first line of the file was not a row."""
+	written. With no header the file begins with an empty line only if the first line of the file was not a row.
+
+	A file whose read finds no live row (all deleted) is written the same way, with no row: the header line, the defaults
+	lines, and the empty line for a header-less file that began with one. A reset is as wide as the header then (none
+	with no header). A file that holds nothing (no byte, or only empty streams) is left as it is."""
 	given = list(taskDic.items()) if taskDic else []
 	givenDefaults = list(defaults) if defaults not in (..., None) else []
 	for tries in range(_SPEC_REWRITE_ATTEMPTS):
@@ -2319,18 +2323,20 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 		file =  readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,
 								verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
 								encoding = encoding,strict = strict,delimiter = delimiter,defaults=readDefaults,correctColumnNum = correctColumnNum,errors = errors)
-		if not file:
-			return file, True
 		dlm = get_delimiter(delimiter,file_name=fileName)
 		formatted = _formatHeader(header,delimiter=dlm)
 		if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = formatted,encoding = encoding,strict = False,delimiter=dlm,errors = errors):
 			raise FileNotFoundError("Something catastrophic happened! File still not found after creation")  # (removed since the read: made again)
+		if not file and _fileHoldsNothing(fileName):
+			return file, True  # no row, and no byte (or only empty streams) to compact: left as it is
 		kept = _legacyKeptHeader(fileName, formatted, verifyHeader, verbose, teeLogger, encoding, strict, dlm)
 		# Everything that is to be written is looked at, and encoded, before the file is touched:
 		# rows that took the caller's defaults can hold text it cannot write.
 		payload, count, columns = _legacyFormatRows(fileName, file, teeLogger, formatted, verifyHeader, verbose, encoding,
 													strict, dlm, errors, assume=_sanitize(kept,delimiter=dlm) if kept else [])
 		blank = not kept and _legacyBeginsBlank(fileName, encoding, teeLogger, dlm)
+		if not count:
+			columns = len(kept)  # no row to take the width from: a reader takes it from the header line
 		if readDefaults.reset and columns > 1:
 			# An empty defaults line was read: no defaults reach the rows that follow it, whoever reads them (the rows
 			# were read with it, and any the caller of that read gave are not written). Written before the rows, so
