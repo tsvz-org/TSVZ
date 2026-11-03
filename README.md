@@ -277,10 +277,14 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 - **A scrub of a `.tsv` whose rows were all deleted shrinks it.** `scrubTabularFile`,
   `tsvz scrub` (also through a `tsvz serve` handler) of a `.tsv`-family file (`.tsv`,
   `.csv`, `.nsv` and their compressed forms) in which every key has been deleted
-  leaves the file as an empty store: the header line it has (or the one the scrub is
-  given, for a file with none), its `#_defaults_#` lines as a scrub of a file with rows
-  keeps them (an empty one is written after the header, as wide as the header; the
-  last non-empty one after it), and the empty first line a header-less file began with.
+  leaves the file as an empty store: the header line it has (a file with none keeps its
+  first line as its header, an empty one included, when the scrub checks the header, which
+  is the default, with a "Header mismatch" warning; the header the scrub is given is
+  written only with `verifyHeader=False`),
+  and its `#_defaults_#` lines as a scrub of a file with rows keeps them (an empty one
+  after the header, the last non-empty one after it, both as wide as the file's lines;
+  with no header line they follow an empty first line, which a scrub then writes). A
+  scrub of a path that is not there makes no file and returns `{}`, as in 5.1.
   5.1 and 5.0 left such a file as it was, deletion lines included, so a writer that
   appended keys, deleted them all and scrubbed, over and over, saw the file grow without
   limit (205, 405, 605 bytes, ... for 20 keys a cycle); now it is the same size after

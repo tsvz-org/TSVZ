@@ -267,8 +267,8 @@ def test_basic_roundtrip():
 
 
 def test_version():
-	assert TSVZ.version == '5.1'
-	assert TSVZ.__version__ == '5.1'
+	assert TSVZ.version == '5.2'
+	assert TSVZ.__version__ == '5.2'
 	assert not hasattr(TSVZ, 'WalStore')
 
 
@@ -11254,11 +11254,72 @@ def test_legacy_scrub_of_an_all_deleted_file_of_another_delimiter_keeps_its_head
 	assert _bytes(p) == SUFFIX_DELIMITERS[suffix].join(['id', 'v']).encode() + b'\n'
 
 
-def test_legacy_scrub_of_an_all_deleted_file_and_no_header_writes_no_reset(tmp_path):
-	# A reset is as wide as the rows' first line, which a header-less file with no row does not have.
+# A scrub leaves later appends reading as they would on the file it was not run on (a twin): its defaults lines stay,
+# as wide as the file's lines, and a defaults line is never the first line of a file with no header.
+NO_ROW_NO_HEADER_TWINS = [
+	# (file, the caller's defaults of the scrub and the reads, the row appended, what the scrub leaves, a header of the file's width)
+	(b'\n#_defaults_#\t\t\na\tx\ty\na\t\t\n', ['#_defaults_#', 'D1', 'D2'], ['n', '', '7'], b'\n#_defaults_#\t\t\n', 'id\tv\tw'),  # (a)
+	(b'a\t1\t2\t3\n#_defaults_#\tX\na\t\t\t\n', None, ['b', '1', '', '3'], b'\n#_defaults_#\tX\t\t\n', None),  # (b) (a reader given a header takes the twin's first row for it, and reads it differently)
+	(b'a\t1\t2\n#_defaults_#\tX\tY\na\t\t\n', None, ['n', '', '7'], b'\n#_defaults_#\tX\tY\n', 'id\tv\tw'),  # (c)
+	(b'a\tx\ty\n#_defaults_#\t\t\na\t\t\n', ['#_defaults_#', 'D1', 'D2'], ['n', '', '7'], b'\n#_defaults_#\t\t\n', 'id\tv\tw'),
+]
+
+
+@pytest.mark.parametrize('before,defaults,row,after,header', NO_ROW_NO_HEADER_TWINS)
+def test_legacy_scrub_of_an_all_deleted_file_with_no_header_reads_later_appends_as_the_unscrubbed_file_does(tmp_path, before, defaults, row, after, header):
+	p, twin = str(tmp_path / 's.tsv'), str(tmp_path / 't.tsv')
+	for path in (p, twin):
+		_touch(path, before)
+	kwargs = {} if defaults is None else {'defaults': list(defaults)}
+	assert TSVZ.scrubTabularFile(p, **kwargs) == {}
+	assert _bytes(p) == after
+	for path in (p, twin):
+		TSVZ.appendTabularFile(path, row)
+	for read in ({}, {'strict': False}, {'strict': True}) + (({'header': header, 'strict': False},) if header else ()):
+		read = dict(read, **kwargs)
+		got, was = TSVZ.readTabularFile(p, **read), TSVZ.readTabularFile(twin, **read)
+		assert dict(got) == dict(was), (read, got, was)
+
+
+def test_legacy_scrub_of_an_all_deleted_file_with_no_header_and_no_defaults_writes_none(tmp_path):
 	p = str(tmp_path / 'h.tsv')
-	_touch(p, b'\n#_defaults_#\t\t\na\t\t\n')
-	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b'\n'
+	_touch(p, b'a\t1\na\t\n')
+	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b''  # (a first line that is a row: nothing is left to keep)
+
+
+def test_legacy_scrub_of_a_missing_file_makes_none_and_returns_nothing(tmp_path):
+	# 5.1 returned {} and made nothing; the first 5.2 made the file (a scrub with createIfNotExist=False, the default),
+	# and raised for a directory that is not there.
+	for name in ('m.tsv', 'm.tsv.gz'):
+		p = str(tmp_path / name)
+		for kwargs in ({}, {'header': 'id\tv'}, {'header': 'id\tv', 'verifyHeader': False}):
+			assert TSVZ.scrubTabularFile(p, **kwargs) == {}
+			assert not os.path.exists(p)
+			assert TSVZ._legacyScrub(p, **kwargs) == ({}, True)
+	gone = str(tmp_path / 'nodir' / 'x.tsv')
+	assert TSVZ.scrubTabularFile(gone) == {} and TSVZ.scrubTabularFile(gone, header='id\tv') == {}
+	assert not os.path.exists(os.path.dirname(gone))
+
+
+def test_legacy_scrub_that_is_asked_to_create_the_file_still_does(tmp_path):
+	p = str(tmp_path / 'c.tsv')
+	assert TSVZ.scrubTabularFile(p, header='id\tv', createIfNotExist=True) == {}
+	assert _bytes(p) == b'id\tv\n'
+
+
+@pytest.mark.parametrize('name', ['plain-text', 'cut-first-member'])
+@pytest.mark.parametrize('header', ['', 'id\tv'])
+def test_legacy_scrub_of_a_gz_file_whose_first_line_cannot_be_decoded_does_not_raise(tmp_path, capsys, name, header):
+	# 5.1 returned {} after the read's damage warning; the first 5.2 raised BadGzipFile / zlib.error reading the first line.
+	import gzip
+	p = str(tmp_path / 'x.tsv.gz')
+	if name == 'plain-text':
+		data = b'id\tv\na\t1\nb\t2\n'
+	else:
+		data = gzip.compress(b'id\tv\n' + b''.join(b'k%d\tv\n' % i for i in range(2000)))[:200] + gzip.compress(b'z\t9\n')
+	_touch(p, data)
+	assert TSVZ.scrubTabularFile(p, header=header) == {}
+	assert any('compressed stream is damaged' in w for w in _tsvz_warnings(capsys))
 
 
 @pytest.mark.parametrize('kind', ['zero', 'one', 'two'])

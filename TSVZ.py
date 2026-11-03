@@ -1345,6 +1345,8 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,def
 			correctColumnNum = len(lineCache)
 		# if verbose:
 		# 	__teePrintOrNot(f"detected correctColumnNum: {len(lineCache)}",teeLogger=teeLogger)
+	if isinstance(defaults, _DefaultsList) and defaults.columns is None:
+		defaults.columns = correctColumnNum
 	if len(lineCache) == 1 or not any(lineCache[1:]):
 		if correctColumnNum == 1: 
 			taskDic[lineCache[0]] = lineCache if not storeOffset else offset
@@ -2055,8 +2057,11 @@ def _legacyFirstLine(fileName, encoding, teeLogger):
 	or, compressed, only empty streams (a 0-byte .bz2 or .xz is no stream to read, as _fileHoldsNothing's readers know)."""
 	if _isCompressedFile(fileName) and _fileHoldsNothing(fileName):
 		return ''
-	with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
-		return file.readline().decode(encoding=encoding,errors='replace')
+	try:
+		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
+			return file.readline().decode(encoding=encoding,errors='replace')
+	except Exception:  # a first line the codec cannot decode (gzip: BadGzipFile, zlib.error; bz2, xz, zstd: their own errors): none to keep
+		return ''
 
 def _legacyKeptHeader(fileName, header, verifyHeader, verbose, teeLogger, encoding, strict, delimiter, warn=True):
 	"""The header ``clearTabularFile`` leaves in the file: the file's own first line when a header is given and
@@ -2287,6 +2292,7 @@ class _DefaultsList(list):
 	replaces its cells in place), not the caller's defaults it began with."""
 	found = False
 	reset = False  # an empty defaults line was read (it stays one whatever follows it)
+	columns = None  # the column count the read took (_processLine), None before it took one
 	line = None  # the cells of that line as the file has them (``defaults`` holds them filled and fitted to the columns)
 
 	def __setitem__(self, index, value):
@@ -2323,12 +2329,12 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 		file =  readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,
 								verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
 								encoding = encoding,strict = strict,delimiter = delimiter,defaults=readDefaults,correctColumnNum = correctColumnNum,errors = errors)
+		if not file and (not os.path.exists(fileName) or _fileHoldsNothing(fileName)):
+			return file, True  # no row, and no file (not made by a scrub), or no byte (or only empty streams) to compact: as it is
 		dlm = get_delimiter(delimiter,file_name=fileName)
 		formatted = _formatHeader(header,delimiter=dlm)
 		if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = formatted,encoding = encoding,strict = False,delimiter=dlm,errors = errors):
 			raise FileNotFoundError("Something catastrophic happened! File still not found after creation")  # (removed since the read: made again)
-		if not file and _fileHoldsNothing(fileName):
-			return file, True  # no row, and no byte (or only empty streams) to compact: left as it is
 		kept = _legacyKeptHeader(fileName, formatted, verifyHeader, verbose, teeLogger, encoding, strict, dlm)
 		# Everything that is to be written is looked at, and encoded, before the file is touched:
 		# rows that took the caller's defaults can hold text it cannot write.
@@ -2336,7 +2342,13 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 													strict, dlm, errors, assume=_sanitize(kept,delimiter=dlm) if kept else [])
 		blank = not kept and _legacyBeginsBlank(fileName, encoding, teeLogger, dlm)
 		if not count:
-			columns = len(kept)  # no row to take the width from: a reader takes it from the header line
+			# No row to take the width from: a reader takes it from the header line, else from the first line it reads,
+			# which a defaults line written here would be, so it is as wide as the file's lines were.
+			columns = len(kept) or readDefaults.columns or 0
+		last = readDefaults.line if readDefaults.found else None
+		last = last if last and len(last) > 1 else None
+		if not count and not kept and ((readDefaults.reset and columns > 1) or last):
+			blank = True  # a defaults line is never the first line of a file with no header: a reader given one would take it for it
 		if readDefaults.reset and columns > 1:
 			# An empty defaults line was read: no defaults reach the rows that follow it, whoever reads them (the rows
 			# were read with it, and any the caller of that read gave are not written). Written before the rows, so
@@ -2349,8 +2361,9 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 			else:
 				first, newline, rest = payload.partition(b'\n')
 				payload = first + newline + reset + rest
-		last = readDefaults.line if readDefaults.found else None
-		if last and len(last) > 1:
+		if last:
+			if not count and len(last) < columns:
+				last = list(last) + [''] * (columns - len(last))  # (the same defaults to a reader, now the width of the file)
 			payload += _encodeRow(_sanitize(last,delimiter=dlm),dlm,encoding,errors,what='defaults') + b'\n'
 		if _legacyReplace(fileName, kept, blank, encoding, dlm, errors, payload, expect=stamp) is None:
 			continue  # another writer changed the file after the read
