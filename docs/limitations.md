@@ -72,18 +72,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone runs two writers that both rewrite the same file.
 - Approved: 2026-10-29, the user chose "Defer (Recommended)".
 
-### get_file_obj('ab') on a compressed store unlocks before the trailer
-- Kind: deferred
-- What the operator sees: `get_file_obj('ab')` and `release_file_obj()`, the 3.39 API, hand a program the store's
-  file through its codec; on release the lock is let go of before the codec writes its trailer (and, for bz2 and
-  xz, its data), so another writer appending in that gap can corrupt the stream. 3.39, 4.9 and main do the same.
-  `TSVZed`'s own writes do not use them.
-- Why: only programs that call this API on a compressed store while another process appends are affected; the
-  fix (close the codec writer first, keeping the lock through a duplicated descriptor) touches the `lockf`
-  bookkeeping.
-- Revisit when: someone uses `get_file_obj()` on compressed stores.
-- Approved: 2026-10-29, the user chose "Defer (Recommended)".
-
 ### A compressed member cut short by a writer killed mid-append can end its cut line with garbage
 - Kind: deferred
 - What the operator sees: a writer killed part way through an append to a `.tsv.gz` (more rarely `.xz`) leaves a

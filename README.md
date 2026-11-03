@@ -287,6 +287,11 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   every scrub. A file with no byte (or a compressed one with only empty streams) is
   still left alone. A scrub that finds the file changed since its read still reads
   again and writes nothing if it keeps changing, as for a file with rows.
+- **`get_file_obj('ab')` on a compressed store writes its trailer before the lock is let
+  go.** A program that calls it on a `.tsv.gz`, `.bz2`, `.xz` or `.zst` store and writes
+  through the file now has all of it, the gzip trailer and the bz2 and xz data included,
+  in the file when `release_file_obj()` unlocks it. 5.1 and earlier wrote them after the
+  unlock, where another writer could append in between and corrupt the stream.
 
 ## Upgrading to 5.1 from 5.0
 

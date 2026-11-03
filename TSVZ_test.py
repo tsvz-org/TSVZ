@@ -11329,5 +11329,54 @@ def test_serve_handlers_scrub_of_an_all_deleted_file_compacts_it(tmp_path):
 	assert _bytes(p) == b'\n'
 
 
+# ==========================================================================
+# 5.2: get_file_obj('ab') on a compressed store writes its trailer (and bz2/xz data) before the lock is let go
+# ==========================================================================
+@pytest.mark.parametrize('modes', ['ab', 'a'])
+@pytest.mark.parametrize('suffix', [x for x in _OVERWRITE_SUFFIXES if x != '.tsv'])
+def test_get_file_obj_append_on_a_compressed_store_has_written_everything_when_the_lock_is_let_go(tmp_path, monkeypatch, suffix, modes):
+	# The codec closed (its gzip trailer, all bz2 and xz data) after the unlock, in the gap another writer appends in.
+	p = str(tmp_path / ('f' + _suffix_or_skip(suffix)))
+	t = _stopped(p, header='id\tv')
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()  # an earlier member
+	sizes = []
+	real = TSVZ._unlockFile
+	monkeypatch.setattr(TSVZ, '_unlockFile', lambda f: (sizes.append(os.fstat(f.fileno()).st_size), real(f))[1])
+	f = t.get_file_obj(modes)
+	rows = ''.join('k%04d\tvalue%d\n' % (i, i) for i in range(2000))
+	f.write(rows if 'b' not in modes else rows.encode())
+	t.release_file_obj(f)
+	monkeypatch.undo()
+	assert sizes == [os.path.getsize(p)], sizes
+	# what was written reads back, after the earlier member
+	expected = {'a': ['a', '1']}
+	expected.update(('k%04d' % i, ['k%04d' % i, 'value%d' % i]) for i in range(2000))
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=True) == expected
+	t.close()
+	u = TSVZ.TSVZed(p, header='id\tv', verbose=False, rewrite_on_load=False, rewrite_on_exit=False)
+	assert {k: list(v) for k, v in u.items()} == expected
+	u['z'] = ['z', '9']  # and the store still appends
+	u.close()
+	assert TSVZ.readTabularFile(p, header='id\tv')['z'] == ['z', '9']
+
+
+@pytest.mark.parametrize('modes', ['wb', 'ab', 'a'])  # ('w' text was never supported: it hands out a binary file)
+@pytest.mark.parametrize('suffix', _OVERWRITE_SUFFIXES)
+def test_get_file_obj_gives_a_file_that_release_file_obj_closes_and_unlocks(tmp_path, suffix, modes):
+	# 'wb' and a plain .tsv are as before: the bytes (or text) written are in the file once released.
+	p = str(tmp_path / ('g' + _suffix_or_skip(suffix)))
+	t = _stopped(p, header='id\tv')
+	t.commitAppendToFile()
+	f = t.get_file_obj(modes)
+	line = 'a\t1\n'
+	f.write(line.encode() if 'b' in modes else line)
+	t.release_file_obj(f)
+	assert not t.writeLock.locked()
+	body = _text(p)
+	assert body.endswith(b'a\t1\n') and (body == b'a\t1\n') == ('w' in modes)
+	t.close()
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))

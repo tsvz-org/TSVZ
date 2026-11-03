@@ -6112,8 +6112,8 @@ memoryOnly:{self.memoryOnly}
 	
 	def get_file_obj(self,modes = 'ab'):
 		"""The store's file opened in ``modes`` and locked, with writeLock held until release_file_obj() (3.39 API; the
-		store's own writes do not use it). 'wb' empties it once locked, a compressed one then written through its
-		codec. None when it cannot be opened or locked (reported)."""
+		store's own writes do not use it). 'wb' empties it once locked; for a compressed file 'w' and 'a' modes give
+		a writer through its codec over the locked file (a new member at the end for 'a'). None when it cannot be opened or locked (reported)."""
 		self.writeLock.acquire()
 		file = None
 		try:
@@ -6122,12 +6122,21 @@ memoryOnly:{self.memoryOnly}
 				file = _openUntruncated(self._fileName)
 			elif modes == 'a+b':
 				file = open(self._fileName, 'a+b')
+			elif 'a' in modes and '+' not in modes and _fileCodec(self._fileName):
+				_requireCodec(_fileCodec(self._fileName))
+				file = open(self._fileName, 'ab')  # the codec writes into this locked file, a new member at its end
 			else:
 				file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding, teeLogger=self.teeLogger)
 			_lockFile(file)
 			if 'w' in modes:
 				file.truncate(0)
 				file = _compressedWriter(self._fileName, file) or file
+			elif 'a' in modes and '+' not in modes and _fileCodec(self._fileName):
+				raw = file
+				file = _compressedWriter(self._fileName, raw)  # (release_file_obj closes it, trailer and all, before the unlock)
+				if 'b' not in modes:
+					file = io.TextIOWrapper(file, encoding=self.encoding)
+					file._tsvzRaw = raw
 			if self.verbose:
 				self.__teePrintOrNot(f"File {self._fileName} locked with mode {modes}")
 			return file
