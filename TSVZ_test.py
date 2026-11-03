@@ -11292,6 +11292,49 @@ def test_legacy_scrub_of_an_all_deleted_file_with_no_header_and_no_defaults_writ
 	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b''  # (a first line that is a row: nothing is left to keep)
 
 
+STRICT_SCRUB_DROPPED_LINE = [
+	(b'a\t1', '', ['#_defaults_#', '', '']),  # the defaults make it 3 columns wide: "a\t1" is 2
+	(b'c\t\nc\t\tX', '', None),  # the first line makes it 2 wide, "c\t\tX" is 3 (and the key is deleted by the first)
+	(b'id\tv\nb\t\t2', 'id\tv', None),
+	(b'id\tv\tw\na\t1', 'id\tv\tw', None),
+	(b'#_defaults_#\nb\t2', '', ['#_defaults_#', 'P', 'Q']),  # the empty defaults line turns the caller's off
+]
+
+
+@pytest.mark.parametrize('text,header,defaults', STRICT_SCRUB_DROPPED_LINE)
+def test_strict_legacy_scrub_leaves_a_file_whose_read_dropped_a_line_for_its_width(tmp_path, text, header, defaults):
+	# The strict read finds no live row, but a line it dropped for its width is not a deletion: writing the file as an
+	# empty store (5.2's all-deleted scrub) would lose it. 5.1 left such a file as it was.
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, text)
+	kwargs = {'header': header, 'strict': True}
+	if defaults is not None:
+		kwargs['defaults'] = list(defaults)
+	assert TSVZ.scrubTabularFile(p, **kwargs) == {}
+	assert _bytes(p) == text
+	assert TSVZ.readTabularFile(p, header=header, strict=False, **({} if defaults is None else {'defaults': list(defaults)}))  # the row is still there to a loose read
+
+
+@pytest.mark.parametrize('header,text,after', [
+	('id\tv', b'id\tv\na\t1\na\t\n', b'id\tv\n'),
+	('', b'\nb\t2\nb\t\n', b'\n'),
+	('', b'#c\n\na\t\n', b'\n'),
+], ids=['headed', 'headerless', 'comment-first'])
+def test_strict_legacy_scrub_still_compacts_a_file_whose_every_line_is_a_deletion_comment_or_header(tmp_path, header, text, after):
+	p = str(tmp_path / 'e.tsv')
+	_touch(p, text)
+	assert TSVZ.scrubTabularFile(p, header=header, strict=True) == {}
+	assert _bytes(p) == after
+
+
+def test_strict_legacy_scrub_with_a_row_and_a_dropped_line_still_drops_the_line(tmp_path):
+	# A live row means the file is rewritten as before: strict mode drops the line it dropped when it read.
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'id\tv\na\t1\nb\t\t2\n')
+	assert TSVZ.scrubTabularFile(p, header='id\tv', strict=True) == {'a': ['a', '1']}
+	assert _bytes(p) == b'id\tv\na\t1\n'
+
+
 def test_legacy_scrub_of_a_missing_file_makes_none_and_returns_nothing(tmp_path):
 	# 5.1 returned {} and made nothing; the first 5.2 made the file (a scrub with createIfNotExist=False, the default),
 	# and raised for a directory that is not there.

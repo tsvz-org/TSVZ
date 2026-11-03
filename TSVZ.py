@@ -1366,6 +1366,8 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,def
 		return correctColumnNum , []
 	elif len(lineCache) != correctColumnNum:
 		if strict and not any(defaults[1:]):
+			if isinstance(defaults, _DefaultsList):
+				defaults.dropped = True
 			if reporter is not None:
 				reporter.note('strict-drop', None, 'dropped a line whose column count is not {} (strict mode)'.format(correctColumnNum))
 			return correctColumnNum , []
@@ -2293,6 +2295,7 @@ class _DefaultsList(list):
 	found = False
 	reset = False  # an empty defaults line was read (it stays one whatever follows it)
 	columns = None  # the column count the read took (_processLine), None before it took one
+	dropped = False  # a strict read dropped a line for its width (_processLine): a read with no row may not be all deletions
 	line = None  # the cells of that line as the file has them (``defaults`` holds them filled and fitted to the columns)
 
 	def __setitem__(self, index, value):
@@ -2315,7 +2318,8 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 
 	A file whose read finds no live row (all deleted) is written the same way, with no row: the header line, the defaults
 	lines, and the empty line for a header-less file that began with one. A reset is as wide as the header then (none
-	with no header). A file that holds nothing (no byte, or only empty streams) is left as it is."""
+	with no header). A file that holds nothing (no byte, or only empty streams) is left as it is, and so is one whose
+	strict read dropped a line for its width: that line is not a deletion, and writing the file empty would lose it."""
 	given = list(taskDic.items()) if taskDic else []
 	givenDefaults = list(defaults) if defaults not in (..., None) else []
 	for tries in range(_SPEC_REWRITE_ATTEMPTS):
@@ -2329,8 +2333,8 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 		file =  readTabularFile(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,
 								verifyHeader = verifyHeader,verbose = verbose,taskDic = taskDic,
 								encoding = encoding,strict = strict,delimiter = delimiter,defaults=readDefaults,correctColumnNum = correctColumnNum,errors = errors)
-		if not file and (not os.path.exists(fileName) or _fileHoldsNothing(fileName)):
-			return file, True  # no row, and no file (not made by a scrub), or no byte (or only empty streams) to compact: as it is
+		if not file and (readDefaults.dropped or not os.path.exists(fileName) or _fileHoldsNothing(fileName)):
+			return file, True  # no row, and no file (not made by a scrub), no byte (or only empty streams) to compact, or a line the strict read dropped (not a deletion; it stays): as it is
 		dlm = get_delimiter(delimiter,file_name=fileName)
 		formatted = _formatHeader(header,delimiter=dlm)
 		if not _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = teeLogger,header = formatted,encoding = encoding,strict = False,delimiter=dlm,errors = errors):

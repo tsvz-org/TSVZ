@@ -135,3 +135,48 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   defaults the store's program uses.
 - Revisit when: an operator hits it.
 - Approved: 2026-11-01, the user chose "Known limitation (Recommended)".
+
+### A defaults line narrower than the rows is cut at a scrub
+- Kind: deferred
+- What the operator sees: a scrub (`scrubTabularFile`, `tsvz scrub`, a `tsvz serve` handler) of a `.tsv`-family file
+  that is given no header to take the column count from, and is given defaults (`defaults=`, `--x-defaults`)
+  narrower than the file's rows, reads the file at the width of those defaults and writes it back that wide: every
+  row loses the cells past it, a strict scrub drops the rows it reads as the wrong width. For example,
+  `a\t1\t2\t3` scrubbed with `defaults=['#_defaults_#', 'D']` becomes `a\t1`. A reader given the same defaults
+  already reads the rows cut; the scrub makes it permanent. A narrow `#_defaults_#` line in the file itself is not
+  cut, and neither is a file whose header the scrub is given and checks. Same in 5.1.
+- Why: the scrub and the reader take their column count from the defaults they are given before they look at the
+  rows, and which width should win is the scrub/reader column-width rule, which gets its own design after 5.2, with
+  the differential scrub fuzzer as its test.
+- Revisit when: the width-rule design (after 5.2 ships).
+- Approved: 2026-11-03, the user chose "bb3e697 + small fix (Recommended)", whose description said the narrow-defaults
+  cut bug stays as in 5.1 and the width rule gets its own design.
+
+### A row wider than the header loses its extra cells at a scrub or TSVZed rewrite
+- Kind: deferred
+- What the operator sees: a `.tsv` whose header is `id\tv` and which holds a row `a\t1\t2` (written by hand or by
+  another tool) reads as `a: [a, 1]` (readers and a `TSVZed` cut a line to the header's width). A scrub, with the
+  header given or not, and any rewrite by a `TSVZed` (after a change, or `hardMapToFile()`) write that row back as
+  `a\t1`: the third cell is lost from the file. With `strict=True` the row is dropped at the read instead, and a
+  scrub or rewrite writes the file without it (a strict scrub of a file with no other live row leaves it as it is).
+  Same in 5.1.
+- Why: the width of a file is its header's (or its first line's), whatever the rows hold; whether a wider row should
+  widen the file, or be kept as written, is the scrub/reader column-width rule, which gets its own design after 5.2,
+  with the differential scrub fuzzer as its test.
+- Revisit when: the width-rule design (after 5.2 ships).
+- Approved: 2026-11-03, the user chose "In the width design (Recommended)".
+
+### A bare #_defaults_# first line is misread by a reader without defaults
+- Kind: deferred
+- What the operator sees: a `.tsv` with no header whose first line is `#_defaults_#` alone (an empty defaults line),
+  followed by rows of two or more cells, is read by a reader given no defaults (`readTabularFile(p)`,
+  `readTabularFile(p, strict=False)`) with a column count of 1, taken from that line: it returns a row named
+  `#_defaults_#`, and the rows after it are dropped (strict, the default of `readTabularFile`) or cut to their key
+  (`strict=False`). A scrub without defaults then writes the file that way (`#_defaults_#\na\t1\t2` becomes
+  `\n#_defaults_#\na\n`): the rows' other cells are lost. A reader given defaults of two or more columns reads it
+  correctly. 5.2's scrub never writes such a file (it puts an empty line first); a hand-made one does. Same in 5.1.
+- Why: a reader takes its column count from the first line it reads, a defaults line included; which line sets the
+  width is the scrub/reader column-width rule, which gets its own design after 5.2, with the differential scrub
+  fuzzer as its test.
+- Revisit when: the width-rule design (after 5.2 ships).
+- Approved: 2026-11-03, the user chose "In the width design (Recommended)".

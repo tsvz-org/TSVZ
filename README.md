@@ -294,7 +294,9 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   appended keys, deleted them all and scrubbed, over and over, saw the file grow without
   limit (205, 405, 605 bytes, ... for 20 keys a cycle); now it is the same size after
   every scrub. A file with no byte (or a compressed one with only empty streams) is
-  still left alone. A scrub that finds the file changed since its read still reads
+  still left alone, and so is a file whose strict scrub (`strict=True`, `--x-strict`) read
+  dropped a line for its width and found no row: that line is not a deletion, as 5.1 left
+  it. A scrub that finds the file changed since its read still reads
   again and writes nothing if it keeps changing, as for a file with rows.
 - **`get_file_obj('ab')` on a compressed store writes its trailer before the lock is let
   go.** A program that calls it on a `.tsv.gz`, `.bz2`, `.xz` or `.zst` store and writes
@@ -369,6 +371,15 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   those cells empty for a program that opens the store with its own defaults; run the
   scrub with the defaults that program uses
   ([limitations](docs/limitations.md#a-scrub-run-with-other-defaults-than-the-stores-program-can-change-how-early-rows-read)).
+- **Known, as in 5.1: the column count of a scrub or read can cut rows.** A scrub given
+  defaults narrower than the rows, and no header, writes the rows that narrow; a row
+  wider than the header is written back at the header's width by a scrub or a `TSVZed`
+  rewrite; a `.tsv` with no header that begins with a bare `#_defaults_#` line is read
+  with one column by a reader given no defaults. All three lose cells; they wait for the
+  column-width design after 5.2
+  ([narrow defaults](docs/limitations.md#a-defaults-line-narrower-than-the-rows-is-cut-at-a-scrub),
+  [wider than the header](docs/limitations.md#a-row-wider-than-the-header-loses-its-extra-cells-at-a-scrub-or-tsvzed-rewrite),
+  [bare defaults line](docs/limitations.md#a-bare-_defaults_-first-line-is-misread-by-a-reader-without-defaults)).
 - **Running programs keep 5.0** until they are restarted: long-running programs that
   import TSVZ, and running `tsvz serve` handlers.
 
