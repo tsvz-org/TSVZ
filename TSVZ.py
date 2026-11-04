@@ -128,8 +128,9 @@ def _checkedMembers(f, codec, damage):
 	  reading goes on at the next member. A rewrite killed inside a later member's write leaves the same shape, and
 	  the old members after it are then read: decoding cannot tell the two apart (docs/limitations.md).
 	- Magic bytes inside a cut member's own compressed bytes (about one in 2^24 a byte for gzip) end it early: when
-	  what begins there is damaged too, the cut member's bytes are taken to the magic bytes after it, and they
-	  must still decode as cut short (at most _CUT_EXTENSIONS times in a row).
+	  what begins there is damaged too and its own bytes do not decode as cut short, the cut member's bytes are
+	  taken to the magic bytes after it, and they must still decode as cut short (at most _CUT_EXTENSIONS times in
+	  a row). A damaged member's own bytes are tried first: two killed appends in a row are two cut members.
 	- Any other damage (bytes that do not decode, a member that fails its check) stops the reading there, as a
 	  codec's reader does: what follows is not read.
 
@@ -153,29 +154,34 @@ def _checkedMembers(f, codec, damage):
 				yield output
 			continue
 		if first:
-			damage.append('the first member is cut short or does not decode ({}): reading stopped there'.format(
+			damage.append('the first member is cut short or does not decode ({}): reading stopped there; a scrub '
+						  '(tsvz scrub, scrubTabularFile) makes the file again, as an empty store with its header'.format(
 				error or 'it ends before the member does'))
 			return
 		following = _nextMemberStart(f, codec, start + 1)
-		begin = start
-		if cut is not None and extended < _CUT_EXTENSIONS:  # magic bytes inside the cut member: it may go on
-			begin = cut
-			extended += 1
 		if following is None:  # the last member: nothing after it to read
-			if begin == start:
-				damage.append('the member at byte {} is cut short: left out'.format(start) if status == 'short' else
-							  'the bytes at byte {} do not decode ({}): left out'.format(start, error))
+			damage.append('the member at byte {} is cut short: left out'.format(start) if status == 'short' else
+						  'the bytes at byte {} do not decode ({}): left out'.format(start, error))
 			return
-		f.seek(begin)
-		raw = f.read(following - begin)
-		cutShort, _, error = _decodeAlone(_gzipUnpad(raw) if name == 'gzip' else raw, codec)
-		if not cutShort:
-			damage.append('the {} bytes at byte {} do not decode ({}): reading stopped there'.format(len(raw), begin, error))
-			return
-		if begin == start:
+		cutShort, size, error = _cutShortTo(f, codec, start, following)
+		if cutShort:
 			damage.append('the member at byte {} is cut short: left out, the rest is read'.format(start))
 			cut, extended = start, 0
+		elif cut is not None and extended < _CUT_EXTENSIONS and _cutShortTo(f, codec, cut, following)[0]:
+			extended += 1  # magic bytes inside the cut member before: its bytes run on to the next magic
+		else:
+			damage.append('the {} bytes at byte {} do not decode ({}): reading stopped there'.format(size, start, error))
+			return
 		src.seek(following)
+
+
+def _cutShortTo(f, codec, begin, end):
+	"""``(cutShort, size, error)``: whether the bytes of ``f`` from ``begin`` to ``end``, decoded on their own (spec
+	§16.6 rule 2; gzip zero padding that ends them left out), merely end before their member does."""
+	f.seek(begin)
+	raw = f.read(end - begin)
+	cutShort, _, error = _decodeAlone(_gzipUnpad(raw) if _CODEC_NAMES[codec] == 'gzip' else raw, codec)
+	return cutShort, len(raw), error
 
 
 def _firstLineIn(f, codec):
