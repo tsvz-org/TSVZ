@@ -318,6 +318,11 @@ def _content(path):
 	return gzip.decompress(data) if path.endswith('.gz') else data
 
 
+def _read_with_339(path):
+	"""What 3.39's reader finds in the legacy file at ``path`` (the rows, in order)."""
+	return list(TSVZ_old.readTabularFile(path, header=LEGACY_HEADER, strict=False).items())
+
+
 def _twin_paths(base, suffix):
 	old_dir, new_dir = base / 'old', base / 'new'
 	old_dir.mkdir(parents=True, exist_ok=True)
@@ -520,7 +525,10 @@ def test_legacy_tsvzed_matches_339(tmp_path):
 			ops = _legacy_ops(seed)
 			assert _observe(lambda: _drive_tsvzed(TSVZ, new_path, ops), os.path.dirname(new_path)) == \
 				_observe(lambda: _drive_tsvzed(TSVZ_old, old_path, ops), os.path.dirname(old_path)), (suffix, seed)
-			assert _content(new_path) == _content(old_path), (suffix, seed)
+			# Not the bytes: since 5.2 a TSVZed that loads a file holding a key's row and its deletion rewrites it, as
+			# 3.39 did only for a key with two values, so the file does not grow with every session (it is never larger).
+			assert len(_content(new_path)) <= len(_content(old_path)), (suffix, seed)
+			assert _read_with_339(new_path) == _read_with_339(old_path), (suffix, seed)
 
 
 def test_legacy_tsvzedlite_matches_339(tmp_path):
@@ -11335,6 +11343,39 @@ def test_strict_legacy_scrub_with_a_row_and_a_dropped_line_still_drops_the_line(
 	assert _bytes(p) == b'id\tv\na\t1\n'
 
 
+def _tsvzed_set_delete_sessions(p, sessions=5, **kwargs):
+	"""TSVZed with its default settings, one object per session: set 20 keys, delete them, close; the size after each."""
+	sizes = []
+	for _ in range(sessions):
+		t = TSVZ.TSVZed(p, header='id\tv', verbose=False, **kwargs)
+		for k in range(20):
+			t['k%d' % k] = ['k%d' % k, 'x']
+		for k in range(20):
+			del t['k%d' % k]
+		t.close()
+		sizes.append(os.path.getsize(p))
+	return sizes
+
+
+@pytest.mark.parametrize('kwargs', [{}, {'rewrite_interval': 0.01}], ids=['default', 'rewrite_interval'])
+def test_tsvzed_sessions_that_set_and_delete_keys_do_not_grow_the_file(tmp_path, kwargs):
+	# 5.1 and 3.39: 205, 405, 605 ... The load rewrote only a file that held a key with two values, not one that held a
+	# key's row and its deletion.
+	p = str(tmp_path / 'g.tsv')
+	sizes = _tsvzed_set_delete_sessions(p, **kwargs)
+	assert len(set(sizes)) == 1, sizes
+	assert len(TSVZ.TSVZed(p, header='id\tv', verbose=False)) == 0
+
+
+def test_tsvzed_load_rewrites_a_file_that_holds_a_row_and_its_deletion(tmp_path):
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'id\tv\na\t1\nb\t2\na\t\n')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False)
+	assert dict(t) == {'b': ['b', '2']}
+	t.close()
+	assert _bytes(p) == b'id\tv\nb\t2\n'
+
+
 def test_legacy_scrub_of_a_missing_file_makes_none_and_returns_nothing(tmp_path):
 	# 5.1 returned {} and made nothing; the first 5.2 made the file (a scrub with createIfNotExist=False, the default),
 	# and raised for a directory that is not there.
@@ -11445,11 +11486,47 @@ def test_legacy_scrub_of_an_all_deleted_file_with_a_header_it_cannot_encode_writ
 def test_cli_scrub_of_an_all_deleted_file_compacts_it(tmp_path):
 	p = str(tmp_path / 'cli.tsv')
 	_touch(p, b'id\tv\na\t1\na\t\n')
-	assert _run('scrub', p, '--x-header', 'id\\tv')[0] == 0  # given the header
+	assert _run('scrub', p, '--x-header', 'id\\tv')[0] == 0  # the header is passed to the scrub (checked), so line 1 stays
 	assert _bytes(p) == b'id\tv\n'
 	_touch(p, b'\na\t1\na\t\n')  # a file with no header line, given none
 	assert _run('scrub', p)[0] == 0
 	assert _bytes(p) == b'\n'
+
+
+def test_cli_scrub_with_a_header_keeps_it_when_every_key_including_the_headers_first_cell_was_deleted(tmp_path):
+	# `tsvz keys` lists `id`, the header's first cell, as a key: deleting every key listed deletes it too. A scrub given
+	# the header keeps line 1 as the header; 5.2 before this read the header line as a key and wrote 0 bytes.
+	p = str(tmp_path / 'h.tsv')
+	for key, value in (('a', '1'), ('b', '2')):
+		assert _run('set', p, key, value, '--x-header', 'id\\tv')[0] == 0
+	for key in ('a', 'b', 'id'):
+		assert _run('delete', p, key, '--x-header', 'id\\tv')[0] == 0
+	assert _run('scrub', p, '--x-header', 'id\\tv')[0] == 0
+	assert _bytes(p) == b'id\tv\n'
+	assert _run('set', p, 'c', '3')[0] == 0
+	assert TSVZ.readTabularFile(p, header='id\tv') == {'c': ['c', '3']}
+
+
+def test_cli_scrub_without_a_header_still_reads_the_first_line_as_a_row(tmp_path):
+	p = str(tmp_path / 'n.tsv')
+	_touch(p, b'id\tv\na\t1\na\t\nid\t\nid\n')
+	assert _run('scrub', p)[0] == 0
+	assert _bytes(p) == b''
+
+
+def test_cli_scrub_with_a_header_and_strict_checks_the_header_and_drops_rows_of_another_width(tmp_path):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'x\tw\na\t1\n')
+	status, out, err = _run('scrub', p, '--x-header', 'id\\tv')  # loose: a warning, the file keeps its own first line
+	assert status == 0 and 'Header mismatch' in (out + err) and _bytes(p) == b'x\tw\na\t1\n'
+	assert _run('scrub', p, '--x-header', 'id\\tv', '--x-strict')[0] == 1  # strict: the mismatch is an error
+	assert _bytes(p) == b'x\tw\na\t1\n'
+	_touch(p, b'id\tv\na\t1\t2\nb\t3\n')  # strict drops a row of another width at a scrub with rows
+	assert _run('scrub', p, '--x-header', 'id\\tv', '--x-strict')[0] == 0
+	assert _bytes(p) == b'id\tv\nb\t3\n'
+	_touch(p, b'id\tv\na\t1\t2\n')  # and leaves a file with no live row, whose line it dropped (d9bf316)
+	assert _run('scrub', p, '--x-header', 'id\\tv', '--x-strict')[0] == 0
+	assert _bytes(p) == b'id\tv\na\t1\t2\n'
 
 
 def test_serve_handlers_scrub_of_an_all_deleted_file_compacts_it(tmp_path):
@@ -11461,12 +11538,12 @@ def test_serve_handlers_scrub_of_an_all_deleted_file_compacts_it(tmp_path):
 
 
 # ==========================================================================
-# 5.2: get_file_obj('ab') on a compressed store writes its trailer (and bz2/xz data) before the lock is let go
+# 5.2: get_file_obj('ab') on a compressed store writes its trailer (and bz2/xz/zstd data) before the lock is let go
 # ==========================================================================
 @pytest.mark.parametrize('modes', ['ab', 'a'])
 @pytest.mark.parametrize('suffix', [x for x in _OVERWRITE_SUFFIXES if x != '.tsv'])
 def test_get_file_obj_append_on_a_compressed_store_has_written_everything_when_the_lock_is_let_go(tmp_path, monkeypatch, suffix, modes):
-	# The codec closed (its gzip trailer, all bz2 and xz data) after the unlock, in the gap another writer appends in.
+	# The codec closed (its gzip trailer, all bz2, xz and zstd data) after the unlock, in the gap another writer appends in.
 	p = str(tmp_path / ('f' + _suffix_or_skip(suffix)))
 	t = _stopped(p, header='id\tv')
 	t['a'] = ['a', '1']

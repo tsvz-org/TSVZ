@@ -2317,8 +2317,8 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 	written. With no header the file begins with an empty line only if the first line of the file was not a row.
 
 	A file whose read finds no live row (all deleted) is written the same way, with no row: the header line, the defaults
-	lines, and the empty line for a header-less file that began with one. A reset is as wide as the header then (none
-	with no header). A file that holds nothing (no byte, or only empty streams) is left as it is, and so is one whose
+	lines, and the empty line for a header-less file that began with one. A reset is as wide as the header then, or, with
+	no header, as the lines the read took its column count from. A file that holds nothing (no byte, or only empty streams) is left as it is, and so is one whose
 	strict read dropped a line for its width: that line is not a deletion, and writing the file empty would lose it."""
 	given = list(taskDic.items()) if taskDic else []
 	givenDefaults = list(defaults) if defaults not in (..., None) else []
@@ -4322,7 +4322,7 @@ class _TSVZedLoad(OrderedDict):
 
 	Its rows are shaped as ``TSVZed.__setitem__`` shapes them in memory only (keys and cells right-stripped,
 	the column count and the defaults applied), with a column count and defaults of its own. ``dirty`` tells
-	that the file holds a key twice.
+	that the file holds a key twice (two values, or a row and its deletion).
 	"""
 
 	def __init__(self, owner, columns, defaults):
@@ -4372,6 +4372,7 @@ class _TSVZedLoad(OrderedDict):
 	def __delitem__(self, key):
 		key = str(key)
 		OrderedDict.__delitem__(self, key if OrderedDict.__contains__(self, key) else key.rstrip())
+		self.dirty = True  # the file holds the key twice: its row, and this deletion
 
 	def replay(self, rows):
 		"""Apply rows queued for the file, as reading them back will: a row whose values are all empty deletes."""
@@ -7550,7 +7551,9 @@ class _ServeStore(object):
 				if self.spec:
 					return _specScrub(self.path, teeLogger=log, verifyHeader=False, verbose=self.verbose,
 									  strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)[1]
-				return _legacyScrub(self.path, teeLogger=log, verifyHeader=False, verbose=self.verbose,
+				# The header the store is given is the file's: its first line stays the header (a scrub that checked
+				# none would read it as a key, and leave a store of deleted keys with 0 bytes).
+				return _legacyScrub(self.path, teeLogger=log, header=self.header, verifyHeader=True, verbose=self.verbose,
 									strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)[1]
 			finally:
 				self.parts = None  # read again at the next request
@@ -9059,7 +9062,7 @@ def _cliEngineOp(args, delimiter, logger, stdin, stdout):
 						strict=args.strict, teeLogger=logger, verbose=args.verbose,
 						create=not exists and operation != 'clear',  # clear creates the store itself
 						createDefaults=None if operation == 'setdefault' else [],
-						checkHeader=operation in ('set', 'append', 'delete', 'clear'), lazy=True)  # as 3.39 did
+						checkHeader=operation in ('set', 'append', 'delete', 'clear', 'scrub'), lazy=True)  # as 3.39 did (a scrub keeps the first line as the header)
 
 	def request(line, bulk=None):
 		"""The response to ``line``; the engine's messages go to stderr as they come, at their own level."""

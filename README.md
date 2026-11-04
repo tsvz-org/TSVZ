@@ -276,20 +276,25 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 
 - **A scrub of a `.tsv` whose rows were all deleted shrinks it.** `scrubTabularFile`,
   `tsvz scrub` (also through a `tsvz serve` handler) of a `.tsv`-family file (`.tsv`,
-  `.csv`, `.nsv` and their compressed forms) in which every key has been deleted
+  `.csv`, `.nsv`, `.psv` and their compressed forms) in which every key has been deleted
   leaves the file as an empty store: the header line it has, and its `#_defaults_#`
   lines as a scrub of a file with rows keeps them (an empty one after the header, the
   last non-empty one after it, both as wide as the header, or as the column count the
   read took, which caller defaults set when given). A file with no header line keeps its
-  empty first line, or becomes 0 bytes when its first line was a row, and a defaults line
-  it keeps follows an empty first line, which the scrub then writes. A scrub that is given
+  empty first line, or becomes 0 bytes when its first line was a row; a first line that
+  is no row (a comment, say) becomes an empty line. A defaults line it keeps follows an
+  empty first line, which the scrub then writes. Comment lines go, as a scrub of a file
+  with rows already drops them. A scrub that is given
   a header (and checks it, the default) keeps the file's first line as its header, an
   empty one included, with a "Header mismatch" warning when it differs; the header it is
-  given is written only with `verifyHeader=False`. A scrub of a path that is not there
+  given is written only with `verifyHeader=False`, or when the file's first line cannot be
+  decoded (plain text named `.gz`). A scrub of a path that is not there
   makes no file and returns `{}`, as in 5.1, unless `createIfNotExist=True`. A compressed
   file whose read decodes no row (plain text named `.gz`, a first member cut short) is
   made again as an empty store, as a scrub of a damaged file with rows already was in
-  5.1: the bytes after the damage go (see the damaged-stream notes above).
+  5.1: the bytes after the damage go (see the damaged-stream notes above), and
+  `tsvz clear --x-header H --x-strict` (`clearTabularFile(verifyHeader=True)`) now clears
+  such a file, where 5.1 exited 1 with the codec's error.
   5.1 and 5.0 left such a file as it was, deletion lines included, so a writer that
   appended keys, deleted them all and scrubbed, over and over, saw the file grow without
   limit (205, 405, 605 bytes, ... for 20 keys a cycle); now it is the same size after
@@ -300,7 +305,7 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   again and writes nothing if it keeps changing, as for a file with rows.
 - **`get_file_obj('ab')` on a compressed store writes its trailer before the lock is let
   go.** A program that calls it on a `.tsv.gz`, `.bz2`, `.xz` or `.zst` store and writes
-  through the file now has all of it, the gzip trailer and the bz2 and xz data included,
+  through the file now has all of it, the gzip trailer and the bz2, xz and zstd data included,
   in the file when `release_file_obj()` unlocks it. 5.1 and earlier wrote them after the
   unlock, where another writer could append in between and corrupt the stream.
 
@@ -371,15 +376,15 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   those cells empty for a program that opens the store with its own defaults; run the
   scrub with the defaults that program uses
   ([limitations](docs/limitations.md#a-scrub-run-with-other-defaults-than-the-stores-program-can-change-how-early-rows-read)).
-- **Known, as in 5.1: the column count of a scrub or read can cut rows.** A scrub given
-  defaults narrower than the rows, and no header, writes the rows that narrow; a row
-  wider than the header is written back at the header's width by a scrub or a `TSVZed`
-  rewrite; a `.tsv` with no header that begins with a bare `#_defaults_#` line is read
-  with one column by a reader given no defaults. All three lose cells; they wait for the
-  column-width design after 5.2
-  ([narrow defaults](docs/limitations.md#a-defaults-line-narrower-than-the-rows-is-cut-at-a-scrub),
-  [wider than the header](docs/limitations.md#a-row-wider-than-the-header-loses-its-extra-cells-at-a-scrub-or-tsvzed-rewrite),
-  [bare defaults line](docs/limitations.md#a-bare-_defaults_-first-line-is-misread-by-a-reader-without-defaults)).
+- **Known, mostly as in 5.1: a scrub, a rewrite or a read takes one column count for every row,
+  and can lose cells or keys.** A scrub given defaults narrower than the rows, a row wider
+  than the header, and a `.tsv` that begins with a bare `#_defaults_#` line (read without
+  defaults) are examples; the entry lists each, and which is new in 5.2
+  ([limitations](docs/limitations.md#scrubs-and-rewrites-read-rows-at-one-column-width-deferred-to-the-width-design)).
+  A strict scrub of a file whose read dropped a line for its width and found no row leaves it,
+  so it grows again over append, delete-all and scrub cycles
+  ([limitations](docs/limitations.md#a-strict-scrub-leaves-a-file-whose-read-dropped-a-line-for-its-width)).
+  Both wait for the column-width design after 5.2.
 - **Running programs keep 5.0** until they are restarted: long-running programs that
   import TSVZ, and running `tsvz serve` handlers.
 
