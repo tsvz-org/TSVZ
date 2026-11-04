@@ -2667,6 +2667,152 @@ def _chainFill(line, previous):
 	return [cell if cell or i == 0 or i >= len(previous) else previous[i] for i, cell in enumerate(cells)]
 
 
+def _legacyLineKind(text, width, strictActive, delimiter):
+	"""What a read at column count ``width`` makes of the legacy line ``text``, as _processLine decides it, changing
+	nothing: ``(kind, key, ncells, strictTakes)``. ``kind`` is 'skip' (comment, empty, no key), 'row', 'delete',
+	'defaults' or 'reset' (a #_defaults_# line with no value); ``strictTakes`` whether a strict read applies it, with
+	defaults that hold a value in effect where it stands (``strictActive``). A bare #_defaults_# line is a 'reset' at
+	every width (at width 1 it is also the row '#_defaults_#' to the reader: the compaction keeps every such line)."""
+	line = text.strip('\x00').rstrip('\r\n')
+	if not line or (line.startswith('#') and not line.startswith(DEFAULTS_INDICATOR_KEY)):
+		return 'skip', None, 0, False
+	cells = _unsanitize(line.split(delimiter), delimiter)
+	if not cells or not cells[0]:
+		return 'skip', None, 0, False
+	if len(cells) == 1 or not any(cells[1:]):
+		if cells[0] == DEFAULTS_INDICATOR_KEY:
+			return 'reset', cells[0], len(cells), True
+		return ('row' if width == 1 else 'delete'), cells[0], len(cells), True
+	takes = len(cells) == width or strictActive
+	return ('defaults' if cells[0] == DEFAULTS_INDICATOR_KEY else 'row'), cells[0], len(cells), takes
+
+
+def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched):
+	"""One pass of _legacyCompact over the legacy lines ``raw`` (bytes, without their newline): the lines kept, each a
+	line of ``raw`` byte for byte and in its place, but for a key's last line moved up into its first line's place
+	and a dead key's protected line emptied (built from its own bytes).
+
+	``width`` is the column count of the caller's reader (-1: taken from the first keyed line), ``consumed`` whether
+	that reader takes line 1 for its header, ``matched`` whether line 1 holds that header, ``defaults`` the caller's.
+	Kept: line 1; every #_defaults_# line; for each live key since its last deletion, its first line (its place) and
+	its last (its value), and the first and last a strict reader takes, unless nothing between the first and the last
+	changes how a row reads, when the last line takes the first one's place; the first keyed line after line 1 when a
+	reader takes its column count from it (line 1 holds no key, or a header the caller's reader does not take): a dead
+	key's line there is kept emptied (a deletion as wide as it was), or with the deletion that ends it."""
+	enc = encoding or 'utf8'
+	strictActive = len(defaults) > 1 and any(defaults[1:])
+
+	def keyed(i):  # (a keyed line to any reader)
+		return _legacyLineKind(raw[i].decode(enc, errors='replace'), 1, False, delimiter)[0] != 'skip'
+	line0Keyed = bool(raw) and keyed(0)
+	after0 = next((i for i in range(1, len(raw)) if keyed(i)), None)
+	protectable = (0,) if after0 is None else (0, after0)
+	live = OrderedDict()  # key -> [first, last, firstTaken, lastTaken, firstN, lastN, firstTakes, lastTakes] since its last deletion
+	pinfo = {}  # protectable index holding a row -> (key, ncells)
+	killer = {}  # protectable index whose key died -> the deletion that ended it
+	lastDelete = {}  # key -> its last deletion
+	boundaries = []  # #_defaults_# lines, in order
+	firstKeyed = None
+	for i, line in enumerate(raw):
+		if i == 0 and consumed:
+			continue
+		text = line.decode(enc, errors='replace')
+		kind, key, n, takes = _legacyLineKind(text, width, strictActive, delimiter)
+		if kind == 'skip':
+			continue
+		if width == -1:  # the first keyed line sets the column count, as _processLine does
+			width = len(defaults) if len(defaults) > 1 else n
+			kind, key, n, takes = _legacyLineKind(text, width, strictActive, delimiter)
+		if firstKeyed is None:
+			firstKeyed = i
+		if kind in ('defaults', 'reset'):
+			boundaries.append(i)
+			strictActive = False if kind == 'reset' else (True if takes else strictActive)
+		elif kind == 'delete':
+			rec = live.pop(key, None)
+			if rec is not None:
+				for j in protectable:
+					if j in pinfo and pinfo[j][0] == key and j >= rec[0]:
+						killer[j] = i
+			lastDelete[key] = i
+		else:
+			if i in protectable:
+				pinfo[i] = (key, n)
+			rec = live.get(key)
+			if rec is None:
+				live[key] = [i, i, i if takes else None, i if takes else None, n, n, takes, takes]
+			else:
+				rec[1], rec[5], rec[7] = i, n, takes
+				if takes:
+					if rec[2] is None:
+						rec[2] = i
+					rec[3] = i
+	kept = set(boundaries)
+	if raw:
+		kept.add(0)
+	content = {}
+	for rec in live.values():
+		first, last, firstTaken, lastTaken, firstN, lastN, firstTakes, lastTakes = rec
+		kept.add(first)
+		if first == last:
+			continue
+		if (bisect.bisect_right(boundaries, first) == bisect.bisect_left(boundaries, last) and firstTakes and lastTakes
+				and first != 0 and (first not in (firstKeyed, after0) or firstN == lastN)):
+			content[first] = raw[last]  # (the key is one line: its value, at its place; the same defaults reach it)
+			continue
+		kept.add(last)
+		if firstTaken is not None:
+			kept.add(firstTaken)  # (a strict reader's place)
+		if lastTaken is not None:
+			kept.add(lastTaken)  # (and its value)
+	protected = [0] if raw else []
+	if after0 is not None and (not line0Keyed or (consumed and not matched)):
+		protected.append(after0)
+	for j in protected:
+		kept.add(j)
+		if j in killer:
+			if j != 0 and pinfo[j][1] > 1 and delimiter != '\x00':
+				# Emptied: a deletion as wide as the line was, so a reader takes the same column count from it and
+				# the key stays dead; the deletion that ended it is then not needed. (Not in .nsv: its readers strip
+				# trailing NULs, so an emptied line would read one cell wide.)
+				d = delimiter.encode(enc)
+				content[j] = raw[j].strip(b'\x00').split(d, 1)[0] + d * (pinfo[j][1] - 1)
+			else:
+				kept.add(killer[j])
+	if consumed and line0Keyed and not matched:
+		# line 1 is a row to a reader given no header: when its key ends deleted, that deletion stays for it
+		key0 = _legacyLineKind(raw[0].decode(enc, errors='replace'), width, False, delimiter)[1]
+		if key0 is not None and key0 not in live and key0 in lastDelete:
+			kept.add(lastDelete[key0])
+	return [content.get(i, raw[i]) for i in sorted(kept)]
+
+
+def _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched):
+	"""The legacy file whose lines are ``raw`` (bytes, without their newline) compacted by dropping lines (comments,
+	empty lines, superseded lines, dead keys' lines): what every reader given the caller's arguments takes from it,
+	of any version and either strictness, stays, because every line kept is kept as it is, in its place
+	(_legacyCompactOnce). Repeats until a pass changes nothing (emptying a line can make another one droppable), at most
+	4 passes: stopping early is less compact, never wrong."""
+	defaults = list(defaults) if defaults and defaults is not ... else []
+	for _ in range(4):
+		out = _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched)
+		if out == raw:
+			break
+		raw = out
+	return raw
+
+
+def _legacyWidthOf(line0, header, consumed, defaults, encoding, delimiter):
+	"""The column count a whole read with ``header`` (taken for line 1 when ``consumed``) and ``defaults`` starts from,
+	given line 1 (bytes, or None): the header's when line 1 holds it, else the defaults' (two or more cells), else -1
+	(from the first keyed line)."""
+	if consumed and line0 is not None and _headerMatches(header, line0.decode(encoding or 'utf8', errors='replace').rstrip('\r\n'), delimiter):
+		return len(header)
+	if defaults and defaults is not ... and len(defaults) > 1:
+		return len(defaults)
+	return -1
+
+
 class _DefaultsList(list):
 	"""The defaults list of a read: ``found`` says whether the file's own ``#_defaults_#`` line set it (_processLine
 	replaces its cells in place), not the caller's defaults it began with."""

@@ -12547,3 +12547,174 @@ def test_tsvzed_open_keeps_a_wide_row_whole_in_memory(tmp_path, text, row):
 		assert dict(t) == {'a': row}
 	finally:
 		t.close()
+
+
+# --- 5.5: the compaction (_legacyLineKind, _legacyCompact) ---
+def _kind_corpus():
+	lines = ['', '# c', '#c\t1', '\r']
+	for key in ('a', '#_defaults_#'):
+		for n in range(4):
+			for values in __import__('itertools').product(['1', 'X', ''], repeat=n):
+				lines.append('\t'.join((key,) + values))
+	lines += [line + '\r' for line in lines if line]
+	return lines
+
+
+def test_legacy_line_kind_agrees_with_processLine():
+	"""_legacyLineKind classifies a line as _processLine reads it; the guard against the two drifting apart."""
+	D = TSVZ.DEFAULTS_INDICATOR_KEY
+	for delimiter in ('\t', '\x00'):
+		for text in _kind_corpus():
+			text = text.replace('\t', delimiter)
+			for nul in (('', delimiter) if delimiter == '\x00' else ('',)):
+				line = text + nul
+				for width in (1, 2, 3):
+					for strictActive in (False, True):
+						kind, key, n, takes = TSVZ._legacyLineKind(line, width, strictActive, delimiter)
+						seeded = {'a': ['a', 'old']}
+						results = {}
+						for strict in (False, True):
+							taskDic = dict(seeded)
+							defaults = [D, 'Z'] if strictActive else [D]
+							reporter = TSVZ._Reporter('x', None)
+							TSVZ._processLine(line, taskDic, width, strict=strict, delimiter=delimiter,
+											  defaults=defaults, reporter=reporter)
+							results[strict] = (taskDic, defaults, reporter.has('strict-drop'))
+						where = (line, width, strictActive)
+						taskDic, defaults, _ = results[False]
+						if kind == 'skip':
+							assert taskDic == seeded and defaults == ([D, 'Z'] if strictActive else [D]), where
+							continue
+						if kind == 'reset':
+							if width == 1:  # (at width 1 the reader stores the row '#_defaults_#'; kept anyway)
+								assert D in taskDic, where
+							else:
+								assert defaults == [D], where
+						elif kind == 'delete':
+							assert key == 'a' and 'a' not in taskDic, where
+						elif kind == 'row':
+							assert taskDic.get(key) is not None and taskDic.get(key) != ['a', 'old'], where
+						else:
+							assert defaults[0] == D and any(defaults[1:]) and key == D, where  # (a loose read applies it)
+						taskDic, defaults, dropped = results[True]
+						assert dropped == (not takes), where
+						if kind == 'row':
+							assert (taskDic.get(key) != seeded.get(key)) == takes, where
+
+
+def _compact(raw, header='', defaults=None, delimiter='\t', passes=None):
+	hdr = TSVZ._formatHeader(header, delimiter=delimiter) if header else []
+	consumed = bool(hdr)
+	dflt = list(defaults) if defaults else []
+	matched = consumed and bool(raw) and TSVZ._headerMatches(hdr, raw[0].decode('utf8', errors='replace'), delimiter)
+	width = TSVZ._legacyWidthOf(raw[0] if raw else None, hdr, consumed, dflt, 'utf8', delimiter)
+	if passes is None:
+		return TSVZ._legacyCompact(raw, width, consumed, dflt, delimiter, 'utf8', matched)
+	for _ in range(10):
+		out = TSVZ._legacyCompactOnce(raw, width, consumed, dflt, delimiter, 'utf8', matched)
+		if out == raw:
+			return out
+		passes.append(1)
+		raw = out
+	raise AssertionError('no fixed point in 10 passes')
+
+
+def _lines(data):
+	raw = data.split(b'\n')
+	if raw and raw[-1] == b'':
+		raw.pop()
+	return raw
+
+
+def _views(mod, path, header, defaults, strict, tsvzed):
+	out = []
+	kwargs = dict(header=header, strict=strict)
+	if defaults is not None:
+		kwargs['defaults'] = list(defaults)
+	for s in ((False, True) if not strict else (True, False)):
+		kwargs['strict'] = s
+		try:
+			with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+				out.append(('ok', list(mod.readTabularFile(path, **kwargs).items())))
+		except Exception as e:
+			out.append(('raise', type(e).__name__))
+	if tsvzed:
+		kwargs['strict'] = strict
+		try:
+			with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+				t = mod.TSVZed(path, rewrite_on_load=False, rewrite_on_exit=False, monitor_external_changes=False,
+							   **kwargs)
+				out.append(('ok', list(t.items())))
+				t.close()
+		except Exception as e:
+			out.append(('raise', type(e).__name__))
+	return out
+
+
+D_ = '#_defaults_#'
+COMPACT_EXAMPLES = [
+	# (text, header, defaults, strict, delimiter, expected)
+	('id\tv\na\t\t7\n', 'id\tv', None, False, '\t', 'id\tv\na\t\t7\n'),                     # E1
+	('id\tv\na\t1\na\t2\nb\t3\n', 'id\tv', None, False, '\t', 'id\tv\na\t2\nb\t3\n'),
+	('id\tv\n# c\na\t1\n', 'id\tv', None, False, '\t', 'id\tv\na\t1\n'),
+	('id\tv\na\t1\na\t\n', 'id\tv', None, False, '\t', 'id\tv\n'),
+	('a\t1\na\t\nb\t2\nb\t\n', '', None, False, '\t', 'a\t1\na\t\n'),                     # line 1 and its deletion stay
+	('\na\t1\na\t\nb\t2\n', '', None, False, '\t', '\na\t\nb\t2\n'),                      # the protected line, emptied
+	('\na\x001\na\x00\x00\nb\x002\n', '', None, False, '\x00', '\na\x001\na\x00\x00\nb\x002\n'),  # .nsv: both kept
+	('a\nb\nc\nb\t\n', '', None, False, '\t', 'a\nb\nc\nb\t\n'),                          # W 1 (E9)
+	('#_defaults_#\tX\na\t1\tX\nb\t2\n', '', None, True, '\t', '#_defaults_#\tX\na\t1\tX\nb\t2\n'),  # S3
+	('id\tv\tw\na\t\t1\n#_defaults_#\tX\n', 'id\tv\tw', None, False, '\t', 'id\tv\tw\na\t\t1\n#_defaults_#\tX\n'),  # T1
+	('id\tv\tw\na\t1\t\n#_defaults_#\tX\na\t2\t\n', 'id\tv\tw', None, False, '\t',
+	 'id\tv\tw\na\t1\t\n#_defaults_#\tX\na\t2\t\n'),                                       # a defaults line between
+	('id\tv\na\t1\na\t1\t2\na\t3\n', 'id\tv', None, True, '\t', 'id\tv\na\t3\n'),
+	('id\tv\na\t1\na\t1\t2\n', 'id\tv', None, False, '\t', 'id\tv\na\t1\na\t1\t2\n'),    # strict's value and loose's
+	('b\t2\nc\t\t\t2\n', '', None, False, '\t', 'b\t2\nc\t\t\t2\n'),                      # E2
+	('a\t\t\t1\n', '', [D_, ''], False, '\t', 'a\t\t\t1\n'),                              # E3
+	('a\t1\t2\t3\n', '', [D_, 'D'], False, '\t', 'a\t1\t2\t3\n'),                         # E4
+	('#_defaults_#\tX\tY\tZ\na\t\n', '', [D_, 'D'], False, '\t', '#_defaults_#\tX\tY\tZ\n'),  # E5
+	('id\tv\na\t1\t2\n', 'id\tv', None, False, '\t', 'id\tv\na\t1\t2\n'),                 # E6, C3/C4
+	('id\tv\na\t1\t2\nb\t1\nb\t\n', 'id\tv', None, False, '\t', 'id\tv\na\t1\t2\n'),      # E7a
+	('id\tv\na\t\t7\nb\t1\nb\t\n', 'id\tv', None, False, '\t', 'id\tv\na\t\t7\n'),        # E7b
+	('a\t1\nb\t1\t2\n', '', None, False, '\t', 'a\t1\nb\t1\t2\n'),                        # E8
+	('#_defaults_#\tX\na\t1\t2\t3\n', '', None, False, '\t', '#_defaults_#\tX\na\t1\t2\t3\n'),  # E10
+	('\n#_defaults_#\na\t1\t2\n', '', None, False, '\t', '\n#_defaults_#\na\t1\t2\n'),    # E11
+	('id\tv\nb\t\t2\n', 'id\tv', None, True, '\t', 'id\tv\nb\t\t2\n'),                    # S1
+	('id\tv\tw\na\t1\nb\t1\t2\t3\n', 'id\tv\tw', None, False, '\t', 'id\tv\tw\na\t1\nb\t1\t2\t3\n'),  # G1t
+]
+
+
+@pytest.mark.parametrize('text, header, defaults, strict, delimiter, expected', COMPACT_EXAMPLES)
+def test_legacy_compact_byte_examples(tmp_path, text, header, defaults, strict, delimiter, expected):
+	raw = _lines(text.encode('utf8'))
+	out = _compact(raw, header, defaults, delimiter)
+	assert b''.join(line + b'\n' for line in out) == expected.encode('utf8')
+	assert _compact(out, header, defaults, delimiter) == out  # (3) idempotent
+	d = delimiter.encode()
+	for line in out:  # (4) every output line is an input line, or one emptied (a key and delimiters)
+		assert line in raw or (line.split(d, 1)[0] and line.rstrip(d) == line.split(d, 1)[0]), line
+	suffix = '.nsv' if delimiter == '\x00' else '.tsv'
+	before, after = str(tmp_path / ('before' + suffix)), str(tmp_path / ('after' + suffix))
+	_touch(before, text.encode('utf8'))
+	_touch(after, expected.encode('utf8'))
+	# (1) every reader given the example's arguments, and (2) 3.39's reader, sees the same before and after
+	assert _views(TSVZ, after, header, defaults, strict, True) == _views(TSVZ, before, header, defaults, strict, True)
+	assert _views(TSVZ_old, after, header, defaults, strict, False) == \
+		_views(TSVZ_old, before, header, defaults, strict, False)
+
+
+def test_legacy_compact_reaches_a_fixed_point_within_3_passes():
+	import legacyfuzz
+	rng = random.Random(55)
+	worst = 0
+	for _ in range(2000):
+		raw = _lines(legacyfuzz.gen_text(rng).encode('utf8'))
+		for header in ('', 'id\tv', 'id\tv\tw'):
+			for defaults in (None, [D_, 'P'], [D_, 'P', 'Q'], [D_, '', '']):
+				passes = []
+				_compact(raw, header, defaults, '\t', passes)
+				worst = max(worst, len(passes))
+	assert worst <= 3
+	for text, header, defaults, strict, delimiter, expected in COMPACT_EXAMPLES:
+		passes = []
+		_compact(_lines(text.encode('utf8')), header, defaults, delimiter, passes)
+		assert len(passes) <= 3
