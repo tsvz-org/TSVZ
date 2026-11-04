@@ -189,3 +189,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: compacting it would write the file as an empty store and lose the dropped line, which is data (d9bf316).
 - Revisit when: the width design (after 5.2 ships).
 - Approved: 2026-11-03, the user chose "Deferred to width design (Recommended)".
+
+### A rewrite without --x-header can put a row equal to H on line 1
+- Kind: known limitation
+- What the operator sees: a header-less `.tsv`-family file rewritten by `tsvz scrub` without `--x-header`, by
+  `scrubTabularFile`, or by a `TSVZed` rewrite can get a row equal to a header H as its line 1
+  (`a\t1\nid\tv\na\t\n` becomes `id\tv\n`). After that, `tsvz` commands with `--x-header H` take that row for the
+  header: `tsvz keys --x-header 'id\tv'` shows nothing, though the row stays in the file and reads without
+  `--x-header` show it. Only `tsvz scrub --x-header H` guards against it (it puts an empty first line in front).
+- Why: the library's rewrites do not know the header the CLI is given later.
+- Revisit when: the library's rewrites get the same guard (for example with the column-width design).
+- Approved: 2026-11-03, the user chose "Known limitation (Recommended)".

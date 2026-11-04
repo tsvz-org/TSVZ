@@ -133,15 +133,18 @@ named like an operation then needs a path prefix (`./read`).
   - `--x-header H` and `--x-defaults KEY<d>D1<d>...` decode backslash escapes such as `\t`;
   - `--x-header H` makes line 1 of a `.tsv`-family file its header for every operation
     when line 1 is H: the same number of cells, each equal to H's once the whitespace
-    around it is taken off (a trailing empty cell counts: `id\tv\t` is not `id\tv`). It
+    around it is taken off (a trailing empty cell counts: `id\tv\t` is not `id\tv`; a UTF-8
+    byte order mark before line 1, as Excel writes one, is skipped). It
     is then never a key, row or count, `scrub` and `clear` keep it, and
     `read --format table` shows it above the rows. When line 1 differs, the file has no
     header and line 1 is a row, with 3.39's "Header mismatch" warning (`--x-strict`: an
     error, exit 1, nothing written). A missing or empty file gets H first. Without
     `--x-header`, line 1 is a row, as in 3.39. (The library's own header check, a
-    `header=` given to `appendTabularFile`, `clearTabularFile` or `TSVZed`, is 3.39's,
-    looser one: each cell of H within the cell of line 1 under it, so `idaho\tvalue`
-    passes for `id\tv`.)
+    `header=` given to `readTabularFile`, `appendTabularFile`, `clearTabularFile`,
+    `scrubTabularFile` or `TSVZed`, is 3.39's, looser one: each cell of H within the
+    cell of line 1 under it, so `idaho\tvalue` passes for `id\tv`.) A rewrite without
+    `--x-header` can put a row equal to H on line 1
+    ([limitations](docs/limitations.md#a-rewrite-without---x-header-can-put-a-row-equal-to-h-on-line-1)).
   - `--x-strict` / `--x-force` turn 3.39's column and header checks on or off.
 
 ## Serving a store
@@ -359,10 +362,21 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   written) for every operation, through a handler too. A missing or empty file gets H
   first at its first write, as in 5.1. A `tsvz serve STORE --x-header H` handler applies
   the rule to every request it answers, routed `tsvz` commands included; with
-  `--x-strict` it is strict for them as above (5.1 ignored `--x-strict` at `serve`). The
-  library's own header check (`header=` to `appendTabularFile`, `clearTabularFile`,
-  `scrubTabularFile`, `TSVZed`) is unchanged, 3.39's containment check. In 5.1 only
-  `set`, `append`, `delete` and `clear` used `--x-header`: the reads and `scrub` took line 1 as a row (`tsvz keys`
+  `--x-strict` it is strict for them as above (5.1 ignored `--x-strict` at `serve`): such
+  a handler refuses to start on a file whose line 1 is not H, its routed `.tsv` reads and
+  scrubs drop lines of another column count, and its `.tsvz` reads are strict, as for a
+  direct `--x-strict` command. The library's own header check (`header=` to
+  `readTabularFile`, `appendTabularFile`, `clearTabularFile`, `scrubTabularFile`,
+  `TSVZed`) is unchanged, 3.39's containment check. The CLI's writes check line 1 more
+  strictly than 5.1's did: 5.1's `set`, `append`, `delete` and `clear` with `--x-header`
+  silently took a line 1 that merely held H's cells (`id\tvalue` for `id\tv`) for the
+  header and fitted rows to H's width; now they warn and write the row at its own width,
+  and with `--x-strict` exit 1. A rewrite without `--x-header` (a scrub without it,
+  `scrubTabularFile`, a `TSVZed` rewrite) can still put a row equal to H on line 1 of a
+  header-less file
+  ([limitations](docs/limitations.md#a-rewrite-without---x-header-can-put-a-row-equal-to-h-on-line-1)).
+  In 5.1 only `set`, `append`, `delete` and `clear` used `--x-header`: the reads and
+  `scrub` took line 1 as a row (`tsvz keys`
   printed `id a b` for two keys, `len` said 3, `popitem first` popped the header), and
   so did every request to a handler. Without `--x-header` nothing changed: line 1 is a
   row, as in 5.1 and 3.39. In a `.tsvz` store `pop`, `popitem` and `setdefault` now check
