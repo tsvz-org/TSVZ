@@ -297,7 +297,7 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
-## Upgrading to 5.4
+## Upgrading to 5.4 from 5.3
 
 The file formats are unchanged.
 
@@ -307,7 +307,7 @@ The file formats are unchanged.
   `tsvz serve` read a `.gz`, `.bz2`, `.xz` or `.zst` file so. Python's codec readers hand
   a member's text over before they check it: a member cut short by a writer killed
   mid-append, once another member was appended after it, could end its last line with a
-  garbage value (gzip, more rarely xz), which a `TSVZed` then wrote back. Now:
+  garbage value (gzip, more rarely bz2 or xz), which a `TSVZed` then wrote back. Now:
   - a member cut short is left out whole, also when it is the last one (5.3 and earlier
     kept the whole lines it decoded): its writer was never told those rows were saved. A
     `.tsvz` part still keeps a cut member's whole lines, as spec §16.6 says, so the two
@@ -326,7 +326,7 @@ The file formats are unchanged.
   - a member that fails its check gives none of its rows (5.3 and earlier used them, then
     stopped).
   - other damage stops the read there, as before: bytes that do not decode, also after a
-    complete `.bz2` or `.xz` stream, which 5.2's `readTabularFile` (and so a scrub, a clear
+    complete `.bz2` or `.xz` stream, which 5.3's and earlier versions' `readTabularFile` (and so a scrub, a clear
     and `tsvz serve`'s reads) passed over silently, where a `TSVZed` already reported
     them; xz stream padding (zero bytes after a stream) is not damage.
   - the damage warning names each member left out and where it begins.
@@ -613,7 +613,7 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 | L2 | Setting a row whose values are all empty deletes it in memory too (it already meant delete on disk), with a warning. |
 | L3 | `TSVZedLite` on a compressed file keeps rows in memory; 3.39 read compressed bytes as text. Rows held in memory (also `#` keys) are returned directly. |
 | L4 | New warnings on stderr (invalid encoding, lines dropped by `strict`); data unchanged. |
-| L5 | A damaged compressed file is read up to the damage instead of raising; from 5.4 a member cut short is left out and the members after it are read. |
+| L5 | A damaged compressed file is read up to the damage instead of raising; from 5.4 a member cut short after the first is left out and the members after it are read (a damaged first member stops the read). |
 | L6 | `mapToFile` no longer glues a row it adds at the end of the file to the next one. |
 | L7 | `TSVZed`'s `in` and `get` find a key as `t[key]` does: the live key equal to it, else the key right-stripped. 3.39 matched them exactly, so `'x ' in t` was false while `t['x ']` read `x`, and `t.setdefault('x ', …)` overwrote `x`. |
 | L8 | Appending (`TSVZed`, `TSVZedLite`, `appendTabularFile`, `appendLinesTabularFile`) to an existing empty file (no byte, or a compressed file holding only empty streams) writes the store's header first, as creating the file does; 3.39 wrote the rows alone (a read then took the first one for the header), and `appendTabularFile` with `strict` refused the file. |
