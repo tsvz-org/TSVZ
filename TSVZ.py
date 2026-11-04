@@ -1609,6 +1609,20 @@ def _headerMatches(header, line, delimiter):
 	return _headerCellsMatch(header, _formatHeader(line, delimiter=get_delimiter(delimiter)))
 
 
+def _isHeaderLine(header, line, delimiter):
+	"""Whether ``line`` is the header ``header`` to the CLI's ``--x-header`` rule: the same number of cells, each equal
+	once the whitespace around it (and the line's end) is taken off. Stricter than 3.39's ``_lineContainHeader``."""
+	cells = line.rstrip('\r\n').split(delimiter)
+	return len(cells) == len(header) and all(a.strip() == b.strip() for a, b in zip(cells, header))
+
+
+def _headerMismatch(header, line, teeLogger, strict, delimiter):
+	"""Print 3.39's "Header mismatch" (as ``_lineContainHeader`` prints it) for ``line``; raise as it does when strict."""
+	__teePrintOrNot(f"Header mismatch: \n{_formatHeader(line, delimiter=delimiter)} \n!= \n{header}",teeLogger=teeLogger)
+	if strict:
+		raise ValueError("Data format error! Header mismatch")
+
+
 def _lineContainHeader(header,line,verbose = False,teeLogger = None,strict = False,delimiter = ...):
 	"""
 	Verify if a line contains the header.
@@ -2304,7 +2318,8 @@ class _DefaultsList(list):
 
 
 def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,
-				 taskDic = None,encoding = 'utf8',strict = False,delimiter = ...,defaults = ...,correctColumnNum = -1,errors = 'strict'):
+				 taskDic = None,encoding = 'utf8',strict = False,delimiter = ...,defaults = ...,correctColumnNum = -1,errors = 'strict',
+				 notFirst = None):
 	"""Compact a legacy file in place; return ``(taskDic, done)``: the rows read, and whether the file was written (or
 	had nothing to write). ``done`` is False when nothing was written because the file kept changing (the shape of
 	``_specScrub``): it is rewritten only if it is what the read saw (spec §19.8), so a row another process appends
@@ -2319,7 +2334,10 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 	A file whose read finds no live row (all deleted) is written the same way, with no row: the header line, the defaults
 	lines, and the empty line for a header-less file that began with one. A reset is as wide as the header then, or, with
 	no header, as the lines the read took its column count from. A file that holds nothing (no byte, or only empty streams) is left as it is, and so is one whose
-	strict read dropped a line for its width: that line is not a deletion, and writing the file empty would lose it."""
+	strict read dropped a line for its width: that line is not a deletion, and writing the file empty would lose it.
+
+	``notFirst``, a header list, for a file written with no header: when its first row would be that header
+	(``_isHeaderLine``), the file begins with an empty line instead, so a reader given that header still reads the row."""
 	given = list(taskDic.items()) if taskDic else []
 	givenDefaults = list(defaults) if defaults not in (..., None) else []
 	for tries in range(_SPEC_REWRITE_ATTEMPTS):
@@ -2345,6 +2363,9 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 		payload, count, columns = _legacyFormatRows(fileName, file, teeLogger, formatted, verifyHeader, verbose, encoding,
 													strict, dlm, errors, assume=_sanitize(kept,delimiter=dlm) if kept else [])
 		blank = not kept and _legacyBeginsBlank(fileName, encoding, teeLogger, dlm)
+		if not kept and not blank and notFirst and count and \
+				_isHeaderLine(notFirst, payload.split(b'\n', 1)[0].decode(encoding or 'utf8', errors='replace'), dlm):
+			blank = True
 		if not count:
 			# No row to take the width from: a reader takes it from the header line, else from the first line it reads,
 			# which a defaults line written here would be, so it is as wide as the file's lines were.
@@ -7177,6 +7198,9 @@ class _ServeStore(object):
 					self._loadLegacy(reporter, log)
 				self.unreadable = reporter.incomplete()
 				self.stopped = reporter.has('stopped')  # a stop policy ended the read (spec §4.10)
+			except Exception:
+				self.parts = None  # (a strict header mismatch): the next request reads again, and fails again
+				raise
 			finally:
 				reporter.flush()
 
@@ -7184,16 +7208,15 @@ class _ServeStore(object):
 		"""The header in effect for a loose file whose first line is ``line``: the one rule of ``--x-header``.
 
 		``line`` is None when the file is missing, holds nothing, or its first line cannot be read. With a header
-		given, line 1 is the header when it matches that header (3.39's check, ``_lineContainHeader``), or when there
-		is no line 1 yet (a write puts the header first). Otherwise 3.39's "Header mismatch" is printed and strict
-		raises (nothing is written); loose, the file has no header and line 1 is a row, for every request, the scrub
-		included. Sets and returns ``self.header``."""
+		given, line 1 is the header when it is that header (``_isHeaderLine``: the same cells, each without the
+		whitespace around it), or when there is no line 1 yet (a write puts the header first). Otherwise 3.39's
+		"Header mismatch" is printed and strict raises (nothing is written); loose, the file has no header and line 1
+		is a row, for every request, the scrub included. Sets and returns ``self.header``."""
 		header = self.given
-		if any(header) and line is not None and not _headerMatches(header, line, self.delimiter):
+		if any(header) and line is not None and not _isHeaderLine(header, line, self.delimiter):
 			if line != self.mismatch or self.strict:  # (said once for the line, as 3.39 says it)
 				self.mismatch = line
-				_lineContainHeader(header, line, teeLogger=log if log is not None else self.teeLogger,
-								   strict=self.strict, delimiter=self.delimiter)
+				_headerMismatch(header, line, log if log is not None else self.teeLogger, self.strict, self.delimiter)
 			header = ['']
 		self.header = header
 		return header
@@ -7314,8 +7337,8 @@ class _ServeStore(object):
 		"""Replay what was appended to the active part; False when it changed some other way."""
 		old = self.stamps.get(path)
 		if (self.stopped or _parsePartName(path).codec or old is None or stamp[0] != old[0]
-				or stamp[1] < self.offset or stamp[1] <= old[1] or (not self.spec and not self.lineNo and any(self.given))):
-			# (a loose file's line 1 is read by a reload, which tells whether it is the header)
+				or stamp[1] < self.offset or stamp[1] <= old[1] or (not self.spec and self.lineNo <= 1 and any(self.given))):
+			# (a loose file's line 1 is read by a reload, which tells whether it is the header, also once it is whole)
 			return False  # an append always grows the part; anything else is a rewrite (and a stopped read is read again)
 		try:
 			with open(path, 'rb') as f:
@@ -7601,9 +7624,13 @@ class _ServeStore(object):
 				if self.spec:
 					return _specScrub(self.path, teeLogger=log, verifyHeader=False, verbose=self.verbose,
 									  strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)[1]
-				# Line 1 is the header exactly when every read takes it for one, so the scrub keeps what they read.
-				return _legacyScrub(self.path, teeLogger=log, header=self._legacyHeaderNow(log), verifyHeader=True,
-									verbose=self.verbose, strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)[1]
+				# Line 1 is the header exactly when every read takes it for one, so the scrub keeps what they read; in a
+				# file with no header, a row that is the header given is never written as line 1 (reads would take it
+				# for the header).
+				header = self._legacyHeaderNow(log)
+				return _legacyScrub(self.path, teeLogger=log, header=header, verifyHeader=True, verbose=self.verbose,
+									strict=self.strict, delimiter=self.delimiter, defaults=self.defaults,
+									notFirst=self.given if any(self.given) and not any(header) else None)[1]
 			finally:
 				self.parts = None  # read again at the next request
 
@@ -9160,7 +9187,7 @@ def _cliServe(args, delimiter, logger, stdin, stdout):
 	restore = _serveSignals()  # before the pointer file announces this handler
 	try:
 		store = _ServeStore(args.store, delimiter=delimiter, header=args.header, createDefaults=args.defaults,
-							teeLogger=logger, verbose=args.verbose, create=True)
+							strict=args.strict, teeLogger=logger, verbose=args.verbose, create=True)
 		handle.start(store)
 		logger.teelog('tsvz: serving {} at {} (pid {})'.format(args.store, handle.address, os.getpid()))
 		handle.serve()

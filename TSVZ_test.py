@@ -11695,6 +11695,80 @@ def test_cli_serve_with_x_header_answers_routed_requests_by_the_same_rule(tmp_pa
 			proc.communicate()
 
 
+@pytest.mark.parametrize('suffix', _XH_SUFFIXES)
+def test_cli_x_header_line_1_is_the_header_only_when_its_cells_equal_the_headers(tmp_path, suffix):
+	# 3.39's check takes a line holding each cell of H for it: `idaho\tvalue` for `id\tv`, any line for a header with
+	# an empty cell. The --x-header rule compares the cells, each without the whitespace around it.
+	f = _XH(tmp_path, suffix)
+	d = f.delimiter
+	for text, header, keys in (('idaho|value\nb|2\n', f.header, 'idaho\nb\n'),
+							   ('idaho|5\nb|2\n', 'id' + ('\\t' if d == '\t' else d), 'idaho\nb\n'),
+							   ('a|v1\nb|2\n', ('\\t' if d == '\t' else d) + 'v', 'a\nb\n'),
+							   ('id|v|\nb|2\n', f.header, 'id\nb\n'),  # a third, empty cell: not the header
+							   (' id | v  \nb|2\n', f.header, 'b\n')):  # whitespace around the cells: the header
+		f.put(text)
+		f.header = header
+		status, out, err = f.run('keys')
+		assert (status, out) == (0, keys), (text, header, out, err)
+		assert ('Header mismatch' in err) == (keys != 'b\n'), (text, err)
+
+
+@pytest.mark.parametrize('suffix', _XH_SUFFIXES)
+def test_cli_x_header_scrub_of_a_file_with_no_header_never_writes_the_header_as_line_1(tmp_path, suffix):
+	# Line 1 `a|1` is a row; a is deleted, so the first row left is `id|v`, the header given. Written first, every read
+	# with --x-header would take it for the header: the scrub begins the file with an empty line instead.
+	f = _XH(tmp_path, suffix)
+	f.put('a|1\nid|v\na|\n')
+	assert f.run('keys')[:2] == (0, 'id\n')
+	assert f.run('scrub')[0] == 0
+	assert f.text() == '\nid|v\n'
+	assert f.run('keys')[:2] == (0, 'id\n') and f.run('read', header=False) == (0, 'id|v\n', '')
+	assert f.run('scrub')[0] == 0 and f.text() == '\nid|v\n'  # and a second scrub changes nothing
+	f.put('a|1\nb|2\nid|v\na|\n')
+	assert f.run('scrub')[0] == 0 and f.text() == 'b|2\nid|v\n'  # a first row that is not the header: no empty line
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+@pytest.mark.parametrize('suffix', _XH_SUFFIXES)
+def test_cli_serve_with_x_header_and_strict_is_strict_for_routed_requests(tmp_path, suffix):
+	f = _XH(tmp_path, suffix)
+	f.put('x|w\na|1\n')
+	r = subprocess.run([sys.executable, os.path.join(HERE, 'TSVZ.py'), 'serve', f.path, '--x-header', f.header,
+						'--x-strict'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+	assert r.returncode == 1 and 'Header mismatch' in r.stderr  # line 1 is not the header: it does not start
+	f.put('id|v\na|1|2\nb|3\n')
+	proc = _serve_process(f.path, '--x-header', f.header, '--x-strict')
+	try:
+		assert f.run('keys', header=False) == (0, 'b\n', '')  # routed; strict drops the row of another width
+		assert f.run('read', header=False) == (0, 'b|3\n', '')
+		f.put('x|w\nb|3\n')  # another process puts another line 1 in
+		before = _bytes(f.path)
+		for args in (('keys',), ('read',), ('set', 'c', '1'), ('delete', 'b'), ('pop', 'b'), ('scrub',)):
+			status, out, err = f.run(*args, header=False)
+			assert (status, out) == (1, '') and 'Header mismatch' in err, (args, status, out, err)
+		assert _bytes(f.path) == before
+		assert _cli('stop', f.path).returncode == 0
+		proc.communicate(timeout=10)
+	finally:
+		if proc.poll() is None:
+			proc.kill()
+			proc.communicate()
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_serve_with_x_header_reads_a_line_1_written_in_two_appends_as_the_header(tmp_path):
+	p = str(tmp_path / 't.tsv')
+	_touch(p, b'i')  # a writer has written part of the header so far
+	store = TSVZ._ServeStore(p, header='id\tv')
+	try:
+		store.keys(None)
+		with open(p, 'ab') as f:
+			f.write(b'd\tv\na\t1\n')
+		assert store.keys(None) == ['a']
+	finally:
+		store.close()
+
+
 @pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
 def test_serve_with_x_header_reads_a_header_appended_to_a_file_that_held_nothing_as_the_header(tmp_path):
 	p = str(tmp_path / 'e.tsv')
