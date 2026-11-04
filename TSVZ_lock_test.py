@@ -946,6 +946,38 @@ def test_a_write_abandoned_at_exit_does_not_start_once_the_lock_comes_free(tmp_p
 	assert open(p, 'rb').read() == before, 'the abandoned write started after the exit let go of it'
 
 
+#: The same program for a .tsvz store (no header).
+ABANDONED_SPEC = ABANDONED.replace("header='id\\tv', rewrite_on_load=False, ", "")
+
+
+def test_a_tsvz_write_abandoned_at_exit_does_not_start_once_the_lock_comes_free(tmp_path, kind):
+	# The same for a .tsvz store, whose commit appends to its active part.
+	p = str(tmp_path / 's.tsvz')
+	with open(p, 'wb') as f:
+		f.write(b''.join(('k%04d\tvalue-k%04d\n' % (i, i)).encode() for i in range(20)))
+	before = open(p, 'rb').read()
+	assert ABANDONED_SPEC != ABANDONED
+	store = subprocess.Popen([sys.executable, '-c', ABANDONED_SPEC, p, HERE, kind], stdout=subprocess.PIPE,
+							 stderr=subprocess.PIPE)
+	holder = None
+	try:
+		_expect(store, 'open')
+		holder = _hold(p, 'native', kind=kind)
+		open(p + '.go', 'w').close()
+		_expect(store, 'exiting')
+		time.sleep(0.7)
+		store.send_signal(signal.SIGINT)
+		time.sleep(1)
+		store.send_signal(signal.SIGINT)
+		out, err = store.communicate(timeout=20)
+		assert b'being finished' in err, err
+		holder.wait(10)
+	finally:
+		_release(p)
+		_kill(store, holder)
+	assert open(p, 'rb').read() == before, 'the abandoned write started after the exit let go of it'
+
+
 def test_a_handler_takes_its_check_bytes_under_the_read_lock(tmp_path, monkeypatch, kind):
 	# The bytes a handler follows appends from must be of the file its view was read from: taken under the READ lock.
 	p = _tsv(tmp_path, 20)

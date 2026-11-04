@@ -3841,7 +3841,7 @@ def _specBackupPart(path, reporter):
 	return backup
 
 
-def _specAppendTo(f, path, payload, reporter, fsync=False, memberSize=None):
+def _specAppendTo(f, path, payload, reporter, fsync=False, memberSize=None, proceed=None):
 	"""Append whole records to the open part ``f`` (``path``) under its locks (design §5.4).
 
 	Uncompressed: an uncommitted tail is truncated first. Compressed: the
@@ -3850,11 +3850,14 @@ def _specAppendTo(f, path, payload, reporter, fsync=False, memberSize=None):
 	member (spec §16.6). Returns ``(offset, before, after)``: where the payload
 	begins, and the part's ``_specStamp`` just before and after it is written,
 	both taken under the lock, so no other locked writer's append falls between.
+	``proceed``: called once the lock is taken; False writes nothing and returns None.
 	"""
 	with _pathLock(path):
 		_seekRawStart(f)  # msvcrt locks from the raw position: lock and unlock the same range
 		_lockFile(f, mode=_APPEND)
 		try:
+			if proceed is not None and not proceed():
+				return None
 			before = _specStamp(os.fstat(f.fileno()))
 			offset = _appendOpen(f, payload, _parsePartName(path).codec, None, 'truncate', reporter, fsync, memberSize)
 			return offset, before, _specStamp(os.fstat(f.fileno()))
@@ -3866,11 +3869,11 @@ def _specAppendTo(f, path, payload, reporter, fsync=False, memberSize=None):
 			_unlockFile(f)
 
 
-def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None):
+def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None, proceed=None):
 	"""``_specAppendTo`` the part ``path``; a missing part is created."""
 	_requireCodec(_parsePartName(path).codec)
 	with open(path, 'a+b') as f:
-		return _specAppendTo(f, path, payload, reporter, fsync, memberSize)
+		return _specAppendTo(f, path, payload, reporter, fsync, memberSize, proceed)
 
 
 #: Reads a scrub or clear makes before it gives up on a store that keeps changing.
@@ -5254,8 +5257,14 @@ class TSVZed(OrderedDict):
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		try:
 			payload = _encodeText(''.join(item + '\n' for item in items), 'utf-8', self.errors)  # checked when set
-			_, before, after = _specAppendPayload(self._activePath, payload, reporter, fsync=True,
-												  memberSize=self._specState.memberSize)
+			# The exit abandoned the store while this waited for the lock: nothing is written (_unattended).
+			written = _specAppendPayload(self._activePath, payload, reporter, fsync=True,
+										 memberSize=self._specState.memberSize, proceed=lambda: not self._unattended())
+			if written is None:
+				self.appendQueue.extendleft(reversed(items))
+				reporter.flush()
+				return self
+			_, before, after = written
 			if before == self._specSeen:
 				self._specNoteSeen(after)  # else another writer changed the part first: the next check reloads
 			if self._writeFailing:
