@@ -1175,7 +1175,8 @@ def _readLock(path):
 	thread) that holds the file's lock is waited out, so the read never meets it part way. Taken on a descriptor of
 	its own, so the reader opens the file as before. Not taken when this thread holds a TSVZ lock on the file
 	already (it would wait for itself), where readers do not lock (lockf, Windows), or when the file cannot be
-	opened or locked: the read goes on unlocked, and its own open raises what it raises. A Ctrl-C ends the wait."""
+	opened or locked: the read goes on unlocked, and its own open raises what it raises. A Ctrl-C ends the wait.
+	Yields the descriptor it opened (None when it opened none)."""
 	if _LOCK_KIND not in ('ofd', 'flock'):
 		yield
 		return
@@ -1191,7 +1192,7 @@ def _readLock(path):
 				locked = _lockFile(f, _READ)
 		except OSError:
 			pass  # a read never fails because its lock did
-		yield
+		yield f
 	finally:
 		try:
 			if locked:

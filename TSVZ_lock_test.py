@@ -344,17 +344,24 @@ def test_a_keyboardinterrupt_inside_a_read_lock_leaves_nothing_registered(tmp_pa
 @pytest.mark.filterwarnings('ignore::DeprecationWarning')  # fork() in a process with threads: here on purpose
 @pytest.mark.parametrize('mode', ['READ', 'REWRITE'])
 def test_a_forked_child_does_not_keep_a_lock_its_parent_held(tmp_path, mode, kind):
+	# The child shares the locked open file description. 5.2: its unlock of the inherited descriptor (a copy of the
+	# holder's release, a finalizer) dropped the parent's lock while the parent still held it, and a close of it
+	# without an unlock kept the lock after the parent let go. 5.3 points it at /dev/null in the child.
 	p = _tsv(tmp_path, 3)
 	held, release = threading.Event(), threading.Event()
+	box = {}
+	how = 'ofdw' if kind == 'ofd' else 'flock'
 
 	def holder():
 		if mode == 'READ':
-			with TSVZ._readLock(p):
+			with TSVZ._readLock(p) as f:
+				box['f'] = f
 				held.set()
 				release.wait(20)
 		else:
 			with open(p, 'r+b') as f:
 				TSVZ._lockFile(f)
+				box['f'] = f
 				held.set()
 				release.wait(20)
 				TSVZ._unlockFile(f)
@@ -364,15 +371,22 @@ def test_a_forked_child_does_not_keep_a_lock_its_parent_held(tmp_path, mode, kin
 	pid = os.fork()
 	if pid == 0:
 		try:
+			TSVZ._unlockFile(box['f'])
+			open(p + '.unlocked', 'w').close()
 			time.sleep(3)
 		finally:
 			os._exit(0)
 	try:
+		end = time.time() + 10
+		while not os.path.exists(p + '.unlocked') and time.time() < end:
+			time.sleep(0.01)
+		assert _other(p, how) == 'busy', "the forked child's unlock dropped the parent's lock"
 		release.set()
 		t.join(10)
-		assert _other(p, 'ofdw' if kind == 'ofd' else 'flock') == 'free', 'the forked child kept the lock'
+		assert _other(p, how) == 'free', 'the forked child kept the lock'
 		assert os.waitpid(pid, os.WNOHANG) == (0, 0)  # (the child was still running)
 	finally:
+		release.set()
 		os.waitpid(pid, 0)
 
 
