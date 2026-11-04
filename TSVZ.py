@@ -1611,8 +1611,9 @@ def _headerMatches(header, line, delimiter):
 
 def _isHeaderLine(header, line, delimiter):
 	"""Whether ``line`` is the header ``header`` to the CLI's ``--x-header`` rule: the same number of cells, each equal
-	once the whitespace around it (and the line's end) is taken off. Stricter than 3.39's ``_lineContainHeader``."""
-	cells = line.rstrip('\r\n').split(delimiter)
+	once the whitespace around it (and the line's end, and a UTF-8 byte order mark before it, as Excel writes one) is
+	taken off. Stricter than 3.39's ``_lineContainHeader``."""
+	cells = line.rstrip('\r\n').lstrip('\ufeff').split(delimiter)
 	return len(cells) == len(header) and all(a.strip() == b.strip() for a, b in zip(cells, header))
 
 

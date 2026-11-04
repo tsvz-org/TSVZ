@@ -11713,6 +11713,23 @@ def test_cli_x_header_line_1_is_the_header_only_when_its_cells_equal_the_headers
 		assert ('Header mismatch' in err) == (keys != 'b\n'), (text, err)
 
 
+@pytest.mark.parametrize('suffix', ['.csv', '.tsv', '.csv.gz'])
+def test_cli_x_header_line_1_after_a_utf8_byte_order_mark_is_the_header(tmp_path, suffix):
+	# Excel's "CSV UTF-8" begins the file with a byte order mark: line 1 is still the header (5.1 took it, by containment).
+	f = _XH(tmp_path, suffix)
+	f.put('﻿id|v\na|1\nb|2\nb|\n')
+	for strict in (False, True):
+		assert f.run('keys', strict=strict) == (0, 'a\n', ''), strict
+		assert f.run('len', strict=strict) == (0, '1\n', '')
+		assert f.run('read', strict=strict) == (0, 'a|1\n', '')
+	assert f.run('set', 'k', '1', '2', strict=True) == (0, '', '')
+	assert f.text() == '﻿id|v\na|1\nb|2\nb|\nk|1\n'  # fitted to the header's width
+	assert f.run('scrub', strict=True) == (0, '', '')
+	assert f.text() == '﻿id|v\na|1\nk|1\n'  # line 1 kept as it was, the mark included
+	assert f.run('keys') == (0, 'a\nk\n', '')
+	assert f.run('clear', strict=True) == (0, '', '') and f.text() == 'id|v\n'  # emptied: the header given, no mark
+
+
 @pytest.mark.parametrize('suffix', _XH_SUFFIXES)
 def test_cli_x_header_scrub_of_a_file_with_no_header_never_writes_the_header_as_line_1(tmp_path, suffix):
 	# Line 1 `a|1` is a row; a is deleted, so the first row left is `id|v`, the header given. Written first, every read
