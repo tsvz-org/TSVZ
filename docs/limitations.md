@@ -160,80 +160,49 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone removes or rotates store files while they are written and loses rows this way.
 - Approved: 2026-10-29, the user chose "Record both (Recommended)".
 
-### A scrub run with other defaults than the store's program can change how early rows read
-- Kind: known limitation
-- What the operator sees: when a `.tsv` holds an empty `#_defaults_#` line (one that turns defaults off) and rows
-  with empty cells before any defaults line, a scrub run with other defaults than the program that reads the store
-  (for example `tsvz scrub f.tsv`, with none, for a program that opens it with constructor defaults) can change how
-  those rows read for that program: before the scrub its own defaults fill their empty cells; after it, the reset
-  line the scrub writes before the rows keeps them empty.
-- Why: a scrub fills rows with its own caller's defaults and does not keep where each row sat relative to a reset;
-  keeping that exactly would mean recording, per row, whether it was read under a reset. Run the scrub with the
-  defaults the store's program uses.
-- Revisit when: an operator hits it.
-- Approved: 2026-11-01, the user chose "Known limitation (Recommended)".
-
-### Scrubs and rewrites read rows at one column width (deferred to the width design)
-- Kind: deferred
-- What the operator sees: a scrub (`scrubTabularFile`, `tsvz scrub`, a `tsvz serve` handler), and a `TSVZed`'s
-  rewrite, read every row of a `.tsv`-family file at one column count, and write the rows back at it: cells past it
-  are lost, and when the cut leaves only empty cells the row is written as a deletion line, so the key is gone
-  (`id\tv\na\t\t7` scrubbed with its header becomes `id\tv\na\t\n`; `b\t2\nc\t\t\t2` becomes `b\t2\nc\t\n`;
-  `a\t\t\t1` scrubbed with defaults `[D, '']` becomes `a\t\n`). Where the count comes from, and so what is cut:
-  - Defaults given to the scrub (`defaults=`, `--x-defaults`) narrower than the rows, with no header to take the
-    count from: the rows are cut to their width (`a\t1\t2\t3` with `[D, 'D']` becomes `a\t1`). A strict scrub
-    drops the rows of another width only when the given defaults are all empty; with a non-empty cell it cuts as a
-    loose one does. A `#_defaults_#` line of the file narrower than the rows, after the first row, cuts no row
-    and is written back as it is (as the file's first line it does cut them: see below). Same in 5.1.
-  - A file with no header and no live row, scrubbed with defaults narrower than its own `#_defaults_#` line: the
-    line is cut to the width of the given defaults (`#_defaults_#\tX\tY\tZ\na\t\n` with `[D, 'D']` is written
-    `\n#_defaults_#\tX\n`). New in 5.2: 5.1 left such a file as it was.
-  - A row wider than the header (written by hand or another tool), at a scrub or a `TSVZed` rewrite (after a
-    change, or `hardMapToFile()`): `id\tv\na\t1\t2` becomes `id\tv\na\t1`. A strict scrub drops the row, and the
-    other rows are written. `tsvz scrub --x-strict` of `id\tv\na\t1\t2` with no `--x-header` writes `id\tv\n`, the
-    header line being read as a key. Same in 5.1 at a scrub, at a rewrite after a change, and at a `TSVZed` open
-    of a file that holds a key with two values. New in 5.2: a `TSVZed` open (`rewrite_on_load`, the default) also
-    rewrites a file that holds a key's row and its deletion, so the cut becomes permanent at a plain open, with
-    nothing changed: `id\tv\na\t1\t2\nb\t1\nb\t\n` becomes `id\tv\na\t1  \n`, and `id\tv\na\t\t7\nb\t1\nb\t\n`
-    becomes `id\tv\na\t  \n`, the 7 lost (the spaces pad the in-place rewrite). With `rewrite_on_load=False` the
-    next exit or periodic rewrite does it.
-  - A header-less row wider than the first row of the file: `a\t1\nb\t1\t2` becomes `a\t1\nb\t1`. Same in 5.1.
-  - A file of one-column keys that holds one line of two cells (`a\nb\nc\nb\t\n`, which
-    `appendTabularFile(p, ['b', ''])` writes): every key is written as a deletion line, `a\t\nb\t\nc\t\n`, and all
-    are gone. Same in 5.1.
-  - A narrow `#_defaults_#` first line that is not bare (`#_defaults_#\tX\na\t1\t2\t3`): the reader takes its
-    count from it, and the rows are cut (`a\t1`). Same in 5.1.
-  - A bare `#_defaults_#` first line, or one behind an empty first line (`\n#_defaults_#\na\t1\t2`), read without
-    defaults: the count is 1, `readTabularFile(p)` returns a row named `#_defaults_#` and drops the rows
-    (`strict=True`, the default) or cuts them to their key (`strict=False`); a scrub writes that (`a`). Defaults of
-    two or more cells read it right. 5.2's scrub never turns a file that reads right into one; scrubbing one keeps
-    it one (`\n#_defaults_#\na\t1\t2` becomes `\n#_defaults_#\na\n`). Same in 5.1.
-- Why: one column-width rule for reads, scrubs and rewrites gets its own design after 5.2, tested with the
-  differential scrub fuzzer. Patching one trigger at a time moves the cut around.
-- Revisit when: the width design (after 5.2 ships).
-- Approved: 2026-11-03, the user chose "bb3e697 + small fix (Recommended)", "In the width design (Recommended)" and
-  "One umbrella entry (Recommended)".
-
-### A strict scrub leaves a file whose read dropped a line for its width
-- Kind: deferred
-- What the operator sees: a strict scrub (`strict=True`, `tsvz scrub --x-strict`) of a `.tsv`-family file whose
-  strict read finds no live row, and dropped a line for its width (`id\tv\nb\t\t2` with header `id\tv`; `a\t1`
-  with defaults of three cells), leaves it as it is. A writer that appends keys, deletes them all and scrubs over
-  and over then sees the file grow without limit, as in 5.1. A scrub that is not strict compacts it, and cuts the
-  line: `id\tv\nb\t\t2` becomes `id\tv\nb\t\n`, and b is lost (see the width entry above). The headed example is
-  `tsvz scrub`'s only with `--x-header id\tv`; without it line 1 is a row, so the strict read finds the live key
-  `id`, drops the wider line, and writes `id\tv\n`.
-- Why: compacting it would write the file as an empty store and lose the dropped line, which is data (d9bf316).
-- Revisit when: the width design (after 5.2 ships).
-- Approved: 2026-11-03, the user chose "Deferred to width design (Recommended)".
-
 ### A rewrite without --x-header can put a row equal to H on line 1
 - Kind: known limitation
-- What the operator sees: a header-less `.tsv`-family file rewritten by `tsvz scrub` without `--x-header`, by
-  `scrubTabularFile`, or by a `TSVZed` rewrite can get a row equal to a header H as its line 1
-  (`a\t1\nid\tv\na\t\n` becomes `id\tv\n`). After that, `tsvz` commands with `--x-header H` take that row for the
-  header: `tsvz keys --x-header 'id\tv'` shows nothing, though the row stays in the file and reads without
-  `--x-header` show it. Only `tsvz scrub --x-header H` guards against it (it puts an empty first line in front).
-- Why: the library's rewrites do not know the header the CLI is given later.
-- Revisit when: the library's rewrites get the same guard (for example with the column-width design).
-- Approved: 2026-11-03, the user chose "Known limitation (Recommended)".
+- What the operator sees: a header-less `.tsv`-family file that a `TSVZed` writes from its memory (after
+  `move_to_end`, after a delete in a one-column store, or when it makes a damaged, removed or emptied file again) can
+  get a row equal to a header H as its line 1 (`a\t1\nid\tv\na\t\n` becomes `id\tv\n`). After that, `tsvz`
+  commands with `--x-header H` take that row for the header: `tsvz keys --x-header 'id\tv'` shows nothing, though the
+  row stays in the file and reads without `--x-header` show it. Scrubs (`tsvz scrub`, `scrubTabularFile`, a handler)
+  and a `TSVZed` rewrite of a healthy file never change line 1 (a scrub adds a header you pass with
+  `verifyHeader=False`, which is not a row).
+- Why: a write from memory does not know the header the CLI is given later.
+- Revisit when: an operator meets it after one of those memory writes.
+- Approved: 2026-11-03, the user chose "Known limitation (Recommended)". Narrowed in 5.5 (the scrub and a TSVZed
+  rewrite of a healthy file keep line 1).
+
+### Readers given other arguments than the scrub's can see a different file after a scrub or a rewrite
+- Kind: known limitation
+- What the operator sees: a scrub (`scrubTabularFile`, `tsvz scrub`, a `tsvz serve` handler), and a `TSVZed`
+  rewrite of a healthy file (which compacts it the same way), decide which lines are dead with their own reader:
+  its header, defaults and column count. A reader given other
+  ones can see another file afterwards: one that takes the file as one column (its first keyed line is one cell),
+  for which lone keys are rows the scrub dropped as deletions, and one given a header that line 1 is not, which
+  takes its column count from a line the scrub may have dropped. Every reader given the scrub's own arguments, of
+  any version from 3.39, sees what it saw before. In fuzzing, about 1% of random files and argument sets, where 5.4
+  changed far more of these readers' views.
+- Why: what is dead depends on the reader; keeping every line any reader could need would keep most of the lines a
+  compaction exists to drop.
+- Revisit when: an operator reads one file with several header or defaults settings and loses rows after a scrub
+  or a rewrite. Scrub, and open `TSVZed`s, with the arguments the file's readers use.
+- Approved: 2026-11-04, the user chose "Known limitation (Recommended)", and "One entry for both (Recommended)"
+  for covering `TSVZed` rewrites of a healthy file in the same entry.
+
+### A file whose first keyed line is a bare #_defaults_# reads as one column without defaults
+- Kind: known limitation
+- What the operator sees: a `.tsv`-family file whose first line with a key is a bare `#_defaults_#` (an empty
+  defaults line, for example `\n#_defaults_#\na\t1\t2`), read without defaults of two or more cells and without a
+  header that line 1 holds (`readTabularFile(p)`, `tsvz read`, a `TSVZed` given no defaults), takes its column count
+  from that line: one. The reader then shows a row named `#_defaults_#`; a strict read (`readTabularFile`'s default)
+  drops every row of more than one cell, and a loose one shows them whole. Read with the defaults the file's
+  program uses (or its header) it reads right. Scrubs and rewrites keep such a file as it is, so it does not get
+  worse.
+- Why: the column count comes from the first keyed line in every version from 3.39, and old and new readers must
+  agree on it; skipping a bare defaults line there would make 5.5 readers see other rows than older readers of the
+  same bytes.
+- Revisit when: an operator meets such a file read without its defaults, or when every reader of these files can be
+  changed at once.
+- Approved: 2026-11-04, the user chose "Known limitation (Recommended)".

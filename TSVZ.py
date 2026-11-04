@@ -43,7 +43,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.4'
+version = '5.5'
 __version__ = version
 author = 'pan@zopyr.us'
 COMMIT_DATE = '2026-11-04'
@@ -2661,6 +2661,12 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 	Scrub a Tabular (CSV / TSV / NSV) file by reading it and writing the contents back into the file.
 	If using compressed files. This will recompress the file in whole and possibily increase the compression ratio reducing the file size.
 	Return the data as a dictionary.
+
+	For a .tsv-family file the scrub drops comments, empty lines, superseded lines and dead keys' lines, and keeps
+	every other line as the file has it, in place (line 1 and every #_defaults_# line included), so every reader
+	given the scrub's header, defaults and column count reads the file as before; a strict scrub writes what a loose
+	one writes. It never refuses text it cannot encode, because it copies bytes. A header given with
+	verifyHeader=False is written first when line 1 is not it.
 	
 	Parameters:
 	- fileName (str): The path to the Tabular file.

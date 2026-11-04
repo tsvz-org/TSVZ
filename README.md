@@ -142,8 +142,9 @@ named like an operation then needs a path prefix (`./read`).
     `--x-header`, line 1 is a row, as in 3.39. (The library's own header check, a
     `header=` given to `readTabularFile`, `appendTabularFile`, `clearTabularFile`,
     `scrubTabularFile` or `TSVZed`, is 3.39's, looser one: each cell of H within the
-    cell of line 1 under it, so `idaho\tvalue` passes for `id\tv`.) A rewrite without
-    `--x-header` can put a row equal to H on line 1
+    cell of line 1 under it, so `idaho\tvalue` passes for `id\tv`.) A scrub never changes
+    line 1; a `TSVZed` that writes its memory over a header-less file can put a row equal to
+    H there
     ([limitations](docs/limitations.md#a-rewrite-without---x-header-can-put-a-row-equal-to-h-on-line-1)).
   - `--x-strict` / `--x-force` turn 3.39's column and header checks on or off.
 
@@ -297,6 +298,87 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
+## Upgrading to 5.5 from 5.4
+
+The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family file 5.5
+writes.
+
+- **Rows wider than the file's column count are read whole.** `readTabularFile` (also
+  `lastLineOnly`), `read_last_valid_line`, `TSVZed`, `TSVZedLite`, `tsvz read`/`get` and
+  their table output, and `tsvz serve`: a row is padded to the column count as before,
+  and only its empty cells past it go (`a\t1\t\t` at two columns is `[a, 1]`); 3.39 to
+  5.4 cut it, and a scrub or rewrite then erased the cells (and a row whose cut left only
+  empty cells became a deletion). `len(row)` can now exceed the header's width; a
+  `correctColumnNum=` a caller gives no longer cuts. A program that adds a column sees it.
+  While 5.4 and older processes share the file, they still see such rows cut, and their
+  scrubs and rewrites still erase the cells: upgrade every process that rewrites the file.
+- **A shorter `#_defaults_#` line keeps the defaults before it for the cells it lacks.**
+  `#_defaults_#\tX\tY` then `#_defaults_#\tZ` leaves `Z, Y` in effect (5.4: `Z` and, past
+  the column count, nothing).
+- **`TSVZed` reads a one-column file as `readTabularFile` does**: lone keys are rows (3.39
+  to 5.4 showed it empty, and the next rewrite erased the keys). A `del` (or `pop`,
+  `popitem`) in a one-column store appends nothing (a lone key would read back as a row
+  there); the next rewrite writes the store from memory, and the store rewrites at exit.
+- **A cell that is whitespace once unescaped (`<LF>`) is still filled with the defaults
+  when a `TSVZed` loads it** (as 5.4): only the cells its right-strip empties;
+  `id\tv\n#_defaults_#\tNA\nk\t<LF>` loads `[k, NA]`.
+- **Writes never cut a row.** `TSVZed[k] = row` (not strict), `TSVZedLite[k] = row`,
+  `appendTabularFile`, `appendLinesTabularFile`, `tsvz set`/`append` and the handler pad a
+  shorter row and keep a wider one (dropping only empty cells past the count), so every
+  cell written is checked against the encoding; a strict `TSVZed` or `TSVZedLite` still
+  refuses another width, judged after those empty cells are dropped (`['a', '1', '']`
+  fits two columns). A strict reader (`readTabularFile`'s default) drops a row of another
+  width, as before: a row appended wider than the header is not in its view, where 3.39
+  to 5.4 wrote it cut and showed it.
+- **`TSVZed.correctColumnNum` after a load is the column count the read took** (the
+  header's, the defaults', or the first keyed line's), not the first row's length, which
+  a wider row can now exceed.
+- **A scrub compacts by dropping lines.** `scrubTabularFile`, `tsvz scrub` and a handler
+  `scrub` drop comments, empty lines, superseded lines and dead keys' lines, and keep
+  every other line byte for byte where it was. The exceptions: a key's last line can move
+  up into its first line's place (the key then is one line), a dead key's line that
+  readers take their column count from is kept emptied (`a\t` for `a\t1`), and a header
+  you pass with `verifyHeader=False` is added as line 1 when the file's line 1 is not it.
+  Otherwise line 1 never changes (`tsvz scrub --x-header` no longer puts an empty line
+  first: no row can move onto line 1), the `#_defaults_#` lines stay where they are (5.1
+  to 5.4 moved them and wrote resets), the caller's defaults are never written into rows,
+  a strict scrub writes what a loose one writes and keeps the lines strict drops, and
+  text the encoding cannot hold no longer refuses a scrub (its bytes are copied). A file
+  whose keys were all deleted keeps its line 1, and in a header-less file one emptied
+  line where needed, the same size after every scrub (5.2 to 5.4 shrank it to the bare
+  header). A scrub ends the file's last line with a newline, and writes the file again
+  even when it drops nothing (a compressed one is recompressed), as before.
+- **A `TSVZed` rewrite of a healthy file compacts it the same way and appends what memory
+  adds**: rows memory holds that the file does not read the same (changed in place, put
+  in memory directly), deletion lines for keys memory no longer holds, and, last, a
+  `#_defaults_#` line with the store's defaults when the file does not already end with
+  them (a bare `#_defaults_#` reset when the store has none and the file ends with some;
+  neither when the store's own reader would not take it). A file that is damaged,
+  missing or empty, a store reordered by `move_to_end`, and a one-column store after a
+  delete, are written from memory as before. It no longer writes its header over a line
+  1 that is not that header (5.4 did, and a reader given no header lost the row line 1
+  was); such a file keeps warning "Header mismatch" until it is fixed. It no longer
+  refuses a rewrite for a row it read but cannot encode again; only rows memory must
+  write are checked. Its `#_defaults_#` lines are kept, so a program that sets
+  `t['#_defaults_#']` over and over keeps a line for each change (5.4's rewrite
+  collapsed them). It costs a second parse of the compacted lines (one flag per key, not
+  the rows): for 100,000 two-cell rows with one changed in place, `hardMapToFile()`
+  peaks at 26 MiB and takes 0.65 s, where 5.4 took 8.4 MiB and 0.15 s (Python 3.14).
+- **A whole reload starts from the defaults and column count the program gave.** A
+  `TSVZed` that follows another process's rewrite (any rewrite, not an append) now reads
+  the file as its constructor did (or with the defaults of its last `setDefaults()`), not
+  with the defaults its last read ended with. Release note: a `TSVZed` of 3.39 to 5.4
+  that shares a file with any process that rewrites it (a scrub, another `TSVZed`'s
+  periodic or open-time rewrite) can misread a file whose meaning depends on its
+  defaults (a bare `#_defaults_#` first line, defaults the program gives):
+  `#_defaults_#\na\tX\nb` read with defaults `['', 'P']` shows `{a: [a, X]}`, and 5.2
+  showed `{}` after following such a rewrite. Upgrade those processes.
+- **Readers given other arguments than the scrub's can see a different file after a scrub
+  or a `TSVZed` rewrite**: see [docs/limitations.md](docs/limitations.md#readers-given-other-arguments-than-the-scrubs-can-see-a-different-file-after-a-scrub-or-a-rewrite).
+- **A file whose first keyed line is a bare `#_defaults_#` reads as one column without
+  defaults**: pass the defaults the file's program uses
+  ([docs/limitations.md](docs/limitations.md#a-file-whose-first-keyed-line-is-a-bare-_defaults_-reads-as-one-column-without-defaults)).
+
 ## Upgrading to 5.4 from 5.3
 
 The file formats are unchanged.
@@ -398,7 +480,8 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family file
 5.2 writes.
 
-- **A scrub of a `.tsv` whose rows were all deleted shrinks it.** `scrubTabularFile`,
+- **A scrub of a `.tsv` whose rows were all deleted shrinks it** (5.5: see
+  [Upgrading to 5.5](#upgrading-to-55-from-54); it now keeps line 1). `scrubTabularFile`,
   `tsvz scrub` (also through a `tsvz serve` handler) of a `.tsv`-family file (`.tsv`,
   `.csv`, `.nsv`, `.psv` and their compressed forms) in which every key has been deleted
   leaves the file as an empty store: the header line it has, and its `#_defaults_#`
@@ -443,11 +526,12 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   that opens such a file now rewrites it once. With `rewrite_on_load=False` the open
   does not, and the next exit or periodic rewrite does it (`rewrite_on_exit=True`,
   `rewrite_interval`). What such a rewrite does, it now does at a plain open:
-  - it cuts a row wider than the header, and the cut stays
-    ([limitations](docs/limitations.md#scrubs-and-rewrites-read-rows-at-one-column-width-deferred-to-the-width-design)):
+  - it cuts a row wider than the header, and the cut stays (5.5: no longer; see
+    [Upgrading to 5.5](#upgrading-to-55-from-54)):
     `id\tv\na\t1\t2\nb\t1\nb\t\n` becomes `id\tv\na\t1  \n`, and
     `id\tv\na\t\t7\nb\t1\nb\t\n` becomes `id\tv\na\t  \n`, the 7 lost;
-  - it writes over the file in place and pads with spaces (`a\t1  ` above): TSVZ readers
+  - it writes over the file in place and pads with spaces (`a\t1  ` above; 5.5 writes a
+    compaction whole): TSVZ readers
     strip them, tools that read the raw bytes (`awk`, `cut`) see them;
   - on a file it cannot write (read-only), it prints `Failed to open file … Permission
     denied` twice and leaves the file as it is, as 5.1 did for a key with two values.
@@ -460,7 +544,7 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   the scrub alike, so a scrub keeps the rows a read shows (but for the column-width cases
   below), and in such a file it never writes a row that is H as line 1: it puts an empty
   line first (`a\t1\nid\tv\na\t\n` becomes `\nid\tv\n`), so the reads still take that row
-  for a row. With `--x-strict` a line 1 that is not H is an error (exit 1, nothing
+  for a row (5.5: a scrub keeps line 1, so it leaves that file as it is). With `--x-strict` a line 1 that is not H is an error (exit 1, nothing
   written) for every operation, through a handler too. A missing or empty file gets H
   first at its first write, as in 5.1. A `tsvz serve STORE --x-header H` handler applies
   the rule to every request it answers, routed `tsvz` commands included; with
@@ -475,8 +559,8 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   header and fitted rows to H's width; now they warn and write the row at its own width,
   and with `--x-strict` exit 1. A rewrite without `--x-header` (a scrub without it,
   `scrubTabularFile`, a `TSVZed` rewrite) can still put a row equal to H on line 1 of a
-  header-less file
-  ([limitations](docs/limitations.md#a-rewrite-without---x-header-can-put-a-row-equal-to-h-on-line-1)).
+  header-less file (5.5: only a `TSVZed` writing its memory;
+  [limitations](docs/limitations.md#a-rewrite-without---x-header-can-put-a-row-equal-to-h-on-line-1)).
   In 5.1 only `set`, `append`, `delete` and `clear` used `--x-header`: the reads and
   `scrub` took line 1 as a row (`tsvz keys`
   printed `id a b` for two keys, `len` said 3, `popitem first` popped the header), and
@@ -486,12 +570,10 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 - **Known, mostly as in 5.1: a scrub, a rewrite or a read takes one column count for every row,
   and can lose cells or keys.** A scrub given defaults narrower than the rows, a row wider
   than the header, and a `.tsv` that begins with a bare `#_defaults_#` line (read without
-  defaults) are examples; the entry lists each, and which is new in 5.2
-  ([limitations](docs/limitations.md#scrubs-and-rewrites-read-rows-at-one-column-width-deferred-to-the-width-design)).
-  A strict scrub of a file whose read dropped a line for its width and found no row leaves it,
-  so it grows again over append, delete-all and scrub cycles
-  ([limitations](docs/limitations.md#a-strict-scrub-leaves-a-file-whose-read-dropped-a-line-for-its-width)).
-  Both wait for the column-width design after 5.2.
+  defaults) are examples. A strict scrub of a file whose read dropped a line for its width
+  and found no row leaves it, so it grows again over append, delete-all and scrub cycles.
+  Both waited for the column-width design, which 5.5 is: see
+  [Upgrading to 5.5](#upgrading-to-55-from-54).
 
 ## Upgrading to 5.1 from 5.0
 
@@ -514,7 +596,8 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 - **`scrubTabularFile(lastLineOnly=True)` is a read.** It returns the last row and
   writes nothing, as for a `.tsvz`. 5.0 and 3.39 wrote that row back as deletion lines
   (`id\tv\na\t\n3\t\n`), and the store was gone.
-- **A scrub keeps the file's `#_defaults_#` lines.** The defaults in effect at the end
+- **A scrub keeps the file's `#_defaults_#` lines** (5.5: where they are; see
+  [Upgrading to 5.5](#upgrading-to-55-from-54)). The defaults in effect at the end
   of the read are written after the rows: the last non-empty defaults line, its empty
   cells filled from the line before it as a reader fills them. An empty defaults line
   that was read (it turns defaults off) is written before the rows, padded to their
@@ -558,8 +641,7 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   early rows read.** In a `.tsv` with an empty `#_defaults_#` line and rows with empty
   cells before any defaults line, the reset line the scrub writes before the rows keeps
   those cells empty for a program that opens the store with its own defaults; run the
-  scrub with the defaults that program uses
-  ([limitations](docs/limitations.md#a-scrub-run-with-other-defaults-than-the-stores-program-can-change-how-early-rows-read)).
+  scrub with the defaults that program uses (5.5: no longer; a scrub writes no reset).
 - **Running programs keep 5.0** until they are restarted: long-running programs that
   import TSVZ, and running `tsvz serve` handlers.
 
@@ -631,8 +713,14 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 | L15 | `scrubTabularFile`, `clearTabularFile`, `tsvz scrub`, `tsvz clear` and `TSVZedLite.clear_file()` write the new content over the file and then cut it, under the file's lock; 3.39 emptied the file first, with no lock, so a reader could meet it empty. |
 | L16 | A scrub writes only if the file is still what its read saw: it reads again up to three times, then writes nothing, with a warning (`tsvz scrub` exits 1, C6); 3.39 wrote over rows appended after its read. |
 | L17 | `scrubTabularFile(lastLineOnly=True)` returns the last row and writes nothing; 3.39 wrote that row back as deletion lines, and the store was gone. |
-| L18 | A scrub keeps the file's `#_defaults_#` lines (an empty one before the rows, the defaults in effect after them), so every row reads as it did; 3.39 dropped them, so rows appended later got no defaults. |
-| L19 | A scrub given no header, and a `TSVZed` given none, keep a file's header line first; 3.39 put an empty line in front of it, and a reader given the header then read the header as a row. |
+| L18 | A scrub keeps every `#_defaults_#` line as the file has it, where it was, so every row reads as it did; 3.39 dropped them, so rows appended later got no defaults. |
+| L19 | A scrub never changes line 1, except that a header you pass with `verifyHeader=False` is added; a `TSVZed` rewrite of a healthy file never changes it; 3.39 put an empty line in front of a header line, and a reader given the header then read the header as a row. |
+| L20 | A row wider than the column count is read whole (only its empty cells past the count go); 3.39 cut it. |
+| L21 | `TSVZed` reads a one-column file's lone keys as rows, as `readTabularFile` does (3.39 showed none); a delete there is written by a rewrite from memory, not as a line. |
+| L22 | Writes never cut a row: a wider row is written whole; 3.39 cut it to the column count. |
+| L23 | A scrub, and a `TSVZed` rewrite of a healthy file, drop lines and keep the lines they keep byte for byte, in place (a key's last line may move up into its first line's place; a dead key's line readers take their column count from is kept emptied); 3.39 wrote the rows it read. |
+| L24 | A `TSVZed`'s whole reload starts from the defaults the program gave, not those its last read ended with. |
+| L25 | A `TSVZed` rewrite appends its defaults line at the end, when the file does not already end with those defaults, instead of writing it after the header. |
 
 ### `.tsvz`, `.csvz`, `.nsvz`, `.psvz`: now tsvz-spec-v1
 
@@ -670,7 +758,7 @@ and `-d=,`, except the ones C5 and C9 list.
 | C7 | `-c/--header`, `--defaults`, `-s/--strict` and `-f/--force` are undocumented aliases of the `--x-` options. `--x-header` and `--x-defaults` keep non-ASCII text. |
 | C8 | Usage errors print tsvz's own message, exit 2; the `-h` text is new. |
 | C9 | Arguments after STORE for `read`, `clear` and `scrub` are a usage error, exit 2 (3.39 ignored them, so `clear junk` cleared the file). |
-| C10 | The table (a terminal, or `--format table`) of `get`, `keys`, `pop`, `popitem`, `setdefault`, and of `read` on a `.tsvz`-family store, shows the rows only: no row is drawn as a header, and no row is cut to the first row's or the terminal's width. `read` of a `.tsv`-family file keeps 3.39's table, whose first row is the file's header line. |
+| C10 | The table (a terminal, or `--format table`) of `get`, `keys`, `pop`, `popitem`, `setdefault`, and of `read` on a `.tsvz`-family store, shows the rows only: no row is drawn as a header, and no row is cut to the first row's or the terminal's width. `read` of a `.tsv`-family file keeps 3.39's table, whose first row is the file's header line (5.5: padded to the widest row, so no row is cut to it). |
 | C11 | The table shows control characters, bidi controls and line separators as escapes (`\r`, `\n`, `\t`, `\xNN`, `\uNNNN`), so no value can move the cursor, reorder the line or restyle the terminal. It sizes columns in terminal columns, so CJK text (two columns a character) lines up. The table is for reading: a backslash in a value is shown as is, so use records for exact values. |
 | C12 | While stripping is on, `get`, `has`, `pop`, `delete` and `setdefault` take the live key equal to a KEY ending in a space or tab before the stripped one (spec §20.2.7), so `tsvz keys s \| tsvz delete s -` deletes every key. `delete` of such a KEY reads the store first, and exits 1 without writing when the store cannot be read whole. |
 
