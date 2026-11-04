@@ -6277,7 +6277,10 @@ memoryOnly:{self.memoryOnly}
 				# The defaults line comes right after the header, so it survives a
 				# full rewrite -- it is not a regular mapping key. With no header line written the first line
 				# is a row (a header, to the store that owns the file): after that.
-				line = _encodeRow(_sanitize(defaults,delimiter=delimiter),delimiter,encoding,errors,what='defaults')
+				# As wide as the rows (5.5): a strict reader takes no defaults line of another width, and a compacting
+				# rewrite would then append one that it takes.
+				line = _encodeRow(_sanitize(_fitRow(defaults, self.correctColumnNum),delimiter=delimiter),delimiter,
+								  encoding,errors,what='defaults')
 				first, later = ([line], []) if header is not None else ([], [line])
 			rows = _RewriteRows(first, values, delimiter, encoding, errors, self.header, later)
 			del values  # the snapshot holds the cells

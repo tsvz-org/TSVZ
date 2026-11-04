@@ -13099,3 +13099,18 @@ def test_tsvzed_rewrite_appends_no_defaults_line_its_own_reader_would_not_take(t
 	t.hardMapToFile()
 	t.close()
 	assert _bytes(p) == text
+
+
+def test_tsvzed_memory_dump_writes_its_defaults_line_as_wide_as_the_rows(tmp_path):
+	# (fuzzer, run 7i) a strict reader took no 2-cell defaults line at width 3, so the next (compacting) rewrite
+	# appended one it takes: two rewrites wrote two files.
+	p = str(tmp_path / 'e.tsv')
+	_touch(p, b'')
+	t = TSVZ.TSVZed(p, header='id\tv\tw', defaults=['#_defaults_#', 'P'], strict=True, rewrite_on_load=False,
+					append_check_delay=0.01, verbose=False)
+	t.hardMapToFile()
+	first = _bytes(p)
+	t.hardMapToFile()
+	t.close()
+	assert first == _bytes(p) == b'id\tv\tw\n#_defaults_#\tP\t\n'
+	assert TSVZ.readTabularFile(p, header='id\tv\tw', strict=True, defaults=[]) == {}
