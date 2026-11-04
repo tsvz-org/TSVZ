@@ -250,10 +250,12 @@ microseconds as a write starts is followed as a rotation instead); while that re
 fails or is refused, the rows are appended to a new file there, and memory keeps all of
 them for the rewrite that gets through. A compressed file is read member by member, and a
 member's rows are used only once it passes its codec's check (the gzip CRC-32 and length,
-the bzip2 CRCs, the xz check, the zstd content checksum TSVZ writes): a member cut short,
-as a writer killed mid-append leaves it, is left out whole and the members after it are
-read; other damage (bytes that do not decode, a member that fails its check, the old bytes
-a whole rewrite cut short leaves after its new members) stops the read there (L5). A
+the bzip2 CRCs, the xz check, the zstd content checksum TSVZ writes): a member after the
+first cut short, as a writer killed mid-append leaves it, is left out whole and the
+members after it are read; a first member cut short and any other damage (bytes that do
+not decode, a member that fails its check) stop the read there (L5). A rewrite of a
+multi-member file killed inside a later member's write can make a read take its old
+members back ([docs/limitations.md](docs/limitations.md)). A
 compressed file another writer left damaged is made again too: what the read did not get
 goes, the damaged member and, after damage that stops the read, everything after it (rows
 appended there would be read by no one). While that
@@ -306,22 +308,33 @@ The file formats are unchanged.
   a member's text over before they check it: a member cut short by a writer killed
   mid-append, once another member was appended after it, could end its last line with a
   garbage value (gzip, more rarely xz), which a `TSVZed` then wrote back. Now:
-  - a member cut short is left out whole, also when it is the last one (5.3 and earlier kept the whole
-    lines it decoded): its writer was never told those rows were saved. The members after
-    it are read, where 5.3 and earlier stopped at it, so a cut first member followed by good members
-    (5.2's scrub made that an empty store) now reads the good ones; given a header, the
-    first line read is taken as the header line, as for any file whose first line is not
-    the header. A `TSVZed` that read it makes the file again at its next write, without
-    the cut member.
-  - a member that fails its check gives none of its rows (5.3 and earlier used them, then stopped).
-  - other damage stops the read there, as before: bytes that do not decode (also after a
-    complete `.bz2` or `.xz` stream, which earlier versions' `readTabularFile` passed over silently),
-    a member that fails its check, and the old bytes a whole rewrite cut short leaves after
-    its new members (they hold rows as they were before the rewrite, so they are not read).
+  - a member cut short is left out whole, also when it is the last one (5.3 and earlier
+    kept the whole lines it decoded): its writer was never told those rows were saved. A
+    `.tsvz` part still keeps a cut member's whole lines, as spec §16.6 says, so the two
+    differ there.
+  - after a member cut short that is not the first, the members after it are read, where
+    5.3 and earlier stopped at it, so the appends that followed a killed append are read.
+    A `TSVZed` that read it makes the file again at its next write, without the cut member.
+  - a first member cut short stops the read, as before, and now gives none of its rows
+    (5.3 and earlier handed over the lines gzip decoded of it): a whole rewrite killed in
+    its first member leaves the old file's bytes after it, whose rows are as they were
+    before the rewrite (deleted keys too). Its line 1 is not taken unchecked either: an
+    append that checks the header (`tsvz set --x-header`, `appendTabularFile` with a
+    header) raises and writes nothing, and a scrub or clear makes the file again.
+    A rewrite killed inside a later member's write of a multi-member file is not told
+    from a killed append ([docs/limitations.md](docs/limitations.md)).
+  - a member that fails its check gives none of its rows (5.3 and earlier used them, then
+    stopped).
+  - other damage stops the read there, as before: bytes that do not decode, also after a
+    complete `.bz2` or `.xz` stream, which 5.2's `readTabularFile` (and so a scrub, a clear
+    and `tsvz serve`'s reads) passed over silently, where a `TSVZed` already reported
+    them; xz stream padding (zero bytes after a stream) is not damage.
   - the damage warning names each member left out and where it begins.
   - a member's text is held until its check passes: TSVZ writes at most 1 MiB of text a
     member, and a file another tool compressed whole is one member, held whole while it is
-    read (the read builds the rows from it anyway).
+    read (the read builds the rows from it anyway). A read of line 1 alone (an append's
+    header check, a clear, a scrub) decodes the first member in pieces and keeps only that
+    line until the member's check passes.
 
 ## Upgrading to 5.3 from 5.2
 
@@ -405,7 +418,7 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   made again as an empty store, as a scrub of a damaged file with rows already was in
   5.1: what the read did not get goes, the bytes after the damage and also the lines of the
   damaged member before it that the codec never handed over (Python's gzip gives none of
-  a first member cut short, where `zcat` shows them; 5.4 reads the members after it), and
+  a first member cut short, where `zcat` shows them), and
   `tsvz clear --x-header H --x-strict` (`clearTabularFile(verifyHeader=True)`) now clears
   such a file, where 5.1 exited 1 with the codec's error.
   5.1 and 5.0 left such a file as it was, deletion lines included, so a writer that

@@ -11407,12 +11407,8 @@ def test_legacy_scrub_of_a_gz_file_whose_first_line_cannot_be_decoded_does_not_r
 	else:
 		data = gzip.compress(b'id\tv\n' + b''.join(b'k%d\tv\n' % i for i in range(2000)))[:200] + gzip.compress(b'z\t9\n')
 	_touch(p, data)
-	# From 5.4 the good member after a cut first one is read: as a row, or, given a header, as the header line.
-	expected = {'z': ['z', '9']} if name == 'cut-first-member' and not header else {}
-	assert dict(TSVZ.scrubTabularFile(p, header=header)) == expected
+	assert TSVZ.scrubTabularFile(p, header=header) == {}
 	assert any('compressed stream is damaged' in w for w in _tsvz_warnings(capsys))
-	if name == 'cut-first-member':
-		assert gzip.decompress(_bytes(p)) == b'z\t9\n'
 
 
 @pytest.mark.parametrize('strict', [True, False])
@@ -11904,14 +11900,15 @@ def test_members_a_cut_last_member_is_left_out_whole(tmp_path, capsys, suffix):
 
 
 @pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
-def test_members_a_cut_first_member_is_left_out_and_the_members_after_it_read(tmp_path, capsys, suffix):
-	# Main read nothing: its codec reader stopped at the first member's damage.
+def test_members_a_cut_first_member_stops_the_read(tmp_path, capsys, suffix):
+	# A whole rewrite killed part way leaves its first member cut short and then the old file's bytes: they are not
+	# read (old rows, deleted keys), so a cut first member stops the read, as a codec's reader does.
 	_, cut = _cutMember(suffix, 7)
 	p = str(tmp_path / ('g.' + suffix))
 	_touch(p, cut + _member(suffix, b'k1\tv1\n') + _member(suffix, b'k2\tv2\n'))
 	data, warnings = _read_quiet(p, capsys, header='')
-	assert data == {'k1': ['k1', 'v1'], 'k2': ['k2', 'v2']}
-	assert len(warnings) == 1 and 'cut short' in warnings[0], warnings
+	assert data == {}
+	assert len(warnings) == 1 and 'first member' in warnings[0] and 'stopped' in warnings[0], warnings
 
 
 @pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
@@ -12044,6 +12041,137 @@ def test_members_open_file_as_compressed_reads_checked_members_in_text_and_binar
 		assert f.read(2) == b'1\n'
 	with TSVZ.openFileAsCompressed(p, 'r') as f:
 		assert f.readline() == 'a\t1\n' and f.readline() == 'b\t2\n'
+
+
+
+def _rewriteCut(suffix, rng, keys, appends, member=None):
+	"""A store compacted into big members, then one-row appends (keys s<j> = old, and d<j> = old, deleted before
+	the rewrite), and a whole rewrite of it (k and s keys = new) killed part way: its bytes up to a random X, then
+	the old file's from X. ``member``: X inside that member of the rewrite (0 the first). Returns the bytes, or
+	None when the rewrite is not shorter than the old file."""
+	codec = suffix.rpartition('.')[2]
+	old = _member(suffix, b'key\tval\n' + b''.join(b'k%d\told\n' % i for i in range(keys)))
+	old += b''.join(_member(suffix, (b'd%d\told\n' if rng.random() < 0.2 else b's%d\told\n') % j) for j in range(appends))
+	text = b'key\tval\n' + b''.join(b'k%d\tnew\n' % i for i in range(keys)) + b''.join(b's%d\tnew\n' % j for j in range(appends))
+	new = TSVZ._compressBytes(codec, text)
+	if len(new) >= len(old):
+		return None
+	starts = [0]
+	while True:
+		at = TSVZ._nextMemberStart(io.BytesIO(new), codec, starts[-1] + 1)
+		if at is None:
+			break
+		starts.append(at)
+	member = member or 0
+	low, high = starts[member] + 20, (starts[member + 1] if member + 1 < len(starts) else len(new)) - 1
+	at = rng.randint(low, high)
+	if new[:at] == old[:at]:
+		return None  # (cut inside the bytes the two begin with: the file is the old one, as it should read)
+	return new[:at] + old[at:]
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_a_one_member_rewrite_killed_part_way_reads_no_old_row(tmp_path, capsys, suffix):
+	# 5.4's first build took the cut first member for a killed append and read the old members after it: deleted
+	# keys came back and old values won (gz 83 of 150 random cuts, bz2 124, xz 28, zst 148).
+	rng = random.Random(1234)
+	p = str(tmp_path / ('g.' + suffix))
+	tried = 0
+	while tried < 25:
+		data = _rewriteCut(suffix, rng, rng.randint(200, 2000), rng.randint(200, 3000))
+		if data is None:
+			continue
+		tried += 1
+		_touch(p, data)
+		read, warnings = _read_quiet(p, capsys, header='')
+		assert read == {} and len(warnings) == 1 and 'first member' in warnings[0], (tried, len(read), warnings)
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_a_multi_member_rewrite_killed_in_its_first_member_reads_no_old_row(tmp_path, capsys, suffix):
+	rng = random.Random(77)
+	p = str(tmp_path / ('g.' + suffix))
+	for _ in range(3):
+		data = _rewriteCut(suffix, rng, 160000, 3000, member=0)
+		_touch(p, data)
+		read, warnings = _read_quiet(p, capsys, header='')
+		assert read == {} and len(warnings) == 1 and 'first member' in warnings[0], (len(read), warnings)
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_a_multi_member_rewrite_killed_in_a_later_member_reads_its_complete_members(tmp_path, capsys, suffix):
+	# A known limitation (docs/limitations.md): the old members after the cut one can then be read too.
+	rng = random.Random(78)
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, _rewriteCut(suffix, rng, 160000, 3000, member=1))
+	read, warnings = _read_quiet(p, capsys, header='')
+	new = [k for k, v in read.items() if v[1] == 'new']
+	assert new == ['k%d' % i for i in range(len(new))] and len(new) > 50000 and len(warnings) == 1, (len(new), warnings)
+
+
+def test_members_gzip_magic_bytes_inside_a_cut_member_do_not_stop_the_read(tmp_path, capsys):
+	# The cut member's own bytes hold 1F 8B 08 (stored here: level 0), and what begins there does not decode: 5.4's
+	# first build stopped reading there, losing every member after it (4 of 300 cut 1 MiB members).
+	import zlib
+	rows = b''.join(b'c%d\tv\n' % i for i in range(200)) + b'x\t\x1f\x8b\x08\xff junk\n' + b''.join(b'e%d\tv\n' % i for i in range(200))
+	packer = zlib.compressobj(0, zlib.DEFLATED, 31)
+	whole = packer.compress(rows) + packer.flush()
+	inside = whole.find(b'\x1f\x8b\x08', 1)
+	assert inside > 0
+	cut = whole[:inside + 200]
+	p = str(tmp_path / 'g.tsv.gz')
+	_touch(p, _member('tsv.gz', b'key\tval\nk0\tv0\n') + cut + _member('tsv.gz', b'z\t9\n'))
+	data, warnings = _read_quiet(p, capsys)
+	assert data == {'k0': ['k0', 'v0'], 'z': ['z', '9']} and len(warnings) == 1 and 'stopped' not in warnings[0], warnings
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_the_first_line_of_a_one_member_file_is_read_without_holding_the_member(tmp_path, suffix):
+	# An append's header check decoded and held the whole member of a file another tool compressed whole (200 MiB
+	# of text: 427 MiB, where 5.2 needed 37 MiB).
+	import tracemalloc
+	p = str(tmp_path / ('g.' + suffix))
+	text = b'key\tval\n' + b''.join(b'r%09d\t%012d\n' % (i, i * 7) for i in range(1500000))
+	_touch(p, TSVZ._codecModule(suffix.rpartition('.')[2]).compress(text))
+	del text
+	tracemalloc.start()
+	try:
+		TSVZ.appendTabularFile(p, ['zz', '1'], header='key\tval')
+		peak = tracemalloc.get_traced_memory()[1]
+	finally:
+		tracemalloc.stop()
+	assert peak < 16 << 20, peak  # (the text is 34 MiB)
+	assert TSVZ.readTabularFile(p, header='key\tval')['zz'] == ['zz', '1']
+
+
+def test_members_a_header_check_of_a_file_whose_first_member_is_cut_raises_and_writes_nothing(tmp_path):
+	# Its line 1 is not used unchecked (5.2's GzipFile handed a member cut in its trailer over, then appended).
+	first = _member('tsv.gz', b'key\tval\nk0\tv0\n')
+	data = first[:-5] + _member('tsv.gz', b'z1\t9\n')
+	p = str(tmp_path / 'g.tsv.gz')
+	_touch(p, data)
+	with pytest.raises(Exception) as caught:
+		TSVZ.appendTabularFile(p, ['n', '1'], header='key\tval')
+	assert 'first member' in str(caught.value) and _bytes(p) == data
+
+
+def test_members_xz_stream_padding_is_not_damage(tmp_path, capsys):
+	p = str(tmp_path / 'g.tsv.xz')
+	_touch(p, _member('tsv.xz', b'key\tval\nk0\tv0\n') + b'\0' * 8 + _member('tsv.xz', b'k1\tv1\n') + b'\0' * 4)
+	assert _read_quiet(p, capsys) == ({'k0': ['k0', 'v0'], 'k1': ['k1', 'v1']}, [])
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_a_compressed_reader_seeks_from_the_end_and_read_of_the_rest_raises_when_called_again(tmp_path, suffix):
+	_, cut = _cutMember(suffix, 4)
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, _member(suffix, b'a\t1\n') + cut + _member(suffix, b'b\t2\n'))
+	with TSVZ.openFileAsCompressed(p, 'rb') as f:
+		assert f.seek(0, io.SEEK_END) == 8 and f.seek(-2, io.SEEK_END) == 6 and f.read(2) == b'2\n'
+		f.seek(0)
+		assert f.read() == b'a\t1\nb\t2\n'
+		with pytest.raises(Exception):
+			f.read()
 
 
 if __name__ == '__main__':
