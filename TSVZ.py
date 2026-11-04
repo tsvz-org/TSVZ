@@ -1012,10 +1012,12 @@ _PATH_LOCKS_GUARD = threading.Lock()
 def _pathLock(path):
 	"""Return the process-wide lock for ``path``.
 
-	Writers also hold this lock while they append to or rewrite a file: the
-	file lock does not always exclude threads of one process (``lockf``, still
-	the fallback where the other locks are refused, excludes none), and
-	Windows' ``msvcrt`` gives up after 10 s. Readers never take it.
+	One-shot appends (_lockedAppend), the making of a missing file, scrubs and
+	clears (_specRewriteInPlace) and .tsvz part writes also hold it while they
+	lock the file: ``lockf``, still the fallback where the other locks are
+	refused, excludes no thread of the process, and Windows' ``msvcrt`` gives
+	up after 10 s. A TSVZed's own writes, which its writeLock serialises, and
+	readers do not take it.
 	"""
 	key = os.path.realpath(path)
 	with _PATH_LOCKS_GUARD:
@@ -1058,18 +1060,21 @@ def _ofdLock(f, kind, start=0, length=0):
 
 
 #: The descriptors TSVZ holds a lock on: fd -> [kind ('ofd', 'flock' or 'lockf': how it is unlocked), the file's
-#: _fileIdentity, the locking thread's _heldHere() set, a weak reference to the file object]. Entered before the
-#: lock call, left at the unlock, so a fork at any moment finds every lock the child could inherit (_locksAfterFork).
+#: _fileIdentity, the locking thread's ident, a weak reference to the file object]. Entered before the lock call,
+#: left at the unlock, so a fork at any moment finds every lock the child could inherit (_locksAfterFork).
 _HELD = {}
-_THREAD_HELD = threading.local()
 
 
 def _heldHere():
-	"""The _fileIdentity of every file this thread holds a TSVZ lock on: a read of one takes no lock (_readLock)."""
-	keys = getattr(_THREAD_HELD, 'keys', None)
-	if keys is None:
-		keys = _THREAD_HELD.keys = set()
-	return keys
+	"""The _fileIdentity of every file this thread holds a TSVZ lock on, through a file object still open (one
+	closed without an unlock let go of its lock): a read of one takes no lock (_readLock)."""
+	me = threading.get_ident()
+	held = set()
+	for _, key, owner, ref in list(_HELD.values()):
+		f = ref()
+		if owner == me and f is not None and not f.closed:
+			held.add(key)
+	return held
 
 
 def _locksAfterFork():
@@ -1077,12 +1082,11 @@ def _locksAfterFork():
 	release it, and the parent's lockf locks are not inherited. Its open file description and flock locks are: each
 	descriptor that holds one is pointed at /dev/null, so the child holds none and the parent's lock is as it was (a
 	copy of a get_file_obj() holder then fails its writes with EBADF)."""
-	global _PATH_LOCKS_GUARD, _THREAD_HELD
+	global _PATH_LOCKS_GUARD
 	_PATH_LOCKS_GUARD = threading.Lock()
 	_PATH_LOCKS.clear()
 	held = list(_HELD.items())
 	_HELD.clear()
-	_THREAD_HELD = threading.local()
 	inherited = [fd for fd, (kind, _, _, ref) in held if kind != 'lockf' and ref() is not None and not ref().closed]
 	if inherited:
 		null = os.open(os.devnull, os.O_RDONLY)
@@ -1126,13 +1130,8 @@ def _lockFile(f, mode=_REWRITE):
 	if mode == _READ and kind not in ('ofd', 'flock'):
 		return False
 	fd = f.fileno()
-	key = _fileIdentity(os.fstat(fd))
-	here = _heldHere()
-	entry = [kind, key, here, weakref.ref(f)]
-	stale = _HELD.get(fd)
-	if stale is not None:
-		stale[2].discard(stale[1])  # its file was closed without an unlock: the lock went with it
-	_HELD[fd] = entry  # before the lock call: a fork from now on finds it
+	entry = [kind, _fileIdentity(os.fstat(fd)), threading.get_ident(), weakref.ref(f)]
+	_HELD[fd] = entry  # before the lock call: a fork from now on finds it (an entry left by a file closed unlocked goes)
 	try:
 		try:
 			if kind == 'ofd':
@@ -1165,7 +1164,6 @@ def _lockFile(f, mode=_REWRITE):
 		if _HELD.get(fd) is entry:
 			del _HELD[fd]
 		raise
-	here.add(key)
 	return True
 
 
@@ -1230,8 +1228,7 @@ def _unlockFile(f):
 			entry = _HELD.pop(fd, None)
 			if entry is None:
 				return
-			kind, key, here, _ = entry
-			here.discard(key)
+			kind = entry[0]
 			if kind == 'ofd':
 				_ofdLock(f, fcntl.F_UNLCK)
 			elif kind == 'flock':
@@ -4776,6 +4773,8 @@ class TSVZed(OrderedDict):
 			self._specLoaded = False
 		self._requests = deque()  # the jobs _call hands the writer thread
 		self._wake = threading.Event()  # set when one is handed: the thread does not wait out its tick
+		self._workerDone = threading.Event()  # set as the writer thread ends (_workerRuns)
+		self._workerPid = os.getpid()
 		self.appendThread  = threading.Thread(target=self._appendWorker,daemon=True)
 		self.appendThread.start()
 		_LIVE_STORES[id(self)] = self  # before load(): what it writes is finished at exit, whatever ends the program
@@ -5362,7 +5361,7 @@ rewrite_on_exit:{self.rewrite_on_exit}
 rewrite_interval:{self.rewrite_interval}
 append_check_delay:{self.append_check_delay}
 appendQueueLength:{len(self.appendQueue)}
-appendThreadAlive:{self.appendThread.is_alive()}
+appendThreadAlive:{self._workerRuns()}
 dirty:{self.dirty}
 deSynced:{self.deSynced}
 memoryOnly:{self.memoryOnly}
@@ -5504,7 +5503,7 @@ memoryOnly:{self.memoryOnly}
 				made = self._mapToFile(sync=reloadInternalFromFile)
 				if made and self.verbose:
 					self.__teePrintOrNot(f"{len(self)} records rewrote to {self._fileName}")
-			if not self.appendThread.is_alive():
+			if not self._workerRuns():
 				self._commit()
 			return made  # False when the rewrite failed or was refused (reported)
 		except Exception as e:
@@ -5538,6 +5537,8 @@ memoryOnly:{self.memoryOnly}
 	_refusalReported = False
 	_refusals = 0  # refusals in a row, since the last _accepted(): each doubles the wait before the next try
 	_closing = False  # stopAppendThread() makes its last rewrite: none is tried after it
+	_writing = 0  # write jobs and writes under way on the writer thread (_startWrite): the exit lets go of none of them
+	_letGo = False  # the exit let go of the store (_atExit): its writer thread starts no write
 	_exiting = False  # _stopLiveStores stops it at exit: a Ctrl-C there finishes the store, which does not run on
 
 	def _refuse(self, where, error, explicit=False):
@@ -5555,7 +5556,7 @@ memoryOnly:{self.memoryOnly}
 		if explicit:
 			raise error
 		message = str(error)
-		stopped = self._closing or not self.appendThread.is_alive()
+		stopped = self._closing or not self._workerRuns()
 		if (message, self._damaged, stopped) == self._refusalReported:
 			return
 		self._refusalReported = (message, self._damaged, stopped)
@@ -5686,6 +5687,15 @@ memoryOnly:{self.memoryOnly}
 				or (known[0][1] is not None and _fileIdentity(st) != known[0]))
 
 	def _writeFile(self, whole, sync=True, snapshot=None):
+		"""_writeFileStarted, unless the exit has let go of the store (False: nothing is written)."""
+		if not self._startWrite():
+			return False
+		try:
+			return self._writeFileStarted(whole, sync, snapshot)
+		finally:
+			self._endWrite()
+
+	def _writeFileStarted(self, whole, sync=True, snapshot=None):
 		"""Write memory (or ``snapshot()``'s, a clear's) over the legacy file in place, or whole (``whole``, a compressed
 		file, written as whole members, or a missing one: written over the file, then cut to its end): True when all of
 		it is on disk, False when the file could not be opened or locked (reported); what stops it raises.
@@ -6065,14 +6075,13 @@ memoryOnly:{self.memoryOnly}
 	def _call(self, fn, *args):
 		"""``fn(*args)``, run on the store's writer thread while this one waits: a KeyboardInterrupt stops the wait, never
 		the write. Run here on that thread itself, or when it is not running (after close, in a forked child)."""
-		thread = self.appendThread
-		if thread is threading.current_thread() or not thread.is_alive():
+		if self.appendThread is threading.current_thread() or not self._workerRuns():
 			return fn(*args)
 		job = [fn, args, threading.Event(), None, None]
 		self._requests.append(job)
 		self._wake.set()
 		while not job[2].wait(0.1):  # in steps: a Ctrl-C stops the wait on every platform
-			if not thread.is_alive():  # it stopped before it took the job
+			if not self._workerRuns():  # it stopped before it took the job
 				try:
 					self._requests.remove(job)
 				except ValueError:
@@ -6082,20 +6091,53 @@ memoryOnly:{self.memoryOnly}
 			raise job[4]
 		return job[3]
 
+	def _workerRuns(self):
+		"""True while the writer thread runs: until the end of _appendWorker, not Thread.is_alive() (on Python 3.9 to
+		3.12 a KeyboardInterrupt in Thread.join() marks a running thread stopped); False in a forked child."""
+		return not self._workerDone.is_set() and self._workerPid == os.getpid()
+
+	def _startWrite(self):
+		"""Note a write job or a write starting on the writer thread, so the exit waits for it (_atExit); False, and
+		nothing noted, once the exit has let go of the store: nothing more is written."""
+		with self._memLock:
+			if self._letGo:
+				return False
+			self._writing += 1
+			return True
+
+	def _endWrite(self):
+		with self._memLock:
+			self._writing -= 1
+
 	def _runRequests(self):
-		"""Run, on the writer thread, the jobs _call handed it, in order."""
+		"""Run, on the writer thread, the jobs _call handed it, in order. A job that writes (all but reload's and
+		checkExternalChanges') is not started once the exit has let go of the store."""
 		while True:
 			try:
 				job = self._requests.popleft()
 			except IndexError:
 				return
+			writes = job[0] != self._reload and job[0] != self._checkExternalChanges
 			try:
-				job[3] = job[0](*job[1])
+				if writes and not self._startWrite():
+					job[3] = None
+				else:
+					try:
+						job[3] = job[0](*job[1])
+					finally:
+						if writes:
+							self._endWrite()
 			except BaseException as e:
 				job[4] = e
 			job[2].set()
 
 	def _appendWorker(self):
+		try:
+			self._appendWork()
+		finally:
+			self._workerDone.set()
+
+	def _appendWork(self):
 		while not self.shutdownEvent.is_set():
 			self._wake.clear()
 			self._runRequests()
@@ -6138,6 +6180,15 @@ memoryOnly:{self.memoryOnly}
 		return self._remake and (self._closing or not self._refusalPending() and not self._failing('rewrite'))
 
 	def _commitOnce(self):
+		"""_commitOnceStarted, unless the exit has let go of the store (nothing is written)."""
+		if not self._startWrite():
+			return self
+		try:
+			return self._commitOnceStarted()
+		finally:
+			self._endWrite()
+
+	def _commitOnceStarted(self):
 		"""_commit(), once: 'remake' when another writer's change it read under the lock is damage (_remakeDue)."""
 		if not self.appendQueue:
 			return self
@@ -6272,23 +6323,27 @@ memoryOnly:{self.memoryOnly}
 		"""Stop the writer thread once it has done its jobs and appended the queue; forget the store (_LIVE_STORES)."""
 		self.shutdownEvent.set()
 		self._wake.set()
-		thread = self.appendThread
-		if thread is not threading.current_thread():
-			while thread.is_alive():
-				thread.join(0.1)  # in steps: a Ctrl-C stops the wait on every platform
+		if self.appendThread is not threading.current_thread():
+			while self._workerRuns():
+				self._workerDone.wait(0.1)  # in steps: a Ctrl-C stops the wait on every platform (not join(): _workerRuns)
 		_LIVE_STORES.pop(id(self), None)
 
 	def _atExit(self):
 		"""What _stopLiveStores does with a store left running at exit. A legacy store with nothing to write (nothing
-		queued, not dirty, damaged or to be made again, no rewrite_on_exit) is let go of without waiting for its writer
-		thread, a daemon, which may be waiting for another process's lock to read the file: a program whose store
-		waits in its load ends at one Ctrl-C."""
+		queued, not dirty, damaged or to be made again, no rewrite_on_exit, no write job handed to its writer thread or
+		under way there) is let go of without waiting for that thread, a daemon, which may be waiting for another
+		process's lock to read the file: a program whose store waits in its load ends at one Ctrl-C. From then on the
+		thread starts no write (_startWrite), so none is cut short as the interpreter ends."""
 		self._exiting = True
-		if not self._spec and not (self.appendQueue or self.dirty or self._damaged or self._remake or self.rewrite_on_exit):
-			self.shutdownEvent.set()
-			self._wake.set()
-			_LIVE_STORES.pop(id(self), None)
-			return None
+		if not self._spec:
+			with self._memLock:
+				self._letGo = not (self.appendQueue or self.dirty or self._damaged or self._remake or self.rewrite_on_exit
+								   or self._requests or self._writing)
+			if self._letGo:
+				self.shutdownEvent.set()
+				self._wake.set()
+				_LIVE_STORES.pop(id(self), None)
+				return None
 		return self.stopAppendThread()
 	
 	def get_file_obj(self,modes = 'ab'):
@@ -6296,8 +6351,8 @@ memoryOnly:{self.memoryOnly}
 		store's own writes do not use it). 'wb' empties it once locked; for a compressed file 'w' and 'a' modes give
 		a writer through its codec over the locked file (a new member at the end for 'a'). None when it cannot be opened or locked (reported).
 
-		'a' modes take the append lock, so other processes' readers go on while it is held; other modes take the
-		rewrite lock, which readers wait for (_lockFile). The calling thread reads the file (readTabularFile) without
+		'a' modes take the append lock, so on Linux other processes' readers go on while it is held (with flock,
+		elsewhere, they wait); other modes take the rewrite lock, which readers wait for (_lockFile). The calling thread reads the file (readTabularFile) without
 		waiting for its own lock, but must not wait on another store of the same file (its reload(), close() or a
 		write) while it holds it: that store's thread waits for this lock, for ever."""
 		self.writeLock.acquire()
@@ -7420,7 +7475,7 @@ class _ServeStore(object):
 		self.stamps = self._stamps(self.parts)
 		self.data = self.mapping()
 		self.legacyDefaults = list(self.defaults)
-		self.width, self.offset, self.lineNo, self.tailSeen = -1, 0, 0, b''
+		self.width, self.offset, self.lineNo, self.tailSeen, self.check = -1, 0, 0, b'', b''
 		self.header = self.given  # (no line 1: a write puts the header first)
 		# A compressed file with no byte, or only empty streams, is an empty store, as readTabularFile reads it.
 		if self.parts and not (_isCompressedFile(self.path) and _fileHoldsNothing(self.path)):
@@ -7442,10 +7497,10 @@ class _ServeStore(object):
 					self.width, self.offset, self.lineNo = _legacyReadLoop(
 						f, self.path, self.data, self.width, self.lineNo, self.strict, self.delimiter,
 						self.legacyDefaults, False, 'utf8', reporter)
+					self.check = self._readCheck()  # under the READ lock: of the bytes the view was read from
 			except OSError as e:
 				reporter.note('unreadable', None, 'could not read {} ({})'.format(self.path, e))
 		self.label = ''
-		self.check = self._readCheck()
 
 	def _readCheck(self):
 		"""The bytes just before the read offset of the active part ('' when compressed or empty)."""

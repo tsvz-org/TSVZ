@@ -307,7 +307,10 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   process's rewrite land: 5.2 and earlier could read the file part way, find no key and
   write nothing, so the key came back once the rewrite ended.
 - **Linux:** a read also waits for an append by 3.39 to 5.2, which locks the whole file.
-  A 5.3 append does not wait for readers, and readers do not wait for it.
+  A 5.3 append does not wait for readers, and readers do not wait for it. A rewrite waits
+  for the reads in flight, and while it waits every append waits too (the rewrite holds the
+  append lock first, so no new append starts). Reads that overlap without a pause (several
+  processes reading the file in a loop) can hold a rewrite off for as long as they go on.
 - **macOS and other systems:** locks are `flock`. Reads and appends wait for each other
   there. A read in another thread no longer drops a write's lock, and two threads' writes
   exclude each other (5.2 could write a new file's header twice).
@@ -324,7 +327,14 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   write) can wait for ever: that store's thread waits for this thread's lock
   ([limitations](docs/limitations.md#a-thread-holding-get_file_obj-waits-for-ever-on-another-store-of-the-same-file)).
 - At exit a `TSVZed` with nothing to write no longer waits for its writer thread, so one
-  Ctrl-C ends a program whose store waits in its load for another process's rewrite.
+  Ctrl-C ends a program whose store waits in its load for another process's rewrite. A
+  store with rows queued, or a write handed to its thread (`hardMapToFile()`, say), is
+  still finished at exit.
+- **Fixed: on Python 3.9 to 3.12 one Ctrl-C at exit could drop a store's queued rows.**
+  A Ctrl-C in `Thread.join()` marks the running thread as stopped there, so 5.2 stopped
+  waiting at once while it printed "is being finished; Ctrl-C again to abandon it". 5.3
+  waits for its writer thread another way: the first Ctrl-C keeps waiting, the second
+  abandons the write, on every Python.
 - Still not covered: writers that empty the file before or without the lock (3.39's and
   4.9's compressed rewrites and `clear()`, 3.39 to 5.0 scrub and clear, other tools),
   readers from 5.2 and earlier and tsvz-rs, Python 3.6 forks, `lockf`-only hosts and
@@ -620,7 +630,7 @@ Conformance testing).
 
 - §17.5: a numbered part opened directly is read alone, with a warning.
 - §14.5: the defaults-on-missing read applies to `t[key]` only.
-- §18.6: `.tsv`-family readers hold the access lock shared only while they read (byte 0; a `TSVZed` checks what it read before by identity, size and bytes), appends take the append lock (byte 1), and rewrites take it, then the whole file; on systems other than Linux both are one whole-file `flock`. What remains a deviation: `.tsvz` part readers take no lock (they read again until the parts keep still); where only `lockf` works, writers use it and readers do not lock; Windows readers do not lock; and writers also take an in-process lock per path (`_pathLock`). See [docs/limitations.md](docs/limitations.md).
+- §18.6: `.tsv`-family readers hold the access lock shared only while they read (byte 0; a `TSVZed` checks what it read before by identity, size and bytes), appends take the append lock (byte 1), and rewrites take it, then the whole file; on systems other than Linux both are one whole-file `flock`. What remains a deviation: `.tsvz` part readers take no lock (they read again until the parts keep still); where only `lockf` works, writers use it and readers do not lock; Windows readers do not lock; and one-shot appends, the making of a file, scrubs, clears and `.tsvz` part writes also take an in-process lock per path (`_pathLock`), which a `TSVZed`'s own writes do not. See [docs/limitations.md](docs/limitations.md).
 - §19.4: a scrub whose rows would read differently under the final markers writes them with stripping and fill-empty off, then restores the final markers after the rows.
 - §20.7: `-q` also silences informational messages ("Created …"); only errors remain.
 - §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.

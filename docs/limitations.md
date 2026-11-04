@@ -16,11 +16,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - the reader is TSVZ 5.2 or older, or tsvz-rs: it takes no lock and can see a 5.3 rewrite part way, as before.
     Restarting the program on 5.3 ends it;
   - Python 3.6: a child that `fork()` made while a thread held a TSVZ lock keeps that lock until it exits, so the
-    parent's later reads and writes of the file wait for the child (3.7 and later drop it in the child);
-  - where only `lockf` works (a Linux kernel without open file description locks: before 3.15, or an unpatched
-    RHEL 7 3.10 kernel, which has them backported once updated; or a file system that refuses both those locks and
-    `flock`), readers take no lock, because a shared `lockf` would replace the process's own write lock; there a
-    delete can still be lost, and a read in another thread of the process can still drop a write's lock, as in 5.2;
+    parent's later writes of the file wait for the child (an inherited read lock holds off only rewrites, and on
+    `flock` systems appends too; an inherited write lock holds off reads as well). 3.7 and later drop it in the
+    child;
+  - where only `lockf` works (on Linux, a kernel or file system that refuses open file description locks: a kernel
+    before 3.15, or an unpatched RHEL 7 3.10 kernel, which has them backported once updated; elsewhere, a file
+    system that refuses `flock`), readers take no lock, because a shared `lockf` would replace the process's own
+    write lock; there a delete can still be lost, a read in another thread of the process can still drop a write's
+    lock, and two threads' writes do not exclude each other (a new file's header can be written twice), as in 5.2;
   - Windows is unchanged: readers take no lock.
 - Why: TSVZ cannot change older programs or other tools, and a writer that empties the file first or ignores the
   lock gives a reader nothing to wait on. Python 3.6 has no at-fork hook. On `lockf`-only hosts `lockf` is kept so

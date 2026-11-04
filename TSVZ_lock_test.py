@@ -330,6 +330,22 @@ def test_a_read_inside_a_read_in_one_thread_takes_no_second_lock(tmp_path, kind)
 	assert not TSVZ._HELD and not _here()
 
 
+def test_a_file_closed_without_an_unlock_does_not_stop_later_reads_from_locking(tmp_path, kind):
+	# Closing a locked file lets go of its lock: this thread's later reads of the file lock again.
+	p = _tsv(tmp_path, 3)
+	f = open(p, 'r+b')
+	TSVZ._lockFile(f)
+	fd = f.fileno()
+	f.close()  # (a get_file_obj() never released, a Ctrl-C between the lock and its try)
+	try:
+		assert not _here()
+		with TSVZ._readLock(p) as r:
+			assert r.fileno() in TSVZ._HELD
+			assert _other(p, 'ofdw' if kind == 'ofd' else 'flock') == 'busy'
+	finally:
+		TSVZ._HELD.pop(fd, None)
+
+
 def test_a_keyboardinterrupt_inside_a_read_lock_leaves_nothing_registered(tmp_path, kind):
 	p = _tsv(tmp_path, 3)
 	with pytest.raises(KeyboardInterrupt):
@@ -735,9 +751,9 @@ def test_ctrl_c_in_a_store_waiting_on_another_process_lets_the_program_exit(tmp_
 def test_ctrl_c_at_close_of_a_store_with_a_queued_row_ends_after_three(tmp_path, kind):
 	# The store has a row to write and waits for another process's lock. A Ctrl-C stops close()'s wait; at exit the
 	# write in progress is waited for again, a Ctrl-C there says it is being finished, and the next abandons it: three
-	# in all (as in 5.2, where the wait was for another writer only; documented here, not a new rule). On Python 3.7
-	# to 3.12 a Ctrl-C in Thread.join() marks the thread as stopped while it runs, so the exit does not wait for it
-	# and one Ctrl-C ends the program.
+	# in all (as in 5.2, where the wait was for another writer only; documented here, not a new rule). 5.2 on Python
+	# 3.9 to 3.12 ended at one: a Ctrl-C in Thread.join() marks the thread as stopped while it runs, so the exit did not
+	# wait for it and dropped the row.
 	p = _tsv(tmp_path, 20)
 	store = _child(STORE, p, 'queued', kind=kind)
 	holder = None
@@ -759,11 +775,122 @@ def test_ctrl_c_at_close_of_a_store_with_a_queued_row_ends_after_three(tmp_path,
 				pass
 		assert store.poll() is not None, 'three Ctrl-Cs did not end the program'
 		err = store.stderr.read() + store.stdout.read()
-		assert signals in ((1, 3) if (3, 7) <= sys.version_info < (3, 13) else (3,)), (signals, err)
-		assert signals == 1 or b'being finished' in err, err
+		assert signals == 3 and b'being finished' in err, (signals, err)
 	finally:
 		_release(p)
 		_kill(store, holder)
+
+
+EXIT_QUEUED = r'''
+p = ARGS[0]
+t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+say('open')
+released(p + '.go')
+t['new'] = ['new', 'N']
+say('exiting')
+'''
+
+
+def test_ctrl_c_at_exit_of_a_store_with_a_queued_row_keeps_waiting_and_writes_it(tmp_path, kind):
+	# At exit a first Ctrl-C says the write is being finished and keeps waiting: the row is written once the other
+	# process lets go. 5.2 on Python 3.9 to 3.12 ended there and dropped the row (Thread.join()'s Ctrl-C quirk).
+	p = _tsv(tmp_path, 20)
+	store = _child(EXIT_QUEUED, p, kind=kind)
+	holder = None
+	try:
+		_expect(store, 'open')
+		holder = _hold(p, 'native', kind=kind)
+		open(p + '.go', 'w').close()
+		_expect(store, 'exiting')
+		time.sleep(0.7)
+		store.send_signal(signal.SIGINT)
+		time.sleep(1.5)
+		assert store.poll() is None, 'the exit did not wait for the queued row'
+		_release(p)
+		out, err = store.communicate(timeout=20)
+		assert b'being finished' in err, err
+	finally:
+		_release(p)
+		_kill(store, holder)
+	assert TSVZ.readTabularFile(p, header='id\tv').get('new') == ['new', 'N']
+
+
+EXIT_REWRITE = r'''
+p = ARGS[0]
+t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+say('open')
+released(p + '.go')
+say('rewriting')
+t.hardMapToFile()
+'''
+
+
+def test_ctrl_c_while_an_explicit_rewrite_waits_for_another_process_finishes_it_at_exit(tmp_path, kind):
+	# The exit used to let go of a store whose hardMapToFile() waited for another process's lock (nothing was queued
+	# or dirty yet): when the lock came free during the rest of the exit, the thread began the rewrite and was cut as
+	# the interpreter ended, leaving a compressed file unreadable. Now the exit waits for the job.
+	p = str(tmp_path / 'f.tsv.gz')
+	with TSVZ.openFileAsCompressed(p, 'wb') as f:
+		f.write(b'id\tv\n' + b''.join(('k%04d\tvalue-k%04d\n' % (i, i)).encode() for i in range(20000)))
+	store = _child(EXIT_REWRITE, p, kind=kind)
+	holder = None
+	try:
+		_expect(store, 'open')
+		holder = _hold(p, 'native', kind=kind)
+		open(p + '.go', 'w').close()
+		_expect(store, 'rewriting')
+		time.sleep(0.7)
+		store.send_signal(signal.SIGINT)
+		time.sleep(1)
+		assert store.poll() is None, 'the exit let go of a store whose rewrite was waiting'
+		_release(p)
+		out, err = store.communicate(timeout=30)
+	finally:
+		_release(p)
+		_kill(store, holder)
+	rows = TSVZ.readTabularFile(p, header='id\tv', strict=False)
+	assert len(rows) == 20000, err
+
+
+def test_a_store_the_exit_let_go_of_starts_no_write(tmp_path):
+	p = _tsv(tmp_path, 20)
+	before = open(p, 'rb').read()
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+	try:
+		assert t._atExit() is None and t._letGo  # nothing to write: let go of
+		t.dirty = True
+		t.appendQueue.append(['late', 'L'])  # a row queued after the exit let go (another exit handler's)
+		assert t._writeFile(whole=True) is False
+		t._commitOnce()
+		assert open(p, 'rb').read() == before
+	finally:
+		t.appendQueue.clear()
+		t.dirty = False
+		t._finish()
+
+
+def test_a_handler_takes_its_check_bytes_under_the_read_lock(tmp_path, monkeypatch, kind):
+	# The bytes a handler follows appends from must be of the file its view was read from: taken under the READ lock.
+	p = _tsv(tmp_path, 20)
+	seen = []
+	real = TSVZ._ServeStore._readCheck
+
+	def checking(self):
+		seen.append(len(TSVZ._HELD))
+		return real(self)
+	monkeypatch.setattr(TSVZ._ServeStore, '_readCheck', checking)
+	store = TSVZ._ServeStore(p, create=True)
+	store.reload(None)
+	assert seen and seen[-1] == 1, seen
+
+
+def test_a_held_read_lock_makes_an_older_lockf_writer_wait(tmp_path):
+	# Native kind: on macOS this is flock against 3.39 to 5.2's lockf (design 4.6).
+	p = _tsv(tmp_path, 3)
+	with TSVZ._readLock(p) as f:
+		assert f is not None and TSVZ._HELD
+		assert _other(p, 'lockf') == 'busy'
+	assert _other(p, 'lockf') == 'free'
 
 
 SETTER = r'''
