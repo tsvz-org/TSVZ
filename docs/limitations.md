@@ -72,17 +72,34 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone runs two writers that both rewrite the same file.
 - Approved: 2026-10-29, the user chose "Defer (Recommended)".
 
+### A multi-member compressed rewrite killed inside a later member's write can bring old rows back
+- Kind: known limitation
+- What the operator sees: a whole rewrite of a compressed `.tsv` file of several members (more than 1 MiB of
+  text) that is killed (kill -9, OOM, power loss) inside the write of its second or a later member leaves its
+  new members, that member cut short, and then the old file's bytes from there on. A read takes the cut member
+  for a killed append: it leaves it out and reads the old members after it, so rows come back as they were
+  before the rewrite, deleted keys included, and the next write of a `TSVZed` that read it keeps them. In probe
+  runs of 40 random cuts after the first member: gz 7, bz2 2, xz 5, zst 12. A rewrite killed inside its first
+  member stops the read (5.4), as 5.3 did.
+- Why: decoding cannot tell a killed append from a killed rewrite: both leave a member cut short followed by
+  members that decode. Rewrites write over the file in place (so a reader never meets it emptied), which is
+  what leaves the old bytes behind.
+- Revisit when: someone loses rows or sees deleted keys back after a crash during a rewrite; for example with
+  an end-of-stream check for bz2/xz, or a rewrite that cannot leave old members behind it.
+- Approved: 2026-11-04, the user chose "A: stop if first member (Recommended)".
+
 ### Appends that do not read the store first land after damage, where reads do not reach them
 - Kind: known limitation
-- What the operator sees: once a compressed `.tsv` file holds damage that is not a member cut short (bytes that
-  do not decode, a member that fails its check, the old bytes a whole rewrite cut short leaves after its new
-  members), every read stops there (L5). A running `TSVZed` makes the file again from memory at its next write, so
+- What the operator sees: once a compressed `.tsv` file holds damage that is not a later member cut short
+  (bytes that do not decode, a member that fails its check, a first member cut short), every read stops there
+  (L5). A running `TSVZed` makes the file again from memory at its next write, so
   its rows stay readable (not while that rewrite fails or is refused: see the README's fault tolerance), but a
   one-shot `tsvz set`, `appendTabularFile()`, a `TSVZedLite` or a `TSVZed` opened with
   `monitor_external_changes=False` (for damage that lands after it loaded the file) appends without reading the
   file first, so its rows land after the damage, where no read reaches them, and the next `TSVZed` or scrub that
-  makes the file again drops them. 4.9 to 5.3 do the same, also after a member cut short (a writer killed
-  mid-append), which from 5.4 reads are no longer stopped by: it is left out and the members after it are read.
+  makes the file again drops them. 4.9 to 5.3 do the same, also after a later member cut short (a writer
+  killed mid-append), which from 5.4 reads are no longer stopped by: it is left out and the members after it
+  are read. A first member cut short still stops reads.
 - Why: covering them would make every such append read the whole file first; today `tsvz set` is one append.
 - Revisit when: someone mixes one-shot appends with crashing writers on one compressed file.
 - Approved: 2026-10-29, the user chose "Known limitation (Recommended)".
