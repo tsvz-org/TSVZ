@@ -534,8 +534,11 @@ def _skipUnexcluded(kind, writer):
 		pytest.skip('flock and POSIX locks do not exclude each other on Linux (why Linux keeps OFD locks)')
 
 
-def _deleteDuring(tmp_path, kind, code, args, victim):
+def _deleteDuring(tmp_path, kind, code, args, victim, superseded=False):
 	p = _tsv(tmp_path)
+	if superseded:  # (5.5: a TSVZed rewrite of such a file compacts it, then appends what memory adds)
+		with open(p, 'ab') as f:
+			f.write(b'k0002\tagain\nk0003\tagain\n')
 	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
 	assert len(t) == 1000
 	child = _child(code, p, *args, kind=kind)
@@ -560,8 +563,9 @@ def test_a_delete_during_another_process_locked_rewrite_lands(tmp_path, kind, wr
 	_deleteDuring(tmp_path, kind, REWRITER, [writer], 'k0900')
 
 
-def test_a_delete_during_another_tsvzed_whole_rewrite_lands(tmp_path, kind):
-	_deleteDuring(tmp_path, kind, STORE_REWRITER, [], 'k0001')
+@pytest.mark.parametrize('superseded', [False, True], ids=['plain', 'superseded-lines'])
+def test_a_delete_during_another_tsvzed_whole_rewrite_lands(tmp_path, kind, superseded):
+	_deleteDuring(tmp_path, kind, STORE_REWRITER, [], 'k0001', superseded)
 
 
 # ---------------------------------------------------------------------------
@@ -1242,3 +1246,71 @@ def test_a_scrub_waits_out_another_process_locked_rewrite(tmp_path, kind, writer
 		assert len(TSVZ.readTabularFile(p, header='id\tv')) == 1000
 	finally:
 		_kill(child)
+
+
+# ---------------------------------------------------------------------------
+# 5.5: a TSVZed's compacting rewrite reads the file only through its own locked descriptor
+# ---------------------------------------------------------------------------
+def _superseded(tmp_path, n=20):
+	p = _tsv(tmp_path, n)
+	with open(p, 'ab') as f:
+		f.write(b'k0001\tagain\n')  # a superseded line: the rewrite compacts the file
+	return p
+
+
+def test_a_compacting_rewrite_opens_nothing_by_name_and_takes_no_read_lock(tmp_path, monkeypatch):
+	p = _superseded(tmp_path)
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)
+	inside, compacted = [], []
+	real = TSVZ.TSVZed._compactSnapshot
+
+	def compacting(self, f):
+		inside.append(True)
+		try:
+			result = real(self, f)
+		finally:
+			inside.pop()
+		compacted.append(result is not None)
+		return result
+
+	def guard(name, call):
+		def guarded(*args, **kwargs):
+			assert not inside, name + ' called during the compaction'
+			return call(*args, **kwargs)
+		return guarded
+	monkeypatch.setattr(TSVZ.TSVZed, '_compactSnapshot', compacting)
+	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', guard('openFileAsCompressed', TSVZ.openFileAsCompressed))
+	monkeypatch.setattr(TSVZ, '_readLock', guard('_readLock', TSVZ._readLock))
+	monkeypatch.setattr(TSVZ, 'open', guard('open', open), raising=False)
+	t.hardMapToFile()
+	t.close()
+	assert compacted and compacted[0]
+	with open(p, 'rb') as f:
+		data = f.read()
+	assert data.count(b'\n') == 21 and b'k0001\tagain\n' in data and b'k0001\tvalue' not in data
+
+
+def test_a_compacting_rewrite_on_the_lockf_fallback_holds_its_lock_while_it_writes(tmp_path, monkeypatch):
+	import fcntl
+	monkeypatch.setattr(TSVZ, '_LOCK_KIND', 'ofd', raising=False)
+	p = _superseded(tmp_path)
+	real = fcntl.fcntl
+
+	def refusing(fd, cmd, arg=0):
+		if cmd in TSVZ._OFD_COMMANDS:
+			raise OSError(errno.EINVAL, 'Invalid argument')
+		return real(fd, cmd, arg)
+	monkeypatch.setattr(fcntl, 'fcntl', refusing)
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)
+	seen = []
+	write = TSVZ._writeLines
+
+	def writing(*args, **kwargs):
+		seen.append(_other(p, 'lockf'))  # (the compaction read the file before this, through the locked descriptor)
+		return write(*args, **kwargs)
+	monkeypatch.setattr(TSVZ, '_writeLines', writing)
+	t.hardMapToFile()
+	t.close()
+	assert seen and set(seen) == {'busy'}, seen
+	assert _other(p, 'lockf') == 'free'
+	assert TSVZ.readTabularFile(p, header='id\tv')['k0001'] == ['k0001', 'again']

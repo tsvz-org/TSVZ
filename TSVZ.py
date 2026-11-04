@@ -426,9 +426,12 @@ class _RewriteRows(object):
 	in place after the snapshot is written as it was then.
 	"""
 
-	def __init__(self, first, values, delimiter, encoding, errors, header, later=()):
+	whole = False  # (a compaction is written whole: _CompactRows)
+
+	def __init__(self, first, values, delimiter, encoding, errors, header, later=(), tail=()):
 		self.first = first
 		self.later = later  # lines written after the first row (or alone, when there is none)
+		self.tail = tail  # lines written after every row
 		cells = []
 		lengths = array.array('I')
 		extend, append = cells.extend, lengths.append
@@ -481,6 +484,64 @@ class _RewriteRows(object):
 			later = ()
 		for line in later:
 			yield line
+		for line in self.tail:
+			yield line
+
+
+class _CompactRows(_RewriteRows):
+	"""What a compacting ``TSVZed`` rewrite writes (_compactSnapshot): the compacted file's lines (``first``), then the
+	rows memory holds that they do not say, then the deletion and defaults lines (``tail``). Always written whole: an
+	in-place write pads a shorter line with spaces, which would change the bytes of a line kept."""
+	whole = True
+
+
+class _LinesFile(object):
+	"""The lines ``lines`` (bytes, without their newline) read as an open binary file is (readline, iteration, tell),
+	without joining them into a second copy."""
+
+	def __init__(self, lines):
+		self._lines = lines
+		self._next = 0
+		self._pos = 0
+
+	def readline(self, *args):
+		if self._next >= len(self._lines):
+			return b''
+		line = self._lines[self._next] + b'\n'
+		self._next += 1
+		self._pos += len(line)
+		return line
+
+	def __iter__(self):
+		return self
+
+	def __next__(self):
+		line = self.readline()
+		if not line:
+			raise StopIteration
+		return line
+
+	def tell(self):
+		return self._pos
+
+
+def _fileDefaultsAtEnd(lines, width, delimiter, encoding):
+	"""The defaults the legacy ``lines`` themselves leave in effect at their end, read from none: their #_defaults_#
+	lines alone, in order, through _processLine at ``width``, not strict. [] when they have none."""
+	defaults = []
+	enc = encoding or 'utf8'
+	for line in lines:
+		if line.lstrip(b'\x00').startswith(DEFAULTS_INDICATOR_KEY.encode(enc)):
+			_processLine(line.decode(enc, errors='replace'), {}, width, strict=False, delimiter=delimiter, defaults=defaults)
+	return defaults
+
+
+def _trimmedCells(cells):
+	"""``cells`` without the empty cells at its end."""
+	cells = list(cells)
+	while cells and not cells[-1]:
+		cells.pop()
+	return cells
 
 
 def _fileIdentity(st):
@@ -2676,7 +2737,13 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 	line0Keyed = bool(raw) and keyed(0)
 	after0 = next((i for i in range(1, len(raw)) if keyed(i)), None)
 	protectable = (0,) if after0 is None else (0, after0)
-	live = OrderedDict()  # key -> [first, last, firstTaken, lastTaken, firstN, lastN, firstTakes, lastTakes] since its last deletion
+	# Each live key's lines since its last deletion, one slot per key in flat arrays (small per key: memory peaks here
+	# during a TSVZed rewrite): its first and last line, the first and last a strict reader takes (-1: none), the cell
+	# counts of the first and last, and whether a strict reader takes them.
+	live = {}  # key -> slot
+	first, last, firstTaken, lastTaken = array.array('l'), array.array('l'), array.array('l'), array.array('l')
+	firstN, lastN = array.array('l'), array.array('l')
+	firstTakes, lastTakes = bytearray(), bytearray()
 	pinfo = {}  # protectable index holding a row -> (key, ncells)
 	killer = {}  # protectable index whose key died -> the deletion that ended it
 	lastDelete = {}  # key -> its last deletion
@@ -2698,47 +2765,57 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 			boundaries.append(i)
 			strictActive = False if kind == 'reset' else (True if takes else strictActive)
 		elif kind == 'delete':
-			rec = live.pop(key, None)
-			if rec is not None:
+			slot = live.pop(key, None)
+			if slot is not None:
 				for j in protectable:
-					if j in pinfo and pinfo[j][0] == key and j >= rec[0]:
+					if j in pinfo and pinfo[j][0] == key and j >= first[slot]:
 						killer[j] = i
 			lastDelete[key] = i
 		else:
 			if i in protectable:
 				pinfo[i] = (key, n)
-			rec = live.get(key)
-			if rec is None:
-				live[key] = [i, i, i if takes else None, i if takes else None, n, n, takes, takes]
+			slot = live.get(key)
+			if slot is None:
+				live[key] = len(first)
+				first.append(i)
+				last.append(i)
+				firstTaken.append(i if takes else -1)
+				lastTaken.append(i if takes else -1)
+				firstN.append(n)
+				lastN.append(n)
+				firstTakes.append(takes)
+				lastTakes.append(takes)
 			else:
-				rec[1], rec[5], rec[7] = i, n, takes
+				last[slot], lastN[slot], lastTakes[slot] = i, n, takes
 				if takes:
-					if rec[2] is None:
-						rec[2] = i
-					rec[3] = i
-	kept = set(boundaries)
+					if firstTaken[slot] < 0:
+						firstTaken[slot] = i
+					lastTaken[slot] = i
+	kept = bytearray(len(raw))  # (one byte a line: whether it is kept)
+	for i in boundaries:
+		kept[i] = 1
 	if raw:
-		kept.add(0)
+		kept[0] = 1
 	content = {}
-	for rec in live.values():
-		first, last, firstTaken, lastTaken, firstN, lastN, firstTakes, lastTakes = rec
-		kept.add(first)
-		if first == last:
+	for slot in live.values():
+		f, l = first[slot], last[slot]
+		kept[f] = 1
+		if f == l:
 			continue
-		if (bisect.bisect_right(boundaries, first) == bisect.bisect_left(boundaries, last) and firstTakes and lastTakes
-				and first != 0 and (first not in (firstKeyed, after0) or firstN == lastN)):
-			content[first] = raw[last]  # (the key is one line: its value, at its place; the same defaults reach it)
+		if (bisect.bisect_right(boundaries, f) == bisect.bisect_left(boundaries, l) and firstTakes[slot] and lastTakes[slot]
+				and f != 0 and (f not in (firstKeyed, after0) or firstN[slot] == lastN[slot])):
+			content[f] = raw[l]  # (the key is one line: its value, at its place; the same defaults reach it)
 			continue
-		kept.add(last)
-		if firstTaken is not None:
-			kept.add(firstTaken)  # (a strict reader's place)
-		if lastTaken is not None:
-			kept.add(lastTaken)  # (and its value)
+		kept[l] = 1
+		if firstTaken[slot] >= 0:
+			kept[firstTaken[slot]] = 1  # (a strict reader's place)
+		if lastTaken[slot] >= 0:
+			kept[lastTaken[slot]] = 1  # (and its value)
 	protected = [0] if raw else []
 	if after0 is not None and (not line0Keyed or (consumed and not matched)):
 		protected.append(after0)
 	for j in protected:
-		kept.add(j)
+		kept[j] = 1
 		if j in killer:
 			if j != 0 and pinfo[j][1] > 1 and delimiter != '\x00':
 				# Emptied: a deletion as wide as the line was, so a reader takes the same column count from it and
@@ -2747,13 +2824,13 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 				d = delimiter.encode(enc)
 				content[j] = raw[j].strip(b'\x00').split(d, 1)[0] + d * (pinfo[j][1] - 1)
 			else:
-				kept.add(killer[j])
+				kept[killer[j]] = 1
 	if consumed and line0Keyed and not matched:
 		# line 1 is a row to a reader given no header: when its key ends deleted, that deletion stays for it
 		key0 = _legacyLineKind(raw[0].decode(enc, errors='replace'), width, False, delimiter)[1]
 		if key0 is not None and key0 not in live and key0 in lastDelete:
-			kept.add(lastDelete[key0])
-	return [content.get(i, raw[i]) for i in sorted(kept)]
+			kept[lastDelete[key0]] = 1
+	return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]]
 
 
 def _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched):
@@ -4905,6 +4982,29 @@ class _TSVZedLoad(OrderedDict):
 				OrderedDict.pop(self, key, None)
 
 
+class _TSVZedDiff(_TSVZedLoad):
+	"""What a compacting ``TSVZed`` rewrite reads its compacted lines into (_compactSnapshot): no rows, only whether
+	each key the lines leave live reads as memory holds it (``flags[key]`` True or False) or is dead in them (None).
+	Memory is looked up without _memLock (a read of one key): a row replaced meanwhile shows as a difference, and is
+	written, which is harmless."""
+
+	def __init__(self, owner, columns, defaults):
+		super().__init__(owner, columns, defaults)
+		self.flags = {}
+
+	def __setitem__(self, key, value):
+		change = self._change(key, value)
+		if change is not None:
+			key, row = change
+			self.flags[key] = row == dict.get(self.owner, key)
+
+	def __contains__(self, key):
+		return True  # (every deletion is noted)
+
+	def __delitem__(self, key):
+		self.flags[str(key).rstrip()] = None
+
+
 class _TSVZedMerge(_TSVZedLoad):
 	"""What ``TSVZed._applyAppended`` reads the rows another process appended into, apart from the live store: the
 	last change of each key, to apply to memory after, as ``(row, readded)``: its row shaped as a read shapes it
@@ -5129,6 +5229,7 @@ class TSVZed(OrderedDict):
 		self.dirty = False
 		self.deSynced = False
 		self.memoryOnly = False
+		self._dumpNext = False  # the next rewrite writes memory (move_to_end, a one-column store's delete)
 		self.writeLock = threading.Lock()
 		self._memLock = threading.Lock()  # held while memory and appendQueue change together (a set, a delete, reload's swap)
 		self._failures = {}  # legacy writes that fail, by kind: when each is tried again, see _failed()
@@ -5516,16 +5617,28 @@ class TSVZed(OrderedDict):
 					self.__teePrintOrNot(f"Key {key} not found")
 				return
 			self._checkDelete(key)
+			row = dict.get(self, key)
 			super().__delitem__(key)
 			if self.memoryOnly or key.startswith('#'):
 				if self.verbose:
 					self.__teePrintOrNot(f"Key {key} deleted in memory")
 				return
-			self.__appendEmptyLine(key)
+			self._deleteLine(key, row)
 			if self.verbose:
 				self.__teePrintOrNot(f"Appending empty line {key}")
 			self.lastUpdateTime = get_time_ns()
 		
+	def _deleteLine(self, key, row):
+		"""Queue the deletion of ``key`` (its row was ``row``), the caller holding _memLock. In a legacy store whose
+		deletion line would be the key alone (one column, or none yet while memory holds a one-cell row), which a
+		one-column file reads as a row, nothing is queued: the next rewrite writes memory, which has no line for the
+		key (plan Q1), at the latest at exit."""
+		if not self._spec and (self.correctColumnNum == 1 or (self.correctColumnNum == -1 and (
+				len(row) == 1 or any(len(value) == 1 for value in OrderedDict.values(self))))):
+			self._dumpNext = self.dirty = self.rewrite_on_exit = True
+			return self
+		return self.__appendEmptyLine(key)
+
 	def __appendEmptyLine(self,key):
 		# Append a tombstone line: the key followed by empty values. On read a
 		# row whose values are all empty deletes the key (see _processLine).
@@ -5778,7 +5891,7 @@ memoryOnly:{self.memoryOnly}
 			value = OrderedDict.__getitem__(self, key)
 			OrderedDict.__delitem__(self, key)
 			if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
-				self.__appendEmptyLine(key)
+				self._deleteLine(key, value)
 			self.lastUpdateTime = get_time_ns()
 		return key, value
 	
@@ -5801,7 +5914,7 @@ memoryOnly:{self.memoryOnly}
 			value = OrderedDict.__getitem__(self, key)
 			OrderedDict.__delitem__(self, key)
 			if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
-				self.__appendEmptyLine(key)
+				self._deleteLine(key, value)
 			self.lastUpdateTime = get_time_ns()
 		return value
 	
@@ -5817,6 +5930,7 @@ memoryOnly:{self.memoryOnly}
 					  self.teeLogger)
 			return self
 		self.dirty = True
+		self._dumpNext = True  # memory's order is to be written, not the file compacted
 		if not self.rewrite_on_exit:
 			self.rewrite_on_exit = True
 			self.__teePrintOrNot("Warning: move_to_end had been called. Need to resync for changes to apply to disk.")
@@ -6035,16 +6149,118 @@ memoryOnly:{self.memoryOnly}
 			return None
 		return _encodeRow(_sanitize(list(self.header),delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header')
 
+	def _compactSnapshot(self, f):
+		"""``(None, lines, queued)`` for a rewrite of a healthy file (Q-D3): the file's lines, read through the locked
+		``f`` with the queued rows after them, compacted as a scrub compacts them (_legacyCompact), then what memory
+		holds that they do not say (_CompactRows): rows that read otherwise (changed in place, put in memory
+		straight), deletion lines of keys memory no longer holds, and the store's defaults when the lines do not end
+		with them. None when memory is to be written instead (the dump): the file damaged, made again, missing, not a
+		regular file or holding nothing, its read meets damage, memory reordered (move_to_end) or a one-column store's
+		delete pending (_dumpNext), or keys to delete in a file whose column count is 1 (a lone key is a row there).
+
+		Never opens the file by name nor takes the READ lock: this thread holds the REWRITE lock, and closing another
+		descriptor would drop a lockf lock."""
+		if self._damaged or self._remake or self._dumpNext:
+			return None
+		delimiter, encoding, errors = self.delimiter, self.encoding, self.errors
+		enc = encoding or 'utf8'
+		try:
+			st = os.fstat(f.fileno())
+			if not stat.S_ISREG(st.st_mode) or not os.path.isfile(self._fileName):
+				return None
+			codec = _fileCodec(self._fileName)
+			raw = []
+			try:
+				f.flush()
+				f.seek(0)
+				if _holdsNothing(f, codec, st.st_size):
+					return None
+				f.seek(0)
+				stream = _openStreams(codec, f) if codec else f
+				try:
+					for line in stream:
+						raw.append(line[:-1] if line.endswith(b'\n') else line)
+				finally:
+					if codec:
+						stream.close()
+			finally:
+				f.seek(0)
+		except Exception:
+			return None  # (damage met: the dump writes memory, the only good copy)
+		with self._memLock:
+			queued, self.appendQueue = self.appendQueue, deque()
+		try:
+			for row in queued:  # as the commit would append them: the compaction sees the file as it will be
+				if row and (row[0] == DEFAULTS_INDICATOR_KEY or not str(row[0]).startswith('#')):
+					raw.append(_encodeRow(_sanitize(row,delimiter=delimiter),delimiter,encoding,errors,self.header))
+			header = list(self.header) if self.header and any(self.header) else []
+			consumed = bool(header) and self.verifyHeader
+			defaults = list(self._givenDefaults)
+			line0 = raw[0] if raw else None
+			matched = consumed and line0 is not None and _headerMatches(header, line0.decode(enc, errors='replace').rstrip('\r\n'), delimiter)
+			kept = _legacyCompact(raw, _legacyWidthOf(line0, header, consumed, defaults, encoding, delimiter), consumed,
+								  defaults, delimiter, encoding, matched)
+			del raw, line0
+			# What the compacted lines say, streamed: one flag per key, no rows.
+			diff = _TSVZedDiff(self, self._givenColumns, list(self._givenDefaults))
+			reporter = _Reporter(self._fileName, None)  # (never flushed: the store's own reads report)
+			stream = _LinesFile(kept)
+			diffWidth = -1
+			try:
+				start = (-1, 0)
+				if consumed:  # (as _legacyReadHeader takes line 1, saying nothing: the store's own reads warn)
+					stream.readline()
+					start = (len(header) if not kept or matched else -1, 1)
+				diffWidth = _legacyReadLoop(stream, '', diff, start[0], start[1], self.strict, delimiter, diff.defaults,
+											False, encoding, reporter)[0]
+			except Exception:
+				with self._memLock:
+					self.appendQueue.extendleft(reversed(queued))
+				return None
+			flags = diff.flags
+			del diff, stream
+			with self._memLock:
+				values = [row for key, row in OrderedDict.items(self) if flags.get(key) is not True and not str(key).startswith('#')]
+				gone = [key for key, flag in flags.items() if flag is not None and not dict.__contains__(self, key)]
+				want = list(self.defaults)
+			del flags
+			if gone and diffWidth <= 1:
+				# A lone key is a row in a one-column file: it cannot delete there. Memory is written instead.
+				with self._memLock:
+					self.appendQueue.extendleft(reversed(queued))
+				return None
+			tail = [_encodeRow(_sanitize([key] + [''] * (diffWidth - 1),delimiter=delimiter),delimiter,encoding,errors,self.header)
+					for key in gone]
+			own = _trimmedCells(_fileDefaultsAtEnd(kept, diffWidth, delimiter, encoding))
+			if any(want[1:]):
+				if _trimmedCells(want) != own:
+					tail.append(_encodeRow(_sanitize(want,delimiter=delimiter),delimiter,encoding,errors,what='defaults'))
+			elif any(own[1:]):
+				tail.append(_encodeRow([DEFAULTS_INDICATOR_KEY],delimiter,encoding,errors,what='defaults'))  # (a reset)
+			rows = _CompactRows(kept, values, delimiter, encoding, errors, self.header, tail=tail)
+			del values
+			rows.check()
+		except BaseException:
+			with self._memLock:
+				self.appendQueue.extendleft(reversed(queued))
+			raise
+		return None, rows, queued
+
 	def _snapshotForRewrite(self, f):
-		"""``(header, lines, queued)``: the header line (None for none), the defaults line and the rows (_RewriteRows, a
-		flat snapshot taken under _memLock and checked: a TSVZEncodeError changes nothing), and the queued rows, taken
-		from the queue: memory holds them, so the rewrite writes them; _writeFile puts them back if it stops."""
+		"""``(header, lines, queued)``: the compaction of a healthy file (_compactSnapshot), else memory's dump: the
+		header line (None for none), the defaults line and the rows (_RewriteRows, a flat snapshot taken under _memLock
+		and checked: a TSVZEncodeError changes nothing), and the queued rows, taken from the queue: memory holds them,
+		so the rewrite writes them; _writeFile puts them back if it stops."""
+		compact = self._compactSnapshot(f)
+		if compact is not None:
+			return compact
 		delimiter, encoding, errors = self.delimiter, self.encoding, self.errors
 		header = self._headerLine(f)
 		with self._memLock:
 			values = list(self.values())
 			defaults = list(self.defaults)
 			queued, self.appendQueue = self.appendQueue, deque()
+			dumpNext, self._dumpNext = self._dumpNext, False  # (memory's order is written now)
 		try:
 			first = later = []
 			if defaults and len(defaults) > 1:
@@ -6059,6 +6275,7 @@ memoryOnly:{self.memoryOnly}
 		except BaseException:
 			with self._memLock:
 				self.appendQueue.extendleft(reversed(queued))
+				self._dumpNext = self._dumpNext or dumpNext
 			raise
 		return header, rows, queued
 
@@ -6131,6 +6348,7 @@ memoryOnly:{self.memoryOnly}
 					with self._memLock:
 						self.appendQueue.extendleft(reversed(queued))
 				started = True
+				whole = whole or getattr(lines, 'whole', False)  # (a compaction is written whole: never padded in place)
 				self.dirty = self._damaged = True
 				f.seek(0)
 				if whole:

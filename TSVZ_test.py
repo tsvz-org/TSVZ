@@ -576,9 +576,14 @@ def test_legacy_tsvzed_matches_339(tmp_path):
 			new = _observe(lambda: _drive_tsvzed(TSVZ, new_path, ops), os.path.dirname(new_path))
 			old = _observe(lambda: _drive_tsvzed(TSVZ_old, old_path, ops), os.path.dirname(old_path))
 			assert _as_339(new, old) == old, (suffix, seed)
-			# Not the bytes: since 5.2 a TSVZed that loads a file holding a key's row and its deletion rewrites it, as
-			# 3.39 did only for a key with two values, so the file does not grow with every session (it is never larger).
-			assert len(_as_339(_content(new_path), _content(old_path), d)) <= len(_content(old_path)), (suffix, seed)
+			# Not the bytes: since 5.2 a TSVZed that loads a file holding a key's row and its deletion rewrites it, so
+			# the file does not grow with every session. 5.5's rewrite keeps the file's lines (every #_defaults_# line
+			# included) and appends what memory adds, so it can be larger than 3.39's; another session's rewrite does
+			# not make it grow.
+			size = len(_content(new_path))
+			again = TSVZ.TSVZed(new_path, header=LEGACY_HEADER, append_check_delay=0.001, monitor_external_changes=False)
+			again.close()
+			assert len(_content(new_path)) <= size, (suffix, seed)
 			assert _as_339(_read_with_339(new_path), _read_with_339(old_path)) == _read_with_339(old_path), (suffix, seed)
 
 
@@ -793,7 +798,9 @@ def test_l6_map_to_file_keeps_newline_at_end_of_file(tmp_path):
 	t.memoryOnly = False
 	t.mapToFile()
 	t.close()
-	assert open(p, 'rb').read() == b'id\ta\tb\nk1\tx2\ty2\nk2\tp\tq\nk3\tr\ts\n'
+	# (5.5: the file's lines are kept and what memory adds is appended; k1's first line keeps its place)
+	assert open(p, 'rb').read() == b'id\ta\tb\nk1\txx\tyy\nk1\tx2\ty2\nk2\tp\tq\nk3\tr\ts\n'
+	assert TSVZ.readTabularFile(p, header='id\ta\tb') == {'k1': ['k1', 'x2', 'y2'], 'k2': ['k2', 'p', 'q'], 'k3': ['k3', 'r', 's']}
 
 
 # ==========================================================================
@@ -5992,7 +5999,7 @@ def test_tsvzed_legacy_commit_keeps_the_good_rows_around_a_refused_one(tmp_path,
 	assert 'cannot write' in capsys.readouterr().out
 	t['a'][1] = 'fixed'
 	t.hardMapToFile()
-	assert _bytes(p) == b'id\tv\nx\t1\na\tfixed\ny\t1\n'
+	assert _bytes(p) == b'id\tv\nx\t1\ny\t1\na\tfixed\n'  # (5.5: the file's lines kept, memory's row appended)
 	_stop(t)
 
 
@@ -6021,7 +6028,7 @@ def test_tsvzed_legacy_rewrite_checks_everything_before_it_touches_the_file(tmp_
 		getattr(t, method)()
 	assert _bytes(p) == before  # not emptied
 	_FlipList.reads = 0
-	OrderedDict.__setitem__(t, 'a', _FlipList(['a', '1']))
+	OrderedDict.__setitem__(t, 'a', _FlipList(['a', 'changed']))  # (5.5: a row memory must write; it reads ['a', '1'])
 	capsys.readouterr()
 	getattr(t, method)()
 	assert 'Refused' not in capsys.readouterr().out and _FlipList.reads == 1
@@ -6034,37 +6041,59 @@ LEGACY_KEY_ROW = b'id\tv\nr\xe9sum\xe9\t1\nok\t1\nok\t2\n'  # the first key is n
 LEGACY_CELL_ROW = b'id\tv\nk\tr\xe9sum\xe9\nok\t1\nok\t2\n'  # so is the value of k
 
 
-def test_tsvzed_with_a_legacy_encoding_leaves_a_file_it_cannot_write_back_as_it_is(tmp_path, capsys):
+def _must_write_fffd(t):
+	"""5.5: a rewrite of a healthy file copies a line it cannot encode, so a refusal needs a row memory must write: the
+	U+FFFD row of LEGACY_KEY_ROW (or LEGACY_CELL_ROW), changed in place. The file still reads as it did."""
+	key = 'r\ufffdsum\ufffd' if dict.__contains__(t, 'r\ufffdsum\ufffd') else 'k'
+	OrderedDict.__getitem__(t, key)[1] += '0'
+	return t
+
+
+def _open_refused(p, **kwargs):
+	"""A TSVZed whose open-time rewrite (rewrite_on_load: rewrite(force=True)) is refused, as 5.4's was for the U+FFFD
+	row of the file; 5.5 refuses it for that row changed in place (_must_write_fffd)."""
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, **kwargs)
+	_must_write_fffd(t).rewrite(force=True)
+	return t
+
+
+def test_tsvzed_with_a_legacy_encoding_rewrites_a_file_keeping_a_line_it_cannot_decode_byte_for_byte(tmp_path, capsys):
 	# U+FFFD is what reading puts for an undecodable byte; ASCII lacks it, and writing '?' would lose the
-	# bytes and rename the key: the rewrite (rewrite_on_load is on by default) is refused, nothing is lost.
+	# bytes and rename the key. 5.5: a rewrite of a healthy file copies the line (rewrite_on_load is on by default),
+	# so nothing is refused and nothing is lost.
+	compacted = b'id\tv\nr\xe9sum\xe9\t1\nok\t2\n'
 	p = str(tmp_path / 'e.tsv')
 	_touch(p, LEGACY_KEY_ROW)
 	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.01)
 	out = capsys.readouterr().out
-	assert out.count('Refused at') == 1 and 'U+FFFD' in out and 'ASCII' in out and 'Traceback' not in out, out
-	assert _bytes(p) == LEGACY_KEY_ROW
+	assert 'Refused' not in out and 'Traceback' not in out, out
+	assert _bytes(p) == compacted
 	assert t['r�sum�'] == ['r�sum�', '1'] and t['ok'] == ['ok', '2']
 	t.rewrite(force=True)
 	for method in (t.hardMapToFile, t.mapToFile):
-		with pytest.raises(TSVZ.TSVZEncodeError, match='U\\+FFFD'):
-			method()
-	assert capsys.readouterr().out.count('Refused at') == 0  # reported once, not at every try
-	assert _bytes(p) == LEGACY_KEY_ROW
+		method()
+	assert _bytes(p) == compacted
 	t['new'] = ['new', '3']  # a row that can be written is appended as ever
-	assert _wait_for(lambda: _bytes(p) == LEGACY_KEY_ROW + b'new\t3\n')
+	assert _wait_for(lambda: _bytes(p) == compacted + b'new\t3\n')
+	_must_write_fffd(t)  # memory must write the row now: that rewrite is refused
+	with pytest.raises(TSVZ.TSVZEncodeError, match='U\\+FFFD'):
+		t.hardMapToFile()
+	assert _bytes(p) == compacted + b'new\t3\n'
+	OrderedDict.__getitem__(t, 'r\ufffdsum\ufffd')[1] = '1'
 	t.close()
-	assert _bytes(p) == LEGACY_KEY_ROW + b'new\t3\n'
-	assert 'Refused' not in capsys.readouterr().out
+	assert _bytes(p) == compacted + b'new\t3\n'
+	assert 'Traceback' not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('how', ['fix', 'remove'])
-def test_tsvzed_with_a_legacy_encoding_writes_the_rest_once_the_bad_row_is_fixed_or_removed(tmp_path, capsys, how):
+def test_tsvzed_with_a_legacy_encoding_rewrites_the_rest_and_the_bad_row_once_fixed_or_removed(tmp_path, capsys, how):
+	# 5.5: the open's rewrite copies the line it cannot encode (nothing is refused); a fix or a delete is then written.
 	p = str(tmp_path / (how + '.tsv'))
 	_touch(p, LEGACY_CELL_ROW)
 	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.005, rewrite_interval=0.05)
-	assert 'Refused at' in capsys.readouterr().out and _bytes(p) == LEGACY_CELL_ROW
+	assert 'Refused' not in capsys.readouterr().out and _bytes(p) == b'id\tv\nk\tr\xe9sum\xe9\nok\t2\n'
 	time.sleep(0.3)
-	assert _bytes(p) == LEGACY_CELL_ROW and 'Refused' not in capsys.readouterr().out
+	assert _bytes(p) == b'id\tv\nk\tr\xe9sum\xe9\nok\t2\n' and 'Refused' not in capsys.readouterr().out
 	if how == 'fix':
 		t['k'] = ['k', 'fixed']
 	else:
@@ -6322,7 +6351,7 @@ def test_tsvzed_legacy_concurrent_sets_survive_repeated_rewrites(tmp_path):
 def test_tsvzed_legacy_refused_rewrite_does_not_delay_reloading_an_external_change(tmp_path, method):
 	p = str(tmp_path / 'g.tsv')
 	_touch(p, LEGACY_CELL_ROW)
-	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_interval=30, append_check_delay=0.01)  # its rewrite_on_load is refused
+	t = _open_refused(p, header='id\tv', encoding='ascii', rewrite_interval=30, append_check_delay=0.01)  # its rewrite_on_load is refused
 	with pytest.raises(TSVZ.TSVZEncodeError):
 		getattr(t, method)()  # refused
 	assert t._refusedAt is not None
@@ -6335,7 +6364,7 @@ def test_tsvzed_legacy_refused_rewrite_does_not_delay_reloading_an_external_chan
 def test_tsvzed_legacy_refusal_is_timed_on_the_monotonic_clock(tmp_path, monkeypatch):
 	p = str(tmp_path / 'm.tsv')
 	_touch(p, LEGACY_CELL_ROW)
-	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_interval=0.05, append_check_delay=5)
+	t = _open_refused(p, header='id\tv', encoding='ascii', rewrite_interval=0.05, append_check_delay=5)
 	assert t._refusedAt is not None and t.dirty  # its rewrite_on_load is refused
 	calls = []
 	original = t._mapToFile  # what rewrite() calls
@@ -7283,10 +7312,10 @@ def test_tsvzed_legacy_refusal_is_reported_again_after_clear_reload_or_for_anoth
 def test_tsvzed_legacy_encoding_refusal_is_reported_again_after_reload(tmp_path, capsys):
 	p = str(tmp_path / 'r.tsv')
 	_touch(p, LEGACY_KEY_ROW)
-	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.01)
+	t = _open_refused(p, header='id\tv', encoding='ascii', append_check_delay=0.01)
 	assert len(_refusals(capsys)) == 1
 	t.reload()
-	t.rewrite(force=True)
+	_must_write_fffd(t).rewrite(force=True)  # (5.5: the reload took the file's row back: changed again)
 	assert len(_refusals(capsys)) == 1
 	_stop(t)
 	assert _bytes(p) == LEGACY_KEY_ROW
@@ -7296,7 +7325,7 @@ def test_tsvzed_legacy_encoding_refusal_is_reported_again_after_reload(tmp_path,
 def test_tsvzed_legacy_refusal_says_what_the_user_can_do_and_when_it_is_tried_again(tmp_path, capsys, interval):
 	p = str(tmp_path / 'say.tsv')
 	_touch(p, LEGACY_KEY_ROW)
-	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.01, rewrite_interval=interval)
+	t = _open_refused(p, header='id\tv', encoding='ascii', append_check_delay=0.01, rewrite_interval=interval)
 	refused = _refusals(capsys)
 	_stop(t)
 	assert len(refused) == 1
@@ -9946,8 +9975,8 @@ def test_tsvzed_legacy_refusal_of_a_store_to_make_again_says_it_is_tried_again_a
 	# the report says so.
 	p = str(tmp_path / 'again.tsv')
 	_touch(p, LEGACY_KEY_ROW)
-	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, rewrite_interval=0,
-					append_check_delay=0.01)
+	t = _must_write_fffd(TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, rewrite_interval=0,
+									 append_check_delay=0.01))
 	t.dirty = t.deSynced = True  # as a rewrite that failed leaves it
 	refused = []
 	assert _wait_for(lambda: refused.extend(_refusals(capsys)) or refused)
@@ -10069,8 +10098,8 @@ def test_tsvzed_legacy_refusal_at_close_says_none_is_tried_again(tmp_path, capsy
 	# close()'s rewrite is the last: its report promises no retry, at any interval.
 	p = str(tmp_path / 'close.tsv')
 	_touch(p, LEGACY_KEY_ROW)
-	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, rewrite_interval=interval,
-					rewrite_on_exit=True, append_check_delay=60)
+	t = _must_write_fffd(TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, rewrite_interval=interval,
+									 rewrite_on_exit=True, append_check_delay=60))
 	t.dirty = t.deSynced = True  # as a rewrite that failed leaves it
 	t.close()
 	refused = _refusals(capsys)
@@ -10102,7 +10131,7 @@ def test_tsvzed_legacy_refusal_of_a_store_whose_writer_thread_is_stopped_says_no
 	# rewrite on its own there.
 	p = str(tmp_path / 'child.tsv')
 	_touch(p, LEGACY_KEY_ROW)
-	t = _stopped(p, header='id\tv', encoding='ascii')
+	t = _must_write_fffd(_stopped(p, header='id\tv', encoding='ascii'))
 	t.rewrite(force=True)
 	refused = _refusals(capsys)
 	assert len(refused) == 1 and 'None is tried again on its own' in refused[0] and 'a forked child' in refused[0]
@@ -10114,7 +10143,7 @@ def test_tsvzed_legacy_refusal_is_not_reported_again_when_only_its_retry_text_wo
 	# leaves: the same refusal is reported once, however often that flips.
 	p = str(tmp_path / 'flip.tsv')
 	_touch(p, LEGACY_KEY_ROW)
-	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, append_check_delay=60)
+	t = _must_write_fffd(TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, append_check_delay=60))
 	for deSynced in (True, False, True):
 		t.deSynced = deSynced
 		t.rewrite(force=True)
@@ -10128,8 +10157,8 @@ def test_tsvzed_legacy_refusal_is_reported_again_once_the_file_is_damaged(tmp_pa
 	# failed part way, a removed file): memory now holds the only good copy.
 	p = str(tmp_path / 'later.tsv')
 	_touch(p, LEGACY_KEY_ROW)
-	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, rewrite_interval=60,
-					append_check_delay=60)
+	t = _must_write_fffd(TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, rewrite_interval=60,
+									 append_check_delay=60))
 	t.rewrite(force=True)
 	t._damaged = t.deSynced = True  # as a rewrite that failed part way leaves it
 	t.rewrite(force=True)
@@ -10898,10 +10927,7 @@ def test_headerless_whole_write_of_a_file_whose_first_line_is_no_row_keeps_a_lin
 		t = TSVZ.TSVZed(p, verbose=False, rewrite_on_load=False)
 		t.hardMapToFile()
 		t.close()
-	if how == 'scrub':
-		assert _bytes(p).split(b'\n')[0] == data.split(b'\n')[0]
-	else:
-		assert _bytes(p).startswith(b'\n')
+	assert _bytes(p).split(b'\n')[0] == data.split(b'\n')[0]  # (a TSVZed's rewrite of a healthy file too)
 	assert set(_read_with_header(p, 'host\tip')) == set(before)
 	assert set(TSVZ.readTabularFile(p, verifyHeader=False)) == {'web1', 'web2'}
 
@@ -12818,3 +12844,230 @@ def test_legacy_scrub_given_a_header_it_does_not_check_puts_it_first(tmp_path):
 	_touch(p, b'id\tv\na\t1\na\t2\n')
 	TSVZ.scrubTabularFile(p, header='id\tv', verifyHeader=False)
 	assert _bytes(p) == b'id\tv\na\t2\n'  # (line 1 is that header already: nothing added)
+
+
+# --- 5.5: the TSVZed rewrite of a healthy file compacts it, then appends what memory adds (H) ---
+@pytest.mark.parametrize('text, after, row', [(b'id\tv\na\t1\t2\nb\t1\nb\t\n', b'id\tv\na\t1\t2\n', ['a', '1', '2']),
+											   (b'id\tv\na\t\t7\nb\t1\nb\t\n', b'id\tv\na\t\t7\n', ['a', '', '7'])])
+def test_tsvzed_rewrite_on_load_compacts_a_healthy_file(tmp_path, text, after, row):
+	p = str(tmp_path / 'e7.tsv')
+	_touch(p, text)
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.01)
+	try:
+		assert _bytes(p) == after and dict(t) == {'a': row}
+	finally:
+		t.close()
+	assert _bytes(p) == after
+
+
+@pytest.mark.parametrize('method', ['hardMapToFile', 'mapToFile'])
+def test_tsvzed_compacting_rewrite_appends_what_memory_holds_that_the_file_does_not_say(tmp_path, method):
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, b'id\tv\n# by hand\nk1\t1\nk2\t2\nk3\t3\nk3\t4\n')
+	t = _stopped(p, header='id\tv')
+	OrderedDict.__getitem__(t, 'k1')[1] = 'x'  # changed in place: no set sees it
+	OrderedDict.__setitem__(t, 'z', ['z', '9'])  # put in memory straight
+	OrderedDict.__delitem__(t, 'k2')  # removed straight from memory
+	getattr(t, method)()
+	assert _bytes(p) == b'id\tv\nk1\t1\nk2\t2\nk3\t4\nk1\tx\nz\t9\nk2\t\n'
+	for strict in (False, True):
+		assert list(TSVZ.readTabularFile(p, header='id\tv', strict=strict).items()) == \
+			[('k1', ['k1', 'x']), ('k3', ['k3', '4']), ('z', ['z', '9'])]  # k1 keeps its place
+	getattr(t, method)()  # a second rewrite: the key is one line, in its place
+	assert _bytes(p) == b'id\tv\nk1\tx\nk3\t4\nz\t9\n'
+	_stop(t)
+
+
+def test_tsvzed_key_normalisation_survives_a_compacting_rewrite(tmp_path):
+	p = str(tmp_path / 'n.tsv')
+	_touch(p, b'key\tval\na \t1\na\t\n')
+	before = TSVZ.readTabularFile(p, header='key\tval', strict=False)
+	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, append_check_delay=0.01)
+	assert dict(t) == {}
+	t.hardMapToFile()
+	assert dict(t) == {}
+	t.close()
+	t = _quiet_tsvzed(p, header='key\tval')
+	assert dict(t) == {}
+	t.close()
+	assert TSVZ.readTabularFile(p, header='key\tval', strict=False) == before
+
+
+def test_tsvzed_compacting_rewrite_keeps_a_line_1_that_is_not_its_header(tmp_path, capsys):
+	p = str(tmp_path / 'l1.tsv')
+	_touch(p, b'a\t1\nb\t2\nb\t3\n')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=0.01)
+	t.hardMapToFile()
+	t.close()
+	assert _bytes(p) == b'a\t1\nb\t3\n'  # (5.4 wrote its header over line 1: a reader given no header lost `a`)
+	assert TSVZ.readTabularFile(p, strict=False) == {'a': ['a', '1'], 'b': ['b', '3']}
+	assert 'Header mismatch' in capsys.readouterr().out
+
+
+def test_tsvzed_rewrite_appends_its_defaults_when_the_file_does_not_end_with_them(tmp_path):
+	p = str(tmp_path / 'd.tsv')
+	t = TSVZ.TSVZed(p, header='id\tname\tval', defaults='#_defaults_#\t\tNA', append_check_delay=0.01)
+	t['a'] = ['a', 'Alice', '']
+	t['b'] = ['b', '', '3']
+	t.commitAppendToFile()
+	views = [TSVZ.readTabularFile(p, header='id\tname\tval', **kw) for kw in ({}, {'defaults': ['', '', 'NA']})]
+	t.hardMapToFile()
+	assert _bytes(p).endswith(b'\n#_defaults_#\t\tNA\n')
+	size = len(_bytes(p))
+	t.hardMapToFile()
+	assert len(_bytes(p)) == size  # the file ends with them now: nothing more
+	t.close()
+	assert [TSVZ.readTabularFile(p, header='id\tname\tval', **kw) for kw in ({}, {'defaults': ['', '', 'NA']})] == views
+	q = str(tmp_path / 'e.tsv')  # a file that already ends with them gets no line
+	_touch(q, b'id\tname\tval\na\tAlice\t\n#_defaults_#\t\tNA\n')
+	t = TSVZ.TSVZed(q, header='id\tname\tval', defaults='#_defaults_#\t\tNA', rewrite_on_load=False, append_check_delay=0.01)
+	t.hardMapToFile()
+	t.close()
+	assert _bytes(q) == b'id\tname\tval\na\tAlice\t\n#_defaults_#\t\tNA\n'
+
+
+def test_tsvzed_rewrite_appends_a_reset_when_it_has_no_defaults_and_the_file_ends_with_some(tmp_path):
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'id\tv\na\t1\n#_defaults_#\tX\n')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=0.01)
+	t.setDefaults([])
+	t.hardMapToFile()
+	assert _bytes(p) == b'id\tv\na\t1\n#_defaults_#\tX\n#_defaults_#\n'
+	t.hardMapToFile()
+	assert _bytes(p) == b'id\tv\na\t1\n#_defaults_#\tX\n#_defaults_#\n'  # a second rewrite appends nothing
+	t.close()
+	for strict in (False, True):
+		assert TSVZ.readTabularFile(p, header='id\tv', strict=strict) == {'a': ['a', '1']}
+
+
+def _dump_fixture(tmp_path, name):
+	"""A healthy file whose compaction and memory dump differ: line 1 is not the store's header."""
+	p = str(tmp_path / name)
+	_touch(p, b'a\t1\nb\t2\nb\t3\n')
+	return p, TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+
+
+@pytest.mark.parametrize('how', ['move_to_end', 'damaged', 'remake', 'removed', 'emptied'])
+def test_tsvzed_rewrite_writes_memory_when_the_file_cannot_be_compacted(tmp_path, how):
+	p, t = _dump_fixture(tmp_path, how + '.tsv')
+	OrderedDict.__setitem__(t, 'c', ['c', '5'])
+	if how == 'move_to_end':
+		t.move_to_end('b')
+	elif how == 'damaged':
+		t._damaged = True  # (as a rewrite that failed half way leaves it)
+	elif how == 'remake':
+		t._remake = True  # (as a file another writer left damaged leaves it)
+	elif how == 'removed':
+		os.remove(p)
+	else:  # a store whose file holds nothing (it follows another process that empties it, so made here)
+		t.close()
+		_touch(p, b'')
+		t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+		for row in (['b', '3'], ['c', '5']):
+			OrderedDict.__setitem__(t, row[0], row)
+	t.hardMapToFile()
+	t.close()
+	assert _bytes(p) == (b'id\tv\nc\t5\nb\t3\n' if how == 'move_to_end' else b'id\tv\nb\t3\nc\t5\n')
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+@pytest.mark.parametrize('method', ['hardMapToFile', 'mapToFile'])
+def test_tsvzed_legacy_compacting_rewrite_memory_grows_with_the_file_not_with_twice_the_store(tmp_path, suffix, method):
+	# The compaction holds the file's lines (a whole rewrite holds them to write) and one small record per key; the
+	# second parse (what the compacted file says) holds one flag per key, not the rows. Measured slope: SLOPE below.
+	import tracemalloc
+	peaks = []
+	for n in (25000, 100000):
+		p = str(tmp_path / ('big%d.%s' % (n, suffix)))
+		t = _stopped(p)
+		for i in range(n):
+			TSVZ.OrderedDict.__setitem__(t, 'key%08d' % i, ['key%08d' % i, 'value-%08d some other text %d' % (i, i)])
+		t.dirty = True
+		t.hardMapToFile()  # (the file holds nothing yet: memory is written)
+		OrderedDict.__getitem__(t, 'key%08d' % (n // 2))[1] = 'changed'
+		tracemalloc.start()
+		try:
+			getattr(t, method)()
+			peaks.append(tracemalloc.get_traced_memory()[1])
+		finally:
+			tracemalloc.stop()
+		assert _back(p) == dict(t)
+		assert _content(p).endswith(('key%08d\tchanged\n' % (n // 2)).encode())  # compacted, the changed row appended
+	slope = (peaks[1] - peaks[0]) / 75000.0
+	assert slope < SLOPE, (peaks, slope)
+
+
+# Bytes a row of a two-cell store: measured 267 to 277 on Python 3.14 and 290 to 297 on 3.6 (5.5's build; the store
+# itself is about 280), bound at 1.25 x the highest; the plan's ceiling is 400.
+SLOPE = 372
+
+
+# --- 5.5: deletes in a one-column store (plan Q1: rewrite from memory) ---
+@pytest.mark.parametrize('how', ['del', 'pop', 'popitem'])
+def test_a_delete_in_a_one_column_store_appends_nothing_and_the_rewrite_writes_memory(tmp_path, capsys, how):
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, b'a\nb\nc\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=0.01)
+	capsys.readouterr()
+	gone = 'c' if how == 'popitem' else 'b'
+	if how == 'del':
+		del t['b']
+	elif how == 'pop':
+		assert t.pop('b') == ['b']
+	else:
+		assert t.popitem() == ('c', ['c'])
+	t.commitAppendToFile()
+	assert _bytes(p) == b'a\nb\nc\n'  # (a lone key is a row in a one-column file: no line for it)
+	assert capsys.readouterr().out == ''
+	t.close()
+	left = [k for k in 'abc' if k != gone]
+	assert list(TSVZ.readTabularFile(p)) == left
+	t = _quiet_tsvzed(p)
+	assert list(t) == left
+	t.close()
+
+
+def test_a_delete_in_a_store_with_a_one_cell_header_is_written_from_memory(tmp_path):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'id\na\nb\n')
+	t = TSVZ.TSVZed(p, header='id', rewrite_on_load=False, append_check_delay=0.01)
+	del t['a']
+	t.close()
+	assert _bytes(p).split(b'\n')[0] == b'id' and list(TSVZ.readTabularFile(p, header='id')) == ['b']
+
+
+def test_a_delete_in_a_store_still_at_no_column_count_holding_one_cell_rows(tmp_path):
+	p = str(tmp_path / 'n.tsv')
+	_touch(p, b'')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=0.01)
+	with open(p, 'ab') as f:
+		f.write(b'a\nb\n')  # another process appends one-cell rows
+	assert _wait_for(lambda: 'b' in t)
+	del t['a']
+	t.commitAppendToFile()
+	assert _bytes(p) == b'a\nb\n'
+	t.close()
+	assert list(TSVZ.readTabularFile(p)) == ['b']
+
+
+def test_keys_gone_from_a_one_column_store_another_way_are_written_by_the_dump(tmp_path, monkeypatch):
+	p = str(tmp_path / 'c.tsv')
+	_touch(p, b'a\nb\nc\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60)
+	OrderedDict.__delitem__(t, 'a')  # removed straight from memory: a deletion line cannot say it here
+	t.hardMapToFile()
+	assert list(TSVZ.readTabularFile(p)) == ['b', 'c']
+	real = TSVZ._writeLines
+	calls = []
+
+	def failing(*args, **kwargs):
+		calls.append(1)
+		if len(calls) == 1:
+			raise OSError(errno.ENOSPC, 'No space left on device')
+		return real(*args, **kwargs)
+	monkeypatch.setattr(TSVZ, '_writeLines', failing)
+	t.clear()  # its write fails (reported): memory is empty, the file still holds the keys
+	assert len(t) == 0 and list(TSVZ.readTabularFile(p)) == ['b', 'c']
+	t.hardMapToFile()
+	t.close()
+	assert TSVZ.readTabularFile(p) == {}
