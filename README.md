@@ -308,6 +308,28 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   through the file now has all of it, the gzip trailer and the bz2, xz and zstd data included,
   in the file when `release_file_obj()` unlocks it. 5.1 and earlier wrote them after the
   unlock, where another writer could append in between and corrupt the stream.
+- **A `TSVZed` no longer lets a file grow with every session of sets and deletes.** It
+  rewrites a `.tsv`-family file at open when the file holds a key's row and the deletion
+  of it, as 3.39 did only for a key with two values, so a program that sets keys and
+  deletes them in each session (default settings, or `rewrite_interval`) keeps the file
+  the same size (205, 405, 605 bytes, ... for 20 keys a session before). Every session
+  that opens such a file now rewrites it once.
+- **`tsvz scrub --x-header H` keeps the file's first line as its header.** 5.1 ignored
+  `--x-header` at a scrub and read the header line as a key (`tsvz keys` lists `id` as
+  one), which with the all-deleted scrub above left a store whose keys were all deleted
+  with 0 bytes. The header
+  is now checked as a scrub given `header=H` checks it: a "Header mismatch" warning when
+  the first line differs, and with `--x-strict` that is an error (exit 1, nothing written)
+  and rows of another width are dropped. A scrub with no `--x-header` is as before.
+- **Known, mostly as in 5.1: a scrub, a rewrite or a read takes one column count for every row,
+  and can lose cells or keys.** A scrub given defaults narrower than the rows, a row wider
+  than the header, and a `.tsv` that begins with a bare `#_defaults_#` line (read without
+  defaults) are examples; the entry lists each, and which is new in 5.2
+  ([limitations](docs/limitations.md#scrubs-and-rewrites-read-rows-at-one-column-width-deferred-to-the-width-design)).
+  A strict scrub of a file whose read dropped a line for its width and found no row leaves it,
+  so it grows again over append, delete-all and scrub cycles
+  ([limitations](docs/limitations.md#a-strict-scrub-leaves-a-file-whose-read-dropped-a-line-for-its-width)).
+  Both wait for the column-width design after 5.2.
 
 ## Upgrading to 5.1 from 5.0
 
@@ -376,15 +398,6 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   those cells empty for a program that opens the store with its own defaults; run the
   scrub with the defaults that program uses
   ([limitations](docs/limitations.md#a-scrub-run-with-other-defaults-than-the-stores-program-can-change-how-early-rows-read)).
-- **Known, mostly as in 5.1: a scrub, a rewrite or a read takes one column count for every row,
-  and can lose cells or keys.** A scrub given defaults narrower than the rows, a row wider
-  than the header, and a `.tsv` that begins with a bare `#_defaults_#` line (read without
-  defaults) are examples; the entry lists each, and which is new in 5.2
-  ([limitations](docs/limitations.md#scrubs-and-rewrites-read-rows-at-one-column-width-deferred-to-the-width-design)).
-  A strict scrub of a file whose read dropped a line for its width and found no row leaves it,
-  so it grows again over append, delete-all and scrub cycles
-  ([limitations](docs/limitations.md#a-strict-scrub-leaves-a-file-whose-read-dropped-a-line-for-its-width)).
-  Both wait for the column-width design after 5.2.
 - **Running programs keep 5.0** until they are restarted: long-running programs that
   import TSVZ, and running `tsvz serve` handlers.
 
