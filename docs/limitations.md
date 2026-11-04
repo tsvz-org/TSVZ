@@ -146,14 +146,20 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - Defaults given to the scrub (`defaults=`, `--x-defaults`) narrower than the rows, with no header to take the
     count from: the rows are cut to their width (`a\t1\t2\t3` with `[D, 'D']` becomes `a\t1`). A strict scrub
     drops the rows of another width only when the given defaults are all empty; with a non-empty cell it cuts as a
-    loose one does. A narrow `#_defaults_#` line in the file itself is not cut. Same in 5.1.
+    loose one does. A `#_defaults_#` line of the file narrower than the rows, after the first row, cuts no row
+    and is written back as it is (as the file's first line it does cut them: see below). Same in 5.1.
   - A file with no header and no live row, scrubbed with defaults narrower than its own `#_defaults_#` line: the
     line is cut to the width of the given defaults (`#_defaults_#\tX\tY\tZ\na\t\n` with `[D, 'D']` is written
     `\n#_defaults_#\tX\n`). New in 5.2: 5.1 left such a file as it was.
   - A row wider than the header (written by hand or another tool), at a scrub or a `TSVZed` rewrite (after a
     change, or `hardMapToFile()`): `id\tv\na\t1\t2` becomes `id\tv\na\t1`. A strict scrub drops the row, and the
     other rows are written. `tsvz scrub --x-strict` of `id\tv\na\t1\t2` with no `--x-header` writes `id\tv\n`, the
-    header line being read as a key. Same in 5.1.
+    header line being read as a key. Same in 5.1 at a scrub, at a rewrite after a change, and at a `TSVZed` open
+    of a file that holds a key with two values. New in 5.2: a `TSVZed` open (`rewrite_on_load`, the default) also
+    rewrites a file that holds a key's row and its deletion, so the cut becomes permanent at a plain open, with
+    nothing changed: `id\tv\na\t1\t2\nb\t1\nb\t\n` becomes `id\tv\na\t1  \n`, and `id\tv\na\t\t7\nb\t1\nb\t\n`
+    becomes `id\tv\na\t  \n`, the 7 lost (the spaces pad the in-place rewrite). With `rewrite_on_load=False` the
+    next exit or periodic rewrite does it.
   - A header-less row wider than the first row of the file: `a\t1\nb\t1\t2` becomes `a\t1\nb\t1`. Same in 5.1.
   - A file of one-column keys that holds one line of two cells (`a\nb\nc\nb\t\n`, which
     `appendTabularFile(p, ['b', ''])` writes): every key is written as a deletion line, `a\t\nb\t\nc\t\n`, and all
@@ -163,7 +169,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - A bare `#_defaults_#` first line, or one behind an empty first line (`\n#_defaults_#\na\t1\t2`), read without
     defaults: the count is 1, `readTabularFile(p)` returns a row named `#_defaults_#` and drops the rows
     (`strict=True`, the default) or cuts them to their key (`strict=False`); a scrub writes that (`a`). Defaults of
-    two or more cells read it right. 5.2's scrub never writes such a file. Same in 5.1.
+    two or more cells read it right. 5.2's scrub never turns a file that reads right into one; scrubbing one keeps
+    it one (`\n#_defaults_#\na\t1\t2` becomes `\n#_defaults_#\na\n`). Same in 5.1.
 - Why: one column-width rule for reads, scrubs and rewrites gets its own design after 5.2, tested with the
   differential scrub fuzzer. Patching one trigger at a time moves the cut around.
 - Revisit when: the width design (after 5.2 ships).
@@ -175,7 +182,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: a strict scrub (`strict=True`, `tsvz scrub --x-strict`) of a `.tsv`-family file whose
   strict read finds no live row, and dropped a line for its width (`id\tv\nb\t\t2` with header `id\tv`; `a\t1`
   with defaults of three cells), leaves it as it is. A writer that appends keys, deletes them all and scrubs over
-  and over then sees the file grow without limit, as in 5.1; a scrub that is not strict compacts it.
+  and over then sees the file grow without limit, as in 5.1. A scrub that is not strict compacts it, and cuts the
+  line: `id\tv\nb\t\t2` becomes `id\tv\nb\t\n`, and b is lost (see the width entry above). The headed example is
+  `tsvz scrub`'s only with `--x-header id\tv`; without it line 1 is a row, so the strict read finds the live key
+  `id`, drops the wider line, and writes `id\tv\n`.
 - Why: compacting it would write the file as an empty store and lose the dropped line, which is data (d9bf316).
 - Revisit when: the width design (after 5.2 ships).
 - Approved: 2026-11-03, the user chose "Deferred to width design (Recommended)".

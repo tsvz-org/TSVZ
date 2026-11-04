@@ -131,6 +131,12 @@ named like an operation then needs a path prefix (`./read`).
   with a warning.
 - **TSVZ extensions:**
   - `--x-header H` and `--x-defaults KEY<d>D1<d>...` decode backslash escapes such as `\t`;
+  - `--x-header H` makes line 1 of a `.tsv`-family file its header for every operation
+    when line 1 matches H (3.39's header check): it is never a key, row or count, and
+    `scrub` and `clear` keep it. When line 1 differs, the file has no header and line 1
+    is a row, with 3.39's "Header mismatch" warning (`--x-strict`: an error, exit 1,
+    nothing written). A missing or empty file gets H first. Without `--x-header`, line 1
+    is a row, as in 3.39;
   - `--x-strict` / `--x-force` turn 3.39's column and header checks on or off.
 
 ## Serving a store
@@ -161,7 +167,8 @@ status stay the same.
   and `fsync`s everything and removes `STORE.serve`.
 - **Bypassing it.** `--x-direct` makes a `tsvz` command use the files. Command
   lines with `--x-header`, `--x-defaults` or `--x-strict`, or another delimiter
-  than the server's, use the files too.
+  than the server's, use the files too. A server started with `--x-header H`
+  answers every request by the `--x-header` rule above.
 
 ```python
 import TSVZ
@@ -288,11 +295,14 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   a header (and checks it, the default) keeps the file's first line as its header, an
   empty one included, with a "Header mismatch" warning when it differs; the header it is
   given is written only with `verifyHeader=False`, or when the file's first line cannot be
-  decoded (plain text named `.gz`). A scrub of a path that is not there
+  decoded (plain text named `.gz`); `tsvz scrub --x-header` follows the `--x-header` rule
+  below instead. A scrub of a path that is not there
   makes no file and returns `{}`, as in 5.1, unless `createIfNotExist=True`. A compressed
   file whose read decodes no row (plain text named `.gz`, a first member cut short) is
   made again as an empty store, as a scrub of a damaged file with rows already was in
-  5.1: the bytes after the damage go (see the damaged-stream notes above), and
+  5.1: what the read did not get goes, the bytes after the damage and also the lines of the
+  damaged member before it that the codec never handed over (Python's gzip gives none of
+  a first member cut short, where `zcat` shows them) (see the damaged-stream notes above), and
   `tsvz clear --x-header H --x-strict` (`clearTabularFile(verifyHeader=True)`) now clears
   such a file, where 5.1 exited 1 with the codec's error.
   5.1 and 5.0 left such a file as it was, deletion lines included, so a writer that
@@ -313,14 +323,33 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   of it, as 3.39 did only for a key with two values, so a program that sets keys and
   deletes them in each session (default settings, or `rewrite_interval`) keeps the file
   the same size (205, 405, 605 bytes, ... for 20 keys a session before). Every session
-  that opens such a file now rewrites it once.
-- **`tsvz scrub --x-header H` keeps the file's first line as its header.** 5.1 ignored
-  `--x-header` at a scrub and read the header line as a key (`tsvz keys` lists `id` as
-  one), which with the all-deleted scrub above left a store whose keys were all deleted
-  with 0 bytes. The header
-  is now checked as a scrub given `header=H` checks it: a "Header mismatch" warning when
-  the first line differs, and with `--x-strict` that is an error (exit 1, nothing written)
-  and rows of another width are dropped. A scrub with no `--x-header` is as before.
+  that opens such a file now rewrites it once. With `rewrite_on_load=False` the open
+  does not, and the next exit or periodic rewrite does it (`rewrite_on_exit=True`,
+  `rewrite_interval`). What such a rewrite does, it now does at a plain open:
+  - it cuts a row wider than the header, and the cut stays
+    ([limitations](docs/limitations.md#scrubs-and-rewrites-read-rows-at-one-column-width-deferred-to-the-width-design)):
+    `id\tv\na\t1\t2\nb\t1\nb\t\n` becomes `id\tv\na\t1  \n`, and
+    `id\tv\na\t\t7\nb\t1\nb\t\n` becomes `id\tv\na\t  \n`, the 7 lost;
+  - it writes over the file in place and pads with spaces (`a\t1  ` above): TSVZ readers
+    strip them, tools that read the raw bytes (`awk`, `cut`) see them;
+  - on a file it cannot write (read-only), it prints `Failed to open file … Permission
+    denied` twice and leaves the file as it is, as 5.1 did for a key with two values.
+- **`--x-header H` makes line 1 the header for every `tsvz` operation.** On a
+  `.tsv`-family file whose line 1 matches H (3.39's header check: each cell of H within
+  the cell under it), line 1 is the header: `keys`, `len`, `read`, `get`, `has`, `pop`,
+  `popitem` and `delete` never list, count, print, pop or delete it, and `scrub` and
+  `clear` keep it.
+  When line 1 differs, the file has no header and line 1 is a row, with 3.39's
+  "Header mismatch" warning, for the reads and the scrub alike, so a scrub
+  keeps exactly the rows a read shows; with `--x-strict` that is an error (exit 1, nothing
+  written) for every operation. A missing or empty file gets H first at its first write,
+  as in 5.1. A `tsvz serve STORE --x-header H` handler applies the rule to every request
+  it answers, routed `tsvz` commands included. In 5.1 only `set`, `append`, `delete` and
+  `clear` used `--x-header`: the reads and `scrub` took line 1 as a row (`tsvz keys`
+  printed `id a b` for two keys, `len` said 3, `popitem first` popped the header), and
+  so did every request to a handler. Without `--x-header` nothing changed: line 1 is a
+  row, as in 5.1 and 3.39. In a `.tsvz` store `pop`, `popitem` and `setdefault` now check
+  `--x-header` as `set` does; nothing else changed there.
 - **Known, mostly as in 5.1: a scrub, a rewrite or a read takes one column count for every row,
   and can lose cells or keys.** A scrub given defaults narrower than the rows, a row wider
   than the header, and a `.tsv` that begins with a bare `#_defaults_#` line (read without
