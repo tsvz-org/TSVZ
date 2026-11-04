@@ -927,7 +927,8 @@ cross-writer append order may not reflect real time. Otherwise, writes SHOULD be
 funneled through one handler (§18.3).
 
 18.6 **Access and append locks.** A producer that modifies a part in place
-(§19.8) SHOULD coordinate through two independent advisory locks per part:
+(§19.8) SHOULD coordinate through independent advisory locks per part, the access
+and append locks below and the gate described after them:
 
    - the **access lock** — held *shared* by a handle while it reads the part to
      take state from it, and *exclusive* only while the part is truncated or
@@ -941,19 +942,26 @@ funneled through one handler (§18.3).
 
    A producer that rewrites a part in place SHOULD take the append lock before
    the access lock: readers that follow appends then finish and start no more
-   reads, so they cannot hold the rewrite off for good.
+   reads. Readers that overlap can still hold the exclusive access lock off for
+   good where a shared lock is granted while an exclusive one waits (Linux grants
+   it), so a third lock, the **gate**, SHOULD stand before the access lock: a
+   reader takes it shared, takes the access lock shared, and lets go of the gate;
+   a rewrite takes it exclusively after the append lock and before the access
+   lock, so no new read starts while it waits for the reads in flight.
 
-   The two locks SHOULD be distinct byte ranges of the part (for example, one byte
-   each at offsets 0 and 1), so that appending never waits on readers. Locks owned
+   The locks SHOULD be distinct byte ranges of the part (for example, one byte
+   each: the access lock at offset 0, the append lock at 1, the gate at 2), so
+   that appending never waits on readers. Locks owned
    by the open file description (Linux OFD locks) are RECOMMENDED: process-owned
    POSIX record locks are released as soon as the process closes *any* descriptor
    for the file, and do not exclude other handles in the same process. A reader
    SHOULD NOT take a process-owned shared lock in a process that may hold a write
    lock on the part: the shared lock replaces it. Where locks owned by the open
-   file description are missing, whole-file `flock(2)` locks MAY stand in for
-   both: shared for the shared access lock, exclusive for either exclusive hold;
-   appends then wait on readers. On Linux local file systems `flock(2)` does not
-   exclude POSIX record locks, so OFD locks SHOULD be used there.
+   file description are missing, one whole-file `flock(2)` lock MAY stand in for
+   all of them: a reader takes it shared, and an append or a rewrite takes it
+   exclusively. Appends then wait on readers, and there is no gate. On Linux
+   local file systems `flock(2)` does not exclude POSIX record locks, so OFD
+   locks SHOULD be used there.
 
    A locked descriptor that a `fork()` child inherits keeps its lock until the
    child closes it; a producer SHOULD close or replace such descriptors in the
