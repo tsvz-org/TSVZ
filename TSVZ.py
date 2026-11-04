@@ -1370,7 +1370,7 @@ def _lockedAppend(path, payload, tailPolicy, reporter, fsync=False, header=None,
 	that takes them writes between the look at what the file holds and the write. A missing file is created."""
 	with _pathLock(path):
 		with open(path, 'a+b') as f:
-			_lockFile(f)
+			_lockFile(f, mode=_APPEND)
 			try:
 				_appendOpen(f, payload, codec, header, tailPolicy, reporter, fsync, memberSize)
 			finally:
@@ -1536,7 +1536,7 @@ def _read_last_valid_line_forward(fileName, taskDic, correctColumnNum, verbose=F
 	delimiter = get_delimiter(delimiter, file_name=fileName)
 	last_valid = -1 if storeOffset else []
 	scratch = {}
-	with openFileAsCompressed(fileName, 'rb', encoding=encoding, teeLogger=teeLogger) as file:
+	with _readLock(fileName), openFileAsCompressed(fileName, 'rb', encoding=encoding, teeLogger=teeLogger) as file:
 		while True:
 			offset = file.tell()
 			line = file.readline()
@@ -1595,7 +1595,7 @@ def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, tee
 			fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger,
 			strict=strict, encoding=encoding, delimiter=delimiter, defaults=defaults,
 			storeOffset=storeOffset)
-	with openFileAsCompressed(fileName, 'rb',encoding=encoding, teeLogger=teeLogger) as file:
+	with _readLock(fileName), openFileAsCompressed(fileName, 'rb',encoding=encoding, teeLogger=teeLogger) as file:
 		file.seek(0, os.SEEK_END)
 		file_size = file.tell()
 		buffer = b''
@@ -1815,7 +1815,7 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 				# Not over a file another writer made since it was looked for ('xb'), nor a link (its target is made),
 				# and under the lock, as every writer writes: an append that took it first has written the header.
 				with _pathLock(fileName), open(os.path.realpath(fileName), 'xb') as file:  # lockf excludes no thread
-					_lockFile(file)
+					_lockFile(file, mode=_APPEND)
 					try:
 						if not os.fstat(file.fileno()).st_size:
 							file.write(data)
@@ -1927,7 +1927,8 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 		return (-1 if storeOffset else []) if lastLineOnly else taskDic
 	reporter = _Reporter(fileName, teeLogger)
 	try:
-		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
+		# Under the READ lock: another process's rewrite is waited out (a nested read of the file takes no second lock).
+		with _readLock(fileName), openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
 			start = _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, strict, delimiter,
 									  correctColumnNum, encoding, reporter, lastLineOnly)
 			if start is None:
@@ -3807,7 +3808,7 @@ def _specBackupPart(path, reporter):
 	"""
 	with _pathLock(path):
 		with open(path, 'r+b') as f:
-			_lockFile(f)
+			_lockFile(f, mode=_REWRITE)
 			try:
 				first = backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
 				# Readable by whoever could read the part, writable by its owner only, never setuid,
@@ -3852,7 +3853,7 @@ def _specAppendTo(f, path, payload, reporter, fsync=False, memberSize=None):
 	"""
 	with _pathLock(path):
 		_seekRawStart(f)  # msvcrt locks from the raw position: lock and unlock the same range
-		_lockFile(f)
+		_lockFile(f, mode=_APPEND)
 		try:
 			before = _specStamp(os.fstat(f.fileno()))
 			offset = _appendOpen(f, payload, _parsePartName(path).codec, None, 'truncate', reporter, fsync, memberSize)
@@ -3929,7 +3930,7 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None):
 	raw = _compressBytes(codec, content, memberSize=memberSize) if codec else content  # (nothing: one empty member)
 	with _pathLock(path):
 		with open(path, 'r+b') as f:
-			_lockFile(f)
+			_lockFile(f, mode=_REWRITE)
 			try:
 				st = os.fstat(f.fileno())
 				if expect is not None and _specStamp(st) != expect:
@@ -4825,7 +4826,7 @@ class TSVZed(OrderedDict):
 					encoding=self.encoding, strict=self.strict, delimiter=self.delimiter, errors=self.errors):
 				self._readFrom(None, True)  # missing and not made: empty, until an append makes it
 			else:
-				with open(self._fileName, 'rb') as f:
+				with _readLock(self._fileName), open(self._fileName, 'rb') as f:  # never held while _readLocked waits
 					cut = self._readFrom(f, False)
 				if cut:
 					self._readLocked(lambda f: self._readFrom(f, True))
@@ -5661,11 +5662,11 @@ memoryOnly:{self.memoryOnly}
 			raise
 		return header, rows, queued
 
-	def _openLocked(self, opener):
-		"""``opener(fileName)``, locked (closed again when the lock fails)."""
+	def _openLocked(self, opener, mode=_REWRITE):
+		"""``opener(fileName)``, locked for ``mode`` (_lockFile; closed again when the lock fails)."""
 		f = opener(self._fileName)
 		try:
-			_lockFile(f)
+			_lockFile(f, mode=mode)
 		except BaseException:
 			f.close()
 			raise
@@ -5753,9 +5754,11 @@ memoryOnly:{self.memoryOnly}
 		return True
 
 	def _syncFile(self):
-		"""Take in another process's change to the legacy file (_syncFrom), reading it as reload() does: not locked."""
+		"""Take in another process's change to the legacy file (_syncFrom), reading it as reload() does: under the READ
+		lock (_readLock), so another process's rewrite is waited out, never met part way; a read still cut short by
+		damage is read again under the write lock, once the READ lock is let go of (_readLocked)."""
 		with self.writeLock:
-			with open(self._fileName, 'rb') as f:
+			with _readLock(self._fileName), open(self._fileName, 'rb') as f:
 				cut = self._syncFrom(f, False)
 			if cut:
 				self._readLocked(lambda f: self._syncFrom(f, True))
@@ -6155,7 +6158,7 @@ memoryOnly:{self.memoryOnly}
 				codec = _fileCodec(self._fileName)
 				_requireCodec(codec)
 				# The file itself, compressed or not (_appendOpen compresses), created when missing.
-				f = self._openLocked(lambda path: open(path, 'a+b'))
+				f = self._openLocked(lambda path: open(path, 'a+b'), mode=_APPEND)
 			except Exception as e:
 				self._failed('append', f"Failed to open file {self._fileName}: {e}", trace=False)
 				self.deSynced = True
@@ -6270,8 +6273,16 @@ memoryOnly:{self.memoryOnly}
 		_LIVE_STORES.pop(id(self), None)
 
 	def _atExit(self):
-		"""What _stopLiveStores does with a store left running at exit."""
+		"""What _stopLiveStores does with a store left running at exit. A legacy store with nothing to write (nothing
+		queued, not dirty, damaged or to be made again, no rewrite_on_exit) is let go of without waiting for its writer
+		thread, a daemon, which may be waiting for another process's lock to read the file: a program whose store
+		waits in its load ends at one Ctrl-C."""
 		self._exiting = True
+		if not self._spec and not (self.appendQueue or self.dirty or self._damaged or self._remake or self.rewrite_on_exit):
+			self.shutdownEvent.set()
+			self._wake.set()
+			_LIVE_STORES.pop(id(self), None)
+			return None
 		return self.stopAppendThread()
 	
 	def get_file_obj(self,modes = 'ab'):
@@ -6291,7 +6302,7 @@ memoryOnly:{self.memoryOnly}
 				file = open(self._fileName, 'ab')  # the codec writes into this locked file, a new member at its end
 			else:
 				file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding, teeLogger=self.teeLogger)
-			_lockFile(file)
+			_lockFile(file, mode=_APPEND if 'a' in modes else _REWRITE)
 			if 'w' in modes:
 				file.truncate(0)
 				file = _compressedWriter(self._fileName, file) or file
@@ -7403,7 +7414,7 @@ class _ServeStore(object):
 		# A compressed file with no byte, or only empty streams, is an empty store, as readTabularFile reads it.
 		if self.parts and not (_isCompressedFile(self.path) and _fileHoldsNothing(self.path)):
 			try:
-				with openFileAsCompressed(self.path, mode='rb', teeLogger=self.teeLogger) as f:
+				with _readLock(self.path), openFileAsCompressed(self.path, mode='rb', teeLogger=self.teeLogger) as f:
 					if any(self.given):
 						try:
 							raw = f.readline()
@@ -7466,7 +7477,8 @@ class _ServeStore(object):
 			# (a loose file's line 1 is read by a reload, which tells whether it is the header, also once it is whole)
 			return False  # an append always grows the part; anything else is a rewrite (and a stopped read is read again)
 		try:
-			with open(path, 'rb') as f:
+			# A loose file is read under the READ lock (a .tsvz part: its steadiness is checked on reload).
+			with (contextlib.suppress() if self.spec else _readLock(path)), open(path, 'rb') as f:
 				f.seek(self.offset - len(self.check))
 				if f.read(len(self.check)) != self.check:
 					return False

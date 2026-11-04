@@ -368,3 +368,413 @@ def test_a_forked_child_does_not_keep_a_lock_its_parent_held(tmp_path, mode, kin
 		assert os.waitpid(pid, os.WNOHANG) == (0, 0)  # (the child was still running)
 	finally:
 		os.waitpid(pid, 0)
+
+
+# ---------------------------------------------------------------------------
+# Writers take APPEND or REWRITE; older locks
+# ---------------------------------------------------------------------------
+#: A child holding a raw shared lock, as a 5.3 reader does: ARGS[0] the file, ARGS[1] 'ofdr0' or 'flock-sh'.
+READER = r'''
+p, how = ARGS[0], ARGS[1]
+f = open(p, 'rb')
+if how == 'ofdr0':
+	ofd(f, fcntl.F_RDLCK, 0, 1)
+else:
+	fcntl.flock(f, fcntl.LOCK_SH)
+say('held')
+released(p + '.release')
+'''
+
+
+def test_an_append_goes_through_while_another_process_reads_and_a_rewrite_waits(tmp_path, kind):
+	p = _tsv(tmp_path, 20)
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+	reader = _child(READER, p, 'ofdr0' if kind == 'ofd' else 'flock-sh')
+	try:
+		_expect(reader, 'held')
+		append = threading.Thread(target=TSVZ.appendTabularFile, args=(p, ['k9999', 'x']), kwargs={'header': 'id\tv'})
+		append.start()
+		if kind == 'ofd':
+			assert _done_within(append, 2), 'an append waited for a reader'
+		else:
+			assert not _done_within(append, 0.5), 'flock: an append waits for readers'
+		rewrite = threading.Thread(target=t.hardMapToFile)
+		rewrite.start()
+		assert not _done_within(rewrite, 0.5), 'a rewrite went on while another process read the file'
+		_release(p)
+		assert _done_within(rewrite, 5) and _done_within(append, 5)
+	finally:
+		_kill(reader)
+		t.close()
+
+
+def test_older_lockf_writers_and_tsvz_locks_exclude_each_other(tmp_path):
+	# Design T6, and the macOS check of design 4.6: 3.39's whole-file lockf and every 5.3 mode exclude each other.
+	p = _tsv(tmp_path, 20)
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+	holder = _hold(p, 'lockf')
+	try:
+		def read():
+			with TSVZ._readLock(p):
+				pass
+		threads = [threading.Thread(target=TSVZ.appendTabularFile, args=(p, ['k9999', 'x']), kwargs={'header': 'id\tv'}),
+				   threading.Thread(target=t.hardMapToFile), threading.Thread(target=read)]
+		for thread in threads:
+			thread.start()
+		time.sleep(0.5)
+		assert [thread.is_alive() for thread in threads] == [True, True, True], 'went on under a lockf writer'
+		_release(p)
+		assert all(_done_within(thread, 5) for thread in threads)
+	finally:
+		_kill(holder)
+		t.close()
+	with open(p, 'r+b') as f:
+		for mode in (TSVZ._APPEND, TSVZ._REWRITE):
+			assert TSVZ._lockFile(f, mode=mode)
+			assert _other(p, 'lockf') == 'busy'
+			TSVZ._unlockFile(f)
+	assert _other(p, 'lockf') == 'free'
+
+
+# ---------------------------------------------------------------------------
+# Entry 1: a delete during another process's rewrite lands
+# ---------------------------------------------------------------------------
+#: A child that rewrites ARGS[0] under a lock (ARGS[1]: 'lockf', 3.39; 'ofdw', 4.9 to 5.2; 'native', 5.3's own):
+#: it empties the file, writes 500 of its 1000 rows, says 'half', and writes the rest once released.
+REWRITER = r'''
+p, how = ARGS[0], ARGS[1]
+rows = [('k%04d\tvalue-k%04d\n' % (i, i)).encode() for i in range(1000)]
+f = open(p, 'r+b')
+if how == 'lockf':
+	fcntl.lockf(f, fcntl.LOCK_EX)
+elif how == 'ofdw':
+	ofd(f, fcntl.F_WRLCK, 0, 0)
+else:
+	T._lockFile(f)
+f.truncate(0)
+f.write(b'id\tv\n' + b''.join(rows[:500]))
+f.flush()
+say('half')
+released(p + '.release')
+f.write(b''.join(rows[500:]))
+f.flush()
+os.fsync(f.fileno())
+if how == 'native':
+	T._unlockFile(f)
+f.close()
+'''
+
+#: A child whose TSVZed (5.3's own rewrite: write over, then cut) pauses half way through a whole rewrite, after
+#: k0001 was deleted and set again, which moves it to the end of the file.
+STORE_REWRITER = r'''
+p = ARGS[0]
+t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+real = T._writeLines
+def paused(file, header, lines, chunk=1 << 20, codec=None):
+	lines = list(lines)
+	half = len(lines) // 2
+	real(file, header, lines[:half], chunk, codec)
+	file.flush()
+	say('half')
+	released(p + '.release')
+	real(file, None, lines[half:], chunk, codec)
+T._writeLines = paused
+t.memoryOnly = True  # nothing queued: the rewrite writes the moved key
+del t['k0001']
+t['k0001'] = ['k0001', 'value-k0001']
+t.memoryOnly = False
+t.hardMapToFile()
+t.close()
+'''
+
+WRITERS = ['lockf', 'ofdw', 'native']
+
+
+def _skipUnexcluded(kind, writer):
+	if writer == 'ofdw' and not LINUX:
+		pytest.skip('open file description locks are Linux-only')
+	if kind == 'flock' and LINUX and writer != 'native':
+		pytest.skip('flock and POSIX locks do not exclude each other on Linux (why Linux keeps OFD locks)')
+
+
+def _deleteDuring(tmp_path, kind, code, args, victim):
+	p = _tsv(tmp_path)
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+	assert len(t) == 1000
+	child = _child(code, p, *args, kind=kind)
+	try:
+		_expect(child, 'half')
+		time.sleep(1)  # the store's background read meets the rewrite now
+		assert victim in t, 'key missing during the rewrite'
+		del t[victim]
+		_release(p)
+		assert child.wait(20) == 0, child.stderr.read().decode()
+		t.commitAppendToFile()
+		assert victim not in t
+		assert victim not in TSVZ.readTabularFile(p, header='id\tv', strict=False), 'delete lost'
+	finally:
+		_kill(child)
+		t.close()
+
+
+@pytest.mark.parametrize('writer', WRITERS)
+def test_a_delete_during_another_process_locked_rewrite_lands(tmp_path, kind, writer):
+	_skipUnexcluded(kind, writer)
+	_deleteDuring(tmp_path, kind, REWRITER, [writer], 'k0900')
+
+
+def test_a_delete_during_another_tsvzed_whole_rewrite_lands(tmp_path, kind):
+	_deleteDuring(tmp_path, kind, STORE_REWRITER, [], 'k0001')
+
+
+# ---------------------------------------------------------------------------
+# One-shot reads
+# ---------------------------------------------------------------------------
+CLI = r'''
+sys.exit(T._cliMain(ARGS))
+'''
+
+
+@pytest.mark.parametrize('writer', WRITERS)
+def test_one_shot_reads_wait_out_another_process_locked_rewrite(tmp_path, kind, writer):
+	_skipUnexcluded(kind, writer)
+	p = _tsv(tmp_path)
+	child = _child(REWRITER, p, writer, kind=kind)
+	cli = None
+	results = {}
+	try:
+		_expect(child, 'half')
+		read = threading.Thread(target=lambda: results.update(read=TSVZ.readTabularFile(p, header='id\tv', strict=False)))
+		store = threading.Thread(target=lambda: results.update(
+			store=TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)))
+		read.start()
+		store.start()
+		cli = _child(CLI, 'get', p, 'k0900', kind=kind)
+		time.sleep(1)
+		assert read.is_alive() and store.is_alive() and cli.poll() is None, 'a read went on during the rewrite'
+		_release(p)
+		assert _done_within(read, 10) and _done_within(store, 10)
+		out, err = cli.communicate(timeout=20)
+		assert child.wait(20) == 0
+		assert len(results['read']) == 1000 and 'k0900' in results['read']
+		assert len(results['store']) == 1000
+		assert b'value-k0900' in out, err
+	finally:
+		_kill(child, cli)
+		if 'store' in results:
+			results['store'].close()
+
+
+GET_FILE_OBJ = r'''
+p = ARGS[0]
+t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+f = t.get_file_obj('r+b')
+say('read %d' % len(T.readTabularFile(p, header='id\tv')))
+t.release_file_obj(f)
+t.close()
+'''
+
+
+def test_a_get_file_obj_holder_reads_its_file_with_readtabularfile(tmp_path, kind):
+	# Design T4: the same-thread rule. Without it the read would wait for the thread's own lock, for ever.
+	p = _tsv(tmp_path, 20)
+	child = _child(GET_FILE_OBJ, p, kind=kind)
+	try:
+		out, err = child.communicate(timeout=10)
+	finally:
+		_kill(child)
+	assert out.decode().strip() == 'read 20', err.decode()
+
+
+def test_a_reader_waiting_on_a_writer_is_released_when_it_unlocks(tmp_path, kind):
+	# H1
+	p = _tsv(tmp_path, 20)
+	holder = _hold(p, 'native', kind=kind)
+	try:
+		results = []
+		read = threading.Thread(target=lambda: results.append(TSVZ.readTabularFile(p, header='id\tv')))
+		read.start()
+		assert not _done_within(read, 0.5), 'a read went on while another process held the write lock'
+		_release(p)
+		assert _done_within(read, 5)
+		assert len(results[0]) == 20
+	finally:
+		_kill(holder)
+
+
+READ_LIBRARY = r'''
+say('reading')
+T.readTabularFile(ARGS[0], header='id\tv')
+say('done')
+'''
+
+
+@pytest.mark.parametrize('how', ['library', 'cli'])
+def test_ctrl_c_ends_a_read_waiting_on_another_process(tmp_path, kind, how):
+	# H2
+	p = _tsv(tmp_path, 20)
+	holder = _hold(p, 'native', kind=kind)
+	reader = None
+	try:
+		if how == 'library':
+			reader = _child(READ_LIBRARY, p, kind=kind)
+		else:
+			reader = _child("say('reading')\n" + CLI, 'read', p, kind=kind)
+		_expect(reader, 'reading')
+		time.sleep(0.5)
+		assert reader.poll() is None, 'the read did not wait'
+		reader.send_signal(signal.SIGINT)
+		out, err = reader.communicate(timeout=5)
+		assert reader.returncode != 0
+		if how == 'library':
+			assert b'KeyboardInterrupt' in err, err
+		assert _other(p, 'ofdw' if kind == 'ofd' else 'flock') == 'busy', 'the holder lost its lock'
+	finally:
+		_release(p)
+		_kill(reader)
+		if holder.poll() is None:
+			holder.wait(10)
+		_kill(holder)
+	assert _other(p, 'ofdw' if kind == 'ofd' else 'flock') == 'free', 'the interrupted read left a lock behind'
+
+
+# ---------------------------------------------------------------------------
+# The tsvz serve handler
+# ---------------------------------------------------------------------------
+def test_a_handler_pop_during_another_process_locked_rewrite_returns_and_deletes_the_row(tmp_path, kind):
+	p = _tsv(tmp_path)
+	handle = TSVZ._ServeHandle(p)
+	handle.lock()
+	handle.start(TSVZ._ServeStore(p, create=True))
+	serving = threading.Thread(target=handle.serve)
+	serving.start()
+	child = None
+	try:
+		with TSVZ.TSVZClient(p) as c:
+			assert c.get('k0900') == ['k0900', 'value-k0900']
+			child = _child(REWRITER, p, 'native', kind=kind)
+			_expect(child, 'half')
+			results = []
+			pop = threading.Thread(target=lambda: results.append(c.pop('k0900', None)))
+			pop.start()
+			assert not _done_within(pop, 1), 'the handler answered during the rewrite'
+			_release(p)
+			assert _done_within(pop, 10)
+			assert child.wait(20) == 0
+		assert results == [['k0900', 'value-k0900']]
+	finally:
+		_kill(child)
+		handle.stop()
+		serving.join(10)
+		handle.close()
+	assert 'k0900' not in TSVZ.readTabularFile(p, header='id\tv', strict=False)
+
+
+# ---------------------------------------------------------------------------
+# Hangs and starvation
+# ---------------------------------------------------------------------------
+STORE = r'''
+import signal
+p, queued = ARGS[0], ARGS[1] == 'queued'
+if queued:
+	t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+	say('open')
+	released(p + '.go')
+	t['new'] = ['new', 'N']
+	say('closing')
+	t.close()
+else:
+	say('opening')
+	t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+say('done')
+'''
+
+
+def test_ctrl_c_in_a_store_waiting_on_another_process_lets_the_program_exit(tmp_path, kind):
+	# H3: one Ctrl-C ends a program whose store waits in its load for another process's rewrite.
+	p = _tsv(tmp_path, 20)
+	holder = _hold(p, 'native', kind=kind)
+	store = None
+	try:
+		store = _child(STORE, p, 'load', kind=kind)
+		_expect(store, 'opening')
+		time.sleep(0.5)
+		assert store.poll() is None, 'the load did not wait'
+		store.send_signal(signal.SIGINT)
+		try:
+			out, err = store.communicate(timeout=5)
+		except subprocess.TimeoutExpired:
+			raise AssertionError('one Ctrl-C did not end the program')
+		assert store.returncode != 0 and b'done' not in out
+		assert _other(p, 'ofdw' if kind == 'ofd' else 'flock') == 'busy'
+	finally:
+		_release(p)
+		_kill(store, holder)
+
+
+def test_ctrl_c_at_close_of_a_store_with_a_queued_row_ends_after_three(tmp_path, kind):
+	# The store has a row to write and waits for another process's lock. A Ctrl-C stops close()'s wait; at exit the
+	# write in progress is waited for again, a Ctrl-C there says it is being finished, and the next abandons it: three
+	# in all (as in 5.2, where the wait was for another writer only; documented here, not a new rule).
+	p = _tsv(tmp_path, 20)
+	store = _child(STORE, p, 'queued', kind=kind)
+	holder = None
+	try:
+		_expect(store, 'open')
+		holder = _hold(p, 'native', kind=kind)
+		open(p + '.go', 'w').close()
+		_expect(store, 'closing')
+		time.sleep(0.5)
+		signals = 0
+		for _ in range(3):
+			if store.poll() is not None:
+				break
+			store.send_signal(signal.SIGINT)
+			signals += 1
+			try:
+				store.wait(3)
+			except subprocess.TimeoutExpired:
+				pass
+		assert store.poll() is not None, 'three Ctrl-Cs did not end the program'
+		err = store.stderr.read() + store.stdout.read()
+		assert signals == 3 and b'being finished' in err, err
+	finally:
+		_release(p)
+		_kill(store, holder)
+
+
+SETTER = r'''
+p, seconds = ARGS[0], float(ARGS[1])
+t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=0.001)
+say('started')
+end = time.time() + seconds
+i = 0
+while time.time() < end:
+	t['s%d-%d' % (os.getpid(), i % 50)] = ['x', str(i)]
+	i += 1
+	time.sleep(0.001)
+t.close()
+'''
+
+
+def test_a_rewrite_is_not_starved_by_two_appending_stores(tmp_path, kind):
+	# Design T2: with B and C appending and reading all the time, A's rewrite still gets the file.
+	p = str(tmp_path / 'big.tsv')
+	with open(p, 'wb') as f:
+		f.write(b'id\tv\n')
+		row = b'\t' + b'v' * 200 + b'\n'
+		f.write(b''.join(b'k%07d' % i + row for i in range(100000)))  # ~20 MB
+	a = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+	children = []
+	try:
+		for _ in range(2):
+			children.append(_child(SETTER, p, 15, kind=kind))
+		for child in children:
+			_expect(child, 'started', timeout=60)
+		time.sleep(1)
+		start = time.time()
+		a.hardMapToFile()
+		assert time.time() - start < 10, 'the rewrite was starved'
+	finally:
+		_kill(*children)
+		a.close()

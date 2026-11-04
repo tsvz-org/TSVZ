@@ -10147,8 +10147,9 @@ def test_tsvzed_legacy_close_interrupted_leaves_a_store_that_runs_on(tmp_path, m
 
 def test_tsvzed_legacy_ctrl_c_during_the_exit_hooks_rewrite_leaves_the_store_closing(tmp_path, monkeypatch):
 	# At exit a Ctrl-C there only stops the wait: _stopLiveStores finishes the store, which does not run on, so a
-	# refusal of that last rewrite still says none is tried after it.
-	t = TSVZ.TSVZed(str(tmp_path / 'exit.tsv'), header='key\tval', append_check_delay=0.01)
+	# refusal of that last rewrite still says none is tried after it. (rewrite_on_exit: a store with nothing to write
+	# is let go of at exit without a rewrite.)
+	t = TSVZ.TSVZed(str(tmp_path / 'exit.tsv'), header='key\tval', append_check_delay=0.01, rewrite_on_exit=True)
 
 	def interrupted(*args, **kwargs):
 		raise KeyboardInterrupt
