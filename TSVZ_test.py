@@ -12173,5 +12173,46 @@ def test_members_a_compressed_reader_seeks_from_the_end_and_read_of_the_rest_rai
 			f.read()
 
 
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_two_cut_members_in_a_row_then_a_good_one(tmp_path, capsys, suffix):
+	# Two killed appends in a row: 5.4's second build decoded the second cut member as the run of the first, which
+	# failed, so the read stopped and the good append after them was lost (gz 95 of 100).
+	rng = random.Random(3)
+	p = str(tmp_path / ('g.' + suffix))
+	for trial in range(20):
+		parts = [_member(suffix, b'key\tval\nk0\tv0\n')]
+		for _ in range(2):
+			whole = _member(suffix, b''.join(b'c%d\t%x\n' % (i, rng.getrandbits(32)) for i in range(rng.randint(5, 400))))
+			parts.append(whole[:rng.randint(12, len(whole) - 1)])
+		_touch(p, b''.join(parts) + _member(suffix, b'z\t9\n'))
+		data, warnings = _read_quiet(p, capsys)
+		assert data == {'k0': ['k0', 'v0'], 'z': ['z', '9']}, (trial, len(data), warnings)
+		assert len(warnings) == 1 and warnings[0].count('cut short') == 2 and 'stopped' not in warnings[0], warnings
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_a_cut_last_member_after_a_cut_one_is_noted(tmp_path, capsys, suffix):
+	rng = random.Random(5)
+	p = str(tmp_path / ('g.' + suffix))
+	for trial in range(10):
+		parts = [_member(suffix, b'key\tval\nk0\tv0\n')]
+		for _ in range(2):
+			whole = _member(suffix, b''.join(b'c%d\t%x\n' % (i, rng.getrandbits(32)) for i in range(rng.randint(5, 400))))
+			parts.append(whole[:rng.randint(12, len(whole) - 1)])
+		_touch(p, b''.join(parts))
+		data, warnings = _read_quiet(p, capsys)
+		assert data == {'k0': ['k0', 'v0']} and len(warnings) == 1 and warnings[0].count('cut short') == 2, (trial, warnings)
+
+
+def test_members_an_append_to_a_file_whose_first_member_is_cut_says_what_fixes_it(tmp_path):
+	data = _member('tsv.gz', b'key\tval\nk0\tv0\n')[:-5] + _member('tsv.gz', b'z1\t9\n')
+	p = str(tmp_path / 'g.tsv.gz')
+	_touch(p, data)
+	with pytest.raises(Exception) as caught:
+		TSVZ.appendTabularFile(p, ['n', '1'], header='key\tval')
+	assert 'scrub' in str(caught.value) and _bytes(p) == data
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
