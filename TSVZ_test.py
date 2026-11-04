@@ -498,7 +498,7 @@ def _drive_lite(mod, path, ops):
 	return seen
 
 
-def _drive_stateless(mod, path, seed):
+def _drive_stateless(mod, path, seed, ref=None):
 	rng = random.Random(seed)
 	out = []
 	delimiter = mod.get_delimiter(..., path)
@@ -509,7 +509,9 @@ def _drive_stateless(mod, path, seed):
 			rows.append([key] + [rng.choice(LEGACY_VALUES) or 'v' for _ in range(rng.randint(0, 3))])
 		mod.appendLinesTabularFile(path, rows, header=LEGACY_HEADER, createIfNotExist=True)
 		out.append(dict(mod.readTabularFile(path, header=LEGACY_HEADER, strict=False)))
-		out.append(dict(mod.readTabularFile(path, header=LEGACY_HEADER, strict=True)))
+		strict = dict(mod.readTabularFile(path, header=LEGACY_HEADER, strict=True))
+		out.append(strict if ref is None else
+				   ('strict', strict == dict(ref.readTabularFile(path, header=LEGACY_HEADER, strict=True))))
 		out.append(mod.read_last_valid_line(path, {}, -1, delimiter=delimiter))
 	out.append(dict(mod.scrubTabularFile(path, header=LEGACY_HEADER)))
 	out.append(_content(path))
@@ -518,17 +520,57 @@ def _drive_stateless(mod, path, seed):
 	return out
 
 
+def _as_339(new, old, delimiter='\t', cut=None):
+	"""``new`` (what 5.5 shows) with each row that 3.39 shows cut put back to 3.39's cells: a row of ``new`` wider than
+	the same row of ``old``, whose first cells are ``old``'s. 5.5 reads a row whole (R1) and writes it whole (Q5);
+	3.39 cut it to the column count. A row written whole can also be the line a later read takes its column count
+	from, so other rows are padded wider (empty cells, or the defaults for them). That is the one difference the 3.39
+	comparisons allow; ``cut`` (a list) collects the rows put back, so a test can check what they were. Lines of file
+	bytes are compared cell by cell the same way."""
+	if isinstance(new, list) and isinstance(old, list):
+		if (len(new) > len(old) and all(isinstance(c, str) for c in new) and all(isinstance(c, str) for c in old)
+				and new[:len(old)] == old):
+			if cut is not None:
+				cut.append(list(new))
+			return list(old)
+		if len(new) == len(old):
+			return [_as_339(n, o, delimiter, cut) for n, o in zip(new, old)]
+		return new
+	if isinstance(new, tuple) and isinstance(old, tuple) and len(new) == len(old):
+		return tuple(_as_339(n, o, delimiter, cut) for n, o in zip(new, old))
+	if isinstance(new, dict) and isinstance(old, dict) and list(new) == list(old):
+		return type(new)((k, _as_339(new[k], old[k], delimiter, cut)) for k in new)
+	if isinstance(new, bytes) and isinstance(old, bytes):
+		d = delimiter.encode('utf-8')
+		newLines, oldLines = new.split(b'\n'), old.split(b'\n')
+		if len(newLines) != len(oldLines):
+			return new
+		lines = []
+		for n, o in zip(newLines, oldLines):
+			nc, oc = n.split(d), o.split(d)
+			if len(nc) > len(oc) and nc[:len(oc)] == oc:
+				if cut is not None:
+					cut.append(nc)
+				n = o
+			lines.append(n)
+		return b'\n'.join(lines)
+	return new
+
+
 def test_legacy_tsvzed_matches_339(tmp_path):
 	for suffix in LEGACY_SUFFIXES:
 		for seed in range(4):
 			old_path, new_path = _twin_paths(tmp_path / ('%s-%d' % (suffix.replace('.', ''), seed)), suffix)
 			ops = _legacy_ops(seed)
-			assert _observe(lambda: _drive_tsvzed(TSVZ, new_path, ops), os.path.dirname(new_path)) == \
-				_observe(lambda: _drive_tsvzed(TSVZ_old, old_path, ops), os.path.dirname(old_path)), (suffix, seed)
+			d = SUFFIX_DELIMITERS.get(suffix, '\t')
+			# 5.5: a row wider than the header is kept whole (R1, Q5); 3.39 cut it. That is the only difference.
+			new = _observe(lambda: _drive_tsvzed(TSVZ, new_path, ops), os.path.dirname(new_path))
+			old = _observe(lambda: _drive_tsvzed(TSVZ_old, old_path, ops), os.path.dirname(old_path))
+			assert _as_339(new, old) == old, (suffix, seed)
 			# Not the bytes: since 5.2 a TSVZed that loads a file holding a key's row and its deletion rewrites it, as
 			# 3.39 did only for a key with two values, so the file does not grow with every session (it is never larger).
-			assert len(_content(new_path)) <= len(_content(old_path)), (suffix, seed)
-			assert _read_with_339(new_path) == _read_with_339(old_path), (suffix, seed)
+			assert len(_as_339(_content(new_path), _content(old_path), d)) <= len(_content(old_path)), (suffix, seed)
+			assert _as_339(_read_with_339(new_path), _read_with_339(old_path)) == _read_with_339(old_path), (suffix, seed)
 
 
 def test_legacy_tsvzedlite_matches_339(tmp_path):
@@ -536,17 +578,25 @@ def test_legacy_tsvzedlite_matches_339(tmp_path):
 		for seed in range(4):
 			old_path, new_path = _twin_paths(tmp_path / ('%s-%d' % (suffix.replace('.', ''), seed)), suffix)
 			ops = _legacy_ops(seed, hash_keys=False)
-			assert _observe(lambda: _drive_lite(TSVZ, new_path, ops), os.path.dirname(new_path)) == \
-				_observe(lambda: _drive_lite(TSVZ_old, old_path, ops), os.path.dirname(old_path)), (suffix, seed)
-			assert _content(new_path) == _content(old_path), (suffix, seed)
+			d = SUFFIX_DELIMITERS[suffix]
+			new = _observe(lambda: _drive_lite(TSVZ, new_path, ops), os.path.dirname(new_path))
+			old = _observe(lambda: _drive_lite(TSVZ_old, old_path, ops), os.path.dirname(old_path))
+			assert _as_339(new, old) == old, (suffix, seed)
+			assert _as_339(_content(new_path), _content(old_path), d) == _content(old_path), (suffix, seed)
 
 
 def test_legacy_stateless_helpers_match_339(tmp_path):
 	for suffix in LEGACY_SUFFIXES:
 		for seed in range(3):
 			old_path, new_path = _twin_paths(tmp_path / ('%s-%d' % (suffix.replace('.', ''), seed)), suffix)
-			assert _observe(lambda: _drive_stateless(TSVZ, new_path, seed), os.path.dirname(new_path)) == \
-				_observe(lambda: _drive_stateless(TSVZ_old, old_path, seed), os.path.dirname(old_path)), (suffix, seed)
+			d = SUFFIX_DELIMITERS.get(suffix, '\t')
+			new = _observe(lambda: _drive_stateless(TSVZ, new_path, seed, ref=TSVZ_old), os.path.dirname(new_path))
+			old = _observe(lambda: _drive_stateless(TSVZ_old, old_path, seed), os.path.dirname(old_path))
+			# 5.5 appends a row wider than the header whole (Q5), so a strict read drops it where 3.39 took the cut
+			# row: each strict view is compared with 3.39's strict read of the same bytes instead (marked True).
+			if old[0][0] == 'ok':
+				old = (('ok', [('strict', True) if i < 18 and i % 3 == 1 else o for i, o in enumerate(old[0][1])]), old[1])
+			assert _as_339(new, old, d) == old, (suffix, seed)
 
 def test_legacy_read_corpus_matches_339(tmp_path):
 	for suffix, d in SUFFIX_DELIMITERS.items():
@@ -556,7 +606,11 @@ def test_legacy_read_corpus_matches_339(tmp_path):
 			_touch(new_path, content)
 			old_obs = _legacy_read_observations(TSVZ_old, old_path, d, os.path.dirname(old_path), False)
 			new_obs = _legacy_read_observations(TSVZ, new_path, d, os.path.dirname(new_path), False)
-			assert new_obs == old_obs, (name, suffix)
+			cut = []
+			assert _as_339(new_obs, old_obs, d, cut) == old_obs, (name, suffix)
+			# the only rows 3.39 cut: the corpus's wide row, which 5.5 reads as the file has it (R1)
+			assert all(row == ['wide', 'a', 'b', 'c', 'd'] for row in cut), (name, suffix, cut)
+			assert bool(cut) == (name == 'main'), (name, suffix)
 			assert _content(new_path) == _content(old_path), (name, suffix)
 	# gzip-compressed intact copy of the main corpus file (tab-delimited)
 	main = _legacy_corpora('\t')['main']
@@ -565,7 +619,9 @@ def test_legacy_read_corpus_matches_339(tmp_path):
 	_touch(new_path, gzip.compress(main))
 	old_obs = _legacy_read_observations(TSVZ_old, old_path, '\t', os.path.dirname(old_path), True)
 	new_obs = _legacy_read_observations(TSVZ, new_path, '\t', os.path.dirname(new_path), True)
-	assert new_obs == old_obs
+	cut = []
+	assert _as_339(new_obs, old_obs, '\t', cut) == old_obs
+	assert cut and all(row == ['wide', 'a', 'b', 'c', 'd'] for row in cut)
 	assert _content(new_path) == _content(old_path)
 
 
@@ -6334,26 +6390,32 @@ def test_cli_scrub_with_defaults_that_are_not_utf8_leaves_the_rows(tmp_path):
 
 
 @pytest.mark.parametrize('create', [False, True])
-def test_append_lines_checks_what_is_written_after_the_row_is_cut(tmp_path, create):
-	# A third cell the header's width drops is never written, so it cannot be a reason to refuse the call.
+def test_append_lines_checks_every_cell_it_writes_a_wider_row_included(tmp_path, create):
+	# 5.5: a row wider than the header is written whole (writes never cut), so every one of its cells is checked.
 	p = str(tmp_path / 'cut.tsv')
 	if not create:
 		_touch(p, b'key\tval\n')
-	TSVZ.appendLinesTabularFile(p, [['k', 'v', 'extra' + BAD_NAME], ['j', 'w']], header='key\tval', createIfNotExist=create)
-	assert _bytes(p) == b'key\tval\nk\tv\nj\tw\n'
-	with pytest.raises(ValueError) as e:  # the cell that is written still is
+	with pytest.raises(ValueError):
+		TSVZ.appendLinesTabularFile(p, [['k', 'v', 'extra' + BAD_NAME], ['j', 'w']], header='key\tval', createIfNotExist=create)
+	assert not os.path.exists(p) or _bytes(p) in (b'', b'key\tval\n')
+	TSVZ.appendLinesTabularFile(p, [['k', 'v', 'extra'], ['j', 'w']], header='key\tval', createIfNotExist=True)
+	assert _bytes(p) == b'key\tval\nk\tv\textra\nj\tw\n'
+	with pytest.raises(ValueError) as e:
 		TSVZ.appendLinesTabularFile(p, [['z', BAD_NAME, 'extra']], header='key\tval')
 	assert "column 2 'val'" in str(e.value)
-	assert _bytes(p) == b'key\tval\nk\tv\nj\tw\n'
+	assert _bytes(p) == b'key\tval\nk\tv\textra\nj\tw\n'
 
 
 @pytest.mark.parametrize('cls', ['TSVZed', 'TSVZedLite'])
-def test_setitem_checks_the_row_that_is_written_after_it_is_cut_to_the_column_count(tmp_path, cls):
+def test_setitem_checks_every_cell_of_a_row_wider_than_the_column_count(tmp_path, cls):
 	p = str(tmp_path / 'cut.tsv')
 	kwargs = {'append_check_delay': 0.01, 'rewrite_on_load': False} if cls == 'TSVZed' else {}
 	t = getattr(TSVZ, cls)(p, header='key\tval', correctColumnNum=2, strict=False, **kwargs)
-	t['k'] = ['k', 'v', 'extra' + BAD_NAME]  # the third cell is dropped, never written
-	assert t['k'] == ['k', 'v']
+	with pytest.raises(TSVZ.TSVZEncodeError):
+		t['k'] = ['k', 'v', 'extra' + BAD_NAME]  # 5.5: the third cell is written (writes never cut), so it is checked
+	assert 'k' not in t
+	t['k'] = ['k', 'v', 'extra']
+	assert t['k'] == ['k', 'v', 'extra']
 	with pytest.raises(TSVZ.TSVZEncodeError):
 		t['j'] = ['j', BAD_NAME, 'extra']
 	assert 'j' not in t
@@ -6361,7 +6423,7 @@ def test_setitem_checks_the_row_that_is_written_after_it_is_cut_to_the_column_co
 		_stop(t)
 	else:
 		t.fileObj.close()
-	assert _bytes(p) == b'key\tval\nk\tv\n'
+	assert _bytes(p) == b'key\tval\nk\tv\textra\n'
 
 
 @pytest.mark.parametrize('cls', ['TSVZed', 'TSVZedLite'])
@@ -11722,8 +11784,8 @@ def test_cli_x_header_line_1_after_a_utf8_byte_order_mark_is_the_header(tmp_path
 		assert f.run('keys', strict=strict) == (0, 'a\n', ''), strict
 		assert f.run('len', strict=strict) == (0, '1\n', '')
 		assert f.run('read', strict=strict) == (0, 'a|1\n', '')
-	assert f.run('set', 'k', '1', '2', strict=True) == (0, '', '')
-	assert f.text() == '﻿id|v\na|1\nb|2\nb|\nk|1\n'  # fitted to the header's width
+	assert f.run('set', 'k', '1', strict=True) == (0, '', '')  # (5.5: a wider row would be written whole)
+	assert f.text() == '﻿id|v\na|1\nb|2\nb|\nk|1\n'
 	assert f.run('scrub', strict=True) == (0, '', '')
 	assert f.text() == '﻿id|v\na|1\nk|1\n'  # line 1 kept as it was, the mark included
 	assert f.run('keys') == (0, 'a\nk\n', '')
@@ -12250,3 +12312,101 @@ def test_members_the_last_valid_line_before_bytes_that_do_not_decode(tmp_path, c
 
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
+
+
+# --- 5.5: a legacy row is its own cells (R1) ---
+@pytest.mark.parametrize('cells, width, fitted', [
+	(['a'], 3, ['a', '', '']),                      # padded
+	(['a', '1'], 2, ['a', '1']),
+	(['a', '1', '2'], 2, ['a', '1', '2']),          # wider: kept whole
+	(['a', '1', '', ''], 2, ['a', '1']),            # only the empty cells past the width go
+	(['a', '', '7'], 2, ['a', '', '7']),            # never a non-empty cell
+	(['a', '1', '', '2', ''], 2, ['a', '1', '', '2']),
+	(['a', '', ''], 2, ['a', '']),
+	(['a', '1', '2'], 0, ['a', '1', '2']),          # no width: as it is
+	(['a', '1', ''], -1, ['a', '1', '']),
+])
+def test_fit_row(cells, width, fitted):
+	assert TSVZ._fitRow(cells, width) == fitted
+	assert TSVZ._fitRow(tuple(cells), width) == fitted  # (a list, whatever it is given)
+
+
+def test_a_wide_legacy_row_is_read_whole(tmp_path):
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, b'id\tv\na\t1\t2\n')
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=False) == {'a': ['a', '1', '2']}
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=True, defaults=['', 'D']) == {'a': ['a', '1', '2']}
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=True) == {}  # strict without defaults still drops it
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=False, correctColumnNum=2) == {'a': ['a', '1', '2']}
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=False, lastLineOnly=True) == ['a', '1', '2']
+	assert TSVZ.read_last_valid_line(p, {}, 2) == ['a', '1', '2']
+	_touch(p, b'id\tv\na\t\t7\n')
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=False) == {'a': ['a', '', '7']}  # a live key, not a deletion
+	_touch(p, b'a\t1\t\t\n')
+	assert TSVZ.readTabularFile(p, strict=False, correctColumnNum=2) == {'a': ['a', '1']}
+
+
+def test_a_shorter_defaults_line_keeps_the_defaults_before_it_for_the_cells_it_lacks(tmp_path):
+	p = str(tmp_path / 'd.tsv')
+	# W 2; the first defaults line is wider (kept whole), the second one shorter than it: its third cell is Y
+	_touch(p, b'id\tv\n#_defaults_#\tX\tY\n#_defaults_#\tZ\na\t\t\tq\n')
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=False) == {'a': ['a', 'Z', 'Y', 'q']}
+
+
+def test_cli_and_handler_read_a_wide_legacy_row_whole(tmp_path):
+	p = str(tmp_path / 'c.tsv')
+	_touch(p, b'id\tv\na\t1\t2\n')
+	assert _run('read', p, '--x-header', 'id\tv') == (0, 'a\t1\t2\n', '')
+	assert _run('get', p, 'a', '--x-header', 'id\tv') == (0, 'a\t1\t2\n', '')
+	store = TSVZ._ServeStore(p, header='id\tv')
+	try:
+		assert store.get(['a'], None) == ([['a', '1', '2']], False)
+	finally:
+		store.close()
+
+
+def test_legacy_writes_pad_and_never_cut(tmp_path):
+	p = str(tmp_path / 'a.tsv')
+	_touch(p, b'id\tv\n')
+	TSVZ.appendTabularFile(p, ['a', '1', '2'], header='id\tv')
+	TSVZ.appendTabularFile(p, ['b', '1', '', ''], header='id\tv')
+	assert open(p, 'rb').read() == b'id\tv\na\t1\t2\nb\t1\n'
+	p2 = str(tmp_path / 's.tsv')
+	_touch(p2, b'id\tv\n')
+	assert _run('set', p2, 'a', '1', '2', '--x-header', 'id\tv')[0] == 0
+	assert open(p2, 'rb').read() == b'id\tv\na\t1\t2\n'
+
+
+def test_tsvzed_keeps_a_wide_row_and_strict_refuses_it(tmp_path):
+	p = str(tmp_path / 't.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, rewrite_on_exit=False)
+	t['a'] = ['a', 1, 2]
+	assert t['a'] == ['a', '1', '2']
+	t.close()
+	assert open(p, 'rb').read() == b'id\tv\na\t1\t2\n'
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, rewrite_on_exit=False)
+	assert dict(t) == {'a': ['a', '1', '2']}
+	t.close()
+	lite = TSVZ.TSVZedLite(p, header='id\tv', strict=False)
+	lite['b'] = ['b', '1', '2']
+	assert lite['b'] == ['b', '1', '2']
+	lite.close()
+	assert open(p, 'rb').read() == b'id\tv\na\t1\t2\nb\t1\t2\n'
+
+
+@pytest.mark.parametrize('kind', ['tsvzed', 'lite'])
+def test_strict_legacy_stores_judge_the_width_after_dropping_empty_cells_past_it(tmp_path, capsys, kind):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'id\tv\nz\t9\n')
+	if kind == 'tsvzed':
+		t = TSVZ.TSVZed(p, header='id\tv', strict=True, rewrite_on_load=False, rewrite_on_exit=False)
+	else:
+		t = TSVZ.TSVZedLite(p, header='id\tv', strict=True, correctColumnNum=2)  # (a legacy TSVZedLite reads no width)
+	t['a'] = ['a', '1', '']
+	assert t['a'] == ['a', '1']
+	t['b'] = ['b', '1', '2']
+	t['c'] = ['c', '1', '', '2']
+	assert 'b' not in t and 'c' not in t
+	assert 'does not have the correct number of columns' in ''.join(capsys.readouterr())
+	t.close()
+	assert open(p, 'rb').read() == b'id\tv\nz\t9\na\t1\n'

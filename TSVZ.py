@@ -1652,6 +1652,21 @@ def _dirMtimeNs(path):
 		return 0
 
 
+def _fitRow(cells, width):
+	"""A legacy row fitted to the column count ``width``: a narrower row is padded with empty cells; a wider one keeps
+	its cells, less only the empty cells at its end past ``width`` (``a\t1\t\t`` at 2 is ``[a, 1]``, ``a\t1\t2`` stays
+	whole). Never drops a non-empty cell. A ``width`` of 0 or less leaves the row as it is. Returns a list."""
+	cells = list(cells)
+	if width <= 0:
+		return cells
+	if len(cells) < width:
+		return cells + [''] * (width - len(cells))
+	end = len(cells)
+	while end > width and not cells[end - 1]:
+		end -= 1
+	return cells[:end]
+
+
 def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,defaults = ...,
 				 storeOffset = False, offset = -1, reporter = None):
 	"""
@@ -1718,13 +1733,10 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,def
 				reporter.note('strict-drop', None, 'dropped a line whose column count is not {} (strict mode)'.format(correctColumnNum))
 			return correctColumnNum , []
 		else:
-			# fill / cut the line with empty entries til the correct number of columns
-			if len(lineCache) < correctColumnNum:
-				lineCache += ['']*(correctColumnNum-len(lineCache))
-			elif len(lineCache) > correctColumnNum:
-				lineCache = lineCache[:correctColumnNum]
-			# if verbose:
-			# 	__teePrintOrNot(f"Correcting {lineCache[0]}",teeLogger=teeLogger)
+			# a narrower line is padded to the column count; a wider one is read whole (a row is its own cells)
+			lineCache = _fitRow(lineCache, correctColumnNum)
+	if lineCache[0] == DEFAULTS_INDICATOR_KEY and len(lineCache) < len(defaults):
+		lineCache += [''] * (len(defaults) - len(lineCache))  # (a defaults cell it lacks is the one before it)
 	# now replace empty values with defaults
 	if defaults and len(defaults) > 1:
 		for i in range(1,len(lineCache)):
@@ -2413,14 +2425,8 @@ def _legacyFormatRows(fileName, linesToAppend, teeLogger, header, verifyHeader, 
 			correctColumnNum = len(header)
 			if verbose:
 				__teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
-	# truncate / fill the lines to the correct number of columns
-	fitted = []
-	for line in formatedLines:
-		if len(line) < correctColumnNum:
-			line = line + ['']*(correctColumnNum-len(line))
-		elif len(line) > correctColumnNum:
-			line = line[:correctColumnNum]
-		fitted.append(line)
+	# pad the lines to the correct number of columns; a wider one keeps its cells (writes never cut)
+	fitted = [_fitRow(line, correctColumnNum) for line in formatedLines]
 	payload = b'\n'.join([_encodeRow(line,delimiter,encoding,errors,header) for line in fitted]) + b'\n'
 	return payload, len(fitted), correctColumnNum
 
@@ -5301,16 +5307,15 @@ class TSVZed(OrderedDict):
 			return value, columns
 		# verify the value has the correct number of columns
 		if columns > 0:
+			if len(value) > columns:
+				value = _fitRow(value, columns)  # (its empty cells past the column count go; never a non-empty one)
 			if len(value) != columns:
 				if self.strict:
 					self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {columns}. Refuse adding key...",'error')
 					return None
 				elif self.verbose:
 					self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {columns}, correcting...",'warning')
-				if len(value) < columns:
-					value += ['']*(columns-len(value))
-				elif len(value) > columns:
-					value = value[:columns]
+				value = _fitRow(value, columns)  # (padded; a wider row is written whole)
 		else:
 			columns = len(value)  # taken by __setitem__ once the row is known to be writable
 		if defaults and len(defaults) > 1:
@@ -7230,16 +7235,15 @@ class TSVZedLite(MutableMapping):
 			del self[key]
 			return
 		elif self.correctColumnNum > 0:
+			if len(value) > self.correctColumnNum:
+				value = _fitRow(value, self.correctColumnNum)  # (its empty cells past the column count go)
 			if len(value) != self.correctColumnNum:
 				if self.strict:
 					eprint(f"Error: Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...")
 					return
 				elif self.verbose:
 					eprint(f"Warning: Value {value} does not have the correct number of columns: {self.correctColumnNum}, correcting...")
-				if len(value) < self.correctColumnNum:
-					value += ['']*(self.correctColumnNum-len(value))
-				elif len(value) > self.correctColumnNum:
-					value = value[:self.correctColumnNum]
+				value = _fitRow(value, self.correctColumnNum)  # (padded; a wider row is written whole)
 			newColumnNum = None
 		else:
 			newColumnNum = len(value)  # taken once the row is known to be writable
