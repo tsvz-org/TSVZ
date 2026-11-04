@@ -35,6 +35,30 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   for Linux without open file description locks; 2026-11-04, "Accept the wider entry (Recommended)" for this
   wording (readers from 5.2 and earlier, `lockf`-only hosts and Windows folded in).
 
+### Reads by 5.3 programs can hold off a 3.39 to 5.2 writer
+- Kind: known limitation
+- What the operator sees: a rewrite or an append of a `.tsv`-family file by a 3.39 to 5.2 program takes a lock on
+  the whole file, so it waits for the 5.3 reads in flight. 5.3 rewrites pass a gate that stops new reads while
+  they wait; the older writers do not know the gate, so reads by 5.3 programs that overlap without a pause
+  (several processes reading the file in a loop) hold such a write off for as long as they go on. In a test with
+  three 5.3 readers looping, a 5.2 rewrite waited 24 s of a 25 s run and a 5.2 append 23 s. 5.2 readers took no
+  lock, so 5.2 writers never waited for reads before.
+- Why: TSVZ cannot change older programs, and their whole-file lock is what keeps them excluded from 5.3 writes.
+- Revisit when: an operator runs a 3.39 to 5.2 writer beside busy 5.3 readers and cannot upgrade it. Running the
+  writer on 5.3 ends it.
+- Approved: 2026-11-04, the user chose "Known limitation (Recommended)".
+
+### On macOS and other flock systems, overlapping reads can hold off a rewrite
+- Kind: known limitation
+- What the operator sees: outside Linux, TSVZ locks with `flock`, which has no byte ranges and so no gate. Reads
+  of a `.tsv`-family file that overlap without a pause (several processes reading it in a loop) can hold a rewrite
+  off for as long as they go on, and the appends that wait behind the rewrite with it: 18.8 s of a 20 s test run.
+  On Linux the gate stops new reads while a rewrite waits.
+- Why: a gate needs a second lock on the same file that a reader holds only briefly; `flock` gives one lock per
+  open file, and a separate lock file would add a file beside every store.
+- Revisit when: an operator on macOS or BSD sees rewrites stall behind readers.
+- Approved: 2026-11-04, the user chose "Known limitation (Recommended)".
+
 ### A thread holding get_file_obj() waits for ever on another store of the same file
 - Kind: known limitation
 - What the operator sees: a thread that holds `get_file_obj()` of a `.tsv`-family store and then waits on another

@@ -313,13 +313,18 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 - **macOS and other systems:** locks are `flock`. Reads and appends wait for each other
   there, and `flock` has no gate: reads that overlap without a pause (several processes
   reading the file in a loop) can hold a rewrite off for as long as they go on, and the
-  appends behind it with it. A read in another thread no longer drops a write's lock, and two threads' writes
+  appends behind it with it
+  ([limitations](docs/limitations.md#on-macos-and-other-flock-systems-overlapping-reads-can-hold-off-a-rewrite)).
+  A read in another thread no longer drops a write's lock, and two threads' writes
   exclude each other (5.2 could write a new file's header twice).
 - **The lock layout changed.** Reads lock byte 0 shared, passing through a gate at byte 2
   (held shared only until byte 0 is); appends lock byte 1; rewrites lock byte 1, then the
   gate, then the whole file (Linux open file description locks); `flock` on other
   POSIX systems. Older programs' whole-file locks still exclude every 5.3 lock, and 5.3
-  excludes them, so 5.2 and 5.3 programs can share a file. Where only `lockf` works (a
+  excludes them, so 5.2 and 5.3 programs can share a file; 3.39 to 5.2 writers do not
+  pass the gate, so 5.3 reads that overlap without a pause can hold them off
+  ([limitations](docs/limitations.md#reads-by-53-programs-can-hold-off-a-339-to-52-writer)).
+  Where only `lockf` works (a
   Linux kernel without open file description locks, a file system that refuses them and
   `flock`), writers use it and readers take no lock, as in 5.2.
 - A child that `fork()` made drops the TSVZ locks it inherits (Python 3.7 and later): a
