@@ -1110,6 +1110,59 @@ def test_a_store_commit_and_an_append_in_another_thread_write_one_header(tmp_pat
 	assert data.count(b'id\tv\n') == 1, data
 
 
+#: A child that rewrites a compressed .tsv.gz under the file's lock, as a TSVZed rewrite does (over the old bytes,
+#: then cut), and pauses with its first member half written: the file then begins with a cut member.
+GZ_REWRITER = r"""
+import gzip
+p = ARGS[0]
+new = gzip.compress(b'id\tv\n' + b''.join(('k%04d\tnew-k%04d\n' % (i, i)).encode() for i in range(3000)))
+f = open(p, 'r+b')
+T._lockFile(f)
+f.write(new[:len(new) // 2])
+f.flush()
+say('half')
+released(p + '.release')
+f.write(new[len(new) // 2:])
+f.truncate()
+f.flush()
+os.fsync(f.fileno())
+T._unlockFile(f)
+f.close()
+"""
+
+
+def test_a_header_check_waits_out_another_process_compressed_rewrite(tmp_path, kind):
+	# 5.4: the header check of an append (and of a clear, a scrub, a serve handler's write) reads and checks line 1's
+	# whole member. Met part way through another process's rewrite, it read a cut first member: "does not decode".
+	import gzip
+	p = str(tmp_path / 'f.tsv.gz')
+	with open(p, 'wb') as f:
+		f.write(gzip.compress(b'id\tv\n' + b''.join(('k%04d\told-k%04d\n' % (i, i)).encode() for i in range(3000))))
+	child = _child(GZ_REWRITER, p, kind=kind)
+	results = {}
+	try:
+		_expect(child, 'half')
+
+		def check():
+			try:
+				results['line'] = TSVZ._legacyFirstLine(p, 'utf8', None)
+				TSVZ.appendTabularFile(p, ['z', '9'], header='id\tv', strict=True)
+				results['done'] = True
+			except Exception as e:
+				results['error'] = e
+		thread = threading.Thread(target=check)
+		thread.start()
+		time.sleep(1)
+		assert thread.is_alive(), ('a header check went on during the rewrite', results)
+		_release(p)
+		assert _done_within(thread, 20) and child.wait(20) == 0, results
+		assert results.get('done') and results['line'] == 'id\tv\n', results
+		data = TSVZ.readTabularFile(p, header='id\tv', strict=True)
+		assert len(data) == 3001 and data['k0000'] == ['k0000', 'new-k0000'] and data['z'] == ['z', '9']
+	finally:
+		_kill(child)
+
+
 LOOP_READER = r'''
 p, seconds = ARGS[0], float(ARGS[1])
 say('reading')

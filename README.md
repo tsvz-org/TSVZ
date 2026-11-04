@@ -334,7 +334,8 @@ The file formats are unchanged.
     member, and a file another tool compressed whole is one member, held whole while it is
     read (the read builds the rows from it anyway). A read of line 1 alone (an append's
     header check, a clear, a scrub) decodes the first member in pieces and keeps only that
-    line until the member's check passes.
+    line until the member's check passes. It takes the read lock (5.3), so it waits out
+    another process's rewrite rather than reading a first member it has half written.
 
 ## Upgrading to 5.3 from 5.2
 

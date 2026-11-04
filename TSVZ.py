@@ -42,7 +42,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.3'
+version = '5.4'
 __version__ = version
 author = 'pan@zopyr.us'
 COMMIT_DATE = '2026-11-04'
@@ -2418,15 +2418,18 @@ def _legacyFormatRows(fileName, linesToAppend, teeLogger, header, verifyHeader, 
 
 def _legacyFirstLine(fileName, encoding, teeLogger):
 	"""The first line of the legacy file ``fileName`` (which exists) as text; '' for a file that holds nothing: no byte,
-	or, compressed, only empty streams (a 0-byte .bz2 or .xz is no stream to read, as _fileHoldsNothing's readers know)."""
-	if _isCompressedFile(fileName) and _fileHoldsNothing(fileName):
-		return ''
-	codec = _fileCodec(fileName)
-	if codec and _codecSupported(codec):  # (else read as openFileAsCompressed falls back to reading it)
-		with open(fileName, 'rb') as f:
-			return _firstLineIn(f, codec).decode(encoding=encoding,errors='replace')
-	with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
-		return file.readline().decode(encoding=encoding,errors='replace')
+	or, compressed, only empty streams (a 0-byte .bz2 or .xz is no stream to read, as _fileHoldsNothing's readers know).
+	Read under the READ lock (_readLock), as every read is: a header check runs before the append takes its lock, and
+	met part way, another process's rewrite would read as a damaged first member, or as half its line 1."""
+	with _readLock(fileName):
+		if _isCompressedFile(fileName) and _fileHoldsNothing(fileName):
+			return ''
+		codec = _fileCodec(fileName)
+		if codec and _codecSupported(codec):  # (else read as openFileAsCompressed falls back to reading it)
+			with open(fileName, 'rb') as f:
+				return _firstLineIn(f, codec).decode(encoding=encoding,errors='replace')
+		with openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
+			return file.readline().decode(encoding=encoding,errors='replace')
 
 def _legacyKeptHeader(fileName, header, verifyHeader, verbose, teeLogger, encoding, strict, delimiter, warn=True):
 	"""The header ``clearTabularFile`` leaves in the file: the file's own first line when a header is given and
@@ -7679,7 +7682,8 @@ class _ServeStore(object):
 		return header
 
 	def _legacyHeaderNow(self, log):
-		"""``_legacyHeader`` for the file as it is now (a write, ``clear`` or ``scrub`` that does not read it)."""
+		"""``_legacyHeader`` for the file as it is now (a write, ``clear`` or ``scrub`` that does not read it); line 1 is
+		read under the READ lock (_legacyFirstLine)."""
 		line = None
 		if any(self.given) and os.path.isfile(self.path):
 			try:
