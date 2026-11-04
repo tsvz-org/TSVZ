@@ -11517,7 +11517,7 @@ def test_cli_scrub_without_a_header_still_reads_the_first_line_as_a_row(tmp_path
 def test_cli_scrub_with_a_header_and_strict_checks_the_header_and_drops_rows_of_another_width(tmp_path):
 	p = str(tmp_path / 's.tsv')
 	_touch(p, b'x\tw\na\t1\n')
-	status, out, err = _run('scrub', p, '--x-header', 'id\\tv')  # loose: a warning, the file keeps its own first line
+	status, out, err = _run('scrub', p, '--x-header', 'id\\tv')  # loose: a warning, line 1 is a row (no row goes)
 	assert status == 0 and 'Header mismatch' in (out + err) and _bytes(p) == b'x\tw\na\t1\n'
 	assert _run('scrub', p, '--x-header', 'id\\tv', '--x-strict')[0] == 1  # strict: the mismatch is an error
 	assert _bytes(p) == b'x\tw\na\t1\n'
@@ -11535,6 +11535,178 @@ def test_serve_handlers_scrub_of_an_all_deleted_file_compacts_it(tmp_path):
 	store = TSVZ._ServeStore(p, lazy=True)
 	assert store.scrub(None) is True
 	assert _bytes(p) == b'\n'
+
+
+# ==========================================================================
+# 5.2: --x-header makes line 1 the header for every CLI operation, when line 1 is that header
+# ==========================================================================
+_XH_SUFFIXES = ['.tsv', '.csv', '.psv', '.tsv.gz', '.csv.bz2']
+
+
+class _XH(object):
+	"""A loose file of one suffix for the --x-header CLI tests, run as subprocesses: lines go in and come out as text
+	with '|' between cells, whatever the file's delimiter and codec."""
+
+	def __init__(self, tmp_path, suffix, name='x'):
+		self.path = str(tmp_path / (name + _suffix_or_skip(suffix)))
+		self.delimiter = TSVZ.get_delimiter(..., file_name=self.path)
+		self.header = 'id\\tv' if self.delimiter == '\t' else 'id' + self.delimiter + 'v'  # as typed: \t decoded
+
+	def put(self, text):
+		data = text.replace('|', self.delimiter).encode()
+		codec = TSVZ._fileCodec(self.path)
+		_touch(self.path, TSVZ._compressBytes(codec, data) if codec and data else data)
+
+	def text(self):
+		if not os.path.exists(self.path):
+			return None
+		with TSVZ.openFileAsCompressed(self.path, 'rb') as f:
+			return f.read().decode().replace(self.delimiter, '|')
+
+	def run(self, *args, header=True, strict=False):
+		argv = [args[0], self.path] + list(args[1:]) + (['--x-header', self.header] if header else []) + \
+			(['--x-strict'] if strict else [])
+		r = _cli(*argv)
+		return r.returncode, r.stdout.replace(self.delimiter, '|'), r.stderr
+
+
+@pytest.mark.parametrize('suffix', _XH_SUFFIXES)
+def test_cli_x_header_line_1_that_is_the_header_is_never_a_row(tmp_path, suffix):
+	# 5.2 before: keys printed `id a b`, len said 3, read printed the header as a row, popitem first popped it, and a
+	# scrub without --x-header then dropped it.
+	f = _XH(tmp_path, suffix)
+	f.put('id|v\na|1\nb|2\n')
+	assert f.run('keys') == (0, 'a\nb\n', '')
+	assert f.run('len') == (0, '2\n', '')
+	assert f.run('read') == (0, 'a|1\nb|2\n', '')
+	for op in ('get', 'has', 'pop'):
+		assert f.run(op, 'id')[0] == 3, op  # the header's first cell is no key
+	assert f.run('popitem', 'first') == (0, 'a|1\n', '')
+	assert f.run('keys') == (0, 'b\n', '')
+	assert f.run('set', 'c', '3')[0] == 0 and f.run('append', 'd', '4')[0] == 0
+	for key in ('b', 'c', 'id'):
+		assert f.run('delete', key)[0] == 0
+	assert f.run('read') == (0, 'd|4\n', '')
+	assert f.run('scrub') == (0, '', '')
+	assert f.text() == 'id|v\nd|4\n'
+	assert f.run('delete', 'd')[0] == 0 and f.run('scrub')[0] == 0
+	assert f.text() == 'id|v\n'  # every row deleted: the header stays
+	assert f.run('len') == (0, '0\n', '') and f.run('read') == (0, '', '')
+	assert f.run('set', 'e', '5')[0] == 0 and f.run('clear')[0] == 0
+	assert f.text() == 'id|v\n'
+	assert f.run('read', header=False) == (0, 'id|v\n', '')  # without --x-header line 1 is a row, as in 5.1
+
+
+@pytest.mark.parametrize('suffix', _XH_SUFFIXES)
+def test_cli_x_header_line_1_that_is_not_the_header_is_a_row_with_a_warning(tmp_path, suffix):
+	f = _XH(tmp_path, suffix)
+	f.put('x|w\na|1\n')
+	status, out, err = f.run('keys')
+	assert (status, out) == (0, 'x\na\n') and 'Header mismatch' in err  # 3.39's warning
+	assert f.run('len')[:2] == (0, '2\n') and f.run('read')[:2] == (0, 'x|w\na|1\n')
+	assert f.run('get', 'x')[:2] == (0, 'x|w\n') and f.run('has', 'x')[0] == 0
+	assert f.run('popitem', 'first')[:2] == (0, 'x|w\n')
+	assert f.run('set', 'b', '2')[0] == 0 and f.run('pop', 'b')[:2] == (0, 'b|2\n')
+	assert f.text() == 'x|w\na|1\nx\nb|2\nb\n'  # no header put in; a header-less file's deletion is the key alone
+	assert f.run('scrub')[0] == 0 and f.text() == 'a|1\n'
+	# The scrub agrees with the reads (5.2 before kept line 1 as a header here, and brought deleted key a back).
+	f.put('a|1\nb|2\na|\n')
+	assert f.run('keys')[:2] == (0, 'b\n')
+	status, out, err = f.run('scrub')
+	assert status == 0 and 'Header mismatch' in err
+	assert f.text() == 'b|2\n'
+	assert f.run('read')[:2] == (0, 'b|2\n') and f.run('read', header=False) == (0, 'b|2\n', '')
+	f.put('a|1\na|\n')
+	assert f.run('scrub')[0] == 0 and f.text() == ''
+	f.put('x|w\na|1\n')
+	assert f.run('clear')[0] == 0 and f.text() == 'id|v\n'  # emptied: left with the header given
+
+
+@pytest.mark.parametrize('suffix', _XH_SUFFIXES)
+def test_cli_x_header_and_strict_line_1_that_is_not_the_header_fails_and_writes_nothing(tmp_path, suffix):
+	f = _XH(tmp_path, suffix)
+	f.put('x|w\na|1\na|\n')
+	before = _bytes(f.path)
+	for args in (('read',), ('keys',), ('len',), ('get', 'x'), ('has', 'x'), ('pop', 'x'), ('popitem',),
+				 ('delete', 'x'), ('set', 'b', '2'), ('append', 'b', '2'), ('clear',), ('scrub',)):
+		status, out, err = f.run(*args, strict=True)
+		assert (status, out) == (1, '') and 'Header mismatch' in err, args
+		assert _bytes(f.path) == before, args
+	f.put('id|v\na|1\na|\n')
+	assert f.run('keys', strict=True) == (0, '', '')
+	assert f.run('scrub', strict=True) == (0, '', '') and f.text() == 'id|v\n'
+
+
+@pytest.mark.parametrize('suffix', _XH_SUFFIXES)
+def test_cli_x_header_on_a_missing_or_empty_file_writes_it_first(tmp_path, suffix):
+	f = _XH(tmp_path, suffix)
+	assert f.run('set', 'a', '1')[0] == 0 and f.text() == 'id|v\na|1\n'
+	f.put('')
+	assert f.run('keys', strict=True) == (0, '', '')
+	assert f.run('set', 'a', '1', strict=True)[0] == 0 and f.text() == 'id|v\na|1\n'
+	assert f.run('keys', strict=True) == (0, 'a\n', '')
+
+
+@pytest.mark.parametrize('suffix', _XH_SUFFIXES)
+def test_cli_without_x_header_line_1_is_a_row(tmp_path, suffix):
+	f = _XH(tmp_path, suffix)
+	f.put('id|v\na|1\na|\n')
+	assert f.run('keys', header=False) == (0, 'id\n', '')
+	assert f.run('len', header=False) == (0, '1\n', '')
+	assert f.run('popitem', 'first', header=False) == (0, 'id|v\n', '')
+	assert f.run('scrub', header=False)[0] == 0 and f.text() == ''
+
+
+def test_cli_x_header_read_table_shows_the_header_line_above_the_rows(tmp_path):
+	f = _XH(tmp_path, '.tsv')
+	f.put('id|v\na|1\n')
+	status, out, err = f.run('read', '--format', 'table')
+	lines = [line.replace('|', ' ').split() for line in out.splitlines() if line.strip()]
+	assert status == 0 and lines[0] == ['id', 'v'] and lines[-1] == ['a', '1'] and out.count('id') == 1, out
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+@pytest.mark.parametrize('suffix', _XH_SUFFIXES)
+def test_cli_serve_with_x_header_answers_routed_requests_by_the_same_rule(tmp_path, suffix):
+	# 5.2 before: the handler's store had no header; routed keys printed `id a b`, and a routed scrub after deleting
+	# every key listed left 0 bytes.
+	f = _XH(tmp_path, suffix)
+	proc = _serve_process(f.path, '--x-header', f.header)
+	try:
+		for key, value in (('a', '1'), ('b', '2')):
+			assert f.run('set', key, value, header=False)[0] == 0
+		assert f.text() == 'id|v\na|1\nb|2\n'
+		assert f.run('keys', header=False) == (0, 'a\nb\n', '')  # routed: a client with --x-header is not
+		assert f.run('len', header=False) == (0, '2\n', '')
+		assert f.run('read', header=False) == (0, 'a|1\nb|2\n', '')
+		assert f.run('get', 'id', header=False)[0] == 3
+		for key in ('a', 'b', 'id'):
+			assert f.run('delete', key, header=False)[0] == 0
+		assert f.run('scrub', header=False) == (0, '', '')
+		assert f.text() == 'id|v\n'
+		assert f.run('set', 'c', '3', header=False)[0] == 0 and f.run('keys', header=False) == (0, 'c\n', '')
+		assert f.run('popitem', 'first', header=False) == (0, 'c|3\n', '')
+		assert f.run('clear', header=False)[0] == 0 and f.text() == 'id|v\n'
+		assert _cli('stop', f.path).returncode == 0
+		proc.communicate(timeout=10)
+	finally:
+		if proc.poll() is None:
+			proc.kill()
+			proc.communicate()
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_serve_with_x_header_reads_a_header_appended_to_a_file_that_held_nothing_as_the_header(tmp_path):
+	p = str(tmp_path / 'e.tsv')
+	_touch(p)
+	store = TSVZ._ServeStore(p, header='id\tv')
+	try:
+		assert store.keys(None) == []
+		with open(p, 'ab') as f:
+			f.write(b'id\tv\na\t1\n')  # another writer puts the header first
+		assert store.keys(None) == ['a']
+	finally:
+		store.close()
 
 
 # ==========================================================================

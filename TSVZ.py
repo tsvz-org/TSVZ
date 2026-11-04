@@ -7123,12 +7123,13 @@ class _ServeStore(object):
 	takes ``self.lock``; ``log`` is the teeLogger its messages go to.
 
 	``header`` and ``createDefaults`` (default ``defaults``) are what a missing store is created with
-	(``create``). ``checkHeader``: writes and ``clear`` also check ``header`` as 3.39 did (the CLI's
-	``--x-header``). ``lazy``: the store is read at the first request that needs it, not here.
+	(``create``). ``header`` is also the CLI's ``--x-header``: a spec store's writes and ``clear`` check it as
+	3.39 did, and a loose file takes it by one rule for every request (``_legacyHeader``). ``lazy``: the store is
+	read at the first request that needs it, not here.
 	"""
 
 	def __init__(self, fileName, delimiter=..., header='', defaults=None, strict=False, teeLogger=None,
-				 verbose=False, create=False, createDefaults=None, checkHeader=False, lazy=False):
+				 verbose=False, create=False, createDefaults=None, lazy=False):
 		self.path = fileName
 		self.spec = _isSpecPath(fileName)
 		if self.spec:
@@ -7145,7 +7146,9 @@ class _ServeStore(object):
 		self.unreadable = False
 		self.stopped = False
 		self.parts = self.state = None  # not read yet
-		self.header = _formatHeader(header, teeLogger=teeLogger, delimiter=self.delimiter) if checkHeader else ['']
+		self.given = _formatHeader(header, teeLogger=teeLogger, delimiter=self.delimiter) if header else ['']
+		self.header = self.given  # a loose file's: the header in effect, as _legacyHeader last found it
+		self.mismatch = None  # the line 1 last warned of (_legacyHeader)
 		if create:
 			self._create(header, self.defaults if createDefaults is None else createDefaults)
 		if not lazy:
@@ -7171,11 +7174,39 @@ class _ServeStore(object):
 				if self.spec:
 					self._loadSpec(reporter, log)
 				else:
-					self._loadLegacy(reporter)
+					self._loadLegacy(reporter, log)
 				self.unreadable = reporter.incomplete()
 				self.stopped = reporter.has('stopped')  # a stop policy ended the read (spec §4.10)
 			finally:
 				reporter.flush()
+
+	def _legacyHeader(self, line, log):
+		"""The header in effect for a loose file whose first line is ``line``: the one rule of ``--x-header``.
+
+		``line`` is None when the file is missing, holds nothing, or its first line cannot be read. With a header
+		given, line 1 is the header when it matches that header (3.39's check, ``_lineContainHeader``), or when there
+		is no line 1 yet (a write puts the header first). Otherwise 3.39's "Header mismatch" is printed and strict
+		raises (nothing is written); loose, the file has no header and line 1 is a row, for every request, the scrub
+		included. Sets and returns ``self.header``."""
+		header = self.given
+		if any(header) and line is not None and not _headerMatches(header, line, self.delimiter):
+			if line != self.mismatch or self.strict:  # (said once for the line, as 3.39 says it)
+				self.mismatch = line
+				_lineContainHeader(header, line, teeLogger=log if log is not None else self.teeLogger,
+								   strict=self.strict, delimiter=self.delimiter)
+			header = ['']
+		self.header = header
+		return header
+
+	def _legacyHeaderNow(self, log):
+		"""``_legacyHeader`` for the file as it is now (a write, ``clear`` or ``scrub`` that does not read it)."""
+		line = None
+		if any(self.given) and os.path.isfile(self.path):
+			try:
+				line = _legacyFirstLine(self.path, 'utf8', self.teeLogger) or None
+			except Exception:  # a first line the codec cannot decode: the write or scrub that reads it reports it
+				pass
+		return self._legacyHeader(line, log)
 
 	def _noteDirMtime(self, dirMtime):
 		self.dirMtime = dirMtime
@@ -7214,19 +7245,33 @@ class _ServeStore(object):
 		self.label = os.path.basename(self.parts[-1]) + ' ' if len(self.parts) > 1 else ''
 		self.check = info.check if info is not None else b''  # as read: the part may be rewritten since
 
-	def _loadLegacy(self, reporter):
+	def _loadLegacy(self, reporter, log):
 		self.parts = [self.path] if os.path.isfile(self.path) else []
 		self.stamps = self._stamps(self.parts)
 		self.data = self.mapping()
 		self.legacyDefaults = list(self.defaults)
 		self.width, self.offset, self.lineNo, self.tailSeen = -1, 0, 0, b''
+		self.header = self.given  # (no line 1: a write puts the header first)
 		# A compressed file with no byte, or only empty streams, is an empty store, as readTabularFile reads it.
 		if self.parts and not (_isCompressedFile(self.path) and _fileHoldsNothing(self.path)):
 			try:
 				with openFileAsCompressed(self.path, mode='rb', teeLogger=self.teeLogger) as f:
+					if any(self.given):
+						try:
+							raw = f.readline()
+						except Exception as e:  # L5: a stream damaged inside line 1 holds nothing more to read
+							if not _isCompressedFile(self.path):
+								raise
+							reporter.note('damaged', None, 'compressed stream is damaged ({}: {}); read up to the '
+										  'damage'.format(type(e).__name__, e))
+							return
+						if raw and any(self._legacyHeader(raw.decode('utf8', errors='replace'), log)):
+							self.width, self.lineNo = len(self.header), 1  # the header: not a row
+						elif raw:
+							self._apply(raw, reporter)  # line 1 is a row
 					self.width, self.offset, self.lineNo = _legacyReadLoop(
-						f, self.path, self.data, -1, 0, self.strict, self.delimiter, self.legacyDefaults, False,
-						'utf8', reporter)
+						f, self.path, self.data, self.width, self.lineNo, self.strict, self.delimiter,
+						self.legacyDefaults, False, 'utf8', reporter)
 			except OSError as e:
 				reporter.note('unreadable', None, 'could not read {} ({})'.format(self.path, e))
 		self.label = ''
@@ -7269,7 +7314,8 @@ class _ServeStore(object):
 		"""Replay what was appended to the active part; False when it changed some other way."""
 		old = self.stamps.get(path)
 		if (self.stopped or _parsePartName(path).codec or old is None or stamp[0] != old[0]
-				or stamp[1] < self.offset or stamp[1] <= old[1]):
+				or stamp[1] < self.offset or stamp[1] <= old[1] or (not self.spec and not self.lineNo and any(self.given))):
+			# (a loose file's line 1 is read by a reload, which tells whether it is the header)
 			return False  # an append always grows the part; anything else is a rewrite (and a stopped read is read again)
 		try:
 			with open(path, 'rb') as f:
@@ -7422,6 +7468,7 @@ class _ServeStore(object):
 			if rows and any(self.header):
 				_specCheckHeader(self.path, self.header, self.delimiter, self.strict, self.verbose, log)
 			return _specFormatRecords(rows, self.delimiter).encode('utf-8')
+		self._legacyHeaderNow(log)
 		# Rows for a file that holds nothing yet are fitted to the header it is about to begin with.
 		assume = self.header if any(self.header) and _fileHoldsNothing(self.path) else None
 		return _legacyFormatPayload(self.path, [cells for cells, marker in rows], log, self.header, True, self.verbose,
@@ -7536,9 +7583,12 @@ class _ServeStore(object):
 		with self.lock:
 			self.writer.barrier()
 			try:
-				clear = _specClearTabularFile if self.spec else clearTabularFile
-				return clear(self.path, teeLogger=log, header=self.header, verifyHeader=self.strict,
-							 verbose=self.verbose, delimiter=self.delimiter) is not False
+				if self.spec:
+					return _specClearTabularFile(self.path, teeLogger=log, header=self.header, verifyHeader=self.strict,
+												 verbose=self.verbose, delimiter=self.delimiter) is not False
+				self._legacyHeaderNow(log)  # a strict mismatch is an error; else the file is left with the header given
+				return clearTabularFile(self.path, teeLogger=log, header=self.given, verifyHeader=False,
+										verbose=self.verbose, delimiter=self.delimiter) is not False
 			finally:
 				self.parts = None  # read again at the next request
 
@@ -7551,10 +7601,9 @@ class _ServeStore(object):
 				if self.spec:
 					return _specScrub(self.path, teeLogger=log, verifyHeader=False, verbose=self.verbose,
 									  strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)[1]
-				# The header the store is given is the file's: its first line stays the header (a scrub that checked
-				# none would read it as a key, and leave a store of deleted keys with 0 bytes).
-				return _legacyScrub(self.path, teeLogger=log, header=self.header, verifyHeader=True, verbose=self.verbose,
-									strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)[1]
+				# Line 1 is the header exactly when every read takes it for one, so the scrub keeps what they read.
+				return _legacyScrub(self.path, teeLogger=log, header=self._legacyHeaderNow(log), verifyHeader=True,
+									verbose=self.verbose, strict=self.strict, delimiter=self.delimiter, defaults=self.defaults)[1]
 			finally:
 				self.parts = None  # read again at the next request
 
@@ -7578,9 +7627,9 @@ class _ServeStore(object):
 			else:
 				codec = _fileCodec(self.path)
 				_requireCodec(codec)
-				header = None  # a file that holds nothing gets the header first (_appendOpen)
-				if any(self.header):
-					header = functools.partial(_encodeRow, _sanitize(self.header, delimiter=self.delimiter),
+				header = None  # a file that holds nothing gets the header given first (_appendOpen)
+				if any(self.given):
+					header = functools.partial(_encodeRow, _sanitize(self.given, delimiter=self.delimiter),
 											   self.delimiter, 'utf8', 'strict', what='header')
 				_lockedAppend(self.path, payload, 'newline', reporter, fsync=fsync, header=header, codec=codec)
 		finally:
@@ -8649,7 +8698,8 @@ options:
   -q, --quiet                  print errors only
   -v, --verbose                print more detail
   -d, --delimiter D            .tsv-family delimiter: tab, comma, pipe, null or one character
-  --x-header H                 header to check, or to create a new file with
+  --x-header H                 a .tsv's header: line 1 when it is H, else a row
+                               (--x-strict: an error); a new file begins with H
   --x-defaults D               defaults row KEY D1 D2 ... joined by the delimiter (KEY is ignored)
   --x-strict, --x-force        turn the 3.39 column and header checks on or off (default: off)
   --x-direct                   work on the files even when a server runs
@@ -8849,14 +8899,17 @@ def _cliTableCells(rows):
 	return [[_CLI_CONTROL_RE.sub(escape, str(cell)) for cell in row] for row in rows]
 
 
-def _cliEmitRows(rows, args, stdout, spec, delimiter, headerRow=False):
+def _cliEmitRows(rows, args, stdout, spec, delimiter, headerRow=False, header=None):
 	"""Print store rows for ``read`` / ``get`` (spec §20.4): §13 records, 3.39 records or a table.
 
 	The table shows the rows only, each padded to the widest and none truncated to the
 	terminal's width. ``headerRow`` keeps 3.39's ``read`` table of a loose file, whose
-	first row is the file's header line.
+	first row is the file's header line; ``header``, a loose file's header line that is not
+	a row (``--x-header``), is shown there instead. Records never hold it.
 	"""
 	if _cliFormat(args, stdout) == 'table':
+		if headerRow and header:
+			rows = [header] + rows
 		rows = _cliTableCells(rows)
 		if headerRow or not rows:
 			_cliWrite(stdout, pretty_format_table(rows, delimiter=delimiter) + '\n')
@@ -8987,16 +9040,16 @@ def _cliRequestLine(args):
 	return '\t'.join([args.operation] + [_serveEncode(arg) for arg in args.args])
 
 
-def _cliEmitServed(args, delimiter, logger, stdout, response):
+def _cliEmitServed(args, delimiter, logger, stdout, response, header=None):
 	"""Print a response (``(rows, diagnostics, status, message)``) as the operation prints on the files (§20.8);
-	return the exit status."""
+	return the exit status. ``header``: a loose file's header line in effect (``read``'s table shows it)."""
 	rows, diagnostics, status, message = response
 	for text in diagnostics:
 		logger.teelog(text, 'warning')
 	spec = _isSpecPath(args.store)
 	operation = args.operation
 	if operation in ('read', 'get', 'keys', 'pop', 'popitem', 'setdefault'):
-		_cliEmitRows(rows, args, stdout, spec, delimiter, headerRow=operation == 'read' and not spec)
+		_cliEmitRows(rows, args, stdout, spec, delimiter, headerRow=operation == 'read' and not spec, header=header)
 	elif operation == 'len':
 		_cliWrite(stdout, ''.join(row[0] + '\n' for row in rows))
 	elif operation == 'verify':
@@ -9061,8 +9114,7 @@ def _cliEngineOp(args, delimiter, logger, stdin, stdout):
 	store = _ServeStore(args.store, delimiter=delimiter, header=args.header, defaults=args.defaults,
 						strict=args.strict, teeLogger=logger, verbose=args.verbose,
 						create=not exists and operation != 'clear',  # clear creates the store itself
-						createDefaults=None if operation == 'setdefault' else [],
-						checkHeader=operation in ('set', 'append', 'delete', 'clear', 'scrub'), lazy=True)  # as 3.39 did (a scrub keeps the first line as the header)
+						createDefaults=None if operation == 'setdefault' else [], lazy=True)
 
 	def request(line, bulk=None):
 		"""The response to ``line``; the engine's messages go to stderr as they come, at their own level."""
@@ -9078,7 +9130,7 @@ def _cliEngineOp(args, delimiter, logger, stdin, stdout):
 		response = request('\t'.join(written + [_cliRequestLine(args)]), bulk)
 	finally:
 		store.close()
-	return _cliEmitServed(args, delimiter, logger, stdout, response)
+	return _cliEmitServed(args, delimiter, logger, stdout, response, header=store.header if any(store.header) else None)
 
 
 def _cliServe(args, delimiter, logger, stdin, stdout):
