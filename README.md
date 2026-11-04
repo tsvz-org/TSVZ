@@ -132,11 +132,16 @@ named like an operation then needs a path prefix (`./read`).
 - **TSVZ extensions:**
   - `--x-header H` and `--x-defaults KEY<d>D1<d>...` decode backslash escapes such as `\t`;
   - `--x-header H` makes line 1 of a `.tsv`-family file its header for every operation
-    when line 1 matches H (3.39's header check): it is never a key, row or count, and
-    `scrub` and `clear` keep it. When line 1 differs, the file has no header and line 1
-    is a row, with 3.39's "Header mismatch" warning (`--x-strict`: an error, exit 1,
-    nothing written). A missing or empty file gets H first. Without `--x-header`, line 1
-    is a row, as in 3.39;
+    when line 1 is H: the same number of cells, each equal to H's once the whitespace
+    around it is taken off (a trailing empty cell counts: `id\tv\t` is not `id\tv`). It
+    is then never a key, row or count, `scrub` and `clear` keep it, and
+    `read --format table` shows it above the rows. When line 1 differs, the file has no
+    header and line 1 is a row, with 3.39's "Header mismatch" warning (`--x-strict`: an
+    error, exit 1, nothing written). A missing or empty file gets H first. Without
+    `--x-header`, line 1 is a row, as in 3.39. (The library's own header check, a
+    `header=` given to `appendTabularFile`, `clearTabularFile` or `TSVZed`, is 3.39's,
+    looser one: each cell of H within the cell of line 1 under it, so `idaho\tvalue`
+    passes for `id\tv`.)
   - `--x-strict` / `--x-force` turn 3.39's column and header checks on or off.
 
 ## Serving a store
@@ -168,7 +173,12 @@ status stay the same.
 - **Bypassing it.** `--x-direct` makes a `tsvz` command use the files. Command
   lines with `--x-header`, `--x-defaults` or `--x-strict`, or another delimiter
   than the server's, use the files too. A server started with `--x-header H`
-  answers every request by the `--x-header` rule above.
+  answers every request by the `--x-header` rule above, and one started with
+  `--x-strict` too answers as a direct `--x-strict` command does: a line 1 that is
+  not H fails the request (status 1, nothing written), and reads and scrubs drop
+  the rows of another width. It does not start when line 1 is not H then. The
+  table of a routed `read --format table` shows no H line: its first row is set
+  as the table's header, as with no `--x-header`.
 
 ```python
 import TSVZ
@@ -236,7 +246,9 @@ microseconds as a write starts is followed as a rotation instead); while that re
 fails or is refused, the rows are appended to a new file there, and memory keeps all of
 them for the rewrite that gets through. A compressed file another writer left damaged
 is made again too (L5: every read stops at the damage, so rows
-appended after it would be read by no one); the bytes after the damage go. While that
+appended after it would be read by no one): what the read did not get goes, the bytes after
+the damage and also the lines of the damaged member before it that the codec never handed
+over (Python's gzip gives none of a first member cut short, where `zcat` shows them). While that
 rewrite fails, the rows are appended after the damage and memory keeps them for the
 next rewrite that gets through; while it is refused (a row changed in place to text
 the encoding cannot hold), they are appended after it as in 4.9, and the next read
@@ -335,17 +347,22 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   - on a file it cannot write (read-only), it prints `Failed to open file … Permission
     denied` twice and leaves the file as it is, as 5.1 did for a key with two values.
 - **`--x-header H` makes line 1 the header for every `tsvz` operation.** On a
-  `.tsv`-family file whose line 1 matches H (3.39's header check: each cell of H within
-  the cell under it), line 1 is the header: `keys`, `len`, `read`, `get`, `has`, `pop`,
-  `popitem` and `delete` never list, count, print, pop or delete it, and `scrub` and
-  `clear` keep it.
-  When line 1 differs, the file has no header and line 1 is a row, with 3.39's
-  "Header mismatch" warning, for the reads and the scrub alike, so a scrub
-  keeps exactly the rows a read shows; with `--x-strict` that is an error (exit 1, nothing
-  written) for every operation. A missing or empty file gets H first at its first write,
-  as in 5.1. A `tsvz serve STORE --x-header H` handler applies the rule to every request
-  it answers, routed `tsvz` commands included. In 5.1 only `set`, `append`, `delete` and
-  `clear` used `--x-header`: the reads and `scrub` took line 1 as a row (`tsvz keys`
+  `.tsv`-family file whose line 1 is H (an exact match: the same cells, each without the
+  whitespace around it, a trailing empty cell included), line 1 is the header: `keys`,
+  `len`, `read`, `get`, `has`, `pop`, `popitem` and `delete` never list, count, print,
+  pop or delete it, and `scrub` and `clear` keep it. When line 1 differs, the file has no
+  header and line 1 is a row, with 3.39's "Header mismatch" warning, for the reads and
+  the scrub alike, so a scrub keeps the rows a read shows (but for the column-width cases
+  below), and in such a file it never writes a row that is H as line 1: it puts an empty
+  line first (`a\t1\nid\tv\na\t\n` becomes `\nid\tv\n`), so the reads still take that row
+  for a row. With `--x-strict` a line 1 that is not H is an error (exit 1, nothing
+  written) for every operation, through a handler too. A missing or empty file gets H
+  first at its first write, as in 5.1. A `tsvz serve STORE --x-header H` handler applies
+  the rule to every request it answers, routed `tsvz` commands included; with
+  `--x-strict` it is strict for them as above (5.1 ignored `--x-strict` at `serve`). The
+  library's own header check (`header=` to `appendTabularFile`, `clearTabularFile`,
+  `scrubTabularFile`, `TSVZed`) is unchanged, 3.39's containment check. In 5.1 only
+  `set`, `append`, `delete` and `clear` used `--x-header`: the reads and `scrub` took line 1 as a row (`tsvz keys`
   printed `id a b` for two keys, `len` said 3, `popitem first` popped the header), and
   so did every request to a handler. Without `--x-header` nothing changed: line 1 is a
   row, as in 5.1 and 3.39. In a `.tsvz` store `pop`, `popitem` and `setdefault` now check
