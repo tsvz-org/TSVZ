@@ -20,7 +20,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     `flock` systems appends too; an inherited write lock holds off reads as well). 3.7 and later drop it in the
     child;
   - where only `lockf` works (on Linux, a kernel or file system that refuses open file description locks: a kernel
-    before 3.15, or an unpatched RHEL 7 3.10 kernel, which has them backported once updated; elsewhere, a file
+    before 3.15, or a RHEL/CentOS 7 kernel older than 3.10.0-704, i.e. 7.0 to 7.4's own: the backport is in
+    3.10.0-704, and 7.9's 3.10.0-1160 has them, checked on CentOS 7.9; elsewhere, a file
     system that refuses `flock`), readers take no lock, because a shared `lockf` would replace the process's own
     write lock; there a delete can still be lost, a read in another thread of the process can still drop a write's
     lock, and two threads' writes do not exclude each other (a new file's header can be written twice), as in 5.2;
@@ -33,7 +34,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-11-02, the user chose "One known limitation (Recommended)" for older writers that empty the file
   before or without the lock, readers from 5.1 and earlier, and Python 3.6 forks, and "Keep lockf (Recommended)"
   for Linux without open file description locks; 2026-11-04, "Accept the wider entry (Recommended)" for this
-  wording (readers from 5.2 and earlier, `lockf`-only hosts and Windows folded in).
+  wording (readers from 5.2 and earlier, `lockf`-only hosts and Windows folded in); 2026-11-04, "Correct the wording
+  (Recommended)" for the RHEL/CentOS 7 kernel range found on the EL7 test VM.
 
 ### Reads by 5.3 programs can hold off a 3.39 to 5.2 writer
 - Kind: known limitation
