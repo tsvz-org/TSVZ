@@ -12410,3 +12410,140 @@ def test_strict_legacy_stores_judge_the_width_after_dropping_empty_cells_past_it
 	assert 'does not have the correct number of columns' in ''.join(capsys.readouterr())
 	t.close()
 	assert open(p, 'rb').read() == b'id\tv\nz\t9\na\t1\n'
+
+
+# --- 5.5: TSVZed loads (L, R6, Q-D5) ---
+def _quiet_tsvzed(p, **kwargs):
+	kwargs.setdefault('rewrite_on_load', False)
+	kwargs.setdefault('rewrite_on_exit', False)
+	kwargs.setdefault('monitor_external_changes', False)
+	return TSVZ.TSVZed(p, **kwargs)
+
+
+@pytest.mark.parametrize('text', [b'a\nb\nc\n', b'a\nb\nc\nb\t\n'])
+def test_tsvzed_reads_a_one_column_files_lone_keys_as_rows(tmp_path, text):
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, text)
+	t = _quiet_tsvzed(p)
+	try:
+		assert dict(t) == dict(TSVZ.readTabularFile(p, strict=False))
+		assert list(t) == ['a', 'b', 'c'] and t['a'] == ['a']
+		assert t['b'] == (['b', ''] if text.endswith(b'b\t\n') else ['b'])  # (W 1: `b\t` is a row)
+	finally:
+		t.close()
+
+
+@pytest.mark.parametrize('defaults', [None, ['#_defaults_#', 'Y']])
+def test_tsvzed_and_readTabularFile_agree_on_a_one_column_file_with_a_defaults_line(tmp_path, defaults):
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, b'a\n#_defaults_#\tX\nb\t\n')
+	kwargs = {} if defaults is None else {'defaults': defaults}
+	t = _quiet_tsvzed(p, **kwargs)
+	try:
+		read = TSVZ.readTabularFile(p, strict=False, **kwargs)
+		assert dict(t) == {k: [c.rstrip() for c in v] for k, v in read.items()}
+	finally:
+		t.close()
+
+
+def test_tsvzed_fills_a_whitespace_only_cell_with_the_defaults_as_5_4(tmp_path):
+	# A read right-strips every cell, so a cell of spaces is empty as read (`k\t  ` is a deletion); a cell that is
+	# whitespace once unescaped (`<LF>`) is not, and TSVZed's own right-strip empties it: it takes the default (5.4).
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, b'id\tv\n#_defaults_#\tNA\nk\t<LF>\n')
+	t = _quiet_tsvzed(p, header='id\tv')
+	try:
+		assert dict(t) == {'k': ['k', 'NA']}
+		t.reload()
+		assert dict(t) == {'k': ['k', 'NA']}
+	finally:
+		t.close()
+	_touch(p, b'id\tv\nk\t<LF>\n')
+	t = _quiet_tsvzed(p, header='id\tv')
+	try:
+		assert dict(t) == {'k': ['k', '']}  # no defaults in effect: as 5.4
+	finally:
+		t.close()
+
+
+def test_tsvzed_follows_an_appended_whitespace_only_cell_with_the_defaults(tmp_path):
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, b'id\tv\n#_defaults_#\tNA\nj\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, rewrite_on_exit=False, append_check_delay=0.01)
+	try:
+		with open(p, 'ab') as f:
+			f.write(b'k\t<LF>\n')  # another process appends
+		assert _wait_for(lambda: 'k' in t)
+		assert t['k'] == ['k', 'NA']
+	finally:
+		t.close()
+
+
+@pytest.mark.parametrize('how', ['close', 'hardMapToFile'])
+def test_tsvzed_memory_dump_writes_a_whitespace_cell_filled_with_the_defaults_never_a_deletion(tmp_path, how):
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, b'id\tv\n#_defaults_#\tNA\nk\t<LF>\nj\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=0.01)
+	t.move_to_end('k')  # memory's order is written: the dump
+	if how == 'close':
+		t.close()
+	else:
+		t.hardMapToFile()
+		t.close()
+	assert b'k\tNA\n' in _bytes(p) and b'k\t\n' not in _bytes(p)
+	t = _quiet_tsvzed(p, header='id\tv')
+	try:
+		assert t['k'] == ['k', 'NA']
+	finally:
+		t.close()
+
+
+def test_a_whole_reload_starts_from_the_defaults_the_program_gave(tmp_path):
+	p = str(tmp_path / 'd.tsv')
+	text = b'#_defaults_#\na\tX\nb\n'
+	_touch(p, text)
+	t = TSVZ.TSVZed(p, defaults=['#_defaults_#', 'P'], rewrite_on_load=False, rewrite_on_exit=False,
+					monitor_external_changes=False)
+	try:
+		assert dict(t) == {'a': ['a', 'X']}
+		time.sleep(0.05)
+		_touch(p, b'#c\n' + text)  # another process rewrites it, a comment line inserted (not an append)
+		t.checkExternalChanges()
+		t._call(t._syncFile)
+		assert dict(t) == {'a': ['a', 'X']}
+		t.reload()
+		assert dict(t) == {'a': ['a', 'X']}
+		t.setDefaults(['#_defaults_#', 'Q'])
+		_touch(p, b'a\tX\nb\t\t1\n')
+		t.reload()
+		assert dict(t) == {'a': ['a', 'X'], 'b': ['b', 'Q', '1']}  # read with the defaults it gave last
+	finally:
+		t.close()
+
+
+def test_tsvzed_column_count_after_a_load_is_the_one_the_read_took(tmp_path):
+	p = str(tmp_path / 'c.tsv')
+	_touch(p, b'a\t1\na\t\nb\t1\t2\n')
+	t = _quiet_tsvzed(p)
+	try:
+		assert t.correctColumnNum == 2 and t['b'] == ['b', '1', '2']  # 5.4: 3, the first row's length
+	finally:
+		t.close()
+	t = _quiet_tsvzed(p, strict=True)
+	try:
+		t['c'] = ['c', '1']
+		assert t['c'] == ['c', '1']
+	finally:
+		t.close()
+
+
+@pytest.mark.parametrize('text, row', [(b'id\tv\na\t1\t2\nb\t1\nb\t\n', ['a', '1', '2']),
+									   (b'id\tv\na\t\t7\nb\t1\nb\t\n', ['a', '', '7'])])
+def test_tsvzed_open_keeps_a_wide_row_whole_in_memory(tmp_path, text, row):
+	p = str(tmp_path / 'e7.tsv')
+	_touch(p, text)
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.01)
+	try:
+		assert dict(t) == {'a': row}
+	finally:
+		t.close()

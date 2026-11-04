@@ -4731,12 +4731,11 @@ class _TSVZedLoad(OrderedDict):
 		key = str(key).rstrip()
 		if not key:
 			return None
-		shaped = self.owner._shapeRow(key, value, self.columns, self.defaults)
+		shaped = self.owner._shapeRow(key, value, self.columns, self.defaults, load=True)
 		if shaped is None:
 			return None
 		value, columns = shaped
-		if self.columns != 1 and len(value) == 1:
-			return key, None
+		# (a read hands a lone key over only as a row, in a 1-column file; it deletes through __delitem__)
 		self.columns = columns
 		if key == DEFAULTS_INDICATOR_KEY:
 			self.defaults[:] = value
@@ -4979,6 +4978,10 @@ class TSVZed(OrderedDict):
 		self.header = _formatHeader(header,verbose = verbose,teeLogger = self.teeLogger,delimiter=self.delimiter)
 		_checkRow(self.header, self.delimiter, self.encoding, self.errors, what='header')  # before a thread or a file exists
 		self.correctColumnNum = correctColumnNum
+		# A whole read of a legacy file starts from the column count and defaults the program gave (the last
+		# setDefaults()'s), never from those a previous read ended with.
+		self._givenColumns = correctColumnNum
+		self._givenDefaults = list(self.defaults)
 		self.createIfNotExist = createIfNotExist
 		self.verifyHeader = verifyHeader
 		if rewrite_on_load is ...:
@@ -5039,6 +5042,7 @@ class TSVZed(OrderedDict):
 			# #_defaults_#, so new defaults are written as that marker.
 			self._specSetMarker(DEFAULTS_INDICATOR_KEY, defaults)
 			return
+		self._givenDefaults = list(defaults)  # (the defaults a whole read starts from)
 		if not self._constructed:
 			self.defaults = defaults
 			return
@@ -5289,20 +5293,31 @@ class TSVZed(OrderedDict):
 		# else:
 		#     self.appendEvent.set()
 
-	def _shapeRow(self, key, value, columns, defaults):
+	def _shapeRow(self, key, value, columns, defaults, load=False):
 		"""The row ``__setitem__`` keeps for ``key`` (stripped, not empty) and the column count after it; None when strict refuses it.
 
 		A row of the key alone, while ``columns`` is not 1, is a delete; it is returned as it is. What reload()
-		reads into shapes its rows with it too, with its own column count and defaults.
+		reads into shapes its rows with ``load=True``, with its own column count and defaults: a row a read hands over,
+		which the read fitted (padded, never cut) and checked, so it is only right-stripped; a cell the strip empties
+		(whitespace only) takes the default for it, as 5.4 filled it, and a cell the read left empty stays so.
 		"""
 		if isinstance(value,str):
 			value = value.split(self.delimiter)
 		# sanitize the value
+		emptied = [bool(s) and not str(s).rstrip() for s in value] if load else None
 		value = [str(s).rstrip() if s else '' for s in value]
 		# the first field in value should be the key
 		# add it if it is not there
 		if not value or value[0] != key:
 			value = [key]+value
+			if load:
+				emptied.insert(0, False)
+		if load:
+			if defaults and len(defaults) > 1:
+				for i in range(1, min(len(value), len(defaults))):
+					if emptied[i] and defaults[i]:
+						value[i] = defaults[i]
+			return value, (columns if columns > 0 else len(value))
 		if columns != 1 and len(value) == 1:
 			return value, columns
 		# verify the value has the correct number of columns
@@ -6101,8 +6116,8 @@ memoryOnly:{self.memoryOnly}
 					return line, False
 			defaults = list(self.defaults)
 			changes = _TSVZedMerge(self, self.correctColumnNum, list(defaults))
-			_legacyReadLoop(io.BytesIO(rest), '', changes, self.correctColumnNum, 0, self.strict, self.delimiter,
-							changes.defaults, False, self.encoding, reporter)
+			width = _legacyReadLoop(io.BytesIO(rest), '', changes, self.correctColumnNum, 0, self.strict, self.delimiter,
+									changes.defaults, False, self.encoding, reporter)[0]
 		finally:
 			reporter.flush()
 		with self._memLock:
@@ -6127,7 +6142,7 @@ memoryOnly:{self.memoryOnly}
 			if changes.defaults != defaults and DEFAULTS_INDICATOR_KEY not in queued:
 				self.defaults = changes.defaults
 			if self.correctColumnNum == -1 and self:
-				self.correctColumnNum = len(self[next(iter(self))])
+				self.correctColumnNum = width if width > 0 else len(self[next(iter(self))])
 		if self.verbose:
 			self.__teePrintOrNot(f"Read what another process appended to {self._fileName}: {len(self)} records")
 		return None, bool(damage)
@@ -6137,7 +6152,8 @@ memoryOnly:{self.memoryOnly}
 		read apart from memory, then memory is changed in place under _memLock, never emptied (a key the file still
 		holds is never missing for another thread) and takes the file's order. _known is then the bytes read."""
 		seen = getFileUpdateTimeNs(self._fileName)  # before the read: a change during or after it is seen by the next check
-		loaded = _TSVZedLoad(self, self.correctColumnNum, list(self.defaults))
+		loaded = _TSVZedLoad(self, self._givenColumns, list(self._givenDefaults))  # (as the first read did)
+		width = -1
 		known = _KNOWN_NOTHING
 		damaged = False
 		if f is not None:
@@ -6156,8 +6172,8 @@ memoryOnly:{self.memoryOnly}
 						start = _legacyReadHeader(stream, self._fileName, self.header, self.verifyHeader, self.verbose,
 												  self.teeLogger, self.strict, self.delimiter, -1, self.encoding, reporter)
 						if start is not None:
-							_legacyReadLoop(stream, self._fileName, loaded, start[0], start[1], self.strict, self.delimiter,
-											loaded.defaults, False, self.encoding, reporter)
+							width = _legacyReadLoop(stream, self._fileName, loaded, start[0], start[1], self.strict,
+													self.delimiter, loaded.defaults, False, self.encoding, reporter)[0]
 					finally:
 						if codec:
 							stream.close()
@@ -6183,6 +6199,8 @@ memoryOnly:{self.memoryOnly}
 				self.dirty = True  # a key the file holds twice
 			if self.header and any(self.header) and self.verifyHeader:
 				self.correctColumnNum = len(self.header)
+			elif width > 0:
+				self.correctColumnNum = width  # the column count the read took (a row read whole can be wider)
 			elif self:
 				self.correctColumnNum = len(self[next(iter(self))])
 			else:
