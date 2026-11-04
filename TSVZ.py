@@ -1032,8 +1032,8 @@ def _pathLock(path):
 #: changes bytes already written, and by a read again after damage.
 _READ, _APPEND, _REWRITE = 'read', 'append', 'rewrite'
 
-#: How files are locked between processes: 'ofd', Linux open file description locks in byte ranges (READ: byte 2, the
-#: gate, shared until byte 0 is held shared; APPEND: byte 1; REWRITE: byte 1, the gate, then the whole file); 'flock', whole-file flock (READ shared, else
+#: How files are locked between processes: 'ofd', Linux open file description locks in byte ranges (READ: byte 0
+#: shared; APPEND: byte 1; REWRITE: byte 1, then the whole file); 'flock', whole-file flock (READ shared, else
 #: exclusive) on other POSIX systems; 'lockf', process-owned, where neither works (readers then take no lock); None
 #: on Windows (msvcrt, writers only). A writer whose lock is refused falls back to lockf for that descriptor.
 _LOCK_KIND = ('ofd' if sys.platform.startswith('linux') else 'flock') if os.name == 'posix' else None
@@ -1105,12 +1105,9 @@ def _lockFile(f, mode=_REWRITE):
 	"""Lock the open file ``f`` for ``mode`` (_READ, _APPEND, _REWRITE), waiting for it; True when it is locked.
 
 	On Linux the lock belongs to the open file description, in byte ranges
-	(spec §18.6): READ byte 0 shared, passing through the gate (byte 2, held
-	shared only until byte 0 is), APPEND byte 1, REWRITE byte 1, then the gate,
-	then the whole file. Appends never wait for readers; a rewrite waits for
-	both, and while it waits no new append or read starts, so the reads in
-	flight finish and overlapping reads cannot hold it off (Linux grants new
-	shared locks while an exclusive one waits). On other
+	(spec §18.6): READ byte 0 shared, APPEND byte 1, REWRITE byte 1 and then
+	the whole file, so appends never wait for readers, a rewrite waits for both,
+	and no new append starts while it waits for the reads in flight. On other
 	POSIX systems it is a whole-file flock (READ shared). Neither is dropped
 	when another descriptor of the file closes in this process, and both
 	exclude other threads. Every 3.39 to 5.2 lock (one exclusive whole-file
@@ -1139,12 +1136,9 @@ def _lockFile(f, mode=_REWRITE):
 		try:
 			if kind == 'ofd':
 				if mode == _READ:
-					ok = _ofdLock(f, fcntl.F_RDLCK, 2, 1) and _ofdLock(f, fcntl.F_RDLCK, 0, 1)
-					if ok:
-						_ofdLock(f, fcntl.F_UNLCK, 2, 1)  # through the gate
+					ok = _ofdLock(f, fcntl.F_RDLCK, 0, 1)
 				else:
-					ok = _ofdLock(f, fcntl.F_WRLCK, 1, 1) and (mode == _APPEND or (
-						_ofdLock(f, fcntl.F_WRLCK, 2, 1) and _ofdLock(f, fcntl.F_WRLCK)))
+					ok = _ofdLock(f, fcntl.F_WRLCK, 1, 1) and (mode == _APPEND or _ofdLock(f, fcntl.F_WRLCK))
 			elif kind == 'flock':
 				try:
 					fcntl.flock(fd, fcntl.LOCK_SH if mode == _READ else fcntl.LOCK_EX)
@@ -1169,11 +1163,6 @@ def _lockFile(f, mode=_REWRITE):
 	except BaseException:
 		if _HELD.get(fd) is entry:
 			del _HELD[fd]
-		if kind == 'ofd':
-			try:
-				_ofdLock(f, fcntl.F_UNLCK)  # a Ctrl-C in a later step: the bytes taken before it (byte 1, the gate)
-			except BaseException:
-				pass
 		raise
 	return True
 
