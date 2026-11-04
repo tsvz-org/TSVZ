@@ -449,6 +449,8 @@ def check_live_old(text, args, res):
 					o.reload()  # (3.39 follows by reading again)
 			after = view_of(o)
 			width = max([len(r) for _, r in before] or [2])
+			if getattr(o, 'correctColumnNum', -1) > 1:  # (the store's own width: a strict store refuses another one)
+				width = o.correctColumnNum
 			o['zz'] = ['zz'] + ['9'] * (max(width, 2) - 1)
 			o.commitAppendToFile() if hasattr(o, 'commitAppendToFile') else None
 		finally:

@@ -21,6 +21,7 @@ import errno
 import functools
 import hashlib
 import io
+import itertools
 import os
 import re
 import shutil
@@ -525,15 +526,17 @@ class _LinesFile(object):
 		return self._pos
 
 
-def _fileDefaultsAtEnd(lines, width, delimiter, encoding):
+def _fileDefaultsAtEnd(lines, width, delimiter, encoding, consumed, strict):
 	"""The defaults the legacy ``lines`` themselves leave in effect at their end, read from none: their #_defaults_#
-	lines alone, in order, through _processLine at ``width``, not strict. [] when they have none."""
+	lines alone, in order, through _processLine at ``width`` and ``strict``, as a store's reader takes them; line 1
+	left out when that reader takes it for its header (``consumed``). Without the empty cells at the end; [] when they
+	set none."""
 	defaults = []
 	enc = encoding or 'utf8'
-	for line in lines:
+	for line in (itertools.islice(lines, 1, None) if consumed else lines):
 		if line.lstrip(b'\x00').startswith(DEFAULTS_INDICATOR_KEY.encode(enc)):
-			_processLine(line.decode(enc, errors='replace'), {}, width, strict=False, delimiter=delimiter, defaults=defaults)
-	return defaults
+			_processLine(line.decode(enc, errors='replace'), {}, width, strict=strict, delimiter=delimiter, defaults=defaults)
+	return _trimmedCells(defaults)
 
 
 def _trimmedCells(cells):
@@ -6231,12 +6234,19 @@ memoryOnly:{self.memoryOnly}
 				return None
 			tail = [_encodeRow(_sanitize([key] + [''] * (diffWidth - 1),delimiter=delimiter),delimiter,encoding,errors,self.header)
 					for key in gone]
-			own = _trimmedCells(_fileDefaultsAtEnd(kept, diffWidth, delimiter, encoding))
+			own = _fileDefaultsAtEnd(kept, diffWidth, delimiter, encoding, consumed, self.strict)
+			line = None
 			if any(want[1:]):
 				if _trimmedCells(want) != own:
-					tail.append(_encodeRow(_sanitize(want,delimiter=delimiter),delimiter,encoding,errors,what='defaults'))
+					line = _encodeRow(_sanitize(want,delimiter=delimiter),delimiter,encoding,errors,what='defaults')
 			elif any(own[1:]):
-				tail.append(_encodeRow([DEFAULTS_INDICATOR_KEY],delimiter,encoding,errors,what='defaults'))  # (a reset)
+				line = _encodeRow([DEFAULTS_INDICATOR_KEY],delimiter,encoding,errors,what='defaults')  # (a reset)
+			# Appended only when the file then ends with them for the store's reader: a line that reader does not take
+			# (a reset at column count 1 is a row there; strict drops a line of another width) would be appended again
+			# at every rewrite.
+			if line is not None and _fileDefaultsAtEnd(itertools.chain(kept, (line,)), diffWidth, delimiter, encoding,
+														consumed, self.strict) == (_trimmedCells(want) if any(want[1:]) else [DEFAULTS_INDICATOR_KEY]):
+				tail.append(line)
 			rows = _CompactRows(kept, values, delimiter, encoding, errors, self.header, tail=tail)
 			del values
 			rows.check()

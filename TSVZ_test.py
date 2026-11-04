@@ -13071,3 +13071,31 @@ def test_keys_gone_from_a_one_column_store_another_way_are_written_by_the_dump(t
 	t.hardMapToFile()
 	t.close()
 	assert TSVZ.readTabularFile(p) == {}
+
+
+def test_tsvzed_rewrite_reads_the_files_defaults_without_the_line_its_header_takes(tmp_path):
+	# (fuzzer, 7c/7i) line 1 `#_defaults_#\t1` is the header to a store given one: it sets no defaults for it, so the
+	# rewrite appends no reset, once or at every rewrite.
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'#_defaults_#\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	t.hardMapToFile()
+	t.hardMapToFile()
+	t.close()
+	assert _bytes(p) == b'#_defaults_#\t1\n'
+
+
+@pytest.mark.parametrize('text, strict, defaults', [(b'\na\n#_defaults_#\t1\n', True, None),
+													 (b'a\n#_defaults_#\t1\n', False, [])])
+def test_tsvzed_rewrite_appends_no_defaults_line_its_own_reader_would_not_take(tmp_path, text, strict, defaults):
+	# (fuzzer, 7i) at column count 1 a reset is a row, and strict drops a defaults line of another width: such a line
+	# would be appended again at every rewrite.
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, text)
+	t = TSVZ.TSVZed(p, strict=strict, rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	if defaults is not None:
+		t.setDefaults(defaults)
+	t.hardMapToFile()
+	t.hardMapToFile()
+	t.close()
+	assert _bytes(p) == text
