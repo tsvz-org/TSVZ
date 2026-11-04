@@ -1758,26 +1758,34 @@ def _read_last_valid_line_forward(fileName, taskDic, correctColumnNum, verbose=F
 	delimiter = get_delimiter(delimiter, file_name=fileName)
 	last_valid = -1 if storeOffset else []
 	scratch = {}
-	with _readLock(fileName), openFileAsCompressed(fileName, 'rb', encoding=encoding, teeLogger=teeLogger) as file:
-		while True:
-			offset = file.tell()
-			line = file.readline()
-			if not line:
-				break
-			if not line.strip():
-				continue
-			correctColumnNum, lineCache = _processLine(
-				line=line.decode(encoding=encoding, errors='replace'),
-				taskDic=scratch,
-				correctColumnNum=correctColumnNum,
-				strict=strict,
-				delimiter=delimiter,
-				defaults=defaults,
-				storeOffset=storeOffset,
-				offset=offset,
-			)
-			if lineCache:
-				last_valid = offset if storeOffset else lineCache
+	reporter = _Reporter(fileName, teeLogger)
+	try:
+		with _readLock(fileName), openFileAsCompressed(fileName, 'rb', encoding=encoding, teeLogger=teeLogger) as file:
+			while True:
+				offset = file.tell()
+				try:
+					line = file.readline()
+				except _DamagedStream as e:  # raised at the end of the text: every member that checks out was read (L5)
+					reporter.note('damaged', None, _streamDamage(e))
+					break
+				if not line:
+					break
+				if not line.strip():
+					continue
+				correctColumnNum, lineCache = _processLine(
+					line=line.decode(encoding=encoding, errors='replace'),
+					taskDic=scratch,
+					correctColumnNum=correctColumnNum,
+					strict=strict,
+					delimiter=delimiter,
+					defaults=defaults,
+					storeOffset=storeOffset,
+					offset=offset,
+				)
+				if lineCache:
+					last_valid = offset if storeOffset else lineCache
+	finally:
+		reporter.flush()
 	return last_valid
 
 def read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=False, teeLogger=None, strict=False,
