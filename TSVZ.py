@@ -1023,62 +1023,179 @@ def _pathLock(path):
 		return lock
 
 
-#: Linux open file description lock commands (spec §18.6), when this platform has them; None once they fail.
+#: The lock modes of ``_lockFile`` (spec §18.6): READ, taken by readers that make state out of the file, shared, for the
+#: read (``_readLock``); APPEND, taken by appends and by the making of a missing file; REWRITE, taken by anything that
+#: changes bytes already written, and by a read again after damage.
+_READ, _APPEND, _REWRITE = 'read', 'append', 'rewrite'
+
+#: How files are locked between processes: 'ofd', Linux open file description locks in byte ranges (READ: byte 0
+#: shared; APPEND: byte 1; REWRITE: byte 1, then the whole file); 'flock', whole-file flock (READ shared, else
+#: exclusive) on other POSIX systems; 'lockf', process-owned, where neither works (readers then take no lock); None
+#: on Windows (msvcrt, writers only). A writer whose lock is refused falls back to lockf for that descriptor.
+_LOCK_KIND = ('ofd' if sys.platform.startswith('linux') else 'flock') if os.name == 'posix' else None
+
+#: The Linux open file description lock commands: (wait, no wait).
 _OFD_COMMANDS = ((getattr(fcntl, 'F_OFD_SETLKW', 38), getattr(fcntl, 'F_OFD_SETLK', 37))
 				 if os.name == 'posix' and sys.platform.startswith('linux') else None)
 
 
-def _ofdLock(f, kind):
-	"""Set an exclusive (``fcntl.F_WRLCK``) or no (``fcntl.F_UNLCK``) whole-file lock owned by the open file
-	description. Returns False when the kernel lacks such locks (before Linux 3.15)."""
-	if _OFD_COMMANDS is None:
-		return False
+def _ofdLock(f, kind, start=0, length=0):
+	"""Set a shared (``fcntl.F_RDLCK``), exclusive (``fcntl.F_WRLCK``) or no (``fcntl.F_UNLCK``) lock owned by the
+	open file description on ``length`` bytes from ``start`` (0: to the end, whatever it grows to), waiting for it.
+	Returns False when the kernel lacks such locks (EINVAL: before Linux 3.15, or a file system without them)."""
 	import struct
 	# struct flock: l_type, l_whence, l_start, l_len, l_pid (0 for these locks); trailing padding added.
-	request = struct.pack('@hhqqi', kind, os.SEEK_SET, 0, 0, 0) + b'\0' * 8
+	request = struct.pack('@hhqqi', kind, os.SEEK_SET, start, length, 0) + b'\0' * 8
 	try:
-		fcntl.fcntl(f.fileno(), _OFD_COMMANDS[0] if kind == fcntl.F_WRLCK else _OFD_COMMANDS[1], request)
+		fcntl.fcntl(f.fileno(), _OFD_COMMANDS[1] if kind == fcntl.F_UNLCK else _OFD_COMMANDS[0], request)
 	except OSError as e:
-		if e.errno != errno.EINVAL:  # EINVAL: a kernel before 3.15, or a file system without them
+		if e.errno != errno.EINVAL:
 			raise
 		return False
 	return True
 
 
-#: Descriptors locked with lockf because their open file description lock was refused: unlocked the same way.
-_LOCKF_FDS = set()
+#: The descriptors TSVZ holds a lock on: fd -> [kind ('ofd', 'flock' or 'lockf': how it is unlocked), the file's
+#: _fileIdentity, the locking thread's _heldHere() set, a weak reference to the file object]. Entered before the
+#: lock call, left at the unlock, so a fork at any moment finds every lock the child could inherit (_locksAfterFork).
+_HELD = {}
+_THREAD_HELD = threading.local()
+
+
+def _heldHere():
+	"""The _fileIdentity of every file this thread holds a TSVZ lock on: a read of one takes no lock (_readLock)."""
+	keys = getattr(_THREAD_HELD, 'keys', None)
+	if keys is None:
+		keys = _THREAD_HELD.keys = set()
+	return keys
 
 
 def _locksAfterFork():
-	"""In a forked child: the threads that held a path's in-process lock (``_pathLock``) at the fork are
-	not there to release it, and the parent's lockf locks are not inherited."""
-	global _PATH_LOCKS_GUARD
+	"""In a forked child: the threads that held a path's in-process lock (``_pathLock``) at the fork are not there to
+	release it, and the parent's lockf locks are not inherited. Its open file description and flock locks are: each
+	descriptor that holds one is pointed at /dev/null, so the child holds none and the parent's lock is as it was (a
+	copy of a get_file_obj() holder then fails its writes with EBADF)."""
+	global _PATH_LOCKS_GUARD, _THREAD_HELD
 	_PATH_LOCKS_GUARD = threading.Lock()
 	_PATH_LOCKS.clear()
-	_LOCKF_FDS.clear()
+	held = list(_HELD.items())
+	_HELD.clear()
+	_THREAD_HELD = threading.local()
+	inherited = [fd for fd, (kind, _, _, ref) in held if kind != 'lockf' and ref() is not None and not ref().closed]
+	if inherited:
+		null = os.open(os.devnull, os.O_RDONLY)
+		try:
+			for fd in inherited:
+				os.dup2(null, fd)
+		finally:
+			os.close(null)
 
 
 if hasattr(os, 'register_at_fork'):  # Python 3.7+
 	os.register_at_fork(after_in_child=_locksAfterFork)
 
 
-def _lockFile(f):
-	"""Take the exclusive whole-file lock that 3.39 writers take.
+def _lockFile(f, mode=_REWRITE):
+	"""Lock the open file ``f`` for ``mode`` (_READ, _APPEND, _REWRITE), waiting for it; True when it is locked.
 
-	On Linux it belongs to the open file description (spec §18.6), so closing
-	another descriptor of the file in this process does not drop it; it still
-	excludes the process-owned lockf of other writers. Elsewhere, or when the
-	kernel refuses it, it is lockf, which closing any descriptor of the file in
-	this process drops (README: a known limitation).
+	On Linux the lock belongs to the open file description, in byte ranges
+	(spec §18.6): READ byte 0 shared, APPEND byte 1, REWRITE byte 1 and then
+	the whole file, so appends never wait for readers, a rewrite waits for both,
+	and no new append starts while it waits for the reads in flight. On other
+	POSIX systems it is a whole-file flock (READ shared). Neither is dropped
+	when another descriptor of the file closes in this process, and both
+	exclude other threads. Every 3.39 to 5.2 lock (one exclusive whole-file
+	lockf or open file description lock) excludes every mode, and is excluded.
+	A writer's lock the kernel or file system refuses falls back to lockf, which
+	closing any descriptor of the file in this process drops; a READ is then
+	not taken (a shared lockf would replace this process's own write lock), nor
+	when its lock fails in any way: False, and the read goes on unlocked.
+	Windows: msvcrt for writers (from the raw position: see _seekRawStart),
+	nothing for READ. Unlock with _unlockFile, before the file is closed.
 	"""
-	if os.name == 'posix':
-		if _ofdLock(f, fcntl.F_WRLCK):
-			_LOCKF_FDS.discard(f.fileno())
-		else:
-			fcntl.lockf(f, fcntl.LOCK_EX)
-			_LOCKF_FDS.add(f.fileno())
-	elif os.name == 'nt':
+	if os.name == 'nt':
+		if mode == _READ:
+			return False
 		msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 2147483647)
+		return True
+	if os.name != 'posix':
+		return False
+	kind = _LOCK_KIND
+	if mode == _READ and kind not in ('ofd', 'flock'):
+		return False
+	fd = f.fileno()
+	key = _fileIdentity(os.fstat(fd))
+	here = _heldHere()
+	entry = [kind, key, here, weakref.ref(f)]
+	stale = _HELD.get(fd)
+	if stale is not None:
+		stale[2].discard(stale[1])  # its file was closed without an unlock: the lock went with it
+	_HELD[fd] = entry  # before the lock call: a fork from now on finds it
+	try:
+		try:
+			if kind == 'ofd':
+				if mode == _READ:
+					ok = _ofdLock(f, fcntl.F_RDLCK, 0, 1)
+				else:
+					ok = _ofdLock(f, fcntl.F_WRLCK, 1, 1) and (mode == _APPEND or _ofdLock(f, fcntl.F_WRLCK))
+			elif kind == 'flock':
+				try:
+					fcntl.flock(fd, fcntl.LOCK_SH if mode == _READ else fcntl.LOCK_EX)
+					ok = True
+				except OSError as e:
+					if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL):
+						raise
+					ok = False
+			else:
+				ok = False
+		except OSError:
+			if mode == _READ:
+				ok = False
+			else:
+				raise
+		if not ok:
+			if mode == _READ:
+				_HELD.pop(fd, None)
+				return False
+			fcntl.lockf(f, fcntl.LOCK_EX)
+			entry[0] = 'lockf'
+	except BaseException:
+		if _HELD.get(fd) is entry:
+			del _HELD[fd]
+		raise
+	here.add(key)
+	return True
+
+
+@contextlib.contextmanager
+def _readLock(path):
+	"""Hold the READ lock (_lockFile) on the file ``path`` for the ``with`` block: a rewrite by another process (or
+	thread) that holds the file's lock is waited out, so the read never meets it part way. Taken on a descriptor of
+	its own, so the reader opens the file as before. Not taken when this thread holds a TSVZ lock on the file
+	already (it would wait for itself), where readers do not lock (lockf, Windows), or when the file cannot be
+	opened or locked: the read goes on unlocked, and its own open raises what it raises. A Ctrl-C ends the wait."""
+	if _LOCK_KIND not in ('ofd', 'flock'):
+		yield
+		return
+	try:
+		f = open(path, 'rb')
+	except OSError:
+		yield
+		return
+	locked = False
+	try:
+		try:
+			if _fileIdentity(os.fstat(f.fileno())) not in _heldHere():
+				locked = _lockFile(f, _READ)
+		except OSError:
+			pass  # a read never fails because its lock did
+		yield
+	finally:
+		try:
+			if locked:
+				_unlockFile(f)
+		finally:
+			f.close()
 
 
 def _tryLockFile(f):
@@ -1103,13 +1220,20 @@ def _tryLockFile(f):
 
 
 def _unlockFile(f):
+	"""Release the whole-file lock _lockFile took on ``f``, the way it was taken; nothing when TSVZ holds none on it."""
 	try:
 		if os.name == 'posix':
 			fd = f.fileno()
-			if fd in _LOCKF_FDS:
-				_LOCKF_FDS.discard(fd)
-				fcntl.lockf(f, fcntl.LOCK_UN)
-			elif not _ofdLock(f, fcntl.F_UNLCK):
+			entry = _HELD.pop(fd, None)
+			if entry is None:
+				return
+			kind, key, here, _ = entry
+			here.discard(key)
+			if kind == 'ofd':
+				_ofdLock(f, fcntl.F_UNLCK)
+			elif kind == 'flock':
+				fcntl.flock(fd, fcntl.LOCK_UN)
+			else:
 				fcntl.lockf(f, fcntl.LOCK_UN)
 		elif os.name == 'nt':
 			msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 2147483647)

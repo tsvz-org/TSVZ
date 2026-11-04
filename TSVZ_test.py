@@ -1435,7 +1435,7 @@ def test_a_forked_child_does_not_wait_for_a_path_lock_its_parent_held(tmp_path, 
 	# A parent thread waits for another process's lock, holding the in-process lock of the path:
 	# that thread is not in the child.
 	import signal
-	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
+	monkeypatch.setattr(TSVZ, '_LOCK_KIND', 'lockf')
 	p = str(tmp_path / 'l.tsvz')
 	_touch(p, b'a\t1\n')
 	hold = ('import fcntl, sys, time\nf = open(sys.argv[1], "r+b")\nfcntl.lockf(f, fcntl.LOCK_EX)\n'
@@ -3848,9 +3848,9 @@ def test_lite_spec_write_locks_and_unlocks_at_raw_offset_zero(tmp_path, monkeypa
 	positions = []
 	real_lock, real_unlock = TSVZ._lockFile, TSVZ._unlockFile
 
-	def lock(f):
+	def lock(f, *args, **kwargs):
 		positions.append(('lock', os.lseek(f.fileno(), 0, os.SEEK_CUR)))
-		real_lock(f)
+		return real_lock(f, *args, **kwargs)
 
 	def unlock(f):
 		positions.append(('unlock', os.lseek(f.fileno(), 0, os.SEEK_CUR)))
@@ -6571,7 +6571,7 @@ def test_tsvzed_legacy_rewrite_whose_file_lock_fails_never_writes_unlocked(tmp_p
 	before = _bytes(p)
 	fds = _open_fds()
 
-	def failing(f):
+	def failing(f, *args, **kwargs):
 		raise OSError(errno.ENOLCK, 'No locks available')  # NFS without a lock daemon
 
 	monkeypatch.setattr(TSVZ, '_lockFile', failing)
@@ -6685,13 +6685,13 @@ def test_tsvzed_legacy_rewrite_empties_the_file_only_once_it_is_locked(tmp_path,
 	before = _bytes(p)
 	real = TSVZ._lockFile
 
-	def locking(f):
+	def locking(f, *args, **kwargs):
 		mode = getattr(f, 'mode', '')
 		if 'w' in str(mode) or mode == 'rb+':  # the rewrite's lock, which another writer holds
 			if how == 'interrupted':
 				raise KeyboardInterrupt  # Ctrl-C while it waits
 			raise OSError(errno.ENOLCK, 'No locks available')
-		real(f)
+		return real(f, *args, **kwargs)
 
 	monkeypatch.setattr(TSVZ, '_lockFile', locking)
 	try:
@@ -7091,12 +7091,12 @@ def test_tsvzed_legacy_write_looks_for_external_changes_once_the_file_is_locked(
 	real = TSVZ._lockFile
 	state = {'done': False}
 
-	def locking(f):
+	def locking(f, *args, **kwargs):
 		if not state['done']:
 			state['done'] = True
 			# another writer held the lock and appends just before it is granted here
 			_append_external(p, _compressedAs(suffix, b'ext\tB\n'))
-		real(f)
+		return real(f, *args, **kwargs)
 
 	monkeypatch.setattr(TSVZ, '_lockFile', locking)
 	if how == 'append':
@@ -9781,11 +9781,11 @@ def test_an_append_that_takes_the_lock_first_writes_the_only_header(tmp_path, mo
 	p = str(tmp_path / ('new.' + suffix))
 	real = TSVZ._lockFile
 
-	def locking(f):
+	def locking(f, *args, **kwargs):
 		if getattr(f, 'mode', '') == 'xb':  # the maker, between making the file and taking the lock
 			monkeypatch.setattr(TSVZ, '_lockFile', real)
 			TSVZ.appendTabularFile(p, ['a1', 'A'], header='key\tval', verbose=False)
-		return real(f)
+		return real(f, *args, **kwargs)
 
 	monkeypatch.setattr(TSVZ, '_lockFile', locking)
 	assert TSVZ._verifyFileExistence(p, header=['key', 'val'])
@@ -9825,15 +9825,15 @@ def test_two_threads_making_one_file_under_lockf_write_one_header(tmp_path, monk
 	# Where the file lock is lockf (macOS), it excludes no thread of the process: a thread that made a new .tsv.gz and
 	# found it empty under its lock wrote the header after another thread's append had written header and row, and the
 	# file read as a damaged stream. Making the file takes the in-process path lock too, as every other writer does.
-	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
+	monkeypatch.setattr(TSVZ, '_LOCK_KIND', 'lockf')
 	p = str(tmp_path / 'new.tsv.gz')
 	real, realLock = os.fstat, TSVZ._lockFile
 	maker, appender = [], []
 
-	def locking(f):
+	def locking(f, *args, **kwargs):
 		if getattr(f, 'mode', '') == 'xb':
 			maker.append(f.fileno())
-		return realLock(f)
+		return realLock(f, *args, **kwargs)
 
 	def fstat(fd):
 		st = real(fd)
@@ -10321,7 +10321,7 @@ def test_legacy_scrub_and_clear_keep_the_files_header_and_write_under_its_lock(t
 	TSVZ.appendLinesTabularFile(p, [['a', '1']], header='id\tv', createIfNotExist=True)
 	TSVZ.scrubTabularFile(p, header='key\tvalue')  # mismatch: warns, keeps the file's own
 	assert open(p, 'rb').read() == b'id\tv\na\t1\n'
-	if TSVZ._OFD_COMMANDS is None:
+	if TSVZ._LOCK_KIND == 'lockf':
 		pytest.skip('the lock is a lockf lock here, which two descriptors of one process do not contend for')
 	held = open(p, 'r+b')
 	TSVZ._lockFile(held)
@@ -10660,7 +10660,7 @@ def test_tsvzedlite_clear_file_waits_for_the_lock_and_never_truncates_first(tmp_
 	TSVZ.appendLinesTabularFile(p, [['a', '1'], ['b', '2']], header='id\tv', createIfNotExist=True)
 	t = TSVZ.TSVZedLite(p, header='id\tv', strict=False)
 	assert t.fileObj is not None
-	if TSVZ._OFD_COMMANDS is None:
+	if TSVZ._LOCK_KIND == 'lockf':
 		pytest.skip('the lock is a lockf lock here, which two descriptors of one process do not contend for')
 	before = _bytes(p)
 	held = open(p, 'r+b')
@@ -10769,7 +10769,7 @@ APPENDER = '''
 import sys
 sys.path.insert(0, %r)
 import TSVZ as T
-T._OFD_COMMANDS = None
+T._LOCK_KIND = 'lockf'
 T.appendTabularFile(sys.argv[1], ['z', '9'], header='', verifyHeader=False)
 ''' % HERE
 
@@ -10780,7 +10780,7 @@ def test_headerless_tsvzed_rewrite_keeps_its_lockf_lock_while_it_writes(tmp_path
 	# Where there are no open file description locks (macOS, or a file system refusing them) the lock is a lockf lock,
 	# which closing ANY descriptor of the file drops: the rewrite looked at the file's first line by name, closed that,
 	# and ran unlocked, so another process's append made meanwhile was lost.
-	monkeypatch.setattr(TSVZ, '_OFD_COMMANDS', None)
+	monkeypatch.setattr(TSVZ, '_LOCK_KIND', 'lockf')
 	p = str(tmp_path / ('l' + suffix))
 	with TSVZ.openFileAsCompressed(p, 'wb') as f:
 		f.write(b'\na\t1\nb\t2\n')

@@ -660,6 +660,7 @@ runs, because a single run can land in a slower mode as a whole.
 
 ```bash
 python3 -m pytest TSVZ_test.py -q                         # everything, incl. 3.39 differential tests
+python3 -m pytest TSVZ_lock_test.py -q                    # file locks between processes and threads (POSIX)
 python3 -m pytest ../tsvz.org/tsvz_site_test.py -q        # the spec as tsvz.org renders it (needs the tsvz.org checkout next to this one)
 python3 -m pytest tsvzbench_test.py -q                    # the benchmark harness
 python3 -m pytest tsvzconform_test.py -q                  # the conformance runner and cases, against the reference
@@ -667,7 +668,7 @@ python3 benchTSVZ.py /tmp/b.tsv -n 100000 --compare-old    # benchmark (not a te
 ```
 
 `TSVZ_old.py` is the frozen 3.39 module the differential tests compare against;
-it is not installed. CI (`.github/workflows/test.yml`) runs the three test files on
+it is not installed. CI (`.github/workflows/test.yml`) runs the four test files on
 Python 3.6, 3.9, 3.12 and 3.14. Accepted limitations are listed in
 [docs/limitations.md](docs/limitations.md).
 
