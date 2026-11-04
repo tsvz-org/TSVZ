@@ -105,7 +105,8 @@ try:
 		fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
 	else:
 		kind, start, length = {'ofdw': (fcntl.F_WRLCK, 0, 0), 'ofdw1': (fcntl.F_WRLCK, 1, 1),
-							   'ofdr0': (fcntl.F_RDLCK, 0, 1)}[how]
+							   'ofdr0': (fcntl.F_RDLCK, 0, 1), 'ofdw2': (fcntl.F_WRLCK, 2, 1),
+							   'ofdr2': (fcntl.F_RDLCK, 2, 1)}[how]
 		fcntl.fcntl(f.fileno(), 37, struct.pack('@hhqqi', kind, 0, start, length, 0) + b'\0' * 8)
 	print('free')
 except OSError as e:
@@ -185,16 +186,16 @@ def test_lock_modes_take_their_byte_ranges(tmp_path, monkeypatch):
 	p = _tsv(tmp_path, 3)
 	with open(p, 'r+b') as f:
 		assert TSVZ._lockFile(f, TSVZ._APPEND)
-		assert [_other(p, h) for h in ('ofdr0', 'ofdw1', 'lockf', 'ofdw')] == ['free', 'busy', 'busy', 'busy']
+		assert [_other(p, h) for h in ('ofdr0', 'ofdr2', 'ofdw1', 'lockf', 'ofdw')] == ['free', 'free', 'busy', 'busy', 'busy']
 		TSVZ._unlockFile(f)
 		assert TSVZ._lockFile(f, TSVZ._REWRITE)
-		assert [_other(p, h) for h in ('ofdr0', 'ofdw1', 'lockf')] == ['busy', 'busy', 'busy']
+		assert [_other(p, h) for h in ('ofdr0', 'ofdr2', 'ofdw1', 'lockf')] == ['busy', 'busy', 'busy', 'busy']
 		TSVZ._unlockFile(f)
 	with open(p, 'rb') as r:
 		assert TSVZ._lockFile(r, TSVZ._READ)
-		assert [_other(p, h) for h in ('ofdr0', 'ofdw1', 'ofdw', 'lockf')] == ['free', 'free', 'busy', 'busy']
+		assert [_other(p, h) for h in ('ofdr0', 'ofdw1', 'ofdw2', 'ofdw', 'lockf')] == ['free', 'free', 'free', 'busy', 'busy']
 		TSVZ._unlockFile(r)
-	assert [_other(p, h) for h in ('ofdr0', 'ofdw1', 'ofdw', 'lockf', 'flock')] == ['free'] * 5
+	assert [_other(p, h) for h in ('ofdr0', 'ofdw1', 'ofdw2', 'ofdw', 'lockf', 'flock')] == ['free'] * 6
 
 
 @linux_only
@@ -998,3 +999,47 @@ def test_a_store_commit_and_an_append_in_another_thread_write_one_header(tmp_pat
 		t.close()
 	data = open(p, 'rb').read()
 	assert data.count(b'id\tv\n') == 1, data
+
+
+LOOP_READER = r'''
+p, seconds = ARGS[0], float(ARGS[1])
+say('reading')
+end = time.time() + seconds
+while time.time() < end:
+	T.readTabularFile(p, header='id\tv', strict=False)
+'''
+
+APPEND_TIMED = r'''
+start = time.time()
+T.appendTabularFile(ARGS[0], ['zz', 'appended'], header='id\tv')
+say('%.2f' % (time.time() - start))
+'''
+
+
+@linux_only
+def test_overlapping_one_shot_reads_do_not_hold_off_a_rewrite_or_the_appends_behind_it(tmp_path, monkeypatch):
+	# Linux grants new shared locks while an exclusive one waits: readers looping readTabularFile from three
+	# processes kept byte 0 held all the time, so a rewrite waited for as long as they read, and every append waited
+	# behind it (it holds byte 1). The gate (byte 2) lets no new read start while a rewrite waits.
+	monkeypatch.setattr(TSVZ, '_LOCK_KIND', 'ofd', raising=False)
+	p = str(tmp_path / 'big.tsv')
+	with open(p, 'wb') as f:
+		f.write(b'id\tv\n' + b''.join(b'k%07d\t' % i + b'v' * 100 + b'\n' for i in range(80000)))  # ~9 MB
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+	readers, appender = [], None
+	try:
+		for _ in range(3):
+			readers.append(_child(LOOP_READER, p, 20, kind='ofd'))
+		for reader in readers:
+			_expect(reader, 'reading')
+		time.sleep(1)
+		appender = _child('time.sleep(0.5)\n' + APPEND_TIMED, p, kind='ofd')
+		start = time.time()
+		t.hardMapToFile()
+		took = time.time() - start
+		out, err = appender.communicate(timeout=30)
+		assert took < 5, 'the rewrite was held off by reads: {:.1f} s'.format(took)
+		assert float(out.decode().split()[-1]) < 5, 'an append waited behind the held-off rewrite: ' + out.decode()
+	finally:
+		_kill(appender, *readers)
+		t.close()

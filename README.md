@@ -308,14 +308,16 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   write nothing, so the key came back once the rewrite ended.
 - **Linux:** a read also waits for an append by 3.39 to 5.2, which locks the whole file.
   A 5.3 append does not wait for readers, and readers do not wait for it. A rewrite waits
-  for the reads in flight, and while it waits every append waits too (the rewrite holds the
-  append lock first, so no new append starts). Reads that overlap without a pause (several
-  processes reading the file in a loop) can hold a rewrite off for as long as they go on.
+  for the reads in flight, and while it waits no new append or read starts (it holds the
+  append lock and a gate first), so reads that overlap without a pause cannot hold it off.
 - **macOS and other systems:** locks are `flock`. Reads and appends wait for each other
-  there. A read in another thread no longer drops a write's lock, and two threads' writes
+  there, and `flock` has no gate: reads that overlap without a pause (several processes
+  reading the file in a loop) can hold a rewrite off for as long as they go on, and the
+  appends behind it with it. A read in another thread no longer drops a write's lock, and two threads' writes
   exclude each other (5.2 could write a new file's header twice).
-- **The lock layout changed.** Reads lock byte 0 shared; appends lock byte 1; rewrites
-  lock byte 1, then the whole file (Linux open file description locks); `flock` on other
+- **The lock layout changed.** Reads lock byte 0 shared, passing through a gate at byte 2
+  (held shared only until byte 0 is); appends lock byte 1; rewrites lock byte 1, then the
+  gate, then the whole file (Linux open file description locks); `flock` on other
   POSIX systems. Older programs' whole-file locks still exclude every 5.3 lock, and 5.3
   excludes them, so 5.2 and 5.3 programs can share a file. Where only `lockf` works (a
   Linux kernel without open file description locks, a file system that refuses them and
@@ -630,7 +632,7 @@ Conformance testing).
 
 - §17.5: a numbered part opened directly is read alone, with a warning.
 - §14.5: the defaults-on-missing read applies to `t[key]` only.
-- §18.6: `.tsv`-family readers hold the access lock shared only while they read (byte 0; a `TSVZed` checks what it read before by identity, size and bytes), appends take the append lock (byte 1), and rewrites take it, then the whole file; on systems other than Linux both are one whole-file `flock`. What remains a deviation: `.tsvz` part readers take no lock (they read again until the parts keep still); where only `lockf` works, writers use it and readers do not lock; Windows readers do not lock; and one-shot appends, the making of a file, scrubs, clears and `.tsvz` part writes also take an in-process lock per path (`_pathLock`), which a `TSVZed`'s own writes do not. See [docs/limitations.md](docs/limitations.md).
+- §18.6: `.tsv`-family readers hold the access lock shared only while they read (byte 0, through the gate at byte 2; a `TSVZed` checks what it read before by identity, size and bytes), appends take the append lock (byte 1), and rewrites take it, the gate, then the whole file; on systems other than Linux both are one whole-file `flock`. What remains a deviation: `.tsvz` part readers take no lock (they read again until the parts keep still); where only `lockf` works, writers use it and readers do not lock; Windows readers do not lock; and one-shot appends, the making of a file, scrubs, clears and `.tsvz` part writes also take an in-process lock per path (`_pathLock`), which a `TSVZed`'s own writes do not. See [docs/limitations.md](docs/limitations.md).
 - §19.4: a scrub whose rows would read differently under the final markers writes them with stripping and fill-empty off, then restores the final markers after the rows.
 - §20.7: `-q` also silences informational messages ("Created …"); only errors remain.
 - §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.
