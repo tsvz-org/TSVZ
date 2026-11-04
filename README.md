@@ -767,6 +767,7 @@ python3 -m pytest ../tsvz.org/tsvz_site_test.py -q        # the spec as tsvz.org
 python3 -m pytest tsvzbench_test.py -q                    # the benchmark harness
 python3 -m pytest tsvzconform_test.py -q                  # the conformance runner and cases, against the reference
 python3 benchTSVZ.py /tmp/b.tsv -n 100000 --compare-old    # benchmark (not a test)
+python3 legacyfuzz.py pair --ver OLD/TSVZ.py --ver-b TSVZ.py  # the legacy scrub and rewrite differential fuzzer; see its docstring; run it in a container
 ```
 
 `TSVZ_old.py` is the frozen 3.39 module the differential tests compare against;
