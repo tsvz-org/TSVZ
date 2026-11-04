@@ -86,44 +86,20 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone keeps compressed stores written by another tool.
 - Approved: 2026-10-29, the user chose "Known limitation (Recommended)".
 
-### A compressed member cut short by a writer killed mid-append can end its cut line with garbage
-- Kind: deferred
-- What the operator sees: a writer killed part way through an append to a `.tsv.gz` (more rarely `.xz`) leaves a
-  member cut short; once another member is appended after it, Python's GzipFile decodes some of that member's bytes
-  as the rest of the cut line before it fails at the damage. A read then holds that one row with a garbage value
-  (in 72 of 200 random cases on gzip, 2 of 200 on xz, none on bz2; 4.9 and main do the same), and the first write
-  of a `TSVZed` that read it (a rewrite, or its first append, which makes the damaged file again) writes it back.
-- Why: the fix is a reader of its own for compressed full reads (`readTabularFile`, `TSVZed`, the CLI) that
-  decodes member by member, uses a member only once it checks out and keeps only the whole lines of a cut one,
-  holding each member's text until it is checked: a reader redesign of its own.
-- Revisit when: someone finds a garbage value in a compressed store after a crash.
-- Approved: 2026-10-29, the user chose "Defer (Recommended)".
-
 ### Appends that do not read the store first land after damage, where reads do not reach them
 - Kind: known limitation
-- What the operator sees: once another writer has left a compressed `.tsv` file damaged, every read stops at the
-  damage (L5). A running `TSVZed` makes the file again from memory at its next write, so its rows stay readable
-  (not while that rewrite fails or is refused: see the README's fault tolerance), but a one-shot `tsvz set`,
-  `appendTabularFile()`, a `TSVZedLite` or a `TSVZed` opened with `monitor_external_changes=False` (for damage that
-  lands after it loaded the file) appends without reading the file first, so its rows land after the damage, where no
-  read reaches them, and the next `TSVZed` or scrub that makes the file again drops them. 4.9 and main do the same.
+- What the operator sees: once a compressed `.tsv` file holds damage that is not a member cut short (bytes that
+  do not decode, a member that fails its check, the old bytes a whole rewrite cut short leaves after its new
+  members), every read stops there (L5). A running `TSVZed` makes the file again from memory at its next write, so
+  its rows stay readable (not while that rewrite fails or is refused: see the README's fault tolerance), but a
+  one-shot `tsvz set`, `appendTabularFile()`, a `TSVZedLite` or a `TSVZed` opened with
+  `monitor_external_changes=False` (for damage that lands after it loaded the file) appends without reading the
+  file first, so its rows land after the damage, where no read reaches them, and the next `TSVZed` or scrub that
+  makes the file again drops them. 4.9 to 5.3 do the same, also after a member cut short (a writer killed
+  mid-append), which from 5.4 reads are no longer stopped by: it is left out and the members after it are read.
 - Why: covering them would make every such append read the whole file first; today `tsvz set` is one append.
 - Revisit when: someone mixes one-shot appends with crashing writers on one compressed file.
 - Approved: 2026-10-29, the user chose "Known limitation (Recommended)".
-
-### A writer that takes no lock and dies mid-write can hide one append's rows
-- Kind: known limitation
-- What the operator sees: another tool that appends to a compressed `.tsv` file without taking the lock, and is
-  killed part way through a write, leaves the file damaged. When that lands in the moment between a `TSVZed`'s
-  locked read of the file and its append (in stress runs, at the last commit of `close()`), the store does not
-  know of the damage yet: the rows of that append land after it, where no read reaches them, and the next store
-  or scrub that makes the file again drops them. It happened in 2 of 400 stress trials. Every TSVZ writer takes
-  the lock, so TSVZ's own writers never cause it.
-- Why: the store reads and appends under its lock; only a writer that ignores the lock (spec §18.6) can land
-  between the two, and the store cannot see that write until it next reads the file.
-- Revisit when: another tool appends to TSVZ's compressed files without the lock and crashes.
-- Approved: 2026-10-29, the user chose "Record both (Recommended)".
-
 ### A file removed just as a write starts is followed as if rotated
 - Kind: known limitation
 - What the operator sees: when another process removes a `TSVZed`'s `.tsv`-family file, the store's next write
