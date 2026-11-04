@@ -137,10 +137,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   file first, so its rows land after the damage, where no read reaches them, and the next `TSVZed` or scrub that
   makes the file again drops them. 4.9 to 5.3 do the same, also after a later member cut short (a writer
   killed mid-append), which from 5.4 reads are no longer stopped by: it is left out and the members after it
-  are read. A first member cut short still stops reads.
+  are read. A first member cut short still stops reads. A `TSVZed` that did read the file can meet the same:
+  a writer that takes no lock (TSVZ before 5.1, another tool) and dies mid-write in the moment between the
+  store's locked read and its append leaves damage the store did not see, and its rows land after it (2 of 400
+  stress trials).
 - Why: covering them would make every such append read the whole file first; today `tsvz set` is one append.
+  A writer that takes no lock cannot be waited for.
 - Revisit when: someone mixes one-shot appends with crashing writers on one compressed file.
-- Approved: 2026-10-29, the user chose "Known limitation (Recommended)".
+- Approved: 2026-10-29, the user chose "Known limitation (Recommended)"; 2026-11-04, "Add one line to the entry
+  (Recommended)" for a writer that takes no lock and dies between a `TSVZed`'s locked read and its append.
 
 ### A file removed just as a write starts is followed as if rotated
 - Kind: known limitation
