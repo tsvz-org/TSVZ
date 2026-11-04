@@ -8581,7 +8581,7 @@ def test_tsvzed_legacy_merge_keeps_an_intact_member_another_process_appended_bef
 	# The merge decoded what followed the damage through the codec's buffered reader (GzipFile, BZ2File, LZMAFile,
 	# ZstdFile): an intact member followed by one cut short (another process stopped part way) decoded to nothing,
 	# so the intact member's rows were not merged, and the rewrite erased them from the file. It decodes member by
-	# member: every complete one is kept, and the whole lines of one cut short.
+	# member: every complete one is kept; one cut short is left out whole (5.4; before, its whole lines were kept).
 	p = str(tmp_path / ('members.' + suffix))
 	t, rows = _damaged_compressed(p, monkeypatch, suffix)
 	rng = random.Random(3)
@@ -8592,10 +8592,8 @@ def test_tsvzed_legacy_merge_keeps_an_intact_member_another_process_appended_bef
 	err = capsys.readouterr().err
 	assert 'cut short' in err and 'Overwriting external changes' not in err, err
 	assert t['B1'] == ['B1', 'fromB'] and t['B2'] == ['B2', 'fromB']
-	kept = [key for key in t if key.startswith('c')]
-	assert len(kept) < 30000 and kept == ['c%d' % i for i in range(len(kept))]  # its whole lines, in order
-	assert kept or suffix.endswith('bz2'), kept  # bzip2 decodes whole blocks only (900 kB): half of its one block gives none
-	assert dict(t) == dict(rows, **dict((key, t[key]) for key in ['B1', 'B2'] + kept)) and _back(p) == dict(t)
+	assert not [key for key in t if key.startswith('c')]
+	assert dict(t) == dict(rows, B1=['B1', 'fromB'], B2=['B2', 'fromB']) and _back(p) == dict(t)
 
 
 @pytest.mark.parametrize('suffix', ALL_SUFFIXES[1:])
@@ -9505,7 +9503,8 @@ def test_tsvzed_legacy_damaged_file_whose_remake_is_refused_still_gets_the_rows_
 	t['a'][1] = '€'  # no latin-1 for it: a rewrite is refused
 	t['b'] = ['b', 'B2']
 	t.commitAppendToFile()
-	assert not t.appendQueue and b'b\tB2\n' in TSVZ._decodeMembers('gzip', open(p, 'rb').read())[0]
+	after = open(p, 'rb').read().partition(b'garbage echoed\n')[2]  # (reads stop at the garbage: it is not a member cut short)
+	assert not t.appendQueue and b'b\tB2\n' in TSVZ._decodeMembers('gzip', after)[0]
 	assert 'Refused at hardMapToFile()' in capsys.readouterr().out
 
 
@@ -11407,8 +11406,12 @@ def test_legacy_scrub_of_a_gz_file_whose_first_line_cannot_be_decoded_does_not_r
 	else:
 		data = gzip.compress(b'id\tv\n' + b''.join(b'k%d\tv\n' % i for i in range(2000)))[:200] + gzip.compress(b'z\t9\n')
 	_touch(p, data)
-	assert TSVZ.scrubTabularFile(p, header=header) == {}
+	# From 5.4 the good member after a cut first one is read: as a row, or, given a header, as the header line.
+	expected = {'z': ['z', '9']} if name == 'cut-first-member' and not header else {}
+	assert dict(TSVZ.scrubTabularFile(p, header=header)) == expected
 	assert any('compressed stream is damaged' in w for w in _tsvz_warnings(capsys))
+	if name == 'cut-first-member':
+		assert gzip.decompress(_bytes(p)) == b'z\t9\n'
 
 
 @pytest.mark.parametrize('strict', [True, False])
@@ -11847,6 +11850,199 @@ def test_get_file_obj_gives_a_file_that_release_file_obj_closes_and_unlocks(tmp_
 	body = _text(p)
 	assert body.endswith(b'a\t1\n') and (body == b'a\t1\n') == ('w' in modes)
 	t.close()
+
+
+
+# --- 5.4: a compressed legacy file is read member by member, each member used once its check passes -------------
+
+_MEMBER_SUFFIXES = ALL_SUFFIXES[1:]
+#: Seeds of _cutThenGood whose cut member main's codec readers (GzipFile, LZMAFile) decoded into a garbage value.
+_GARBAGE_SEEDS = {'tsv.gz': 17, 'tsv.xz': 34}
+
+
+def _member(suffix, data):
+	return TSVZ._compressBytes(suffix.rpartition('.')[2], data)
+
+
+def _cutMember(suffix, seed):
+	"""``(rows, cut)``: random rows and their member cut short at a random length, as a writer killed mid-append
+	leaves it."""
+	rng = random.Random(seed)
+	rows = b''.join(b'c%d\t%x\n' % (i, rng.getrandbits(32)) for i in range(rng.randint(5, 400)))
+	whole = _member(suffix, rows)
+	return rows, whole[:rng.randint(12, len(whole) - 1)]
+
+
+def _read_quiet(p, capsys, **kwargs):
+	kwargs.setdefault('header', 'key\tval')
+	data = TSVZ.readTabularFile(p, **kwargs)
+	return dict((k, list(v)) for k, v in data.items()), _tsvz_warnings(capsys)
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_a_cut_member_followed_by_a_good_one_is_left_out_whole_and_the_good_one_read(tmp_path, capsys, suffix):
+	# Main decoded the cut member's bytes on into the next member's (GzipFile, LZMAFile): for these seeds the cut
+	# line ended in a garbage value, and reading stopped there, so the good member after it was never read.
+	_, cut = _cutMember(suffix, _GARBAGE_SEEDS.get(suffix, 0))
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, _member(suffix, b'key\tval\nk0\tv0\n') + cut + _member(suffix, b'z\t9\n'))
+	data, warnings = _read_quiet(p, capsys)
+	assert data == {'k0': ['k0', 'v0'], 'z': ['z', '9']}
+	assert len(warnings) == 1 and 'compressed stream is damaged' in warnings[0] and 'cut short' in warnings[0], warnings
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_a_cut_last_member_is_left_out_whole(tmp_path, capsys, suffix):
+	# The usual killed append: its member is the last. Main used the whole lines it decoded before the end.
+	rows, cut = _cutMember(suffix, 5)
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, _member(suffix, b'key\tval\nk0\tv0\n') + _member(suffix, b'k1\tv1\n') + cut)
+	data, warnings = _read_quiet(p, capsys)
+	assert data == {'k0': ['k0', 'v0'], 'k1': ['k1', 'v1']}
+	assert len(warnings) == 1 and 'cut short' in warnings[0], warnings
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_a_cut_first_member_is_left_out_and_the_members_after_it_read(tmp_path, capsys, suffix):
+	# Main read nothing: its codec reader stopped at the first member's damage.
+	_, cut = _cutMember(suffix, 7)
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, cut + _member(suffix, b'k1\tv1\n') + _member(suffix, b'k2\tv2\n'))
+	data, warnings = _read_quiet(p, capsys, header='')
+	assert data == {'k1': ['k1', 'v1'], 'k2': ['k2', 'v2']}
+	assert len(warnings) == 1 and 'cut short' in warnings[0], warnings
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_several_cut_members_are_each_left_out(tmp_path, capsys, suffix):
+	parts = [_member(suffix, b'key\tval\nk0\tv0\n')]
+	for i in range(4):
+		parts.append(_cutMember(suffix, 10 + i)[1])
+		parts.append(_member(suffix, b'g%d\tv%d\n' % (i, i)))
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, b''.join(parts))
+	data, warnings = _read_quiet(p, capsys)
+	assert data == dict([('k0', ['k0', 'v0'])] + [('g%d' % i, ['g%d' % i, 'v%d' % i]) for i in range(4)])
+	assert len(warnings) == 1 and warnings[0].count('cut short') == 4, warnings
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_a_file_that_is_one_big_member_reads_whole(tmp_path, capsys, suffix):
+	# As another tool writes it (gzip, xz, zstd on the whole file): one member of several MiB.
+	rows = b''.join(b'r%d\t%d\n' % (i, i * 7) for i in range(300000))
+	p = str(tmp_path / ('g.' + suffix))
+	module = TSVZ._codecModule(suffix.rpartition('.')[2])
+	_touch(p, module.compress(b'key\tval\n' + rows))
+	data, warnings = _read_quiet(p, capsys)
+	assert len(data) == 300000 and data['r299999'] == ['r299999', str(299999 * 7)] and not warnings
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_empty_members_read_as_nothing(tmp_path, capsys, suffix):
+	empty = _member(suffix, b'')
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, empty + _member(suffix, b'key\tval\nk0\tv0\n') + empty + empty + _member(suffix, b'k1\tv1\n') + empty)
+	data, warnings = _read_quiet(p, capsys)
+	assert data == {'k0': ['k0', 'v0'], 'k1': ['k1', 'v1']} and not warnings
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_plain_text_named_compressed_reads_no_row_with_a_warning(tmp_path, capsys, suffix):
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, b'key\tval\nk0\tv0\n')
+	data, warnings = _read_quiet(p, capsys)
+	assert data == {} and len(warnings) == 1 and 'compressed stream is damaged' in warnings[0], warnings
+
+
+def _flip(data, at):
+	return data[:at] + bytes([data[at] ^ 0xff]) + data[at + 1:]
+
+
+def test_members_a_gzip_member_whose_crc_fails_is_not_used(tmp_path, capsys):
+	# Its length is intact, so it decodes to its end; main used its rows, then stopped at the CRC error.
+	bad = _flip(_member('tsv.gz', b'b1\tx\nb2\ty\n'), -6)  # in the CRC-32 of the trailer
+	p = str(tmp_path / 'g.tsv.gz')
+	_touch(p, _member('tsv.gz', b'key\tval\nk0\tv0\n') + bad + _member('tsv.gz', b'z\t9\n'))
+	data, warnings = _read_quiet(p, capsys)
+	# Not a member cut short: reading stops there, as before (it may be the old bytes a whole rewrite cut short left).
+	assert data == {'k0': ['k0', 'v0']}
+	assert len(warnings) == 1 and 'do not decode' in warnings[0] and 'stopped' in warnings[0], warnings
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_a_member_with_a_corrupt_byte_gives_none_of_its_rows(tmp_path, capsys, suffix):
+	rng = random.Random(1)
+	rows = b''.join(b'b%d\t%x\n' % (i, rng.getrandbits(32)) for i in range(2000))
+	whole = _member(suffix, rows)
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, _member(suffix, b'key\tval\nk0\tv0\n') + _flip(whole, len(whole) // 2))
+	data, warnings = _read_quiet(p, capsys)
+	assert data == {'k0': ['k0', 'v0']} and len(warnings) == 1, (len(data), warnings)
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_trailing_garbage_is_reported_and_the_members_before_it_read(tmp_path, capsys, suffix):
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, _member(suffix, b'key\tval\nk0\tv0\n') + _member(suffix, b'k1\tv1\n') + b'not a member\n')
+	data, warnings = _read_quiet(p, capsys)
+	assert data == {'k0': ['k0', 'v0'], 'k1': ['k1', 'v1']}
+	assert len(warnings) == 1 and 'do not decode' in warnings[0], warnings
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_reading_stops_at_the_old_bytes_a_cut_whole_rewrite_left(tmp_path, capsys, suffix):
+	# A rewrite writes over the file from offset 0; one killed part way leaves its new members, then the old bytes
+	# from the middle of an old member on, then old members, which hold rows as they were. Those are not read: the
+	# damaged bytes are not a member cut short, so reading stops there, as before.
+	old = _member(suffix, b'key\tval\n' + b''.join(b'k%d\told\n' % i for i in range(3000))) + _member(suffix, b'gone\tback\n')
+	new = _member(suffix, b'key\tval\nk0\tnew\n')
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, new + old[len(new) + 40:])
+	data, warnings = _read_quiet(p, capsys)
+	assert data == {'k0': ['k0', 'new']} and len(warnings) == 1 and 'stopped' in warnings[0], (data, warnings)
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_tsvzed_reads_past_a_cut_member_and_its_next_write_makes_the_file_again(tmp_path, capsys, suffix):
+	_, cut = _cutMember(suffix, _GARBAGE_SEEDS.get(suffix, 0))
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, _member(suffix, b'key\tval\nk0\tv0\n') + cut + _member(suffix, b'z\t9\n'))
+	t = _stopped(p)
+	assert dict(t) == {'k0': ['k0', 'v0'], 'z': ['z', '9']}
+	t['k2'] = ['k2', 'v2']
+	t.commitAppendToFile()
+	t.close()
+	capsys.readouterr()
+	data, warnings = _read_quiet(p, capsys)
+	assert data == {'k0': ['k0', 'v0'], 'z': ['z', '9'], 'k2': ['k2', 'v2']} and not warnings, warnings
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_scrub_keeps_the_rows_after_a_cut_member(tmp_path, capsys, suffix):
+	# Main read up to the cut member only and wrote that, losing the good members after it.
+	_, cut = _cutMember(suffix, 3)
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, _member(suffix, b'key\tval\nk0\tv0\n') + cut + _member(suffix, b'z\t9\n'))
+	assert dict(TSVZ.scrubTabularFile(p, header='key\tval')) == {'k0': ['k0', 'v0'], 'z': ['z', '9']}
+	capsys.readouterr()
+	assert _read_quiet(p, capsys) == ({'k0': ['k0', 'v0'], 'z': ['z', '9']}, [])
+
+
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_open_file_as_compressed_reads_checked_members_in_text_and_binary(tmp_path, suffix):
+	_, cut = _cutMember(suffix, 4)
+	p = str(tmp_path / ('g.' + suffix))
+	_touch(p, _member(suffix, b'a\t1\n') + cut + _member(suffix, b'b\t2\n'))
+	with TSVZ.openFileAsCompressed(p, 'rb') as f:
+		assert f.readline() == b'a\t1\n' and f.tell() == 4
+		assert f.readline() == b'b\t2\n'
+		with pytest.raises(Exception) as caught:
+			f.readline()
+		assert 'cut short' in str(caught.value)
+		f.seek(2)
+		assert f.read(2) == b'1\n'
+	with TSVZ.openFileAsCompressed(p, 'r') as f:
+		assert f.readline() == 'a\t1\n' and f.readline() == 'b\t2\n'
 
 
 if __name__ == '__main__':

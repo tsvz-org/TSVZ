@@ -69,19 +69,148 @@ def _codecModule(codec):
 	return importlib.import_module(_CODECS[_CODEC_NAMES.get(codec, codec)][0])
 
 def _openStreams(codec, f):
-	"""The text of ``codec``'s streams in the open binary file ``f``, one after another. BZ2File and LZMAFile take
-	bytes after a stream that do not begin one for the end of the file, silently; this reader raises there, as
-	GzipFile and ZstdFile do, so a read notes the damage (a whole rewrite cut short leaves the old bytes after the
-	new streams)."""
-	module = _codecModule(codec)
-	name = _CODEC_NAMES.get(codec, codec)
-	if name not in ('bzip2', 'xz'):
-		return module.open(f, 'rb')
-	if sys.version_info >= (3, 14):
-		from compression._common._streams import DecompressReader
-	else:
-		from _compression import DecompressReader  # not a top-level 'compression': before 3.14 that is no stdlib's
-	return io.BufferedReader(DecompressReader(f, getattr(module, _CODECS[name][1])))  # no trailing_error: it raises
+	"""The text of ``codec``'s members in the open binary file ``f`` (at offset 0), as a binary reader that is
+	closed without closing ``f``: the members that pass their check, one after another (_checkedMembers). At the
+	end of the text it raises _DamagedStream when a member was left out."""
+	_codecModule(codec)  # ImportError now for a codec this Python lacks (zstd before 3.14), not at the first read
+	return _MemberReader(_MemberStream(f, codec), 1 << 16)
+
+
+class _DamagedStream(Exception):
+	"""Raised by a _MemberReader at the end of its text when a member was damaged: what was left out, and where."""
+
+
+def _streamDamage(e):
+	"""The note a read makes for the error ``e`` reading a compressed legacy file."""
+	if isinstance(e, _DamagedStream):
+		return 'compressed stream is damaged: {}'.format(e)
+	return 'compressed stream is damaged ({}: {}); read up to the damage'.format(type(e).__name__, e)
+
+
+def _checkedMembers(f, codec, damage):
+	"""Yield the text of each member (gzip member, bzip2 or xz stream, zstd frame) of ``codec`` in the open binary
+	file ``f`` (at offset 0; it is seeked) once that member has decoded to its end and passed its check, and append
+	to ``damage`` a note for each member left out.
+
+	Why: a codec's own reader (GzipFile, BZ2File, LZMAFile, ZstdFile) hands a member's text over as it decodes it
+	and checks it only at the member's end. A writer killed mid-append leaves its member cut short; once another
+	member is appended after it, that reader decodes the next member's bytes as the rest of the cut one, and its
+	last line can end in a garbage value before the check fails. Here a member is held whole (_readMember: memory
+	grows with the largest member, which TSVZ writes at most 1 MiB of text into) and used only once it is complete.
+
+	A member that is not complete is damaged. Its bytes run to the next offset after its start where a member of
+	the codec begins (its magic bytes: gzip 1F 8B 08, bzip2 'BZh', xz FD '7zXZ' 00, zstd 28 B5 2F FD), as spec
+	§16.6 has them. When those bytes, decoded on their own, merely end before the member does, it is a member
+	cut short: what a killed append leaves, whose rows its writer was never told were saved. It is left out whole
+	and reading goes on at the next member. Magic bytes inside the cut member's own compressed bytes (a chance of
+	about one in 2^24 a byte for gzip, less for the others) only end it early: what begins there fails to decode
+	or its check, and is damage of its own. Any other damage (bytes that do not decode, a member that fails its
+	check, the old bytes a whole rewrite cut short leaves after its new members, which hold older rows) stops the
+	reading there, as a codec's reader does: what follows is not read. A zstd frame written without a content
+	checksum (TSVZ always writes one, spec §16.8) is complete once it decodes to its end.
+	"""
+	src = _PartBytes(f)
+	gzip = _CODEC_NAMES[codec] == 'gzip'
+	while True:
+		status, output, start, end, error = _readMember(src, codec)
+		if status == 'none':
+			return
+		if status == 'complete':
+			if output:
+				yield output
+			continue
+		following = _nextMemberStart(f, codec, start + 1)
+		if following is None:  # the last member: nothing after it to read
+			damage.append('the member at byte {} is cut short: left out'.format(start) if status == 'short' else
+						  'the bytes at byte {} do not decode ({}): left out'.format(start, error))
+			return
+		f.seek(start)
+		raw = f.read(following - start)
+		cutShort, _, error = _decodeAlone(_gzipUnpad(raw) if gzip else raw, codec)
+		if not cutShort:
+			damage.append('the {} bytes at byte {} do not decode ({}): reading stopped there'.format(len(raw), start, error))
+			return
+		damage.append('the member at byte {} is cut short: left out, the rest is read'.format(start))
+		src.seek(following)
+
+
+class _MemberStream(io.RawIOBase):
+	"""The raw reader under a _MemberReader: the text of the members of ``codec`` in the open binary file ``f`` that
+	pass their check (_checkedMembers), with what was left out in ``damage``. Closing it closes ``f`` only when
+	``owned``. It seeks as GzipFile does: from the start or the current offset, by reading again."""
+
+	def __init__(self, f, codec, owned=False):
+		self.f, self.codec, self.owned = f, codec, owned
+		self.name = getattr(f, 'name', None)
+		self._restart()
+
+	def _restart(self):
+		self.damage = []
+		self._members = _checkedMembers(self.f, self.codec, self.damage)
+		self._out = memoryview(b'')
+		self._pos = 0
+
+	def readable(self):
+		return True
+
+	def seekable(self):
+		return True
+
+	def readinto(self, b):
+		while not len(self._out):
+			output = next(self._members, None)
+			if output is None:
+				return 0
+			self._out = memoryview(output)
+		n = min(len(b), len(self._out))
+		b[:n] = self._out[:n]
+		self._out = self._out[n:]
+		self._pos += n
+		return n
+
+	def tell(self):
+		return self._pos
+
+	def seek(self, offset, whence=io.SEEK_SET):
+		if whence == io.SEEK_CUR:
+			offset += self._pos
+		elif whence != io.SEEK_SET:
+			raise io.UnsupportedOperation('a compressed file seeks from its start or its current offset only')
+		if offset < self._pos:
+			self.f.seek(0)
+			self._restart()
+		while self._pos < offset and self.readinto(bytearray(min(1 << 20, offset - self._pos))):
+			pass
+		return self._pos
+
+	def fileno(self):
+		return self.f.fileno()
+
+	def close(self):
+		if not self.closed and self.owned:
+			self.f.close()
+		super(_MemberStream, self).close()
+
+
+class _MemberReader(io.BufferedReader):
+	"""A buffered _MemberStream whose read(), read1() and readline() (iteration too) raise _DamagedStream where they
+	would return the end of the text, when a member was left out: every member that passed its check has been read
+	by then, so a read that takes the error for damage has missed none of them."""
+
+	def _end(self, data, size):
+		if not data and size != 0 and self.raw.damage:
+			raise _DamagedStream('; '.join(self.raw.damage))
+		return data
+
+	def read(self, size=-1):
+		return self._end(super(_MemberReader, self).read(size), size)
+
+	def read1(self, size=-1):
+		return self._end(super(_MemberReader, self).read1(size), size)
+
+	def readline(self, size=-1):
+		return self._end(super(_MemberReader, self).readline(size), size)
+
 
 def _fileCodec(fileName):
 	"""The codec name ``fileName``'s compression suffix names, or None for a file that is not compressed."""
@@ -279,11 +408,20 @@ class _HashingReader(object):
 		self.f = f
 		self.digest = hashlib.sha256()
 		self.size = 0
+		self.at = 0  # the offset in ``f``: a codec's reader seeks back (_checkedMembers), and bytes are hashed once
 
 	def _took(self, data):
-		self.digest.update(data)
-		self.size += len(data)
+		new = self.at + len(data) - self.size  # bytes past the most read so far
+		self.at += len(data)
+		if new > 0:
+			self.digest.update(data if new == len(data) else data[len(data) - new:])
+			self.size += new
 		return data
+
+	def seek(self, offset, whence=io.SEEK_SET):
+		"""Seek ``f``, back to bytes already read (they are not hashed again) or to the end of what was read."""
+		self.at = self.f.seek(offset, whence)
+		return self.at
 
 	def read(self, size=-1):
 		return self._took(self.f.read(size))
@@ -348,41 +486,11 @@ def _readAfter(f, known):
 
 def _decodeMembers(codec, data):
 	"""``(text, damage)``: what ``data`` (members or frames of ``codec`` one after another, such as what other
-	processes appended to a legacy file after a damage) holds, decoded member by member (_readMember), and a note
-	for each place it is damaged (an empty list when it is not).
-
-	Every complete member is kept; a member cut short (by the end of ``data``, or by the next member: a writer
-	that stopped part way, and another one that appended after it) gives its whole lines; bytes that are not a
-	member that decodes (a corrupt one, garbage) give nothing, and decoding goes on at the next member start, as a
-	spec part is read (spec §16.6). A codec's file reader (GzipFile, BZ2File, LZMAFile) instead stops at the first
-	damage, dropping what the members it buffered held, and BZ2File and LZMAFile take bytes after a stream that do
-	not begin one for its end, without an error.
-	"""
-	f = io.BytesIO(data)
-	src = _PartBytes(f)
-	out = []
+	processes appended to a legacy file after a damage) holds, read as a compressed legacy file is read
+	(_checkedMembers: the members that pass their check), and a note for each place it is damaged (an empty list
+	when it is not)."""
 	damage = []
-	while True:
-		status, output, start, end, error = _readMember(src, codec)
-		if status == 'none':
-			break
-		if status == 'complete':
-			out.append(output)
-			continue
-		following = _nextMemberStart(f, codec, start + 1)
-		raw = data[start:len(data) if following is None else following]
-		if _CODEC_NAMES[codec] == 'gzip':
-			raw = _gzipUnpad(raw)  # zero padding before the next member (spec §16.6)
-		cutShort, output, error = _decodeAlone(raw, codec)
-		if cutShort:
-			out.append(output[:output.rfind(b'\n') + 1])
-			damage.append('the member at byte {} is cut short: its whole lines are kept'.format(start))
-		else:
-			damage.append('the {} bytes at byte {} do not decode ({}): left out'.format(len(raw), start, error))
-		if following is None:
-			break
-		src.seek(following)
-	return b''.join(out), damage
+	return b''.join(_checkedMembers(io.BytesIO(data), codec, damage)), damage
 
 # What fsync(2) fails with on a file it cannot sync, whose data is written all the same: EINVAL and EROFS ("fd is
 # bound to a special file which does not support synchronization"), ENOTSUP / EOPNOTSUPP (some FUSE and network
@@ -439,6 +547,15 @@ def openFileAsCompressed(fileName,mode = 'rb',encoding = 'utf8',teeLogger = None
 		kwargs['encoding'] = encoding
 	if codec:
 		try:
+			if not any(c in mode for c in 'wax+'):  # a read: member by member, each once its check passes
+				raw = open(fileName, 'rb')
+				try:
+					_codecModule(codec)
+				except BaseException:
+					raw.close()
+					raise
+				reader = _MemberReader(_MemberStream(raw, codec, owned=True), 1 << 16)
+				return reader if 'b' in mode else io.TextIOWrapper(reader, encoding=encoding)
 			return _codecModule(codec).open(fileName, mode, **kwargs)
 		except Exception:
 			__teePrintOrNot(f"Failed to open {fileName} with {codec}, trying bin",teeLogger=teeLogger)
@@ -1832,7 +1949,7 @@ def _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, 
 	except Exception as e:
 		if lastLineOnly or not _isCompressedFile(fileName):
 			raise
-		reporter.note('damaged', None, 'compressed stream is damaged ({}: {}); read up to the damage'.format(type(e).__name__, e))
+		reporter.note('damaged', None, _streamDamage(e))
 		return None
 	try:
 		line = raw.decode(encoding=encoding)
@@ -1867,7 +1984,7 @@ def _legacyReadLoop(file, fileName, taskDic, correctColumnNum, lineNo, strict, d
 			# L5: a damaged compressed stream ends the read instead of raising.
 			if not _isCompressedFile(fileName):
 				raise
-			reporter.note('damaged', None, 'compressed stream is damaged ({}: {}); read up to the damage'.format(type(e).__name__, e))
+			reporter.note('damaged', None, _streamDamage(e))
 			break
 		lineNo += 1
 		try:
@@ -7286,8 +7403,7 @@ class _ServeStore(object):
 						except Exception as e:  # L5: a stream damaged inside line 1 holds nothing more to read
 							if not _isCompressedFile(self.path):
 								raise
-							reporter.note('damaged', None, 'compressed stream is damaged ({}: {}); read up to the '
-										  'damage'.format(type(e).__name__, e))
+							reporter.note('damaged', None, _streamDamage(e))
 							return
 						if raw and any(self._legacyHeader(raw.decode('utf8', errors='replace'), log)):
 							self.width, self.lineNo = len(self.header), 1  # the header: not a row
