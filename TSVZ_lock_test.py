@@ -1205,3 +1205,40 @@ def test_overlapping_one_shot_reads_do_not_hold_off_a_rewrite_or_the_appends_beh
 	finally:
 		_kill(appender, *readers)
 		t.close()
+
+
+# ---------------------------------------------------------------------------
+# 5.5: a scrub reads once per attempt, under the READ lock, and its write waits out another rewrite
+# ---------------------------------------------------------------------------
+def test_a_scrub_opens_the_file_once_per_attempt_under_the_read_lock(tmp_path, monkeypatch):
+	p = _tsv(tmp_path, 20)
+	opens = []
+	real = TSVZ.openFileAsCompressed
+
+	def counting(fileName, *args, **kwargs):
+		opens.append((fileName, len(TSVZ._HELD)))
+		return real(fileName, *args, **kwargs)
+	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', counting)
+	assert len(TSVZ.scrubTabularFile(p, header='id\tv')) == 20
+	assert opens == [(p, 1)], opens
+
+
+@pytest.mark.parametrize('writer', WRITERS)
+def test_a_scrub_waits_out_another_process_locked_rewrite(tmp_path, kind, writer):
+	_skipUnexcluded(kind, writer)
+	p = _tsv(tmp_path)
+	child = _child(REWRITER, p, writer, kind=kind)
+	results = {}
+	try:
+		_expect(child, 'half')
+		scrub = threading.Thread(target=lambda: results.update(scrub=TSVZ.scrubTabularFile(p, header='id\tv')))
+		scrub.start()
+		time.sleep(1)
+		assert scrub.is_alive(), 'the scrub went on during the rewrite'
+		_release(p)
+		assert _done_within(scrub, 10)
+		assert child.wait(20) == 0
+		assert len(results['scrub']) == 1000
+		assert len(TSVZ.readTabularFile(p, header='id\tv')) == 1000
+	finally:
+		_kill(child)

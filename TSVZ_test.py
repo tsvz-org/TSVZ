@@ -513,8 +513,17 @@ def _drive_stateless(mod, path, seed, ref=None):
 		out.append(strict if ref is None else
 				   ('strict', strict == dict(ref.readTabularFile(path, header=LEGACY_HEADER, strict=True))))
 		out.append(mod.read_last_valid_line(path, {}, -1, delimiter=delimiter))
-	out.append(dict(mod.scrubTabularFile(path, header=LEGACY_HEADER)))
-	out.append(_content(path))
+	if ref is None:
+		out.append(dict(mod.scrubTabularFile(path, header=LEGACY_HEADER)))
+		out.append(_content(path))
+	else:
+		# 5.5's scrub keeps the lines a strict reader takes, and a wide row written whole is not one: the bytes are
+		# compared before the scrub, and after it what 3.39's readers see (loose, and strict as 5.5's strict read).
+		out.append(_content(path))
+		out.append(dict(mod.scrubTabularFile(path, header=LEGACY_HEADER)))
+		out.append(('scrubbed', dict(ref.readTabularFile(path, header=LEGACY_HEADER, strict=False)),
+					dict(ref.readTabularFile(path, header=LEGACY_HEADER, strict=True)) ==
+					dict(mod.readTabularFile(path, header=LEGACY_HEADER, strict=True))))
 	mod.clearTabularFile(path, header=LEGACY_HEADER)
 	out.append(_content(path))
 	return out
@@ -590,12 +599,10 @@ def test_legacy_stateless_helpers_match_339(tmp_path):
 		for seed in range(3):
 			old_path, new_path = _twin_paths(tmp_path / ('%s-%d' % (suffix.replace('.', ''), seed)), suffix)
 			d = SUFFIX_DELIMITERS.get(suffix, '\t')
-			new = _observe(lambda: _drive_stateless(TSVZ, new_path, seed, ref=TSVZ_old), os.path.dirname(new_path))
-			old = _observe(lambda: _drive_stateless(TSVZ_old, old_path, seed), os.path.dirname(old_path))
 			# 5.5 appends a row wider than the header whole (Q5), so a strict read drops it where 3.39 took the cut
-			# row: each strict view is compared with 3.39's strict read of the same bytes instead (marked True).
-			if old[0][0] == 'ok':
-				old = (('ok', [('strict', True) if i < 18 and i % 3 == 1 else o for i, o in enumerate(old[0][1])]), old[1])
+			# row: each strict view is compared with 3.39's strict read of the same bytes instead (ref).
+			new = _observe(lambda: _drive_stateless(TSVZ, new_path, seed, ref=TSVZ_old), os.path.dirname(new_path))
+			old = _observe(lambda: _drive_stateless(TSVZ_old, old_path, seed, ref=TSVZ_old), os.path.dirname(old_path))
 			assert _as_339(new, old, d) == old, (suffix, seed)
 
 def test_legacy_read_corpus_matches_339(tmp_path):
@@ -3186,7 +3193,14 @@ def test_cli_legacy_matches_339(tmp_path):
 				text = r.stdout
 			outputs.append((r.returncode, text.replace(str(d), 'D')))
 		results.append((outputs, open(p, 'rb').read()))
-	assert results[0] == results[1]
+	# 5.5 appends a row wider than the header whole (Q5) where 3.39 cut it, and its table shows it whole: the one
+	# difference allowed, compared cell by cell (a table's rows parsed back to cells).
+	def cells(outputs):
+		return [(status, [[c.strip() for c in line.split('|')] for line in text.splitlines() if line and '-+-' not in line]
+				 if '-+-' in text else text) for status, text in outputs]
+	(new, newBytes), (old, oldBytes) = results
+	assert _as_339(cells(new), cells(old)) == cells(old)
+	assert _as_339(newBytes, oldBytes) == oldBytes
 
 
 def test_cli_version():
@@ -6351,26 +6365,21 @@ def test_tsvzed_fromkeys_passes_verbose_as_verbose_and_keeps_monitoring_on(tmp_p
 SCRUB_ROWS = b'key\tv1\tv2\nk1\tx\t\nk2\ty\tz\n'
 
 
-def test_legacy_scrub_refuses_defaults_it_cannot_write_before_it_empties_the_file(tmp_path):
+def test_legacy_scrub_never_writes_the_defaults_a_caller_read_with_so_it_cannot_refuse_them(tmp_path):
+	# 5.5: a scrub copies the file's lines; the caller's defaults are never written into rows (5.4 wrote them, and
+	# refused defaults it could not encode).
 	p = str(tmp_path / 'a.tsv')
 	_touch(p, SCRUB_ROWS)
-	with pytest.raises(TSVZ.TSVZEncodeError) as e:  # k1's empty v2 takes the default
-		TSVZ.scrubTabularFile(p, header='key\tv1\tv2', defaults=['', '', BAD_NAME])
-	assert "key 'k1'" in str(e.value) and "column 3 'v2'" in str(e.value), e.value
-	assert _bytes(p) == SCRUB_ROWS  # the rows are still there
-	TSVZ.scrubTabularFile(p, header='key\tv1\tv2', defaults=['', '', BAD_NAME], errors='replace')
-	assert _bytes(p) == b'key\tv1\tv2\nk1\tx\tbad?.txt\nk2\ty\tz\n'
+	view = TSVZ.scrubTabularFile(p, header='key\tv1\tv2', defaults=['', '', BAD_NAME])
+	assert view['k1'] == ['k1', 'x', BAD_NAME]  # (k1's empty v2 takes the default when read)
+	assert _bytes(p) == SCRUB_ROWS
 
 
-def test_legacy_scrub_with_a_legacy_encoding_refuses_a_row_it_read_and_keeps_the_file(tmp_path):
+def test_legacy_scrub_with_a_legacy_encoding_copies_a_line_it_cannot_decode_byte_for_byte(tmp_path):
 	p = str(tmp_path / 's.tsv')
-	_touch(p, b'k\t\x81\n')  # 0x81 is undefined in cp1252: it reads as U+FFFD, which cp1252 lacks
-	with pytest.raises(TSVZ.TSVZEncodeError) as e:
-		TSVZ.scrubTabularFile(p, encoding='cp1252')
-	assert 'U+FFFD' in str(e.value) and "key 'k'" in str(e.value)
-	assert _bytes(p) == b'k\t\x81\n'
-	TSVZ.scrubTabularFile(p, encoding='cp1252', errors='replace')
-	assert b'k\t?\n' in _bytes(p)
+	_touch(p, b'k\t\x81\nj\t1\nj\t2\n')  # 0x81 is undefined in cp1252: it reads as U+FFFD, which cp1252 lacks
+	assert TSVZ.scrubTabularFile(p, encoding='cp1252') == {'k': ['k', '\ufffd'], 'j': ['j', '2']}
+	assert _bytes(p) == b'k\t\x81\nj\t2\n'  # 5.5: the line is copied, never encoded again, so nothing refuses
 
 
 def test_legacy_scrub_checks_a_header_it_keeps_and_a_header_it_writes(tmp_path):
@@ -6382,10 +6391,11 @@ def test_legacy_scrub_checks_a_header_it_keeps_and_a_header_it_writes(tmp_path):
 
 
 def test_cli_scrub_with_defaults_that_are_not_utf8_leaves_the_rows(tmp_path):
+	# 5.5: the defaults a scrub reads with are never written, so they cannot refuse it; the rows stay as they were.
 	p = str(tmp_path / 'c.tsv')
 	_touch(p, SCRUB_ROWS)
 	status, out, err = _run('--x-defaults', 'k\t\t' + BAD_NAME, 'scrub', p)
-	assert status == 1 and 'cannot write' in err and 'Traceback' not in err, err
+	assert status == 0 and 'Traceback' not in err, err
 	assert _bytes(p) == SCRUB_ROWS
 
 
@@ -10461,20 +10471,15 @@ def test_serve_store_scrub_of_a_headed_tsv_keeps_its_header_on_line_1(tmp_path):
 # ==========================================================================
 def _append_between_read_and_write(monkeypatch, p, rows, header='id\tv'):
 	"""Make another writer append one of ``rows`` each time scrub has read the file and is about to write it."""
-	real = TSVZ._legacyFormatRows
+	real = TSVZ._legacyScrubRead
 	left = list(rows)
-	inside = []  # the append below formats its rows with this function too
 
-	def format_then_append(*args, **kwargs):
+	def read_then_append(*args, **kwargs):
 		result = real(*args, **kwargs)
-		if left and not inside:
-			inside.append(True)
-			try:
-				TSVZ.appendLinesTabularFile(p, [left.pop(0)], header=header)
-			finally:
-				inside.pop()
+		if left:
+			TSVZ.appendLinesTabularFile(p, [left.pop(0)], header=header)
 		return result
-	monkeypatch.setattr(TSVZ, '_legacyFormatRows', format_then_append)
+	monkeypatch.setattr(TSVZ, '_legacyScrubRead', read_then_append)
 	return left
 
 
@@ -10601,19 +10606,19 @@ def _read_with_header(p, header, **kw):
 	return {k: list(v) for k, v in TSVZ.readTabularFile(p, header=header, strict=False, **kw).items()}
 
 
-def test_legacy_scrub_writes_the_files_defaults_line_after_the_rows_and_reads_as_before(tmp_path):
-	# 5.0 and 3.39 dropped it, so rows appended later lost their defaults. After the rows, every row reads as it did
-	# (the one before the line keeps its empty cell, the one after it was filled when read), and a header stays first.
+def test_legacy_scrub_keeps_the_files_defaults_line_where_it_was_and_reads_as_before(tmp_path):
+	# 5.0 and 3.39 dropped it, so rows appended later lost their defaults; 5.1 to 5.4 moved it after the rows. 5.5
+	# keeps it where it was: every row reads as it did, and a header stays first.
 	p = str(tmp_path / 'd.tsv')
 	_touch(p, DEFAULTS_TSV)
 	before = _read_with_header(p, 'id\tv\tw')
 	assert before == {'a': ['a', '', '2'], 'b': ['b', 'X', '3']}
 	assert TSVZ.scrubTabularFile(p, header='id\tv\tw') == {'a': ['a', '', '2'], 'b': ['b', 'X', '3']}
-	assert _bytes(p) == b'id\tv\tw\na\t\t2\nb\tX\t3\n#_defaults_#\tX\tY\n'
+	assert _bytes(p) == DEFAULTS_TSV
 	assert _read_with_header(p, 'id\tv\tw') == before
 	TSVZ.scrubTabularFile(p, header='id\tv\tw')
-	assert _bytes(p) == b'id\tv\tw\na\t\t2\nb\tX\t3\n#_defaults_#\tX\tY\n'  # and a second scrub changes nothing
-	t = TSVZ.TSVZed(p, header='id\tv\tw', verbose=False, rewrite_on_load=False)  # a store whose last line is the defaults
+	assert _bytes(p) == DEFAULTS_TSV  # and a second scrub changes nothing
+	t = TSVZ.TSVZed(p, header='id\tv\tw', verbose=False, rewrite_on_load=False)  # a store whose file ends with the defaults in effect
 	assert t.defaults == ['#_defaults_#', 'X', 'Y'] and {k: list(v) for k, v in t.items()} == before
 	t['c'] = ['c', '', '5']
 	t.close()
@@ -10627,7 +10632,7 @@ def test_legacy_scrub_without_a_header_keeps_the_defaults_line_off_line_1(tmp_pa
 	p = str(tmp_path / 'd.tsv')
 	_touch(p, b'id\tv\tw\n#_defaults_#\tX\tY\na\t\t2\nb\t1\t\n')
 	assert _run('scrub', p)[0] == 0
-	assert _bytes(p) == b'id\tv\tw\na\tX\t2\nb\t1\tY\n#_defaults_#\tX\tY\n'
+	assert _bytes(p) == b'id\tv\tw\n#_defaults_#\tX\tY\na\t\t2\nb\t1\t\n'  # (5.5: nothing to drop, line 1 kept)
 	assert TSVZ.readTabularFile(p, header='id\tv\tw') == {'a': ['a', 'X', '2'], 'b': ['b', '1', 'Y']}  # (strict: the header matches)
 
 
@@ -10648,16 +10653,18 @@ def test_tsvzed_made_header_and_defaults_store_survives_tsvz_scrub(tmp_path):
 
 
 def test_legacy_scrub_does_not_write_the_defaults_a_caller_read_with(tmp_path):
-	# `tsvz scrub f.tsv --x-defaults ...` and scrubTabularFile(defaults=...) fill the rows they read; they add no line.
+	# `tsvz scrub f.tsv --x-defaults ...` and scrubTabularFile(defaults=...) fill the rows they read; they add no line,
+	# and (5.5) they write no defaults into rows: the rows stay as the file has them.
 	p = str(tmp_path / 'r.tsv')
 	_touch(p, b'id\tv\tw\na\t\t2\nb\t1\t\n')
 	for defaults in (['#_defaults_#', 'X', 'Y'], ['', 'X', 'Y'], ('k', 'X', 'Y')):
 		_touch(p, b'id\tv\tw\na\t\t2\nb\t1\t\n')
-		TSVZ.scrubTabularFile(p, header='id\tv\tw', defaults=defaults)
-		assert _bytes(p) == b'id\tv\tw\na\tX\t2\nb\t1\tY\n'
+		assert TSVZ.scrubTabularFile(p, header='id\tv\tw', defaults=defaults) == \
+			{'a': ['a', 'X', '2'], 'b': ['b', '1', 'Y']}
+		assert _bytes(p) == b'id\tv\tw\na\t\t2\nb\t1\t\n'
 	_touch(p, b'id\tv\tw\na\t\t2\nb\t1\t\n')
 	assert _run('scrub', p, '--x-defaults', 'k\\tX\\tY')[0] == 0
-	assert _bytes(p) == b'id\tv\tw\na\tX\t2\nb\t1\tY\n'
+	assert _bytes(p) == b'id\tv\tw\na\t\t2\nb\t1\t\n'
 
 
 def test_legacy_scrub_takes_defaults_none_like_the_default(tmp_path):
@@ -10675,7 +10682,7 @@ def test_legacy_scrub_that_reads_again_starts_from_the_callers_defaults(tmp_path
 	_append_between_read_and_write(monkeypatch, p, [['c', '1', '1']], header='id\tv\tw')
 	mine = []
 	TSVZ.scrubTabularFile(p, header='id\tv\tw', defaults=mine)
-	assert _bytes(p) == b'id\tv\tw\na\t\t2\nb\tX\t3\nc\t1\t1\n#_defaults_#\tX\tY\n'
+	assert _bytes(p) == DEFAULTS_TSV + b'c\t1\t1\n'  # (5.5: the defaults line stays where it was)
 	assert mine == []
 
 
@@ -10878,9 +10885,10 @@ NON_ROW_FIRST = [
 
 @pytest.mark.parametrize('how', ['scrub', 'tsvzed'])
 @pytest.mark.parametrize('name,data', NON_ROW_FIRST, ids=[n for n, _ in NON_ROW_FIRST])
-def test_headerless_whole_write_of_a_file_whose_first_line_is_no_row_puts_the_empty_line_first(tmp_path, name, data, how):
+def test_headerless_whole_write_of_a_file_whose_first_line_is_no_row_keeps_a_line_1(tmp_path, name, data, how):
 	# A reader given a header the file lacks takes the first line for it. Where that line is a comment or a marker, the
 	# write dropped it and no empty line took its place, so that reader then lost row 1 (5.0 wrote the empty line).
+	# 5.5: a scrub keeps line 1 as the file has it (a memory dump still puts the empty line first).
 	p = str(tmp_path / 'f.tsv')
 	_touch(p, data)
 	before = _read_with_header(p, 'host\tip')
@@ -10890,7 +10898,10 @@ def test_headerless_whole_write_of_a_file_whose_first_line_is_no_row_puts_the_em
 		t = TSVZ.TSVZed(p, verbose=False, rewrite_on_load=False)
 		t.hardMapToFile()
 		t.close()
-	assert _bytes(p).startswith(b'\n')
+	if how == 'scrub':
+		assert _bytes(p).split(b'\n')[0] == data.split(b'\n')[0]
+	else:
+		assert _bytes(p).startswith(b'\n')
 	assert set(_read_with_header(p, 'host\tip')) == set(before)
 	assert set(TSVZ.readTabularFile(p, verifyHeader=False)) == {'web1', 'web2'}
 
@@ -10926,13 +10937,13 @@ def test_legacy_scrub_writes_the_files_defaults_line_as_the_file_had_it(tmp_path
 	p = str(tmp_path / 'd.tsv')
 	_touch(p, b'id\tv\tw\n#_defaults_#\tX\t\na\t1\t\nb\t2\t\n')
 	TSVZ.scrubTabularFile(p, header='id\tv\tw', defaults=['#_defaults_#', 'P', 'Q'])
-	assert _bytes(p).endswith(b'\n#_defaults_#\tX\t\n')  # (not #_defaults_#\tX\tQ)
+	assert _bytes(p) == b'id\tv\tw\n#_defaults_#\tX\t\na\t1\t\nb\t2\t\n'  # (not #_defaults_#\tX\tQ; 5.5: where it was)
 	_touch(p, b'id\tv\na\t1\n#_defaults_#\tX\tY\n')
 	TSVZ.scrubTabularFile(p, header='id\tv')
 	assert _bytes(p) == b'id\tv\na\t1\n#_defaults_#\tX\tY\n'  # (not cut to the header's two columns)
 	_touch(p, b'id\tv\na\t1\n#_defaults_#\tX\tY\n#_defaults_#\n')
 	TSVZ.scrubTabularFile(p, header='id\tv')
-	assert _bytes(p) == b'id\tv\n#_defaults_#\t\na\t1\n'  # an empty defaults line resets them: written, before the rows, as wide as they
+	assert _bytes(p) == b'id\tv\na\t1\n#_defaults_#\tX\tY\n#_defaults_#\n'  # (5.5: every defaults line where it was)
 
 
 # ==========================================================================
@@ -11025,7 +11036,7 @@ def test_legacy_scrub_writes_a_defaults_line_that_reads_as_the_defaults_in_effec
 	assert before[0] == ['#_defaults_#', 'Z', 'Y']
 	TSVZ.scrubTabularFile(p, header=h)
 	assert look() == before
-	assert _bytes(p).endswith(b'#_defaults_#\tZ\tY\n')
+	assert _bytes(p) == b'id\tv\tw\n#_defaults_#\tX\tY\na\t1\t\n#_defaults_#\tZ\t\nb\t\t2\n'  # (5.5: as the file has it)
 
 
 def test_legacy_scrub_keeps_a_defaults_reset_in_force_for_every_row(tmp_path):
@@ -11039,14 +11050,14 @@ def test_legacy_scrub_keeps_a_defaults_reset_in_force_for_every_row(tmp_path):
 	assert before['b'] == ['b', '', '2']
 	TSVZ.scrubTabularFile(p, header=h, defaults=list(caller))
 	assert _read_with_header(p, h, defaults=list(caller)) == before
-	assert _bytes(p).startswith(b'id\tv\tw\n#_defaults_#\t\t\n')  # first, after the header: before every row
-	# header-less, the first line a row: after that row; and with the empty line that stands for a header: after it
-	_touch(p, b'a\t1\t\n#_defaults_#\tX\tY\nb\t\t2\n#_defaults_#\nc\t\t3\n')
-	TSVZ.scrubTabularFile(p)
-	assert _bytes(p).startswith(b'a\t1\t\n#_defaults_#\t\t\n')
-	_touch(p, b'\na\t1\t\n#_defaults_#\tX\tY\nb\t\t2\n#_defaults_#\nc\t\t3\n')
-	TSVZ.scrubTabularFile(p)
-	assert _bytes(p).startswith(b'\n#_defaults_#\t\t\na\t1\t\n')
+	# 5.5: the reset stays where the file has it, so it is in force for the rows it was in force for
+	assert _bytes(p) == b'id\tv\tw\n#_defaults_#\tX\tY\na\t\t1\n#_defaults_#\nb\t\t2\n'
+	for data in (b'a\t1\t\n#_defaults_#\tX\tY\nb\t\t2\n#_defaults_#\nc\t\t3\n',
+				 b'\na\t1\t\n#_defaults_#\tX\tY\nb\t\t2\n#_defaults_#\nc\t\t3\n'):
+		_touch(p, data)
+		before = _read_with_header(p, '')
+		TSVZ.scrubTabularFile(p)
+		assert _bytes(p) == data and _read_with_header(p, '') == before
 
 
 def test_header_line_of_a_headerless_store_is_read_through_the_descriptor_it_is_given(tmp_path):
@@ -11141,7 +11152,7 @@ def test_legacy_scrub_of_one_column_rows_writes_no_reset_that_would_read_as_a_ro
 	assert _read_with_header(p, '') == before
 
 
-def test_legacy_scrub_pads_a_shorter_later_defaults_line_to_the_width_of_the_earlier_one(tmp_path):
+def test_legacy_scrub_keeps_a_shorter_later_defaults_line_as_it_is(tmp_path):
 	p = str(tmp_path / 'c.tsv')
 	h = 'id\tv\tw'
 	_touch(p, b'id\tv\tw\n#_defaults_#\tX\tY\na\t1\t\n#_defaults_#\tZ\nb\t\t2\n')
@@ -11155,7 +11166,7 @@ def test_legacy_scrub_pads_a_shorter_later_defaults_line_to_the_width_of_the_ear
 	t = TSVZ.TSVZed(p, header=h, verbose=False, rewrite_on_load=False, rewrite_on_exit=False)
 	assert list(t.defaults) == before
 	t.close()
-	assert _bytes(p).endswith(b'#_defaults_#\tZ\tY\n')
+	assert _bytes(p) == b'id\tv\tw\n#_defaults_#\tX\tY\na\t1\t\n#_defaults_#\tZ\nb\t\t2\n'  # (it reads as Z, Y: R4)
 
 
 # ==========================================================================
@@ -11247,18 +11258,18 @@ def _delete_all_and_scrub_cycles(p, header, cycles=5, writer='append'):
 
 
 @pytest.mark.parametrize('suffix', _OVERWRITE_SUFFIXES)
-@pytest.mark.parametrize('header,expected', [(['id', 'v'], b'id\tv\n'), ('', b'\n')], ids=['headed', 'headerless'])
+@pytest.mark.parametrize('header,expected', [(['id', 'v'], b'id\tv\n'), ('', b'\nk0\t\n')], ids=['headed', 'headerless'])
 def test_legacy_scrub_of_an_all_deleted_file_is_the_same_size_after_every_cycle(tmp_path, suffix, header, expected):
 	p = str(tmp_path / ('g' + _suffix_or_skip(suffix)))
 	sizes = _delete_all_and_scrub_cycles(p, header)
 	assert len(set(sizes)) == 1, sizes  # 5.1: 205, 405, 605, ... (headed .tsv)
-	assert _text(p) == expected  # the header, or the empty line that stands for one
+	assert _text(p) == expected  # the header; or line 1 and the first keyed line, emptied (5.5: readers take W from it)
 	assert TSVZ.readTabularFile(p, header=header) == {}
 	TSVZ.appendTabularFile(p, ['a', '1'], header=header)  # and the file is still a store to append to
 	assert TSVZ.readTabularFile(p, header=header) == {'a': ['a', '1']}
 
 
-@pytest.mark.parametrize('header,expected', [(['id', 'v'], b'id\tv\n'), ('', b'\n')], ids=['headed', 'headerless'])
+@pytest.mark.parametrize('header,expected', [(['id', 'v'], b'id\tv\n'), ('', b'\nk0\t\n')], ids=['headed', 'headerless'])
 def test_tsvzedlite_deletes_then_scrub_do_not_grow_the_file(tmp_path, header, expected):
 	p = str(tmp_path / 'l.tsv')
 	sizes = _delete_all_and_scrub_cycles(p, header, writer='lite')
@@ -11270,16 +11281,16 @@ def test_tsvzedlite_deletes_then_scrub_do_not_grow_the_file(tmp_path, header, ex
 	assert t['a'] == ['a', '1']
 
 
-def test_legacy_scrub_of_an_all_deleted_file_with_no_header_given_and_a_row_first_leaves_nothing(tmp_path):
-	# No header, and no empty line first: the file begins with a row (here a deletion line), which a header-less whole
-	# write does not put an empty line in front of (_isRowLine). Nothing is left to keep.
+def test_legacy_scrub_of_an_all_deleted_file_with_no_header_given_keeps_line_1(tmp_path):
+	# 5.5: line 1 never changes; a row there stays with the deletion that ends it, and a first keyed line after a
+	# line 1 that holds none (a reader takes its column count from it) stays emptied. The same size after every scrub.
 	p = str(tmp_path / 'r.tsv')
 	_touch(p, b'a\t1\nb\t2\na\t\nb\t\n')
-	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b''
+	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b'a\t1\na\t\n'
 	_touch(p, b'\na\t1\na\t\n')
-	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b'\n'
+	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b'\na\t\n'
 	_touch(p, b'#c\n\na\t\n')  # a comment first is no row either
-	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b'\n'
+	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b'#c\na\t\n'
 
 
 ALL_DELETED_DEFAULTS = [
@@ -11287,8 +11298,8 @@ ALL_DELETED_DEFAULTS = [
 	(b'id\tv\tw\n#_defaults_#\tX\tY\na\t\t2\na\t\t\n', b'id\tv\tw\n#_defaults_#\tX\tY\n'),
 	(b'id\tv\tw\na\t\t2\n#_defaults_#\t\t\na\t\t\n', b'id\tv\tw\n#_defaults_#\t\t\n'),
 	(b'id\tv\tw\n#_defaults_#\tX\tY\na\t\t2\n#_defaults_#\t\t\na\t\t\n#_defaults_#\tP\t\n',
-	 b'id\tv\tw\n#_defaults_#\t\t\n#_defaults_#\tP\t\n'),
-	(b'id\tv\tw\n#_defaults_#\tX\tY\na\t\t2\na\t\t\n#_defaults_#\t\tZ\n', b'id\tv\tw\n#_defaults_#\tX\tZ\n'),
+	 b'id\tv\tw\n#_defaults_#\tX\tY\n#_defaults_#\t\t\n#_defaults_#\tP\t\n'),  # (5.5: every defaults line, where it was)
+	(b'id\tv\tw\n#_defaults_#\tX\tY\na\t\t2\na\t\t\n#_defaults_#\t\tZ\n', b'id\tv\tw\n#_defaults_#\tX\tY\n#_defaults_#\t\tZ\n'),
 ]
 
 
@@ -11331,11 +11342,12 @@ NO_ROW_NO_HEADER_TWINS = [
 	# file's width for one more read, whether the default strict reads are compared)
 	(b'\n#_defaults_#\t\t\na\tx\ty\na\t\t\n', ['#_defaults_#', 'D1', 'D2'], ['n', '', '7'], b'\n#_defaults_#\t\t\n', 'id\tv\tw', True),  # (a)
 	# (b): a reader given a header takes the twin's first row for it, and reads it differently, so no header read
-	(b'a\t1\t2\t3\n#_defaults_#\tX\na\t\t\t\n', None, ['b', '1', '', '3'], b'\n#_defaults_#\tX\t\t\n', None, True),
-	(b'a\t1\t2\n#_defaults_#\tX\tY\na\t\t\n', None, ['n', '', '7'], b'\n#_defaults_#\tX\tY\n', 'id\tv\tw', True),  # (c)
-	(b'a\tx\ty\n#_defaults_#\t\t\na\t\t\n', ['#_defaults_#', 'D1', 'D2'], ['n', '', '7'], b'\n#_defaults_#\t\t\n', 'id\tv\tw', True),
-	# a defaults line wider than the rows is cut to them (a strict read of the twin drops that line, so it is not compared)
-	(b'a\t1\t2\n#_defaults_#\tX\tY\tZ\tW\na\t\t\n', None, ['n', '', '7'], b'\n#_defaults_#\tX\tY\n', None, False),
+	# (5.5: line 1 is a row, so it stays, with the deletion that ends it: the file is left as it is)
+	(b'a\t1\t2\t3\n#_defaults_#\tX\na\t\t\t\n', None, ['b', '1', '', '3'], b'a\t1\t2\t3\n#_defaults_#\tX\na\t\t\t\n', None, True),
+	(b'a\t1\t2\n#_defaults_#\tX\tY\na\t\t\n', None, ['n', '', '7'], b'a\t1\t2\n#_defaults_#\tX\tY\na\t\t\n', 'id\tv\tw', True),  # (c)
+	(b'a\tx\ty\n#_defaults_#\t\t\na\t\t\n', ['#_defaults_#', 'D1', 'D2'], ['n', '', '7'], b'a\tx\ty\n#_defaults_#\t\t\na\t\t\n', 'id\tv\tw', True),
+	# a defaults line wider than the rows (5.4 cut it to them; 5.5 keeps it whole, as every line)
+	(b'a\t1\t2\n#_defaults_#\tX\tY\tZ\tW\na\t\t\n', None, ['n', '', '7'], b'a\t1\t2\n#_defaults_#\tX\tY\tZ\tW\na\t\t\n', None, False),
 ]
 
 
@@ -11356,10 +11368,10 @@ def test_legacy_scrub_of_an_all_deleted_file_with_no_header_reads_later_appends_
 		assert dict(got) == dict(was), (read, got, was)
 
 
-def test_legacy_scrub_of_an_all_deleted_file_with_no_header_and_no_defaults_writes_none(tmp_path):
+def test_legacy_scrub_of_an_all_deleted_file_with_no_header_and_no_defaults_keeps_line_1_and_its_deletion(tmp_path):
 	p = str(tmp_path / 'h.tsv')
 	_touch(p, b'a\t1\na\t\n')
-	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b''  # (a first line that is a row: nothing is left to keep)
+	assert TSVZ.scrubTabularFile(p) == {} and _bytes(p) == b'a\t1\na\t\n'  # (5.5: line 1 never changes)
 
 
 STRICT_SCRUB_DROPPED_LINE = [
@@ -11372,23 +11384,24 @@ STRICT_SCRUB_DROPPED_LINE = [
 
 
 @pytest.mark.parametrize('text,header,defaults', STRICT_SCRUB_DROPPED_LINE)
-def test_strict_legacy_scrub_leaves_a_file_whose_read_dropped_a_line_for_its_width(tmp_path, text, header, defaults):
+def test_strict_legacy_scrub_keeps_a_line_its_read_dropped_for_its_width(tmp_path, text, header, defaults):
 	# The strict read finds no live row, but a line it dropped for its width is not a deletion: writing the file as an
-	# empty store (5.2's all-deleted scrub) would lose it. 5.1 left such a file as it was.
+	# empty store (5.2's all-deleted scrub) would lose it. 5.1 to 5.4 left such a file as it was; 5.5 compacts it and
+	# keeps the line (a strict scrub writes what a loose one writes). The scrub ends the last line with a newline.
 	p = str(tmp_path / 'd.tsv')
 	_touch(p, text)
 	kwargs = {'header': header, 'strict': True}
 	if defaults is not None:
 		kwargs['defaults'] = list(defaults)
 	assert TSVZ.scrubTabularFile(p, **kwargs) == {}
-	assert _bytes(p) == text
+	assert _bytes(p) == text + b'\n'
 	assert TSVZ.readTabularFile(p, header=header, strict=False, **({} if defaults is None else {'defaults': list(defaults)}))  # the row is still there to a loose read
 
 
 @pytest.mark.parametrize('header,text,after', [
 	('id\tv', b'id\tv\na\t1\na\t\n', b'id\tv\n'),
-	('', b'\nb\t2\nb\t\n', b'\n'),
-	('', b'#c\n\na\t\n', b'\n'),
+	('', b'\nb\t2\nb\t\n', b'\nb\t\n'),  # (5.5: the first keyed line stays, emptied: readers take W from it)
+	('', b'#c\n\na\t\n', b'#c\na\t\n'),  # (5.5: line 1 never changes)
 ], ids=['headed', 'headerless', 'comment-first'])
 def test_strict_legacy_scrub_still_compacts_a_file_whose_every_line_is_a_deletion_comment_or_header(tmp_path, header, text, after):
 	p = str(tmp_path / 'e.tsv')
@@ -11397,12 +11410,13 @@ def test_strict_legacy_scrub_still_compacts_a_file_whose_every_line_is_a_deletio
 	assert _bytes(p) == after
 
 
-def test_strict_legacy_scrub_with_a_row_and_a_dropped_line_still_drops_the_line(tmp_path):
-	# A live row means the file is rewritten as before: strict mode drops the line it dropped when it read.
+def test_strict_legacy_scrub_with_a_row_and_a_dropped_line_keeps_the_line(tmp_path):
+	# 5.5: a strict scrub writes what a loose one writes: the line strict readers drop stays (loose readers show it).
 	p = str(tmp_path / 'r.tsv')
 	_touch(p, b'id\tv\na\t1\nb\t\t2\n')
 	assert TSVZ.scrubTabularFile(p, header='id\tv', strict=True) == {'a': ['a', '1']}
-	assert _bytes(p) == b'id\tv\na\t1\n'
+	assert _bytes(p) == b'id\tv\na\t1\nb\t\t2\n'
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=False) == {'a': ['a', '1'], 'b': ['b', '', '2']}
 
 
 def _tsvzed_set_delete_sessions(p, sessions=5, **kwargs):
@@ -11552,7 +11566,7 @@ def test_cli_scrub_of_an_all_deleted_file_compacts_it(tmp_path):
 	assert _bytes(p) == b'id\tv\n'
 	_touch(p, b'\na\t1\na\t\n')  # a file with no header line, given none
 	assert _run('scrub', p)[0] == 0
-	assert _bytes(p) == b'\n'
+	assert _bytes(p) == b'\na\t\n'  # (5.5: the first keyed line stays, emptied: readers take their column count from it)
 
 
 def test_cli_scrub_with_a_header_keeps_it_when_every_key_including_the_headers_first_cell_was_deleted(tmp_path):
@@ -11573,7 +11587,8 @@ def test_cli_scrub_without_a_header_still_reads_the_first_line_as_a_row(tmp_path
 	p = str(tmp_path / 'n.tsv')
 	_touch(p, b'id\tv\na\t1\na\t\nid\t\nid\n')
 	assert _run('scrub', p)[0] == 0
-	assert _bytes(p) == b''
+	assert _bytes(p) == b'id\tv\nid\t\n'  # (5.5: line 1 never changes; the deletion that ends its key stays)
+	assert TSVZ.readTabularFile(p) == {}
 
 
 def test_cli_scrub_with_a_header_and_strict_checks_the_header_and_drops_rows_of_another_width(tmp_path):
@@ -11583,9 +11598,9 @@ def test_cli_scrub_with_a_header_and_strict_checks_the_header_and_drops_rows_of_
 	assert status == 0 and 'Header mismatch' in (out + err) and _bytes(p) == b'x\tw\na\t1\n'
 	assert _run('scrub', p, '--x-header', 'id\\tv', '--x-strict')[0] == 1  # strict: the mismatch is an error
 	assert _bytes(p) == b'x\tw\na\t1\n'
-	_touch(p, b'id\tv\na\t1\t2\nb\t3\n')  # strict drops a row of another width at a scrub with rows
+	_touch(p, b'id\tv\na\t1\t2\nb\t3\n')  # strict drops a row of another width when it reads; 5.5's scrub keeps it
 	assert _run('scrub', p, '--x-header', 'id\\tv', '--x-strict')[0] == 0
-	assert _bytes(p) == b'id\tv\nb\t3\n'
+	assert _bytes(p) == b'id\tv\na\t1\t2\nb\t3\n'
 	_touch(p, b'id\tv\na\t1\t2\n')  # and leaves a file with no live row, whose line it dropped (d9bf316)
 	assert _run('scrub', p, '--x-header', 'id\\tv', '--x-strict')[0] == 0
 	assert _bytes(p) == b'id\tv\na\t1\t2\n'
@@ -11596,7 +11611,7 @@ def test_serve_handlers_scrub_of_an_all_deleted_file_compacts_it(tmp_path):
 	_touch(p, b'\na\t1\na\t\n')
 	store = TSVZ._ServeStore(p, lazy=True)
 	assert store.scrub(None) is True
-	assert _bytes(p) == b'\n'
+	assert _bytes(p) == b'\na\t\n'  # (5.5: the first keyed line stays, emptied)
 
 
 # ==========================================================================
@@ -11670,16 +11685,18 @@ def test_cli_x_header_line_1_that_is_not_the_header_is_a_row_with_a_warning(tmp_
 	assert f.run('popitem', 'first')[:2] == (0, 'x|w\n')
 	assert f.run('set', 'b', '2')[0] == 0 and f.run('pop', 'b')[:2] == (0, 'b|2\n')
 	assert f.text() == 'x|w\na|1\nx\nb|2\nb\n'  # no header put in; a header-less file's deletion is the key alone
-	assert f.run('scrub')[0] == 0 and f.text() == 'a|1\n'
+	# (5.5: line 1 never changes, so a row there stays with the deletion that ends it)
+	assert f.run('scrub')[0] == 0 and f.text() == 'x|w\na|1\nx\n'
+	assert f.run('read')[:2] == (0, 'a|1\n')
 	# The scrub agrees with the reads (5.2 before kept line 1 as a header here, and brought deleted key a back).
 	f.put('a|1\nb|2\na|\n')
 	assert f.run('keys')[:2] == (0, 'b\n')
 	status, out, err = f.run('scrub')
 	assert status == 0 and 'Header mismatch' in err
-	assert f.text() == 'b|2\n'
+	assert f.text() == 'a|1\nb|2\na|\n'
 	assert f.run('read')[:2] == (0, 'b|2\n') and f.run('read', header=False) == (0, 'b|2\n', '')
 	f.put('a|1\na|\n')
-	assert f.run('scrub')[0] == 0 and f.text() == ''
+	assert f.run('scrub')[0] == 0 and f.text() == 'a|1\na|\n'
 	f.put('x|w\na|1\n')
 	assert f.run('clear')[0] == 0 and f.text() == 'id|v\n'  # emptied: left with the header given
 
@@ -11716,7 +11733,8 @@ def test_cli_without_x_header_line_1_is_a_row(tmp_path, suffix):
 	assert f.run('keys', header=False) == (0, 'id\n', '')
 	assert f.run('len', header=False) == (0, '1\n', '')
 	assert f.run('popitem', 'first', header=False) == (0, 'id|v\n', '')
-	assert f.run('scrub', header=False)[0] == 0 and f.text() == ''
+	assert f.run('scrub', header=False)[0] == 0 and f.text() == 'id|v\nid\n'  # (5.5: line 1 and its deletion stay)
+	assert f.run('keys', header=False) == (0, '', '')
 
 
 def test_cli_x_header_read_table_shows_the_header_line_above_the_rows(tmp_path):
@@ -11795,16 +11813,18 @@ def test_cli_x_header_line_1_after_a_utf8_byte_order_mark_is_the_header(tmp_path
 @pytest.mark.parametrize('suffix', _XH_SUFFIXES)
 def test_cli_x_header_scrub_of_a_file_with_no_header_never_writes_the_header_as_line_1(tmp_path, suffix):
 	# Line 1 `a|1` is a row; a is deleted, so the first row left is `id|v`, the header given. Written first, every read
-	# with --x-header would take it for the header: the scrub begins the file with an empty line instead.
+	# with --x-header would take it for the header. 5.5: a scrub never changes line 1 (it stays, with the deletion that
+	# ends its key), so no empty line is put first either.
 	f = _XH(tmp_path, suffix)
 	f.put('a|1\nid|v\na|\n')
 	assert f.run('keys')[:2] == (0, 'id\n')
 	assert f.run('scrub')[0] == 0
-	assert f.text() == '\nid|v\n'
+	assert f.text() == 'a|1\nid|v\na|\n'
 	assert f.run('keys')[:2] == (0, 'id\n') and f.run('read', header=False) == (0, 'id|v\n', '')
-	assert f.run('scrub')[0] == 0 and f.text() == '\nid|v\n'  # and a second scrub changes nothing
+	assert f.run('scrub')[0] == 0 and f.text() == 'a|1\nid|v\na|\n'  # and a second scrub changes nothing
 	f.put('a|1\nb|2\nid|v\na|\n')
-	assert f.run('scrub')[0] == 0 and f.text() == 'b|2\nid|v\n'  # a first row that is not the header: no empty line
+	assert f.run('scrub')[0] == 0 and f.text() == 'a|1\nb|2\nid|v\na|\n'
+	assert f.run('keys')[:2] == (0, 'b\nid\n')
 
 
 @pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
@@ -12718,3 +12738,83 @@ def test_legacy_compact_reaches_a_fixed_point_within_3_passes():
 		passes = []
 		_compact(_lines(text.encode('utf8')), header, defaults, delimiter, passes)
 		assert len(passes) <= 3
+
+
+def test_cli_read_table_shows_a_wide_legacy_row_whole(tmp_path):
+	p = str(tmp_path / 'c.tsv')
+	_touch(p, b'id\tval\nw\t1\t2\t3\nx\ty\n')
+	for extra in ((), ('--x-header', 'id\\tval')):
+		status, out, err = _run('read', p, '--format', 'table', *extra)
+		rows = [[c.strip() for c in line.split('|')] for line in out.splitlines() if line and '-+-' not in line]
+		assert status == 0 and ['w', '1', '2', '3'] in rows, out
+
+
+# --- 5.5: the scrub (S) ---
+def _scrub_three_ways(tmp_path, text, header, defaults, strict, delimiter):
+	"""The bytes scrubTabularFile, `tsvz scrub` and a handler's scrub leave of ``text``."""
+	suffix = '.nsv' if delimiter == '\x00' else '.tsv'
+	out = []
+	for way in ('library', 'cli', 'handler'):
+		p = str(tmp_path / (way + suffix))
+		_touch(p, text.encode('utf8'))
+		if way == 'library':
+			kwargs = {'header': header, 'strict': strict}
+			if defaults is not None:
+				kwargs['defaults'] = list(defaults)
+			TSVZ.scrubTabularFile(p, **kwargs)
+		elif way == 'cli':
+			argv = ['scrub', p] + (['--x-header', header.replace('\t', '\\t')] if header else [])
+			argv += (['--x-defaults', '\\t'.join(defaults)] if defaults is not None else []) + (['--x-strict'] if strict else [])
+			assert _run(*argv)[0] == 0
+		else:
+			store = TSVZ._ServeStore(p, header=header, defaults=list(defaults) if defaults else None, strict=strict)
+			try:
+				assert store.scrub(None) is True
+			finally:
+				store.close()
+		out.append(_bytes(p))
+	return out
+
+
+@pytest.mark.parametrize('text, header, defaults, strict, delimiter, expected', COMPACT_EXAMPLES)
+def test_legacy_scrub_byte_examples_through_the_library_the_cli_and_a_handler(tmp_path, text, header, defaults, strict,
+																			   delimiter, expected):
+	assert _scrub_three_ways(tmp_path, text, header, defaults, strict, delimiter) == [expected.encode('utf8')] * 3
+
+
+@pytest.mark.parametrize('text, header', [(b'id\tv\nb\t\t2\n', 'id\tv'), (b'a\t1\nb\t1\t2\n', ''),
+										   (b'id\tv\na\t1\na\t1\t2\nb\t\t2\nb\t\n', 'id\tv')])
+def test_strict_and_loose_legacy_scrubs_write_the_same_bytes(tmp_path, text, header):
+	out = []
+	for strict in (False, True):
+		p = str(tmp_path / ('s%d.tsv' % strict))
+		_touch(p, text)
+		TSVZ.scrubTabularFile(p, header=header, strict=strict)
+		out.append(_bytes(p))
+	assert out[0] == out[1]
+
+
+def test_legacy_scrub_keeps_a_line_it_cannot_decode_byte_for_byte(tmp_path):
+	p = str(tmp_path / 'u.tsv')
+	_touch(p, LEGACY_KEY_ROW)
+	TSVZ.scrubTabularFile(p, header='id\tv', encoding='ascii')
+	assert _bytes(p) == b'id\tv\nr\xe9sum\xe9\t1\nok\t2\n'
+
+
+def test_cli_x_header_scrub_of_a_headerless_file_never_changes_line_1(tmp_path):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'a\t1\nid\tv\na\t\nb\t2\nb\t3\n')  # line 1 is a row; a later row is the header given
+	assert _run('scrub', p, '--x-header', 'id\\tv')[0] == 0
+	assert _bytes(p) == b'a\t1\nid\tv\na\t\nb\t3\n'
+	assert _run('keys', p, '--x-header', 'id\\tv')[1] == 'id\nb\n'
+
+
+def test_legacy_scrub_given_a_header_it_does_not_check_puts_it_first(tmp_path):
+	# The one line a scrub adds (answer b: as 5.4): line 1 stays, as line 2.
+	p = str(tmp_path / 'v.tsv')
+	_touch(p, b'a\t1\na\t2\n')
+	TSVZ.scrubTabularFile(p, header='id\tv', verifyHeader=False)
+	assert _bytes(p) == b'id\tv\na\t1\na\t2\n'  # (line 1 is never dropped: a reader given no header reads it)
+	_touch(p, b'id\tv\na\t1\na\t2\n')
+	TSVZ.scrubTabularFile(p, header='id\tv', verifyHeader=False)
+	assert _bytes(p) == b'id\tv\na\t2\n'  # (line 1 is that header already: nothing added)
