@@ -852,21 +852,98 @@ def test_ctrl_c_while_an_explicit_rewrite_waits_for_another_process_finishes_it_
 	assert len(rows) == 20000, err
 
 
-def test_a_store_the_exit_let_go_of_starts_no_write(tmp_path):
+def test_a_store_the_exit_let_go_of_writes_only_what_another_thread_asks_for(tmp_path):
 	p = _tsv(tmp_path, 20)
 	before = open(p, 'rb').read()
 	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
 	try:
 		assert t._atExit() is None and t._letGo  # nothing to write: let go of
-		t.dirty = True
-		t.appendQueue.append(['late', 'L'])  # a row queued after the exit let go (another exit handler's)
-		assert t._writeFile(whole=True) is False
-		t._commitOnce()
+		assert not t._workerRuns()  # every write now runs in the thread that asks for it
+		assert t._workerDone.wait(10)  # the writer thread ended, writing nothing
+		t.appendQueue.append(['late', 'L'])
+		results = []
+		unattended = threading.Thread(target=lambda: results.append(t._startWrite()))
+		t.appendThread, real = unattended, t.appendThread
+		unattended.start()
+		unattended.join()
+		t.appendThread = real
+		assert results == [False]  # the writer thread starts no write of its own
 		assert open(p, 'rb').read() == before
+		t.commitAppendToFile()  # this thread's: written
+		assert TSVZ.readTabularFile(p, header='id\tv')['late'] == ['late', 'L']
 	finally:
-		t.appendQueue.clear()
-		t.dirty = False
 		t._finish()
+
+
+#: An exit handler registered before TSVZ is imported (a lazy import) runs after TSVZ's own exit hook.
+LATE_ATEXIT = r'''
+import atexit, sys
+how, p, here = sys.argv[1], sys.argv[2], sys.argv[3]
+STORE = []
+def save():
+	t = STORE[0]
+	t['x'] = ['x', 'saved-at-exit']
+	if how == 'commit':
+		t.commitAppendToFile()
+	elif how == 'hardmap':
+		t.hardMapToFile()
+	t.close()
+atexit.register(save)
+sys.path.insert(0, here)
+import TSVZ as T
+STORE.append(T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False))
+'''
+
+
+@pytest.mark.parametrize('how', ['commit', 'hardmap', 'close'])
+def test_an_exit_handler_that_runs_after_tsvz_still_writes(tmp_path, how):
+	p = _tsv(tmp_path, 20)
+	subprocess.check_call([sys.executable, '-c', LATE_ATEXIT, how, p, HERE], timeout=60)
+	assert TSVZ.readTabularFile(p, header='id\tv').get('x') == ['x', 'saved-at-exit']
+
+
+#: A store with a queued row whose commit waits for another process's lock at exit; a later exit handler (registered
+#: before TSVZ was imported) lets the other process go, after the second Ctrl-C abandoned the write.
+ABANDONED = r'''
+import atexit, os, sys, time
+p, here, kind = sys.argv[1], sys.argv[2], sys.argv[3]
+def later():
+	open(p + '.release', 'w').close()
+	time.sleep(1.5)  # the rest of the exit: the abandoned write must not start in it
+atexit.register(later)
+sys.path.insert(0, here)
+import TSVZ as T
+T._LOCK_KIND = kind
+t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+sys.stdout.write('open\n'); sys.stdout.flush()
+while not os.path.exists(p + '.go'):
+	time.sleep(0.01)
+t['new'] = ['new', 'N']
+sys.stdout.write('exiting\n'); sys.stdout.flush()
+'''
+
+
+def test_a_write_abandoned_at_exit_does_not_start_once_the_lock_comes_free(tmp_path, kind):
+	p = _tsv(tmp_path, 20)
+	before = open(p, 'rb').read()
+	store = subprocess.Popen([sys.executable, '-c', ABANDONED, p, HERE, kind], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	holder = None
+	try:
+		_expect(store, 'open')
+		holder = _hold(p, 'native', kind=kind)
+		open(p + '.go', 'w').close()
+		_expect(store, 'exiting')
+		time.sleep(0.7)
+		store.send_signal(signal.SIGINT)  # "is being finished"
+		time.sleep(1)
+		store.send_signal(signal.SIGINT)  # abandoned; the later handler then lets the holder go
+		out, err = store.communicate(timeout=20)
+		assert b'being finished' in err, err
+		holder.wait(10)
+	finally:
+		_release(p)
+		_kill(store, holder)
+	assert open(p, 'rb').read() == before, 'the abandoned write started after the exit let go of it'
 
 
 def test_a_handler_takes_its_check_bytes_under_the_read_lock(tmp_path, monkeypatch, kind):

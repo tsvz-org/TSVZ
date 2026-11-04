@@ -4449,15 +4449,20 @@ def _stopLiveStores():
 	"""At exit, stop every store still running (_atExit: a TSVZed's last rewrite and appends), letting a write in
 	progress finish: a first Ctrl-C meanwhile keeps waiting for it, and says so; a second abandons it."""
 	interrupted = False
-	for store in reversed(list(_LIVE_STORES.values())):  # the last made first, as atexit runs its own
-		try:
-			store._atExit()
-		except KeyboardInterrupt:
-			if interrupted:
-				raise
-			interrupted = True
-			eprint(f"TSVZ: the write to {store._fileName} is being finished; Ctrl-C again to abandon it")
-			store._finish()
+	try:
+		for store in reversed(list(_LIVE_STORES.values())):  # the last made first, as atexit runs its own
+			try:
+				store._atExit()
+			except KeyboardInterrupt:
+				if interrupted:
+					raise
+				interrupted = True
+				eprint(f"TSVZ: the write to {store._fileName} is being finished; Ctrl-C again to abandon it")
+				store._finish()
+	except BaseException:
+		for store in list(_LIVE_STORES.values()):
+			store._letGo = True  # abandoned: no writer thread starts a write the interpreter's end would cut short
+		raise
 
 
 atexit.register(_stopLiveStores)
@@ -5538,7 +5543,7 @@ memoryOnly:{self.memoryOnly}
 	_refusals = 0  # refusals in a row, since the last _accepted(): each doubles the wait before the next try
 	_closing = False  # stopAppendThread() makes its last rewrite: none is tried after it
 	_writing = 0  # write jobs and writes under way on the writer thread (_startWrite): the exit lets go of none of them
-	_letGo = False  # the exit let go of the store (_atExit): its writer thread starts no write
+	_letGo = False  # the exit let go of the store (_atExit), or abandoned it: its writer thread starts no write
 	_exiting = False  # _stopLiveStores stops it at exit: a Ctrl-C there finishes the store, which does not run on
 
 	def _refuse(self, where, error, explicit=False):
@@ -5717,6 +5722,10 @@ memoryOnly:{self.memoryOnly}
 			except Exception as e:
 				self._failed('rewrite', f"Failed to open file {self._fileName}: {e}", trace=False)
 				self.deSynced = True
+				return False
+			if self._unattended():  # the exit let go of the store (abandoned) while this waited for the lock
+				_unlockFile(f)
+				f.close()
 				return False
 			started = False
 			end = None
@@ -6092,15 +6101,24 @@ memoryOnly:{self.memoryOnly}
 		return job[3]
 
 	def _workerRuns(self):
-		"""True while the writer thread runs: until the end of _appendWorker, not Thread.is_alive() (on Python 3.9 to
-		3.12 a KeyboardInterrupt in Thread.join() marks a running thread stopped); False in a forked child."""
-		return not self._workerDone.is_set() and self._workerPid == os.getpid()
+		"""True while the writer thread runs and takes jobs: until the end of _appendWorker, not Thread.is_alive() (on
+		Python 3.9 to 3.12 a KeyboardInterrupt in Thread.join() marks a running thread stopped); False in a forked
+		child, and once the exit has let go of the store (_letGo): then every write runs in the thread that asks for
+		it, which the interpreter waits for, and nothing waits for the writer thread, which may wait to read."""
+		return not self._letGo and not self._workerDone.is_set() and self._workerPid == os.getpid()
+
+	def _unattended(self):
+		"""True on the writer thread once the exit has let go of the store: it starts no write of its own (its tick's
+		commits and rewrites, its last commit), and one that was waiting for the file lock writes nothing once it gets
+		it, so the interpreter's end never cuts a write short."""
+		return self._letGo and threading.current_thread() is self.appendThread
 
 	def _startWrite(self):
-		"""Note a write job or a write starting on the writer thread, so the exit waits for it (_atExit); False, and
-		nothing noted, once the exit has let go of the store: nothing more is written."""
+		"""Note a write job or a write starting, so the exit waits for it (_atExit); False, and nothing noted, on the
+		writer thread once the exit has let go of the store (_unattended). A write another thread asks for after that
+		runs in that thread (_workerRuns) and is written."""
 		with self._memLock:
-			if self._letGo:
+			if self._unattended():
 				return False
 			self._writing += 1
 			return True
@@ -6220,6 +6238,10 @@ memoryOnly:{self.memoryOnly}
 				self._failed('append', f"Failed to open file {self._fileName}: {e}", trace=False)
 				self.deSynced = True
 				return self
+			if self._unattended():  # the exit let go of the store (abandoned) while this waited for the lock
+				_unlockFile(f)
+				f.close()
+				return self
 			known = None
 			try:
 				known = None if self._changedSince(f) else self._known
@@ -6297,7 +6319,8 @@ memoryOnly:{self.memoryOnly}
 	
 	def stopAppendThread(self):
 		try:
-			if not self.shutdownEvent.is_set():
+			# Once the exit let go of the store, a close() (another exit handler's) still writes what is queued, here.
+			if not self.shutdownEvent.is_set() or self._letGo:
 				if self._spec:
 					self._specSync()
 				else:
@@ -6308,6 +6331,8 @@ memoryOnly:{self.memoryOnly}
 						# tried once more, however lately a rewrite was refused (no failed one's back-off is waited out
 						# here either): memory holds the only good copy, and goes with the store.
 						self.rewrite(force=self.rewrite_on_exit or self._damaged or self._remake)  # Ensure any final sync operations are performed
+						if self._letGo:
+							self._commit()  # (the writer thread appends nothing more: the queued rows, here)
 					except BaseException:
 						self._closing = self._exiting  # a Ctrl-C stopped the wait: the store runs on, but not at exit
 						raise
