@@ -248,20 +248,23 @@ on another store of the same file, whose thread waits for this lock.) A file ano
 again from memory by the store's next write, an append included (a removal in the
 microseconds as a write starts is followed as a rotation instead); while that rewrite
 fails or is refused, the rows are appended to a new file there, and memory keeps all of
-them for the rewrite that gets through. A compressed file another writer left damaged
-is made again too (L5: every read stops at the damage, so rows
-appended after it would be read by no one): what the read did not get goes, the bytes after
-the damage and also the lines of the damaged member before it that the codec never handed
-over (Python's gzip gives none of a first member cut short, where `zcat` shows them). While that
+them for the rewrite that gets through. A compressed file is read member by member, and a
+member's rows are used only once it passes its codec's check (the gzip CRC-32 and length,
+the bzip2 CRCs, the xz check, the zstd content checksum TSVZ writes): a member cut short,
+as a writer killed mid-append leaves it, is left out whole and the members after it are
+read; other damage (bytes that do not decode, a member that fails its check, the old bytes
+a whole rewrite cut short leaves after its new members) stops the read there (L5). A
+compressed file another writer left damaged is made again too: what the read did not get
+goes, the damaged member and, after damage that stops the read, everything after it (rows
+appended there would be read by no one). While that
 rewrite fails, the rows are appended after the damage and memory keeps them for the
 next rewrite that gets through; while it is refused (a row changed in place to text
 the encoding cannot hold), they are appended after it as in 4.9, and the next read
 drops them. Either way `close()` tries the rewrite once more, whatever
 `rewrite_on_exit` says. Appends that do not read the store first (`tsvz set`,
 `appendTabularFile`, `TSVZedLite`, and a `TSVZed` with `monitor_external_changes=False`
-for damage that lands after it loaded the file) still land after it, and so do a
-`TSVZed`'s rows when a writer that takes no lock leaves the damage between the store's read
-and its append ([docs/limitations.md](docs/limitations.md)).
+for damage that lands after it loaded the file) still land after damage that stops the
+read ([docs/limitations.md](docs/limitations.md)).
 
 It knows the size and SHA-256 of the bytes it last read or wrote. When another process
 has changed the file, and it is the same file (device and inode) and still begins with
@@ -291,6 +294,34 @@ with no header (or `verifyHeader=False`), anything written to a file the damage 
 empty; the keys it sets or deletes then take its values, and the keys it left out keep
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
+
+## Upgrading to 5.4
+
+The file formats are unchanged.
+
+- **A compressed `.tsv`-family file is read member by member, each member once its check
+  passes.** `readTabularFile`, `scrubTabularFile`, `clearTabularFile`, `TSVZed`,
+  `TSVZedLite`, `openFileAsCompressed()` for reading, `get_file_obj('rb')`, the CLI and
+  `tsvz serve` read a `.gz`, `.bz2`, `.xz` or `.zst` file so. Python's codec readers hand
+  a member's text over before they check it: a member cut short by a writer killed
+  mid-append, once another member was appended after it, could end its last line with a
+  garbage value (gzip, more rarely xz), which a `TSVZed` then wrote back. Now:
+  - a member cut short is left out whole, also when it is the last one (5.3 and earlier kept the whole
+    lines it decoded): its writer was never told those rows were saved. The members after
+    it are read, where 5.3 and earlier stopped at it, so a cut first member followed by good members
+    (5.2's scrub made that an empty store) now reads the good ones; given a header, the
+    first line read is taken as the header line, as for any file whose first line is not
+    the header. A `TSVZed` that read it makes the file again at its next write, without
+    the cut member.
+  - a member that fails its check gives none of its rows (5.3 and earlier used them, then stopped).
+  - other damage stops the read there, as before: bytes that do not decode (also after a
+    complete `.bz2` or `.xz` stream, which earlier versions' `readTabularFile` passed over silently),
+    a member that fails its check, and the old bytes a whole rewrite cut short leaves after
+    its new members (they hold rows as they were before the rewrite, so they are not read).
+  - the damage warning names each member left out and where it begins.
+  - a member's text is held until its check passes: TSVZ writes at most 1 MiB of text a
+    member, and a file another tool compressed whole is one member, held whole while it is
+    read (the read builds the rows from it anyway).
 
 ## Upgrading to 5.3 from 5.2
 
@@ -374,7 +405,7 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   made again as an empty store, as a scrub of a damaged file with rows already was in
   5.1: what the read did not get goes, the bytes after the damage and also the lines of the
   damaged member before it that the codec never handed over (Python's gzip gives none of
-  a first member cut short, where `zcat` shows them) (see the damaged-stream notes above), and
+  a first member cut short, where `zcat` shows them; 5.4 reads the members after it), and
   `tsvz clear --x-header H --x-strict` (`clearTabularFile(verifyHeader=True)`) now clears
   such a file, where 5.1 exited 1 with the codec's error.
   5.1 and 5.0 left such a file as it was, deletion lines included, so a writer that
@@ -573,7 +604,7 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 | L2 | Setting a row whose values are all empty deletes it in memory too (it already meant delete on disk), with a warning. |
 | L3 | `TSVZedLite` on a compressed file keeps rows in memory; 3.39 read compressed bytes as text. Rows held in memory (also `#` keys) are returned directly. |
 | L4 | New warnings on stderr (invalid encoding, lines dropped by `strict`); data unchanged. |
-| L5 | A damaged compressed file is read up to the damage instead of raising. |
+| L5 | A damaged compressed file is read up to the damage instead of raising; from 5.4 a member cut short is left out and the members after it are read. |
 | L6 | `mapToFile` no longer glues a row it adds at the end of the file to the next one. |
 | L7 | `TSVZed`'s `in` and `get` find a key as `t[key]` does: the live key equal to it, else the key right-stripped. 3.39 matched them exactly, so `'x ' in t` was false while `t['x ']` read `x`, and `t.setdefault('x ', …)` overwrote `x`. |
 | L8 | Appending (`TSVZed`, `TSVZedLite`, `appendTabularFile`, `appendLinesTabularFile`) to an existing empty file (no byte, or a compressed file holding only empty streams) writes the store's header first, as creating the file does; 3.39 wrote the rows alone (a read then took the first one for the header), and `appendTabularFile` with `strict` refused the file. |
