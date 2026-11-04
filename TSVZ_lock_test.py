@@ -778,3 +778,72 @@ def test_a_rewrite_is_not_starved_by_two_appending_stores(tmp_path, kind):
 	finally:
 		_kill(*children)
 		a.close()
+
+
+# ---------------------------------------------------------------------------
+# Entry 2: flock (macOS and other systems; forced on Linux)
+# ---------------------------------------------------------------------------
+def test_flock_write_lock_survives_other_threads_opening_reading_and_closing_the_file(tmp_path, monkeypatch):
+	# Design T5a: a lockf lock was dropped by any close of the file in the process (p1 a).
+	monkeypatch.setattr(TSVZ, '_LOCK_KIND', 'flock', raising=False)
+	p = _tsv(tmp_path, 20)
+	inside, go = threading.Event(), threading.Event()
+	real = TSVZ._appendOpen
+
+	def paused(*args, **kwargs):
+		inside.set()
+		go.wait(20)
+		return real(*args, **kwargs)
+	monkeypatch.setattr(TSVZ, '_appendOpen', paused)
+	writer = threading.Thread(target=TSVZ.appendTabularFile, args=(p, ['k9999', 'x']), kwargs={'header': 'id\tv'})
+	writer.start()
+	results = []
+	try:
+		assert inside.wait(10)
+		assert _other(p, 'flock') == 'busy'
+		open(p, 'rb').close()
+		TSVZ._fileHoldsNothing(p)
+		assert _other(p, 'flock') == 'busy', 'another thread closing the file dropped the write lock'
+		reader = threading.Thread(target=lambda: results.append(TSVZ.readTabularFile(p, header='id\tv')))
+		reader.start()
+		assert not _done_within(reader, 0.5), 'a read in another thread went on during the write'
+		assert _other(p, 'flock') == 'busy'
+	finally:
+		go.set()
+		writer.join(10)
+	assert _done_within(reader, 5)
+	assert 'k9999' in results[0]
+
+
+def test_a_store_commit_and_an_append_in_another_thread_write_one_header(tmp_path, monkeypatch):
+	# Design T5b (probe p6): under lockf both found the emptied file empty and both wrote the header.
+	monkeypatch.setattr(TSVZ, '_LOCK_KIND', 'flock', raising=False)
+	p = str(tmp_path / 'f.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, rewrite_on_load=False)
+	real = TSVZ._holdsNothing
+
+	def slow(*args, **kwargs):
+		found = real(*args, **kwargs)
+		if found and threading.current_thread() is t.appendThread:
+			time.sleep(0.5)  # only the store's writer thread pauses, inside its lock
+		return found
+	monkeypatch.setattr(TSVZ, '_holdsNothing', slow)
+	try:
+		open(p, 'wb').close()  # emptied (a rewrite cut short, another writer): the next append writes the header first
+		t.externalFileUpdateTime = TSVZ.getFileUpdateTimeNs(p)
+		t._known = TSVZ._KNOWN_NOTHING
+		t.memoryOnly = True
+		t['a'] = ['a', '1']
+		t.memoryOnly = False
+		t.appendQueue.append(['a', '1'])
+		a = threading.Thread(target=t.commitAppendToFile)
+		b = threading.Thread(target=lambda: TSVZ.appendTabularFile(p, ['b', '2'], header='id\tv'))
+		a.start()
+		time.sleep(0.1)
+		b.start()
+		a.join(10)
+		b.join(10)
+	finally:
+		t.close()
+	data = open(p, 'rb').read()
+	assert data.count(b'id\tv\n') == 1, data
