@@ -12215,5 +12215,38 @@ def test_members_an_append_to_a_file_whose_first_member_is_cut_says_what_fixes_i
 	assert 'scrub' in str(caught.value) and _bytes(p) == data
 
 
+
+@pytest.mark.parametrize('how', ['read_last_valid_line', 'readTabularFile', 'scrubTabularFile'])
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_the_last_valid_line_reads_past_a_cut_later_member(tmp_path, capsys, suffix, how):
+	# The forward last-line read raised the end-of-text damage (_DamagedStream) instead of returning the last row.
+	_, cut = _cutMember(suffix, 0)
+	p = str(tmp_path / ('g.' + suffix))
+	data = _member(suffix, b'key\tval\nk0\tv0\n') + cut + _member(suffix, b'z\t9\n')
+	_touch(p, data)
+	if how == 'read_last_valid_line':
+		last = TSVZ.read_last_valid_line(p, {}, -1)
+	else:
+		last = getattr(TSVZ, how)(p, header='key\tval', lastLineOnly=True)
+	assert last == ['z', '9'] and _bytes(p) == data
+	warnings = _tsvz_warnings(capsys)
+	assert len(warnings) == 1 and 'cut short' in warnings[0], warnings
+
+
+@pytest.mark.parametrize('how', ['read_last_valid_line', 'readTabularFile', 'scrubTabularFile'])
+@pytest.mark.parametrize('suffix', _MEMBER_SUFFIXES)
+def test_members_the_last_valid_line_before_bytes_that_do_not_decode(tmp_path, capsys, suffix, how):
+	p = str(tmp_path / ('g.' + suffix))
+	data = _member(suffix, b'key\tval\nk0\tv0\n') + _member(suffix, b'k1\tv1\n') + b'not a member\n'
+	_touch(p, data)
+	if how == 'read_last_valid_line':
+		last = TSVZ.read_last_valid_line(p, {}, -1)
+	else:
+		last = getattr(TSVZ, how)(p, header='key\tval', lastLineOnly=True)
+	assert last == ['k1', 'v1'] and _bytes(p) == data
+	warnings = _tsvz_warnings(capsys)
+	assert len(warnings) == 1 and 'do not decode' in warnings[0], warnings
+
+
 if __name__ == '__main__':
 	sys.exit(pytest.main([__file__] + sys.argv[1:]))
