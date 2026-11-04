@@ -929,18 +929,36 @@ funneled through one handler (§18.3).
 18.6 **Access and append locks.** A producer that modifies a part in place
 (§19.8) SHOULD coordinate through two independent advisory locks per part:
 
-   - the **access lock** — held *shared* by every handle for as long as it has the
-     part open (readers, writers, and live stores alike), and *exclusive* only
-     while the part is truncated or rewritten in place. Exclusive access therefore
-     means that no other handle has the part open;
+   - the **access lock** — held *shared* by a handle while it reads the part to
+     take state from it, and *exclusive* only while the part is truncated or
+     rewritten in place. A handle MAY hold it shared for as long as it has the
+     part open, which makes exclusive access mean that no other handle has the
+     part open. A handle that holds it only while it reads SHOULD check, before it
+     continues from what it read earlier, that the part was not rewritten in
+     between (for example by its identity, its size, and the bytes it last read);
    - the **append lock** — held exclusively for the duration of one batch append
      (§18.2), so appends from different handles never interleave.
+
+   A producer that rewrites a part in place SHOULD take the append lock before
+   the access lock: readers that follow appends then finish and start no more
+   reads, so they cannot hold the rewrite off for good.
 
    The two locks SHOULD be distinct byte ranges of the part (for example, one byte
    each at offsets 0 and 1), so that appending never waits on readers. Locks owned
    by the open file description (Linux OFD locks) are RECOMMENDED: process-owned
    POSIX record locks are released as soon as the process closes *any* descriptor
-   for the file, and do not exclude other handles in the same process.
+   for the file, and do not exclude other handles in the same process. A reader
+   SHOULD NOT take a process-owned shared lock in a process that may hold a write
+   lock on the part: the shared lock replaces it. Where locks owned by the open
+   file description are missing, whole-file `flock(2)` locks MAY stand in for
+   both: shared for the shared access lock, exclusive for either exclusive hold;
+   appends then wait on readers. On Linux local file systems `flock(2)` does not
+   exclude POSIX record locks, so OFD locks SHOULD be used there.
+
+   A locked descriptor that a `fork()` child inherits keeps its lock until the
+   child closes it; a producer SHOULD close or replace such descriptors in the
+   child. A reader that cannot take a lock (the file system refuses locks) reads
+   without it.
 
 18.7 **Parts are never replaced.** A producer **MUST NOT** replace an existing part
 by renaming another file over it. Handles that still have the old file open keep

@@ -66,16 +66,22 @@ def _child(code, *args, **kwargs):
 
 
 def _expect(child, word, timeout=20):
-	"""Read the child's next line, which must be ``word``."""
-	result = []
-	reader = threading.Thread(target=lambda: result.append(child.stdout.readline()))
+	"""Read the child's lines until one is ``word`` (a store's messages, such as "External changes detected", may
+	come first)."""
+	seen = []
+
+	def read():
+		for line in iter(child.stdout.readline, b''):
+			seen.append(line.decode().strip())
+			if seen[-1] == word:
+				return
+	reader = threading.Thread(target=read)
 	reader.daemon = True
 	reader.start()
 	reader.join(timeout)
-	line = result[0].decode().strip() if result else None
-	if line != word:
+	if not seen or seen[-1] != word:
 		child.kill()
-		raise AssertionError('child said {!r}, not {!r}: {}'.format(line, word, child.stderr.read().decode()[-2000:]))
+		raise AssertionError('child said {!r}, not {!r}: {}'.format(seen, word, child.stderr.read().decode()[-2000:]))
 
 
 def _kill(*children):
@@ -715,7 +721,9 @@ def test_ctrl_c_in_a_store_waiting_on_another_process_lets_the_program_exit(tmp_
 def test_ctrl_c_at_close_of_a_store_with_a_queued_row_ends_after_three(tmp_path, kind):
 	# The store has a row to write and waits for another process's lock. A Ctrl-C stops close()'s wait; at exit the
 	# write in progress is waited for again, a Ctrl-C there says it is being finished, and the next abandons it: three
-	# in all (as in 5.2, where the wait was for another writer only; documented here, not a new rule).
+	# in all (as in 5.2, where the wait was for another writer only; documented here, not a new rule). On Python 3.7
+	# to 3.12 a Ctrl-C in Thread.join() marks the thread as stopped while it runs, so the exit does not wait for it
+	# and one Ctrl-C ends the program.
 	p = _tsv(tmp_path, 20)
 	store = _child(STORE, p, 'queued', kind=kind)
 	holder = None
@@ -737,7 +745,8 @@ def test_ctrl_c_at_close_of_a_store_with_a_queued_row_ends_after_three(tmp_path,
 				pass
 		assert store.poll() is not None, 'three Ctrl-Cs did not end the program'
 		err = store.stderr.read() + store.stdout.read()
-		assert signals == 3 and b'being finished' in err, err
+		assert signals in ((1, 3) if (3, 7) <= sys.version_info < (3, 13) else (3,)), (signals, err)
+		assert signals == 1 or b'being finished' in err, err
 	finally:
 		_release(p)
 		_kill(store, holder)
@@ -774,7 +783,8 @@ def test_a_rewrite_is_not_starved_by_two_appending_stores(tmp_path, kind):
 		time.sleep(1)
 		start = time.time()
 		a.hardMapToFile()
-		assert time.time() - start < 10, 'the rewrite was starved'
+		took = time.time() - start
+		assert took < 10, 'the rewrite was starved: {:.1f} s'.format(took)
 	finally:
 		_kill(*children)
 		a.close()

@@ -42,10 +42,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.2'
+version = '5.3'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-11-03'
+COMMIT_DATE = '2026-11-04'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -1012,8 +1012,10 @@ _PATH_LOCKS_GUARD = threading.Lock()
 def _pathLock(path):
 	"""Return the process-wide lock for ``path``.
 
-	POSIX ``lockf`` does not exclude two handles of the same process, so 4.1
-	writers also hold this lock while they append to or rewrite a file.
+	Writers also hold this lock while they append to or rewrite a file: the
+	file lock does not always exclude threads of one process (``lockf``, still
+	the fallback where the other locks are refused, excludes none), and
+	Windows' ``msvcrt`` gives up after 10 s. Readers never take it.
 	"""
 	key = os.path.realpath(path)
 	with _PATH_LOCKS_GUARD:
@@ -4670,7 +4672,10 @@ class TSVZed(OrderedDict):
 	- A legacy file (.tsv, .csv, .nsv, .psv, compressed or not) is written by the store's background thread
 	  only: rewrite(), mapToFile(), hardMapToFile(), commitAppendToFile(), clear(), reload() and close() hand
 	  it the job and wait for it, so a KeyboardInterrupt stops the wait, never the write. At exit, a write in
-	  progress is finished (a second Ctrl-C abandons it).
+	  progress is finished (a second Ctrl-C abandons it); a store with nothing to write is not waited for.
+	- Its reads of a legacy file (the load, reload() and the background read) hold the file's READ lock, so
+	  another process's rewrite under the file lock is waited out, never met part way; its appends take the
+	  append lock (which, on Linux, readers do not wait for) and its rewrites the rewrite lock (_lockFile).
 	- Another process's change to a legacy file that leaves the bytes this store knows it holds where they
 	  were (the same file, size and SHA-256) is read from there on and applied to memory; any other change
 	  reloads the file, with the queued rows replayed on it.
@@ -6288,7 +6293,12 @@ memoryOnly:{self.memoryOnly}
 	def get_file_obj(self,modes = 'ab'):
 		"""The store's file opened in ``modes`` and locked, with writeLock held until release_file_obj() (3.39 API; the
 		store's own writes do not use it). 'wb' empties it once locked; for a compressed file 'w' and 'a' modes give
-		a writer through its codec over the locked file (a new member at the end for 'a'). None when it cannot be opened or locked (reported)."""
+		a writer through its codec over the locked file (a new member at the end for 'a'). None when it cannot be opened or locked (reported).
+
+		'a' modes take the append lock, so other processes' readers go on while it is held; other modes take the
+		rewrite lock, which readers wait for (_lockFile). The calling thread reads the file (readTabularFile) without
+		waiting for its own lock, but must not wait on another store of the same file (its reload(), close() or a
+		write) while it holds it: that store's thread waits for this lock, for ever."""
 		self.writeLock.acquire()
 		file = None
 		try:

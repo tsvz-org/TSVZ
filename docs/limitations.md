@@ -2,22 +2,49 @@
 
 Approved known limitations and deferrals. Reviewers: read this first, and don't raise these again.
 
-### A read in another thread can drop a lockf write lock
-- Kind: deferred
-- What the operator sees: where TSVZ cannot take an open file description lock (macOS and other systems that
-  are not Linux, or a Linux file system that refuses those locks), it locks a file with `lockf`, and closing
-  any descriptor of that file in the process drops the lock. A read of the store in another thread of the same
-  process (a handler's, another `TSVZed`'s, a `readTabularFile`) can then drop a write's lock while the write
-  holds it, and another process's write can land in the middle of it. A `lockf` lock belongs to the process, so
-  two writes from threads of one process (two stores on one file, or a store and `appendTabularFile`) do not
-  exclude each other either: one starting on a missing file can write its header twice, read as a row `key`
-  (main does the same). On Linux with open file description locks (the usual case) none of this happens.
-- Why: 4.9 tried a close gate (a close waits while another thread holds the lock) and took it out again
-  (cbe1829): five review rounds kept finding hangs in it. A fix needs its own design, for example `flock` on
-  macOS, checked on a Mac.
-- Revisit when: someone runs TSVZ writers on macOS with threads or a handler, or a Mac is at hand to check a
-  `flock` design.
-- Approved: 2026-10-24, the user chose "Record as deferred (Recommended)".
+### Some writers and readers still meet another process's rewrite part way
+- Kind: known limitation
+- What the operator sees: from 5.3 a reader of a `.tsv`-family file (`readTabularFile`, `tsvz get` and `read`, a
+  `TSVZed`'s load, `reload()` and background read, `TSVZedLite`'s load, a `tsvz serve` handler) waits while
+  another process rewrites the file under its lock, so a `del` of a key in that moment is no longer lost. It still
+  can be in these cases:
+  - the other writer empties the file before it takes the lock, or takes no lock: 3.39's and 4.9's rewrite of a
+    compressed file and their `clear()` (`get_file_obj('wb')`), `scrubTabularFile`, `clearTabularFile`,
+    `tsvz scrub` and `tsvz clear` from 3.39 to 5.0, `TSVZedLite` before 5.1, and other tools. A 5.3 reader can meet
+    such a file empty (an empty store) or half written (a compressed one then usually reads as damage and is read
+    again under the lock; a plain one does not);
+  - the reader is TSVZ 5.2 or older, or tsvz-rs: it takes no lock and can see a 5.3 rewrite part way, as before.
+    Restarting the program on 5.3 ends it;
+  - Python 3.6: a child that `fork()` made while a thread held a TSVZ lock keeps that lock until it exits, so the
+    parent's later reads and writes of the file wait for the child (3.7 and later drop it in the child);
+  - where only `lockf` works (a Linux kernel without open file description locks: before 3.15, or an unpatched
+    RHEL 7 3.10 kernel, which has them backported once updated; or a file system that refuses both those locks and
+    `flock`), readers take no lock, because a shared `lockf` would replace the process's own write lock; there a
+    delete can still be lost, and a read in another thread of the process can still drop a write's lock, as in 5.2;
+  - Windows is unchanged: readers take no lock.
+- Why: TSVZ cannot change older programs or other tools, and a writer that empties the file first or ignores the
+  lock gives a reader nothing to wait on. Python 3.6 has no at-fork hook. On `lockf`-only hosts `lockf` is kept so
+  that 3.39 to 5.2 writers stay excluded; `flock` would not exclude them on Linux.
+- Revisit when: an operator loses a delete with only 5.3 or later programs on a file, still runs 3.39 to 5.0
+  writers beside 5.3, or runs on hosts without open file description locks.
+- Approved: 2026-11-02, the user chose "One known limitation (Recommended)" for older writers that empty the file
+  before or without the lock, readers from 5.1 and earlier, and Python 3.6 forks, and "Keep lockf (Recommended)"
+  for Linux without open file description locks; 2026-11-04, "Accept the wider entry (Recommended)" for this
+  wording (readers from 5.2 and earlier, `lockf`-only hosts and Windows folded in).
+
+### A thread holding get_file_obj() waits for ever on another store of the same file
+- Kind: known limitation
+- What the operator sees: a thread that holds `get_file_obj()` of a `.tsv`-family store and then waits on another
+  TSVZ store of the same file in the same process (its `reload()`, `close()`, a write, or its constructor's load)
+  hangs: that store's writer thread waits for the lock this thread holds, which is let go of only at
+  `release_file_obj()`. 5.2 hung the same way when the other store's job was a write; from 5.3 its reads wait too
+  (on Linux only for the rewrite lock: a `get_file_obj()` in an `a` mode holds the append lock, which reads do not
+  wait for). A `readTabularFile` of the file in the holding thread itself does not wait.
+- Why: the lock is held for the caller across calls, which TSVZ cannot see into; telling another store's thread
+  that this thread's lock is its own would need a lock table across stores, the kind of in-process gate that 4.9
+  removed after its hangs.
+- Revisit when: someone holds `get_file_obj()` while working through a second store of the same file.
+- Approved: 2026-11-04, the user chose "Known limitation (Recommended)".
 
 ### A second Ctrl-C at exit abandons a write in progress
 - Kind: known limitation
@@ -55,22 +82,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   means tracking whether the decompressed text ends in a newline, in two places.
 - Revisit when: someone keeps compressed stores written by another tool.
 - Approved: 2026-10-29, the user chose "Known limitation (Recommended)".
-
-### A delete during another process's whole rewrite can be lost
-- Kind: deferred
-- What the operator sees: while another process rewrites a `.tsv`-family file, a `TSVZed`'s background read takes
-  no lock and can see it part way: a key whose line the rewrite has moved may be missing for a moment (an in-place
-  rewrite of a plain `.tsv` writes its lines one by one), and a writer that empties the file first (3.39, 4.9,
-  5.0's scrub and clear, another tool) shows it empty. A `del` of a key in that moment finds no key and writes
-  nothing, so the key is live again once the rewrite ends. 4.9 and main do the same. A `TSVZed`'s own whole
-  rewrites (from 5.0) write over the file and then cut it, and so do (from 5.1) `scrubTabularFile`,
-  `clearTabularFile`, `tsvz scrub`, `tsvz clear` and `TSVZedLite.clear_file()` of a `.tsv`-family file, so a
-  reader never meets them emptied (it can meet, for a moment, a key's old row after its new one), and a read cut
-  short by damage is read again under the lock when the store can open the file for writing.
-- Why: the fix is for reads to take a shared lock and wait out another process's rewrite, which changes how every
-  read locks (spec §18.6 asks for such a lock); that is a design change of its own.
-- Revisit when: someone runs two writers that both rewrite the same file.
-- Approved: 2026-10-29, the user chose "Defer (Recommended)".
 
 ### A compressed member cut short by a writer killed mid-append can end its cut line with garbage
 - Kind: deferred

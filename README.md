@@ -243,7 +243,8 @@ constructor's load hand it the job and wait, so a Ctrl-C stops the wait, never t
 write (the call still raises `KeyboardInterrupt`). At exit a write in progress is
 finished: a Ctrl-C then says so and keeps waiting, and a second one abandons it. A
 closed store is freed. (`get_file_obj()` and `release_file_obj()`, kept from 3.39,
-hand the locked file to the calling thread.) A file another process removed is made
+hand the locked file to the calling thread; while it holds it, that thread must not wait
+on another store of the same file, whose thread waits for this lock.) A file another process removed is made
 again from memory by the store's next write, an append included (a removal in the
 microseconds as a write starts is followed as a rotation instead); while that rewrite
 fails or is refused, the rows are appended to a new file there, and memory keeps all of
@@ -290,6 +291,45 @@ with no header (or `verifyHeader=False`), anything written to a file the damage 
 empty; the keys it sets or deletes then take its values, and the keys it left out keep
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
+
+## Upgrading to 5.3 from 5.2
+
+The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family file
+5.3 writes. What changed is how the file is locked.
+
+- **Readers wait while another process rewrites the file.** `readTabularFile`,
+  `tsvz read` and `tsvz get`, a `TSVZed`'s load, `reload()` and background read,
+  `TSVZedLite`'s load and a `tsvz serve` handler's reads of a `.tsv`-family file take a
+  shared lock while they read, so a rewrite another process (or thread) holds the file's
+  lock for (a `TSVZed` rewrite, a scrub, a clear) is waited out, never met part way. The
+  wait is as long as the rewrite holds the lock, and Ctrl-C ends it; a writer stopped
+  with Ctrl-Z stalls them until it continues. This is what makes a `del` during another
+  process's rewrite land: 5.2 and earlier could read the file part way, find no key and
+  write nothing, so the key came back once the rewrite ended.
+- **Linux:** a read also waits for an append by 3.39 to 5.2, which locks the whole file.
+  A 5.3 append does not wait for readers, and readers do not wait for it.
+- **macOS and other systems:** locks are `flock`. Reads and appends wait for each other
+  there. A read in another thread no longer drops a write's lock, and two threads' writes
+  exclude each other (5.2 could write a new file's header twice).
+- **The lock layout changed.** Reads lock byte 0 shared; appends lock byte 1; rewrites
+  lock byte 1, then the whole file (Linux open file description locks); `flock` on other
+  POSIX systems. Older programs' whole-file locks still exclude every 5.3 lock, and 5.3
+  excludes them, so 5.2 and 5.3 programs can share a file. Where only `lockf` works (a
+  Linux kernel without open file description locks, a file system that refuses them and
+  `flock`), writers use it and readers take no lock, as in 5.2.
+- A child that `fork()` made drops the TSVZ locks it inherits (Python 3.7 and later): a
+  copy of a `get_file_obj()` holder gets EBADF on its writes.
+- A thread holding `get_file_obj()` reads that file (`readTabularFile`) without waiting.
+  One that waits on another TSVZ store of the same file (its `reload()`, `close()` or a
+  write) can wait for ever: that store's thread waits for this thread's lock
+  ([limitations](docs/limitations.md#a-thread-holding-get_file_obj-waits-for-ever-on-another-store-of-the-same-file)).
+- At exit a `TSVZed` with nothing to write no longer waits for its writer thread, so one
+  Ctrl-C ends a program whose store waits in its load for another process's rewrite.
+- Still not covered: writers that empty the file before or without the lock (3.39's and
+  4.9's compressed rewrites and `clear()`, 3.39 to 5.0 scrub and clear, other tools),
+  readers from 5.2 and earlier and tsvz-rs, Python 3.6 forks, `lockf`-only hosts and
+  Windows
+  ([limitations](docs/limitations.md#some-writers-and-readers-still-meet-another-processs-rewrite-part-way)).
 
 ## Upgrading to 5.2 from 5.1
 
@@ -503,8 +543,8 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   handler SIGTERM instead: its pid is on the `pid` line of its pointer file
   (`STORE.serve`), and it finishes its writes and exits.
 - **macOS and other systems that lock with `lockf`:** as in 4.9, a read in another
-  thread of the process can still drop a write's lock
-  ([docs/limitations.md](docs/limitations.md)).
+  thread of the process can still drop a write's lock (5.3 locks with `flock` there:
+  fixed).
 
 ## Breaking changes from 3.39
 
@@ -580,7 +620,7 @@ Conformance testing).
 
 - §17.5: a numbered part opened directly is read alone, with a warning.
 - §14.5: the defaults-on-missing read applies to `t[key]` only.
-- §18.6: locking is one exclusive whole-file lock per write plus an in-process lock; readers do not lock. On Linux it is an open file description lock, which still excludes 3.39's `lockf`; elsewhere (macOS and other systems, or a Linux file system that refuses those locks) it is `lockf`, which closing any descriptor of the file in the process drops: there a read in another thread of the same process, such as a handler's or a `TSVZed`'s, can drop a write's lock while it is held. A known limitation, deferred: see [docs/limitations.md](docs/limitations.md).
+- §18.6: `.tsv`-family readers hold the access lock shared only while they read (byte 0; a `TSVZed` checks what it read before by identity, size and bytes), appends take the append lock (byte 1), and rewrites take it, then the whole file; on systems other than Linux both are one whole-file `flock`. What remains a deviation: `.tsvz` part readers take no lock (they read again until the parts keep still); where only `lockf` works, writers use it and readers do not lock; Windows readers do not lock; and writers also take an in-process lock per path (`_pathLock`). See [docs/limitations.md](docs/limitations.md).
 - §19.4: a scrub whose rows would read differently under the final markers writes them with stripping and fill-empty off, then restores the final markers after the rows.
 - §20.7: `-q` also silences informational messages ("Created …"); only errors remain.
 - §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.
