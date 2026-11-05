@@ -516,12 +516,12 @@ class _LinesFile(object):
 		return self._pos
 
 
-def _fileDefaultsAtEnd(lines, width, delimiter, encoding, consumed, strict):
-	"""The defaults the legacy ``lines`` themselves leave in effect at their end, read from none: their #_defaults_#
-	lines alone, in order, through _processLine at ``width`` and ``strict``, as a store's reader takes them; line 1
-	left out when that reader takes it for its header (``consumed``). Without the empty cells at the end; [] when they
-	set none."""
-	defaults = []
+def _fileDefaultsAtEnd(lines, width, delimiter, encoding, consumed, strict, start=()):
+	"""The defaults the legacy ``lines`` leave in effect at their end, read from ``start`` (none: what the lines
+	themselves say; a store's given defaults: what its reader ends with): their #_defaults_# lines alone, in order,
+	through _processLine at ``width`` and ``strict``, as a store's reader takes them; line 1 left out when that reader
+	takes it for its header (``consumed``). Without the empty cells at the end; [] when they set none."""
+	defaults = list(start)
 	enc = encoding or 'utf8'
 	for line in (itertools.islice(lines, 1, None) if consumed else lines):
 		if line.lstrip(b'\x00').startswith(DEFAULTS_INDICATOR_KEY.encode(enc)):
@@ -2891,9 +2891,10 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	left alone when a reader takes it for its header (``skipFirst``).
 
 	When the column count comes from the first keyed line (``widthFromLines``), that line was one cell wide and it
-	went, the first one-cell line left takes its place, with the key's earlier lines (superseded for every reader) left
-	out: a wider line first would make every other lone key a deletion. A line with no value counts as one cell (a row
-	at column count 1, a deletion at any other) and moves up as the key alone. No such line left: nothing moves."""
+	went, the first of the narrowest lines left takes its place, with the key's earlier lines (superseded for every
+	reader) left out: a wider line first would make every other lone key a deletion, and a strict reader drop what is
+	narrower. A line with no value counts as one cell (a row at column count 1, a deletion at any other) and moves up
+	as the key alone."""
 	enc = encoding or 'utf8'
 
 	def kindOf(line):
@@ -2915,17 +2916,21 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	if place is None:
 		return out, None
 	d = delimiter.encode(enc)
+	best = narrowest = None
 	for j in range(place, len(out)):
-		kind, key, n, _ = kindOf(out[j])
-		cells = out[j].strip(b'\x00').rstrip(b'\r\n').split(d)
-		if kind != 'row' or any(cells[1:]):
-			continue
-		if j == place and n == 1:
-			return out, None
-		name = key.rstrip()
-		rest = [line for line in out[place:j] if (kindOf(line)[1] or '').rstrip() != name]
-		return out[:place] + [out[j] if n == 1 else cells[0]] + rest + out[j + 1:], name
-	return out, None
+		kind, _, n, _ = kindOf(out[j])
+		if kind == 'row':
+			n = n if any(out[j].strip(b'\x00').rstrip(b'\r\n').split(d)[1:]) else 1
+			if narrowest is None or n < narrowest:
+				best, narrowest = j, n
+				if n == 1:
+					break
+	if best is None or kindOf(out[place])[2] == narrowest:
+		return out, None
+	name = kindOf(out[best])[1].rstrip()
+	line = out[best] if kindOf(out[best])[2] == narrowest else out[best].strip(b'\x00').split(d, 1)[0]
+	rest = [other for other in out[place:best] if (kindOf(other)[1] or '').rstrip() != name]
+	return out[:place] + [line] + rest + out[best + 1:], name
 
 
 class _RawTap(object):
@@ -5055,7 +5060,7 @@ class _TSVZedLoad(OrderedDict):
 
 class _TSVZedDiff(_TSVZedLoad):
 	"""What a compacting ``TSVZed`` rewrite reads its compacted lines into (_readLines): no rows, only whether
-	each key the lines leave live reads as memory holds it (``flags[key]`` True or False) or is dead in them (None).
+	each key the lines leave live reads as memory holds it (``flags[key]`` True or False, _readsAs) or is dead in them (None).
 	Memory is looked up without _memLock (a read of one key): a row replaced meanwhile shows as a difference, and is
 	written, which is harmless."""
 
@@ -5067,7 +5072,21 @@ class _TSVZedDiff(_TSVZedLoad):
 		change = self._change(key, value)
 		if change is not None:
 			key, row = change
-			self.flags[key] = row == dict.get(self.owner, key)
+			self.flags[key] = self._readsAs(row, dict.get(self.owner, key))
+
+	def _readsAs(self, row, held):
+		"""True when ``held``, memory's row, written again would read no otherwise than ``row``, as read: the same cells,
+		less the empty ones at their end; past them, only what a read pads a row with (empty, or the defaults in effect
+		here: memory read it at another column count or with other defaults)."""
+		if row == held:
+			return True
+		if held is None:
+			return False
+		held = _trimmedCells(held)
+		count = len(held)
+		defaults = self.defaults
+		return row[:count] == held and all(not cell or (count + i < len(defaults) and cell == defaults[count + i])
+										   for i, cell in enumerate(row[count:]))
 
 	def __contains__(self, key):
 		return True  # (every deletion is noted)
@@ -6378,6 +6397,10 @@ memoryOnly:{self.memoryOnly}
 					want = list(self.defaults)
 				if not gone or diffWidth > 1:
 					break
+				if self.correctColumnNum > 1:
+					# setDefaults() changed how the file reads, to one column; memory never held these: left as they read.
+					gone = []
+					break
 				# A lone key is a row in a one-column file: a line cannot delete there. Their lines go instead.
 				raw, dropAt = kept, dict.fromkeys(gone, len(kept))
 			del flags
@@ -6391,7 +6414,9 @@ memoryOnly:{self.memoryOnly}
 			# (a cell the file's defaults set that the store's leave empty: an empty cell takes the one before it).
 			# Kept only when the store's reader then ends with them: a line it does not take (a reset at column count 1
 			# is a row there) would be added again at every rewrite.
-			own = _fileDefaultsAtEnd(kept, diffWidth, delimiter, encoding, consumed, self.strict)
+			def endOf(lines, start=()):
+				return _fileDefaultsAtEnd(lines, diffWidth, delimiter, encoding, consumed, self.strict, start)
+			own = endOf(kept)
 			goal = _trimmedCells(want) if any(want[1:]) else [DEFAULTS_INDICATOR_KEY]
 			reset = _encodeRow([DEFAULTS_INDICATOR_KEY],delimiter,encoding,errors,what='defaults')
 			lines = []
@@ -6399,13 +6424,13 @@ memoryOnly:{self.memoryOnly}
 				if goal != own:
 					lines = [_encodeRow(_sanitize(_fitRow(want, diffWidth),delimiter=delimiter),delimiter,encoding,errors,
 										what='defaults')]
-					if _fileDefaultsAtEnd(itertools.chain(kept, lines), diffWidth, delimiter, encoding, consumed,
-										  self.strict) != goal:
+					# (from none and from the store's defaults: a strict reader takes a narrower defaults line only under
+					# defaults with values, so the file's lines can read differently from the two)
+					if endOf(itertools.chain(kept, lines)) != goal or endOf(itertools.chain(kept, lines), defaults) != goal:
 						lines.insert(0, reset)
 			elif any(own[1:]) or (remade and any(defaults[1:])):
 				lines = [reset]
-			if lines and _fileDefaultsAtEnd(itertools.chain(kept, lines), diffWidth, delimiter, encoding, consumed,
-											self.strict) == goal:
+			if lines and endOf(itertools.chain(kept, lines)) == goal:
 				if diffWidth > 0 and not remade:
 					kept.extend(lines)  # (before memory's rows: they read with the store's defaults)
 				else:
@@ -6413,17 +6438,19 @@ memoryOnly:{self.memoryOnly}
 			if values and diffWidth > 0:
 				# A row memory adds with an empty cell where the defaults then in effect hold a value would read filled:
 				# those rows go between a reset and the same defaults again (the file still ends with them).
-				end = _trimmedCells(defaults) if remade else _fileDefaultsAtEnd(kept, diffWidth, delimiter, encoding, consumed, self.strict)
+				end = endOf(kept, defaults)
 				if any(i < len(end) and end[i] and not str(row[i]).strip() for row in values for i in range(1, len(row))):
 					if remade:
 						kept.append(reset)  # (the store's reader starts from its own defaults; the file's line is the tail)
 					else:
 						again = _encodeRow(_sanitize(_fitRow(end, diffWidth),delimiter=delimiter),delimiter,encoding,errors,
 										   what='defaults')
-						if _fileDefaultsAtEnd(itertools.chain(kept, (reset, again)), diffWidth, delimiter, encoding, consumed,
-											  self.strict) == end:
+						if endOf(itertools.chain(kept, (reset, again))) == end:
 							kept.append(reset)
 							tail.insert(0, again)
+			# (a narrower row padded: it reads the same at this column count, and a strict reader with no defaults in
+			# effect, as between a reset and the defaults, would drop it; a lone key stays one, for a reader at one column)
+			values = [_fitRow(row, diffWidth) if len(row) < diffWidth and any(row[1:]) else row for row in values]
 			rows = _RewriteRows(kept, values, delimiter, encoding, errors, self.header, tail=tail)
 			del values
 			rows.check()

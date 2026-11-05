@@ -13262,6 +13262,46 @@ def test_a_store_left_with_no_one_cell_line_takes_the_new_column_count(tmp_path)
 	assert _bytes(p) == b'b\tX\nb\t\n' and TSVZ.readTabularFile(p, strict=False) == {}
 
 
+def test_a_one_column_delete_with_only_wider_lines_left_puts_the_narrowest_first(tmp_path):
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, b'c\nb\t2\tX\t2\n')
+	t = TSVZ.TSVZed(p, strict=True, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	del t['c']
+	t['d'] = ['d', 'X', 'X']
+	t.commitAppendToFile()
+	assert t.correctColumnNum == 3 and _bytes(p) == b'd\tX\tX\nb\t2\tX\t2\n'
+	t.hardMapToFile()
+	assert _bytes(p) == b'd\tX\tX\nb\t2\tX\t2\n'  # nothing added again
+	t.close()
+	assert TSVZ.readTabularFile(p, strict=True) == {'d': ['d', 'X', 'X'], 'b': ['b', '2', 'X', '2']}
+
+
+def test_a_rewrite_pads_a_narrower_row_written_under_a_reset_for_a_strict_reader(tmp_path):
+	p = str(tmp_path / 'wide.tsv')
+	_touch(p, b'id\tv\na\t2\tX\t\tX\nb\t2\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, strict=False, verbose=False, monitor_external_changes=False)
+	t.setDefaults(['', '', 'Q'])  # four cells: a's empty third value would read filled, so it goes under a reset
+	t['a'][1] = 'Z'
+	t['a'][3] = ''
+	t['b'][1] = 'Z'  # narrower than four
+	t.hardMapToFile()
+	t.close()
+	got = TSVZ.readTabularFile(p, strict=True, defaults=['#_defaults_#', '', '', 'Q'])
+	assert got['a'] == ['a', 'Z', 'X', '', 'X'] and got['b'][:2] == ['b', 'Z']
+
+
+def test_a_strict_store_defaults_line_narrower_than_the_column_count_is_reset_first(tmp_path):
+	p = str(tmp_path / 'wide.tsv')
+	_touch(p, b'id\tv\na\t\t\t2\tX\n#_defaults_#\tX\t1\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, strict=True, verbose=False, monitor_external_changes=False)
+	t.setDefaults(['', '', 'Q'])  # four cells: the file's defaults line is then narrower than the column count
+	t['a'][1] = 'Z'
+	t.hardMapToFile()
+	t.close()
+	got = TSVZ.readTabularFile(p, strict=True, defaults=['#_defaults_#', '', '', 'Q'])
+	assert got['a'] == ['a', 'Z', '', '2', 'X']
+
+
 def test_a_row_set_after_a_one_column_delete_stays(tmp_path):
 	p = str(tmp_path / 'one.tsv')
 	_touch(p, b'a\nb\nc\n')
