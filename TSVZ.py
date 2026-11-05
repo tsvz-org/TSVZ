@@ -1768,7 +1768,8 @@ def _processLine(line,taskDic,correctColumnNum,strict = True,delimiter = ...,def
 				del taskDic[lineCache[0]]
 		return correctColumnNum , []
 	elif len(lineCache) != correctColumnNum:
-		if strict and not any(defaults[1:]):
+		if strict and len(lineCache) < correctColumnNum and not any(defaults[1:]):
+			# (5.5: strict drops only a narrower line, which it would have to pad; a wider one is taken whole)
 			if reporter is not None:
 				reporter.note('strict-drop', None, 'dropped a line whose column count is not {} (strict mode)'.format(correctColumnNum))
 			return correctColumnNum , []
@@ -2706,7 +2707,7 @@ def _legacyLineKind(text, width, strictActive, delimiter):
 		if cells[0] == DEFAULTS_INDICATOR_KEY:
 			return 'reset', cells[0], len(cells), True
 		return ('row' if width == 1 else 'delete'), cells[0], len(cells), True
-	takes = len(cells) == width or strictActive
+	takes = len(cells) >= width or strictActive  # (strict drops only a narrower line)
 	return ('defaults' if cells[0] == DEFAULTS_INDICATOR_KEY else 'row'), cells[0], len(cells), takes
 
 
@@ -5550,7 +5551,7 @@ class TSVZed(OrderedDict):
 			if len(value) > columns:
 				value = _fitRow(value, columns)  # (its empty cells past the column count go; never a non-empty one)
 			if len(value) != columns:
-				if self.strict:
+				if self.strict and len(value) < columns:  # (5.5: strict refuses only a narrower row; a wider one is kept)
 					self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {columns}. Refuse adding key...",'error')
 					return None
 				elif self.verbose:
@@ -7599,7 +7600,7 @@ class TSVZedLite(MutableMapping):
 			if len(value) > self.correctColumnNum:
 				value = _fitRow(value, self.correctColumnNum)  # (its empty cells past the column count go)
 			if len(value) != self.correctColumnNum:
-				if self.strict:
+				if self.strict and len(value) < self.correctColumnNum:  # (5.5: a wider row is kept whole)
 					eprint(f"Error: Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...")
 					return
 				elif self.verbose:

@@ -510,8 +510,13 @@ def _drive_stateless(mod, path, seed, ref=None):
 		mod.appendLinesTabularFile(path, rows, header=LEGACY_HEADER, createIfNotExist=True)
 		out.append(dict(mod.readTabularFile(path, header=LEGACY_HEADER, strict=False)))
 		strict = dict(mod.readTabularFile(path, header=LEGACY_HEADER, strict=True))
-		out.append(strict if ref is None else
-				   ('strict', strict == dict(ref.readTabularFile(path, header=LEGACY_HEADER, strict=True))))
+		if ref is not None:
+			# 5.5's strict read takes a row wider than the header whole (decision A), where 3.39's dropped it: every
+			# key whose row differs from 3.39's strict read of the same bytes has such a row in 5.5
+			theirs = dict(ref.readTabularFile(path, header=LEGACY_HEADER, strict=True))
+			strict = ('strict', set(theirs) <= set(strict) and all(
+				len(strict[k]) > len(LEGACY_HEADER) for k in strict if theirs.get(k) != strict[k]))
+		out.append(strict)
 		out.append(mod.read_last_valid_line(path, {}, -1, delimiter=delimiter))
 	if ref is None:
 		out.append(dict(mod.scrubTabularFile(path, header=LEGACY_HEADER)))
@@ -521,15 +526,17 @@ def _drive_stateless(mod, path, seed, ref=None):
 		# compared before the scrub, and after it what 3.39's readers see (loose, and strict as 5.5's strict read).
 		out.append(_content(path))
 		out.append(dict(mod.scrubTabularFile(path, header=LEGACY_HEADER)))
+		mine = dict(mod.readTabularFile(path, header=LEGACY_HEADER, strict=True))
+		theirs = dict(ref.readTabularFile(path, header=LEGACY_HEADER, strict=True))
 		out.append(('scrubbed', dict(ref.readTabularFile(path, header=LEGACY_HEADER, strict=False)),
-					dict(ref.readTabularFile(path, header=LEGACY_HEADER, strict=True)) ==
-					dict(mod.readTabularFile(path, header=LEGACY_HEADER, strict=True))))
+					set(theirs) <= set(mine) and all(len(mine[k]) > len(LEGACY_HEADER) for k in mine
+													 if theirs.get(k) != mine[k])))  # (as the strict views above)
 	mod.clearTabularFile(path, header=LEGACY_HEADER)
 	out.append(_content(path))
 	return out
 
 
-def _as_339(new, old, delimiter='\t', cut=None):
+def _as_339(new, old, delimiter='\t', cut=None, allow=()):
 	"""``new`` (what 5.5 shows) with each row that 3.39 shows cut put back to 3.39's cells: a row of ``new`` wider than
 	the same row of ``old``, whose first cells are ``old``'s. 5.5 reads a row whole (R1) and writes it whole (Q5);
 	3.39 cut it to the column count. A row written whole can also be the line a later read takes its column count
@@ -543,12 +550,21 @@ def _as_339(new, old, delimiter='\t', cut=None):
 				cut.append(list(new))
 			return list(old)
 		if len(new) == len(old):
-			return [_as_339(n, o, delimiter, cut) for n, o in zip(new, old)]
+			return [_as_339(n, o, delimiter, cut, allow) for n, o in zip(new, old)]
 		return new
 	if isinstance(new, tuple) and isinstance(old, tuple) and len(new) == len(old):
-		return tuple(_as_339(n, o, delimiter, cut) for n, o in zip(new, old))
+		return tuple(_as_339(n, o, delimiter, cut, allow) for n, o in zip(new, old))
+	if isinstance(new, dict) and isinstance(old, dict) and list(new) != list(old) and set(old) <= set(new):
+		# a strict 3.39 read dropped a row wider than the column count; 5.5's strict read takes it whole (decision A)
+		width = max([len(v) for v in old.values() if isinstance(v, list)] or [0])
+		extra = [k for k in new if k not in old]
+		if all((isinstance(new[k], list) and width and len(new[k]) > width) or k in allow for k in extra) and \
+				[k for k in new if k in old] == list(old):
+			if cut is not None:
+				cut.extend(list(new[k]) if isinstance(new[k], list) else k for k in extra)  # (an offset view: the key)
+			new = type(new)((k, v) for k, v in new.items() if k in old)
 	if isinstance(new, dict) and isinstance(old, dict) and list(new) == list(old):
-		return type(new)((k, _as_339(new[k], old[k], delimiter, cut)) for k in new)
+		return type(new)((k, _as_339(new[k], old[k], delimiter, cut, allow)) for k in new)
 	if isinstance(new, bytes) and isinstance(old, bytes):
 		d = delimiter.encode('utf-8')
 		newLines, oldLines = new.split(b'\n'), old.split(b'\n')
@@ -619,10 +635,11 @@ def test_legacy_read_corpus_matches_339(tmp_path):
 			old_obs = _legacy_read_observations(TSVZ_old, old_path, d, os.path.dirname(old_path), False)
 			new_obs = _legacy_read_observations(TSVZ, new_path, d, os.path.dirname(new_path), False)
 			cut = []
-			assert _as_339(new_obs, old_obs, d, cut) == old_obs, (name, suffix)
+			# ('nul\0v\0w\0' is four cells, one empty, at three columns: wider, so 5.5's strict read takes it too)
+			assert _as_339(new_obs, old_obs, d, cut, allow={'wide', 'nul'}) == old_obs, (name, suffix)
 			# the only rows 3.39 cut: the corpus's wide row, which 5.5 reads as the file has it (R1)
-			assert all(row == ['wide', 'a', 'b', 'c', 'd'] for row in cut), (name, suffix, cut)
-			assert bool(cut) == (name == 'main'), (name, suffix)
+			assert all(row in (['wide', 'a', 'b', 'c', 'd'], 'wide', ['nul', 'v', 'w'], 'nul') for row in cut), (name, suffix, cut)
+			assert bool(cut) == (name == 'main' or (name == 'nul' and suffix == '.nsv')), (name, suffix)
 			assert _content(new_path) == _content(old_path), (name, suffix)
 	# gzip-compressed intact copy of the main corpus file (tab-delimited)
 	main = _legacy_corpora('\t')['main']
@@ -632,8 +649,8 @@ def test_legacy_read_corpus_matches_339(tmp_path):
 	old_obs = _legacy_read_observations(TSVZ_old, old_path, '\t', os.path.dirname(old_path), True)
 	new_obs = _legacy_read_observations(TSVZ, new_path, '\t', os.path.dirname(new_path), True)
 	cut = []
-	assert _as_339(new_obs, old_obs, '\t', cut) == old_obs
-	assert cut and all(row == ['wide', 'a', 'b', 'c', 'd'] for row in cut)
+	assert _as_339(new_obs, old_obs, '\t', cut, allow={'wide'}) == old_obs
+	assert cut and all(row in (['wide', 'a', 'b', 'c', 'd'], 'wide') for row in cut)
 	assert _content(new_path) == _content(old_path)
 
 
@@ -816,10 +833,10 @@ def test_l4_invalid_utf8_is_reported_once(tmp_path, capsys):
 
 def test_l4_strict_drops_are_reported(tmp_path, capsys):
 	p = str(tmp_path / 'a.tsv')
-	_touch(p, b'id\tv\nk1\tx\nk2\ty\tEXTRA\n')
-	data = TSVZ.readTabularFile(p, header='id\tv', strict=True)
+	_touch(p, b'id\tv\tw\nk1\tx\ty\nk2\ty\n')  # (5.5: strict drops a narrower line; a wider one it takes)
+	data = TSVZ.readTabularFile(p, header='id\tv\tw', strict=True)
 	assert list(data) == ['k1']
-	assert _tsvz_warnings(capsys) == ['TSVZ warning: %s: dropped a line whose column count is not 2 (strict mode)' % p]
+	assert _tsvz_warnings(capsys) == ['TSVZ warning: %s: dropped a line whose column count is not 3 (strict mode)' % p]
 
 
 def test_l5_damaged_gzip_reads_up_to_the_damage(tmp_path, capsys):
@@ -11395,8 +11412,8 @@ def test_legacy_scrub_of_an_all_deleted_file_with_no_header_and_no_defaults_keep
 
 STRICT_SCRUB_DROPPED_LINE = [
 	(b'a\t1', '', ['#_defaults_#', '', '']),  # the defaults make it 3 columns wide: "a\t1" is 2
-	(b'c\t\nc\t\tX', '', None),  # the first line makes it 2 wide, "c\t\tX" is 3 (and the key is deleted by the first)
-	(b'id\tv\nb\t\t2', 'id\tv', None),
+	(b'c\t\t\nc\tX', '', None),  # the first line makes it 3 wide, "c\tX" is 2 (and the key is deleted by the first)
+	(b'id\tv\tw\nb\t2', 'id\tv\tw', None),  # (5.5: strict drops only a narrower line, a wider one it takes)
 	(b'id\tv\tw\na\t1', 'id\tv\tw', None),
 	(b'#_defaults_#\nb\t2', '', ['#_defaults_#', 'P', 'Q']),  # the empty defaults line turns the caller's off
 ]
@@ -11432,10 +11449,10 @@ def test_strict_legacy_scrub_still_compacts_a_file_whose_every_line_is_a_deletio
 def test_strict_legacy_scrub_with_a_row_and_a_dropped_line_keeps_the_line(tmp_path):
 	# 5.5: a strict scrub writes what a loose one writes: the line strict readers drop stays (loose readers show it).
 	p = str(tmp_path / 'r.tsv')
-	_touch(p, b'id\tv\na\t1\nb\t\t2\n')
-	assert TSVZ.scrubTabularFile(p, header='id\tv', strict=True) == {'a': ['a', '1']}
-	assert _bytes(p) == b'id\tv\na\t1\nb\t\t2\n'
-	assert TSVZ.readTabularFile(p, header='id\tv', strict=False) == {'a': ['a', '1'], 'b': ['b', '', '2']}
+	_touch(p, b'id\tv\tw\na\t1\t1\nb\t2\n')
+	assert TSVZ.scrubTabularFile(p, header='id\tv\tw', strict=True) == {'a': ['a', '1', '1']}
+	assert _bytes(p) == b'id\tv\tw\na\t1\t1\nb\t2\n'
+	assert TSVZ.readTabularFile(p, header='id\tv\tw', strict=False) == {'a': ['a', '1', '1'], 'b': ['b', '2', '']}
 
 
 def _tsvzed_set_delete_sessions(p, sessions=5, **kwargs):
@@ -11857,8 +11874,9 @@ def test_cli_serve_with_x_header_and_strict_is_strict_for_routed_requests(tmp_pa
 	f.put('id|v\na|1|2\nb|3\n')
 	proc = _serve_process(f.path, '--x-header', f.header, '--x-strict')
 	try:
-		assert f.run('keys', header=False) == (0, 'b\n', '')  # routed; strict drops the row of another width
-		assert f.run('read', header=False) == (0, 'b|3\n', '')
+		# routed; strict (5.5) takes a row wider than the header whole, and drops only a narrower one
+		assert f.run('keys', header=False) == (0, 'a\nb\n', '')
+		assert f.run('read', header=False) == (0, 'a|1|2\nb|3\n', '')
 		f.put('x|w\nb|3\n')  # another process puts another line 1 in
 		before = _bytes(f.path)
 		for args in (('keys',), ('read',), ('set', 'c', '1'), ('delete', 'b'), ('pop', 'b'), ('scrub',)):
@@ -12375,7 +12393,10 @@ def test_a_wide_legacy_row_is_read_whole(tmp_path):
 	_touch(p, b'id\tv\na\t1\t2\n')
 	assert TSVZ.readTabularFile(p, header='id\tv', strict=False) == {'a': ['a', '1', '2']}
 	assert TSVZ.readTabularFile(p, header='id\tv', strict=True, defaults=['', 'D']) == {'a': ['a', '1', '2']}
-	assert TSVZ.readTabularFile(p, header='id\tv', strict=True) == {}  # strict without defaults still drops it
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=True) == {'a': ['a', '1', '2']}  # (strict takes it too)
+	_touch(p, b'id\tv\tw\na\t1\n')
+	assert TSVZ.readTabularFile(p, header='id\tv\tw', strict=True) == {}  # strict drops only a narrower row
+	_touch(p, b'id\tv\na\t1\t2\n')
 	assert TSVZ.readTabularFile(p, header='id\tv', strict=False, correctColumnNum=2) == {'a': ['a', '1', '2']}
 	assert TSVZ.readTabularFile(p, header='id\tv', strict=False, lastLineOnly=True) == ['a', '1', '2']
 	assert TSVZ.read_last_valid_line(p, {}, 2) == ['a', '1', '2']
@@ -12434,7 +12455,7 @@ def test_tsvzed_keeps_a_wide_row_and_strict_refuses_it(tmp_path):
 
 
 @pytest.mark.parametrize('kind', ['tsvzed', 'lite'])
-def test_strict_legacy_stores_judge_the_width_after_dropping_empty_cells_past_it(tmp_path, capsys, kind):
+def test_strict_legacy_stores_keep_wider_rows_and_drop_empty_cells_past_the_width(tmp_path, capsys, kind):
 	p = str(tmp_path / 's.tsv')
 	_touch(p, b'id\tv\nz\t9\n')
 	if kind == 'tsvzed':
@@ -12443,12 +12464,13 @@ def test_strict_legacy_stores_judge_the_width_after_dropping_empty_cells_past_it
 		t = TSVZ.TSVZedLite(p, header='id\tv', strict=True, correctColumnNum=2)  # (a legacy TSVZedLite reads no width)
 	t['a'] = ['a', '1', '']
 	assert t['a'] == ['a', '1']
-	t['b'] = ['b', '1', '2']
+	t['b'] = ['b', '1', '2']  # (5.5: strict refuses only a narrower row; a wider one is kept whole)
 	t['c'] = ['c', '1', '', '2']
-	assert 'b' not in t and 'c' not in t
-	assert 'does not have the correct number of columns' in ''.join(capsys.readouterr())
+	assert t['b'] == ['b', '1', '2'] and t['c'] == ['c', '1', '', '2']
+	t['n'] = ['n']  # (a lone key: a delete)
+	assert 'does not have the correct number of columns' not in ''.join(capsys.readouterr())
 	t.close()
-	assert open(p, 'rb').read() == b'id\tv\nz\t9\na\t1\n'
+	assert open(p, 'rb').read() == b'id\tv\nz\t9\na\t1\nb\t1\t2\nc\t1\t\t2\n'
 
 
 # --- 5.5: TSVZed loads (L, R6, Q-D5) ---
