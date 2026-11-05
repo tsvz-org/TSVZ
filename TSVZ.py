@@ -5054,8 +5054,10 @@ class TSVZed(OrderedDict):
 		If True, creates the file if it doesn't exist.
 	verifyHeader : bool, default=True
 		If True, verifies that the file header matches the provided header.
-	rewrite_on_load : bool, default=True
-		If True, rewrites the entire file when loading to ensure consistency.
+	rewrite_on_load : bool, default=False
+		If True, rewrites (compacts) the file when loading. 5.5 turned the default off (3.39 to 5.4: on); call
+		mapToFile() or hardMapToFile(), or scrub the file, to compact it. The three automatic rewrites
+		(rewrite_on_load, rewrite_on_exit, rewrite_interval) are planned to go in a future version, for explicit calls.
 	rewrite_on_exit : bool, default=False
 		If True, rewrites the entire file when closing/exiting.
 	rewrite_interval : float, default=0
@@ -5182,7 +5184,7 @@ class TSVZed(OrderedDict):
 	def getResourceUsage(self,return_dict = False):
 		return get_resource_usage(return_dict = return_dict)
 
-	def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = ...,
+	def __init__ (self,fileName,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = False,
 				  rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,monitor_external_changes = True,
 				  verbose = False,encoding = 'utf8',delimiter = ...,defaults = None,strict = False,correctColumnNum = -1,errors = 'strict'):
 		super().__init__()
@@ -5214,8 +5216,8 @@ class TSVZed(OrderedDict):
 		self.createIfNotExist = createIfNotExist
 		self.verifyHeader = verifyHeader
 		if rewrite_on_load is ...:
-			# 3.39 rewrote on load by default; spec stores are never rewritten implicitly.
-			rewrite_on_load = not self._spec
+			# (5.5: off by default; 3.39 to 5.4 rewrote a legacy file on load. Spec stores are never rewritten so.)
+			rewrite_on_load = False
 		self.rewrite_on_load = rewrite_on_load
 		self.rewrite_on_exit = rewrite_on_exit
 		self.rewrite_interval = rewrite_interval
@@ -5971,7 +5973,7 @@ memoryOnly:{self.memoryOnly}
 		return size
 
 	@classmethod
-	def fromkeys(cls, iterable, value=None,fileName = None,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = ...,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,verbose = False,errors = 'strict'):
+	def fromkeys(cls, iterable, value=None,fileName = None,teeLogger = None,header = '',createIfNotExist = True,verifyHeader = True,rewrite_on_load = False,rewrite_on_exit = False,rewrite_interval = 0, append_check_delay = 0.01,verbose = False,errors = 'strict'):
 		'''Create a new ordered dictionary with keys from iterable and values set to value.
 		'''
 		self = cls(fileName,teeLogger = teeLogger,header = header,createIfNotExist = createIfNotExist,verifyHeader = verifyHeader,

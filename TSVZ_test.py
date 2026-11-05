@@ -6081,7 +6081,7 @@ def test_tsvzed_with_a_legacy_encoding_rewrites_a_file_keeping_a_line_it_cannot_
 	compacted = b'id\tv\nr\xe9sum\xe9\t1\nok\t2\n'
 	p = str(tmp_path / 'e.tsv')
 	_touch(p, LEGACY_KEY_ROW)
-	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.01)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.01, rewrite_on_load=True)
 	out = capsys.readouterr().out
 	assert 'Refused' not in out and 'Traceback' not in out, out
 	assert _bytes(p) == compacted
@@ -6107,7 +6107,7 @@ def test_tsvzed_with_a_legacy_encoding_rewrites_the_rest_and_the_bad_row_once_fi
 	# 5.5: the open's rewrite copies the line it cannot encode (nothing is refused); a fix or a delete is then written.
 	p = str(tmp_path / (how + '.tsv'))
 	_touch(p, LEGACY_CELL_ROW)
-	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.005, rewrite_interval=0.05)
+	t = TSVZ.TSVZed(p, header='id\tv', encoding='ascii', append_check_delay=0.005, rewrite_interval=0.05, rewrite_on_load=True)
 	assert 'Refused' not in capsys.readouterr().out and _bytes(p) == b'id\tv\nk\tr\xe9sum\xe9\nok\t2\n'
 	time.sleep(0.3)
 	assert _bytes(p) == b'id\tv\nk\tr\xe9sum\xe9\nok\t2\n' and 'Refused' not in capsys.readouterr().out
@@ -8948,7 +8948,7 @@ def slow(file, header, lines, chunk=1 << 20, codec=None):  # a rewrite slow enou
 
 if mode == 'init':
 	TSVZ._writeLines = slow
-	TSVZ.TSVZed(p, header='key\tval')  # a Ctrl-C in its rewrite_on_load ends the program
+	TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=True)  # a Ctrl-C in its rewrite_on_load ends the program
 else:
 	t = TSVZ.TSVZed(p, header='key\tval', rewrite_on_load=False, rewrite_on_exit=True)
 	TSVZ._writeLines = slow
@@ -9107,7 +9107,7 @@ def test_tsvzed_legacy_rewrite_on_load_takes_in_a_change_made_after_the_read(tmp
 		return real(self, *args, **kwargs)
 
 	monkeypatch.setattr(TSVZ.TSVZed, 'rewrite', rewrite)
-	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.01)
+	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.01, rewrite_on_load=True)
 	monkeypatch.undo()
 	assert dict(t) == {'a': ['a', '2'], 'other': ['other', 'X']}
 	assert _bytes(p) == b'key\tval\na\t2\nother\tX\n'
@@ -11469,7 +11469,7 @@ def _tsvzed_set_delete_sessions(p, sessions=5, **kwargs):
 	return sizes
 
 
-@pytest.mark.parametrize('kwargs', [{}, {'rewrite_interval': 0.01}], ids=['default', 'rewrite_interval'])
+@pytest.mark.parametrize('kwargs', [{'rewrite_on_load': True}, {'rewrite_on_exit': True}], ids=['rewrite_on_load', 'rewrite_on_exit'])
 def test_tsvzed_sessions_that_set_and_delete_keys_do_not_grow_the_file(tmp_path, kwargs):
 	# 5.1 and 3.39: 205, 405, 605 ... The load rewrote only a file that held a key with two values, not one that held a
 	# key's row and its deletion.
@@ -11482,7 +11482,7 @@ def test_tsvzed_sessions_that_set_and_delete_keys_do_not_grow_the_file(tmp_path,
 def test_tsvzed_load_rewrites_a_file_that_holds_a_row_and_its_deletion(tmp_path):
 	p = str(tmp_path / 'r.tsv')
 	_touch(p, b'id\tv\na\t1\nb\t2\na\t\n')
-	t = TSVZ.TSVZed(p, header='id\tv', verbose=False)
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, rewrite_on_load=True)
 	assert dict(t) == {'b': ['b', '2']}
 	t.close()
 	assert _bytes(p) == b'id\tv\nb\t2\n'
@@ -12867,7 +12867,7 @@ def test_legacy_scrub_given_a_header_it_does_not_check_puts_it_first(tmp_path):
 def test_tsvzed_rewrite_on_load_compacts_a_healthy_file(tmp_path, text, after, row):
 	p = str(tmp_path / 'e7.tsv')
 	_touch(p, text)
-	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.01)
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.01, rewrite_on_load=True)
 	try:
 		assert _bytes(p) == after and dict(t) == {'a': row}
 	finally:
