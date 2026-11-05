@@ -2771,7 +2771,8 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 		else:
 			if i in protectable:
 				pinfo[i] = (key, n)
-			full = n == width and all(c.strip() for c in _unsanitize(text.strip('\x00').rstrip('\r\n').split(delimiter), delimiter)[1:])
+			full = bool(boundaries) and n == width and all(  # (only a defaults line before it can matter)
+				c.strip() for c in _unsanitize(text.strip('\x00').rstrip('\r\n').split(delimiter), delimiter)[1:])
 			slot = live.get(key)
 			if slot is None:
 				live[key] = len(first)
