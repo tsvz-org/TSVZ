@@ -6259,6 +6259,17 @@ memoryOnly:{self.memoryOnly}
 					kept.extend(lines)  # (before memory's rows: they read with the store's defaults)
 				else:
 					tail.extend(lines)  # (no column count yet: after the rows, so a defaults line does not set it)
+			if values and diffWidth > 0:
+				# A row memory adds with an empty cell where the defaults then in effect hold a value would read filled:
+				# those rows go between a reset and the same defaults again (the file still ends with them).
+				end = _fileDefaultsAtEnd(kept, diffWidth, delimiter, encoding, consumed, self.strict)
+				if any(i < len(end) and end[i] and not str(row[i]).strip() for row in values for i in range(1, len(row))):
+					again = _encodeRow(_sanitize(_fitRow(end, diffWidth),delimiter=delimiter),delimiter,encoding,errors,
+									   what='defaults')
+					if _fileDefaultsAtEnd(itertools.chain(kept, (reset, again)), diffWidth, delimiter, encoding, consumed,
+										  self.strict) == end:
+						kept.append(reset)
+						tail.insert(0, again)
 			rows = _RewriteRows(kept, values, delimiter, encoding, errors, self.header, tail=tail)
 			del values
 			rows.check()

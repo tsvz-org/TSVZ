@@ -31,8 +31,12 @@ scrub's own header, defaults and strict):
   5   header kept: a file whose first line is H, scrubbed with header '' or H, is read by
       readTabularFile(header=H, strict=True) without raising (if it was before)
   6   the scrub raised (judge by exception type / 5.1 on the same input)
+  m   memory ops then a rewrite: a TSVZed (same args) does a few sets, deletes, in-place changes and defaults changes
+      (drawn from the case), then hardMapToFile(); a TSVZed reopened on the file (with the defaults the program gave
+      last) holds what memory held (rows, cells right-stripped, without empty cells at the end, and order). Files
+      whose line 1 is not the header given are left out (line 1 is kept, by decision).
 """
-import argparse, collections, contextlib, faulthandler, importlib.util, io, itertools, json, multiprocessing, os, random, shutil, signal, sys, tempfile, threading, time
+import argparse, collections, contextlib, faulthandler, importlib.util, io, itertools, json, multiprocessing, os, random, shutil, signal, sys, tempfile, threading, time, zlib
 
 
 
@@ -402,6 +406,8 @@ def _check_case(text, args, tsvzed=True, want=None):
 	old_other = with_module(OLD, reader, orig, args, not args['strict']) if want_cs else None
 	if want is None or want & SEVEN:
 		check_rewrite(text, args, res)
+	if want is None or 'm' in want:
+		check_memory_ops(text, args, res)
 
 	write(work, text)
 	st, val = scrub(work, args)
@@ -606,6 +612,85 @@ def tsvzed_rewrite(path, args):
 		finally:
 			s.close()
 	return quiet(go)
+
+
+MKEYS = ['a', 'b', 'c', 'd']
+MVALS = ['1', '2', 'X', '', '']
+
+
+def memory_ops(rng):
+	ops = []
+	for _ in range(rng.randint(1, 5)):
+		k = rng.random()
+		if k < 0.45:
+			key = rng.choice(MKEYS + ['e'])
+			ops.append(('set', key, [key] + [rng.choice(MVALS) for _ in range(rng.randint(1, 3))]))
+		elif k < 0.65:
+			ops.append(('del', rng.choice(MKEYS)))
+		elif k < 0.75:
+			ops.append(('inplace', rng.choice(MKEYS), rng.choice(['1', 'Z'])))
+		elif k < 0.87:
+			ops.append(('setdefaults', rng.choice([[], ['', 'P'], ['', '', 'Q'], ['', 'P', 'Q']])))
+		else:
+			ops.append(('defkey', [D] + [rng.choice(['', 'N', 'M']) for _ in range(rng.randint(0, 2))]))
+	return ops
+
+
+def _mnorm(row):
+	row = [str(c).rstrip() for c in row]
+	while len(row) > 1 and not row[-1]:
+		row.pop()
+	return row
+
+
+def check_memory_ops(text, args, res):
+	"""m: memory ops, then hardMapToFile(), then a reopened TSVZed holds what memory held."""
+	if args['header'] and text.split('\n', 1)[0] != args['header']:
+		return
+	ops = memory_ops(random.Random(zlib.crc32((text + json.dumps(args, sort_keys=True)).encode('utf8'))))
+	p = os.path.join(TMP, 'mem.tsv')
+	write(p, text)
+	kw = dict(header=args['header'], defaults=None if args['defaults'] is None else list(args['defaults']), strict=args['strict'])
+	OD = collections.OrderedDict
+
+	def go():
+		t = T.TSVZed(p, createIfNotExist=False, rewrite_on_load=False, monitor_external_changes=False, **kw)
+		try:
+			for op in ops:
+				if op[0] == 'set':
+					t[op[1]] = list(op[2])
+				elif op[0] == 'del':
+					if op[1] in t:
+						del t[op[1]]
+				elif op[0] == 'inplace':
+					if OD.__contains__(t, op[1]):
+						row = OD.__getitem__(t, op[1])
+						if len(row) > 1:
+							row[1] = op[2]
+				elif op[0] == 'setdefaults':
+					t.setDefaults(list(op[1]))
+				else:
+					t[D] = list(op[1])
+			mem = [(k, _mnorm(v)) for k, v in OD.items(t) if not str(k).startswith('#')]
+			t.hardMapToFile()
+			given = getattr(t, '_givenDefaults', None)
+		finally:
+			t.close()
+		kw2 = dict(kw)
+		if given is not None and any(op[0] == 'setdefaults' for op in ops):
+			kw2['defaults'] = list(given)  # (a whole read starts from the defaults the program gave last)
+		t2 = T.TSVZed(p, createIfNotExist=False, rewrite_on_load=False, monitor_external_changes=False, **kw2)
+		try:
+			after = [(k, _mnorm(v)) for k, v in OD.items(t2) if not str(k).startswith('#')]
+		finally:
+			t2.close()
+		return mem, after
+	st, val = quiet(go)
+	if st != 'ok':
+		return
+	mem, after = val
+	if after != mem:
+		res['m'] = {'ops': ops, 'mem': mem, 'after': after, 'file': readb(p).decode('utf8', 'replace')}
 
 
 def check_rewrite(text, args, res):

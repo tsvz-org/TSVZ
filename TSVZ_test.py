@@ -13262,3 +13262,18 @@ def test_move_to_end_order_is_written_when_the_rewrite_takes_its_rows_again(tmp_
 	assert len(calls) == 1
 	assert list(TSVZ.readTabularFile(p, header='id\tv')) == list(t) and list(t)[:3] == ['b', 'c', 'a'] and 'd' in t
 	t.close()
+
+
+def test_a_row_memory_adds_with_empty_cells_does_not_read_filled_by_the_files_defaults(tmp_path):
+	# (fuzzer, invariant m) b, read before the file's defaults lines, changed in place, was appended after them: its
+	# empty cells read as their values. It now goes between a reset and the same defaults again.
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, b'id\tv\nb\t1\t\t\tX\n\n#_defaults_#\t1\t1\t2\n#_defaults_#\tX\t2\t2')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	OrderedDict.__getitem__(t, 'b')[1] = 'Z'
+	memory = dict(t)
+	t.hardMapToFile()
+	t.close()
+	t = _quiet_tsvzed(p)
+	assert dict(t) == memory and t.defaults == ['#_defaults_#', 'X', '2', '2']
+	t.close()
