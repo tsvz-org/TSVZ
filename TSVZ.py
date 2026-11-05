@@ -5538,6 +5538,9 @@ class TSVZed(OrderedDict):
 		if shaped is None:
 			return
 		value, newColumnNum = shaped
+		if key == DEFAULTS_INDICATOR_KEY and len(value) > 1 and any(value[1:]) and len(value) < len(self.defaults):
+			# R4, as a reader takes this line: a cell it lacks is the one before it
+			value = value + self.defaults[len(value):]
 		if self.correctColumnNum != 1 and len(value) == 1:
 			# a lone key (no following values) means delete the key, per the
 			# TSVZ spec. del is a no-op when the key is absent (tolerated).
@@ -6696,6 +6699,8 @@ memoryOnly:{self.memoryOnly}
 				self.correctColumnNum = len(self.header)
 			elif width > 0:
 				self.correctColumnNum = width  # the column count the read took (a row read whole can be wider)
+			elif len(self._givenDefaults) > 1:
+				self.correctColumnNum = len(self._givenDefaults)  # (no keyed line: what the store's reader will take)
 			elif self:
 				self.correctColumnNum = len(self[next(iter(self))])
 			else:

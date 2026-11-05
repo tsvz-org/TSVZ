@@ -13772,3 +13772,41 @@ def test_a_file_made_again_keeps_a_reset_the_file_held(tmp_path):
 	back = _quiet_tsvzed(p, header='id\tv', defaults=['#_defaults_#', 'P'])
 	assert back.defaults == ['#_defaults_#'] and dict(back) == {'a': ['a', '1']}
 	back.close()
+
+
+def test_a_shorter_defaults_line_set_on_a_store_reads_as_every_reader_takes_it(tmp_path):
+	# (rr2, N2) memory took [#, N]; every reader of the line takes [#, N, Q] (R4).
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, b'id\tv\nc\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv', defaults=['#_defaults_#', 'P', 'Q'], rewrite_on_load=False, append_check_delay=60, verbose=False)
+	t['#_defaults_#'] = ['#_defaults_#', 'N']
+	assert t.defaults == ['#_defaults_#', 'N', 'Q']
+	t['e'] = ['e', '', '', '2']
+	assert t['e'] == ['e', 'N', 'Q', '2']
+	t.commitAppendToFile()
+	memory = dict(t)
+	t.close()
+	back = _quiet_tsvzed(p, header='id\tv', defaults=['#_defaults_#', 'P', 'Q'])
+	assert back.defaults == ['#_defaults_#', 'N', 'Q'] and dict(back) == memory
+	back.close()
+	t = _quiet_tsvzed(p, header='id\tv', defaults=['#_defaults_#', 'P', 'Q'])
+	del t['#_defaults_#']  # (a reset stays a reset)
+	assert t.defaults == ['#_defaults_#']
+	t.close()
+
+
+@pytest.mark.parametrize('strict', [True, False])
+def test_a_store_on_a_file_with_no_keyed_line_takes_the_column_count_of_the_defaults_it_was_given(tmp_path, strict):
+	# (rr3, N5) a strict store accepted a narrower row, then its own reader, which takes the defaults' count, dropped it.
+	p = str(tmp_path / 'e.tsv')
+	_touch(p, b'\n')
+	t = TSVZ.TSVZed(p, defaults=['#_defaults_#', '', ''], strict=strict, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	assert t.correctColumnNum == 3
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '1', '2']
+	assert list(t) == (['b'] if strict else ['a', 'b'])
+	memory = dict(t)
+	t.close()
+	back = _quiet_tsvzed(p, defaults=['#_defaults_#', '', ''], strict=strict)
+	assert dict(back) == memory
+	back.close()
