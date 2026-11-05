@@ -7681,6 +7681,7 @@ def test_tsvzed_legacy_rewrite_that_keeps_failing_still_reloads_another_process_
 	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', denying)
 	monkeypatch.setattr(TSVZ, '_openUntruncated', lambda fileName: denying(fileName, 'wb'))
 	t.rewrite(force=True)  # the rewrite is tried, and fails
+	assert _wait_for(lambda: not t.appendQueue, 5)  # (what was queued is appended: another writer's bytes follow it)
 	assert _wait_for(lambda: t._failing('rewrite'), 5)
 	for _ in range(10):
 		t._failed('rewrite', 'Permission denied', False)  # it kept failing: the next try is a minute away
@@ -7831,6 +7832,7 @@ def test_tsvzed_legacy_background_writer_never_reloads_a_file_its_failed_rewrite
 	rows = dict(t)
 	_failing_rewrite(monkeypatch, partial=b'key\tval\n')  # it left the file holding the header
 	t.rewrite(force=True)  # the rewrite is tried, and fails
+	assert _wait_for(lambda: not t.appendQueue, 5)  # (what was queued is appended: another writer's bytes follow it)
 	assert _wait_for(lambda: t._failing('rewrite'), 5)
 	for _ in range(10):
 		t._failed('rewrite', 'No space left on device', False)  # it keeps failing: the next try is a minute away
@@ -8102,6 +8104,7 @@ def test_tsvzed_legacy_background_writer_appends_to_a_file_its_rewrite_emptied(t
 	t['k0'] = ['k0', 'w']  # dirty: the rewrite has something to change
 	_failing_rewrite(monkeypatch)
 	t.rewrite(force=True)  # the rewrite is tried, and fails
+	assert _wait_for(lambda: not t.appendQueue, 5)  # (what was queued is appended: another writer's bytes follow it)
 	assert _wait_for(lambda: t._failing('rewrite'), 5)
 	for _ in range(10):
 		t._failed('rewrite', 'No space left on device', False)  # the next try is a minute away
@@ -8131,6 +8134,7 @@ def test_tsvzed_legacy_last_writer_wins_after_a_failed_rewrite(tmp_path, monkeyp
 	t['k0'] = ['k0', 'w']
 	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tw\n')
 	t.rewrite(force=True)  # the rewrite is tried, and fails
+	assert _wait_for(lambda: not t.appendQueue, 5)  # (what was queued is appended: another writer's bytes follow it)
 	assert _wait_for(lambda: t._failing('rewrite'), 5)
 	for _ in range(10):
 		t._failed('rewrite', 'No space left on device', False)
@@ -12542,8 +12546,9 @@ def test_tsvzed_memory_dump_writes_a_whitespace_cell_filled_with_the_defaults_ne
 	p = str(tmp_path / 'w.tsv')
 	_touch(p, b'id\tv\n#_defaults_#\tNA\nk\t<LF>\nj\t1\n')
 	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=0.01)
-	t.move_to_end('k')  # memory's order is written: the dump
+	os.remove(p)  # memory is written: the dump
 	if how == 'close':
+		t['z'] = ['z', '1']  # (a commit makes the file again)
 		t.close()
 	else:
 		t.hardMapToFile()
@@ -12959,13 +12964,11 @@ def _dump_fixture(tmp_path, name):
 	return p, TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=0.01, verbose=False)
 
 
-@pytest.mark.parametrize('how', ['move_to_end', 'damaged', 'remake', 'removed', 'emptied'])
+@pytest.mark.parametrize('how', ['damaged', 'remake', 'removed', 'emptied'])
 def test_tsvzed_rewrite_writes_memory_when_the_file_cannot_be_compacted(tmp_path, how):
 	p, t = _dump_fixture(tmp_path, how + '.tsv')
 	OrderedDict.__setitem__(t, 'c', ['c', '5'])
-	if how == 'move_to_end':
-		t.move_to_end('b')
-	elif how == 'damaged':
+	if how == 'damaged':
 		t._damaged = True  # (as a rewrite that failed half way leaves it)
 	elif how == 'remake':
 		t._remake = True  # (as a file another writer left damaged leaves it)
@@ -12979,7 +12982,7 @@ def test_tsvzed_rewrite_writes_memory_when_the_file_cannot_be_compacted(tmp_path
 			OrderedDict.__setitem__(t, row[0], row)
 	t.hardMapToFile()
 	t.close()
-	assert _bytes(p) == (b'id\tv\nc\t5\nb\t3\n' if how == 'move_to_end' else b'id\tv\nb\t3\nc\t5\n')
+	assert _bytes(p) == b'id\tv\nb\t3\nc\t5\n'
 
 
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
@@ -13014,9 +13017,9 @@ def test_tsvzed_legacy_compacting_rewrite_memory_grows_with_the_file_not_with_tw
 SLOPE = 372
 
 
-# --- 5.5: deletes in a one-column store (plan Q1: rewrite from memory) ---
+# --- 5.5: deletes in a one-column store (a drop item: the commit compacts) ---
 @pytest.mark.parametrize('how', ['del', 'pop', 'popitem'])
-def test_a_delete_in_a_one_column_store_appends_nothing_and_the_rewrite_writes_memory(tmp_path, capsys, how):
+def test_a_delete_in_a_one_column_store_takes_its_lines_out_at_the_next_commit(tmp_path, capsys, how):
 	p = str(tmp_path / 'one.tsv')
 	_touch(p, b'a\nb\nc\n')
 	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=0.01)
@@ -13029,17 +13032,17 @@ def test_a_delete_in_a_one_column_store_appends_nothing_and_the_rewrite_writes_m
 	else:
 		assert t.popitem() == ('c', ['c'])
 	t.commitAppendToFile()
-	assert _bytes(p) == b'a\nb\nc\n'  # (a lone key is a row in a one-column file: no line for it)
-	assert capsys.readouterr().out == ''
-	t.close()
 	left = [k for k in 'abc' if k != gone]
+	assert _bytes(p) == b''.join(k.encode() + b'\n' for k in left)  # (a lone key is a row there: its line goes)
+	assert capsys.readouterr().out == '' and not t.rewrite_on_exit and not t.dirty
+	t.close()
 	assert list(TSVZ.readTabularFile(p)) == left
 	t = _quiet_tsvzed(p)
 	assert list(t) == left
 	t.close()
 
 
-def test_a_delete_in_a_store_with_a_one_cell_header_is_written_from_memory(tmp_path):
+def test_a_delete_in_a_store_with_a_one_cell_header_takes_its_line_out(tmp_path):
 	p = str(tmp_path / 'h.tsv')
 	_touch(p, b'id\na\nb\n')
 	t = TSVZ.TSVZed(p, header='id', rewrite_on_load=False, append_check_delay=0.01)
@@ -13056,13 +13059,12 @@ def test_a_delete_in_a_store_still_at_no_column_count_holding_one_cell_rows(tmp_
 		f.write(b'a\nb\n')  # another process appends one-cell rows
 	assert _wait_for(lambda: 'b' in t)
 	del t['a']
-	t.commitAppendToFile()
-	assert _bytes(p) == b'a\nb\n'
-	t.close()
+	t.close()  # (bytes read only after it: a rewrite may be under way)
+	assert _bytes(p) == b'b\n'
 	assert list(TSVZ.readTabularFile(p)) == ['b']
 
 
-def test_keys_gone_from_a_one_column_store_another_way_are_written_by_the_dump(tmp_path, monkeypatch):
+def test_keys_gone_from_a_one_column_store_another_way_lose_their_lines_at_a_rewrite(tmp_path, monkeypatch):
 	p = str(tmp_path / 'c.tsv')
 	_touch(p, b'a\nb\nc\n')
 	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60)
@@ -13177,16 +13179,286 @@ def test_a_one_column_delete_is_not_undone_by_a_whole_read_before_the_rewrite(tm
 	assert list(TSVZ.readTabularFile(p)) == ['a', 'c']
 
 
-def test_a_one_column_delete_is_undone_by_another_process_setting_the_key_again(tmp_path):
+@pytest.mark.parametrize('scrubbed', [False, True], ids=['append', 'append-and-scrub'])
+def test_a_one_column_delete_is_undone_by_another_process_setting_the_key_again(tmp_path, scrubbed):
+	# (rr3) The delete is in the file at the next commit, so a later write of the key is never lost at close, as it was
+	# when the delete waited for a dump at exit. (A write that lands before the delete's commit loses to it, as it loses
+	# to a queued deletion line at any other column count: the last to reach the file wins.)
 	p = str(tmp_path / 'one.tsv')
-	_touch(p, b'a\nb\nc\n')
+	_touch(p, b'a\nb\nc\n# note\n')
 	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=0.01, verbose=False)
 	del t['b']
-	with open(p, 'ab') as f:
-		f.write(b'b\n')  # another process sets b again (a row at width 1)
+	t.commitAppendToFile()
+	TSVZ.appendTabularFile(p, ['b'])  # another process sets b again (a row at width 1)
+	if scrubbed:
+		TSVZ.scrubTabularFile(p)  # (and rewrites the file: the store reads it whole)
 	assert _wait_for(lambda: 'b' in t)
 	t.close()
 	assert sorted(TSVZ.readTabularFile(p)) == ['a', 'b', 'c']
+
+
+def test_o2a_a_wider_row_set_in_a_one_column_store_then_a_delete_keeps_the_other_keys(tmp_path):
+	# (rr2) the dump wrote the wider row first: the file then read at two columns, and b, a lone key, was a deletion.
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, b'a\nb\nc\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	t['a'] = ['a', 'note']
+	del t['c']
+	memory = dict(t)
+	t.close()
+	assert memory == {'a': ['a', 'note'], 'b': ['b']}
+	assert dict(TSVZ.readTabularFile(p, strict=False)) == memory
+	assert list(TSVZ.readTabularFile(p, strict=True)) == ['a', 'b']
+
+
+def _one_column_views(p, keys):
+	assert list(TSVZ.readTabularFile(p, strict=False)) == keys
+	t = _quiet_tsvzed(p)
+	try:
+		assert list(t) == keys
+	finally:
+		t.close()
+
+
+@pytest.mark.parametrize('text, key, expected, keys', [
+	# the first keyed line goes: the next one-cell line takes its place, so the file stays at one column
+	(b'a\nb\tX\nc\n', 'a', b'c\nb\tX\n', ['c', 'b']),
+	(b'a\n#_defaults_#\tX\nb\n', 'a', b'b\n#_defaults_#\tX\n', ['b']),
+	(b'a\nb\tX\nc\tY\nc\n', 'a', b'c\nb\tX\n', ['c', 'b']),  # (c's earlier line is superseded for every reader)
+	(b'a\nb\t\nc\tX\n', 'a', b'b\nc\tX\n', ['b', 'c']),  # (a line with no value moves up as the key alone)
+	# not the first keyed line, or no wider line first: nothing moves
+	(b'a\nb\tX\nc\n', 'c', b'a\nb\tX\n', ['a', 'b']),
+	(b'a\nb\nc\tX\n', 'a', b'b\nc\tX\n', ['b', 'c']),
+	(b'\na\nb\tX\nc\n', 'a', b'\nc\nb\tX\n', ['c', 'b']),  # (the empty line 1 stays)
+	# every line of the key goes
+	(b'a\nb\nb\t1\nb\t\nc\n', 'b', b'a\nc\n', ['a', 'c']),
+	(b'a\nb \t1\nc\n', 'b', b'a\nc\n', ['a', 'c']),  # (the store names `b ` b)
+	# no one-cell line left: the file reads at the wider count, and the store with it
+	(b'a\nb\tX\n', 'a', b'b\tX\n', ['b']),
+	(b'a\n', 'a', b'', []),
+])
+def test_a_one_column_delete_keeps_the_column_count_by_moving_one_line_up(tmp_path, text, key, expected, keys):
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, text)
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	del t[key]
+	t.commitAppendToFile()
+	assert _bytes(p) == expected
+	assert list(t) == keys  # (memory takes the moved key's place too)
+	t.close()
+	assert _bytes(p) == expected
+	_one_column_views(p, keys)
+
+
+def test_a_store_left_with_no_one_cell_line_takes_the_new_column_count(tmp_path):
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, b'a\nb\tX\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	del t['a']
+	t.commitAppendToFile()
+	assert t.correctColumnNum == 2
+	del t['b']  # a deletion line now
+	t.close()
+	assert _bytes(p) == b'b\tX\nb\t\n' and TSVZ.readTabularFile(p, strict=False) == {}
+
+
+def test_a_row_set_after_a_one_column_delete_stays(tmp_path):
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, b'a\nb\nc\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	del t['a']
+	t['a'] = ['a']
+	del t['b']
+	t['d'] = ['d']
+	assert list(t) == ['c', 'a', 'd']
+	t.commitAppendToFile()
+	assert _bytes(p) == b'c\na\nd\n'
+	t.close()
+	_one_column_views(p, ['c', 'a', 'd'])
+
+
+def test_a_one_column_delete_reaches_a_compressed_file(tmp_path):
+	p = str(tmp_path / 'one.tsv.gz')
+	t = TSVZ.TSVZed(p, append_check_delay=60, verbose=False)
+	with open(p, 'wb') as f:
+		f.write(gzip.compress(b'a\nb\nc\n'))
+	t.reload()
+	del t['b']
+	t.close()
+	assert gzip.decompress(_bytes(p)) == b'a\nc\n'
+
+
+def test_a_refused_one_column_rewrite_appends_what_comes_before_the_drop_and_writes_the_rest_at_close(tmp_path, capsys):
+	# A row changed in place that cannot be encoded refuses the rewrite the drop asks for. What was queued before the
+	# drop is still appended; a row after it waits, it must stay after the lines the drop takes out. close() is the last
+	# try: the rows are appended, and the delete it could not write is reported.
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, b'a\nb\nc\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	OrderedDict.__setitem__(t, 'a', ['a', BAD_NAME])
+	t['x'] = ['x']
+	del t['b']
+	t['y'] = ['y']
+	t.commitAppendToFile()
+	assert _bytes(p) == b'a\nb\nc\nx\n' and [row[0] for row in t.appendQueue] == ['b', 'y']
+	assert _refusals(capsys)
+	assert t._refusalPending()
+	t.commitAppendToFile()  # held back: no second try yet
+	assert _bytes(p) == b'a\nb\nc\nx\n'
+	t.close()
+	assert _bytes(p) == b'a\nb\nc\nx\ny\n'
+	assert "The delete of 'b'" in capsys.readouterr().out
+
+
+def test_a_one_column_delete_goes_through_once_a_refused_row_is_fixed(tmp_path, monkeypatch):
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, b'a\nb\nc\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	clock = [1000.0]
+	monkeypatch.setattr(TSVZ, '_specClock', lambda: clock[0])
+	OrderedDict.__setitem__(t, 'a', ['a', BAD_NAME])
+	del t['b']
+	t.commitAppendToFile()
+	assert _bytes(p) == b'a\nb\nc\n'
+	OrderedDict.__setitem__(t, 'a', ['a'])
+	clock[0] += 120
+	t.commitAppendToFile()
+	assert _bytes(p) == b'a\nc\n'
+	t.close()
+
+
+# --- 5.5: move_to_end appends ---
+@pytest.mark.parametrize('text, header, key, appended, keys', [
+	(b'id\tv\na\t1\nb\t2\n', 'id\tv', 'a', b'a\t\na\t1\n', ['b', 'a']),
+	(b'id\tv\na\t1\nb\t2\n', 'id\tv', 'b', b'b\t\nb\t2\n', ['a', 'b']),
+	(b'a\t1\nb\t2\n', '', 'a', b'a\t\na\t1\n', ['b', 'a']),  # (a header-less store, the key on line 1)
+	(b'a\t1\t2\nb\t3\t4\n', '', 'a', b'a\t\t\na\t1\t2\n', ['b', 'a']),
+])
+def test_move_to_end_appends_the_deletion_and_the_row(tmp_path, capsys, text, header, key, appended, keys):
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, text)
+	t = TSVZ.TSVZed(p, header=header, rewrite_on_load=False, append_check_delay=60)
+	capsys.readouterr()
+	memory = dict(t)
+	t.move_to_end(key)
+	assert list(t) == keys and not t.rewrite_on_exit
+	t.commitAppendToFile()
+	assert _bytes(p) == text + appended
+	assert 'Need to resync' not in capsys.readouterr().out
+	t.close()
+	assert _bytes(p) == text + appended  # (no rewrite at close)
+	for strict in (False, True):
+		back = TSVZ.readTabularFile(p, header=header, strict=strict)
+		assert list(back) == keys and dict(back) == memory
+		assert list(TSVZ_old.readTabularFile(p, header=header, strict=strict)) == keys  # (an older reader)
+	t = _quiet_tsvzed(p, header=header)
+	assert list(t) == keys
+	t.hardMapToFile()  # the compaction keeps the order and the column count
+	t.close()
+	back = TSVZ.readTabularFile(p, header=header, strict=True)
+	assert list(back) == keys and dict(back) == memory
+
+
+def test_o2b_move_to_end_in_a_store_that_set_a_wider_row_keeps_every_key_for_strict_readers(tmp_path):
+	# (rr2) the dump wrote the wider row first: strict readers then took three columns and dropped a and b.
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, b'a\t1\nb\t2\nc\t3\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	t['c'] = ['c', '3', 'x']
+	t.move_to_end('a')
+	t.move_to_end('b')
+	memory = dict(t)
+	t.close()
+	assert list(memory) == ['c', 'a', 'b']
+	assert sorted(TSVZ.readTabularFile(p)) == ['a', 'b', 'c']
+	assert dict(TSVZ.readTabularFile(p, strict=False)) == memory
+
+
+@pytest.mark.parametrize('text, header', [(b'id\tv\na\t1\nb\t2\nc\t3\n', 'id\tv'), (b'a\t1\nb\t2\nc\t3\n', ''), (b'a\nb\nc\n', '')])
+def test_move_to_end_to_the_beginning_moves_the_other_keys_to_the_end(tmp_path, text, header):
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, text)
+	t = TSVZ.TSVZed(p, header=header, rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	memory = dict(t)
+	t.move_to_end('c', last=False)
+	assert list(t) == ['c', 'a', 'b']
+	t.close()
+	for strict in (False, True):
+		back = TSVZ.readTabularFile(p, header=header, strict=strict)
+		assert list(back) == ['c', 'a', 'b'] and dict(back) == memory
+	t = _quiet_tsvzed(p, header=header)
+	assert list(t) == ['c', 'a', 'b'] and dict(t) == memory
+	t.close()
+
+
+def test_move_to_end_in_a_one_column_store_queues_a_drop_and_the_row(tmp_path):
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, b'a\nb\nc\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	t.move_to_end('a')
+	assert list(t) == ['b', 'c', 'a']
+	t.reload()  # a whole read replays the queue: the move stays
+	assert list(t) == ['b', 'c', 'a']
+	t.commitAppendToFile()
+	assert _bytes(p) == b'b\nc\na\n'
+	t.close()
+	assert _bytes(p) == b'b\nc\na\n'
+	_one_column_views(p, ['b', 'c', 'a'])
+
+
+def test_move_to_end_of_a_row_read_before_the_defaults_is_not_filled_by_them(tmp_path):
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, b'id\tv\tw\na\t\t1\nb\t2\t3\n#_defaults_#\tX\tY\n')
+	t = TSVZ.TSVZed(p, header='id\tv\tw', rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	memory = dict(t)
+	assert memory['a'] == ['a', '', '1']
+	t.move_to_end('a')
+	t.close()
+	for strict in (False, True):
+		back = TSVZ.readTabularFile(p, header='id\tv\tw', strict=strict)
+		assert list(back) == ['b', 'a'] and dict(back) == memory
+	t = _quiet_tsvzed(p, header='id\tv\tw')
+	assert list(t) == ['b', 'a'] and t.defaults[:3] == ['#_defaults_#', 'X', 'Y']
+	t.close()
+
+
+def test_move_to_end_of_a_row_the_format_cannot_write_moves_it_in_memory_only(tmp_path):
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, b'id\tv\nk\t1\nj\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=60, verbose=False)
+	OrderedDict.__getitem__(t, 'k')[1] = ''  # changed in place: its line would be a deletion
+	t.move_to_end('k')
+	assert list(t) == ['j', 'k'] and not t.appendQueue
+	t.close()
+	assert _bytes(p) == b'id\tv\nk\t1\nj\t1\n'
+
+
+def test_move_to_end_refuses_a_row_it_cannot_write_before_anything_changes(tmp_path):
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, b'id\tv\na\t1\nb\t2\n')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=60, verbose=False)
+	OrderedDict.__setitem__(t, 'a', ['a', BAD_NAME])
+	with pytest.raises(ValueError):
+		t.move_to_end('a')
+	assert list(t) == ['a', 'b'] and not t.appendQueue
+	with pytest.raises(KeyError):
+		t.move_to_end('nope')
+	OrderedDict.__setitem__(t, 'a', ['a', '1'])
+	t.close()
+
+
+def test_move_to_end_commits_while_another_process_appends_and_both_stay(tmp_path):
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, b'id\tv\na\t1\nb\t2\n')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	t.move_to_end('a')
+	TSVZ.appendTabularFile(p, ['c', '3'], header='id\tv')
+	assert _wait_for(lambda: 'c' in t)
+	t.close()
+	assert sorted(TSVZ.readTabularFile(p, header='id\tv')) == ['a', 'b', 'c']
+	t = _quiet_tsvzed(p, header='id\tv')
+	assert sorted(t) == ['a', 'b', 'c']
+	t.close()
 
 
 def test_a_queued_one_cell_row_survives_a_whole_read_when_the_program_gave_a_column_count(tmp_path):
