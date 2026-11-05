@@ -2724,7 +2724,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 	reader takes its column count from it (line 1 holds no key, or a header the caller's reader does not take): a dead
 	key's line there is kept emptied (a deletion as wide as it was), or with the deletion that ends it."""
 	enc = encoding or 'utf8'
-	strictActive = len(defaults) > 1 and any(defaults[1:])
+	strictActive = strictActiveOld = len(defaults) > 1 and any(defaults[1:])
 
 	def keyed(i):  # (a keyed line to any reader)
 		return _legacyLineKind(raw[i].decode(enc, errors='replace'), 1, False, delimiter)[0] != 'skip'
@@ -2733,9 +2733,11 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 	protectable = (0,) if after0 is None else (0, after0)
 	# Each live key's lines since its last deletion, one slot per key in flat arrays (small per key: memory peaks here
 	# during a TSVZed rewrite): its first and last line, the first and last a strict reader takes (-1: none), the cell
-	# counts of the first and last, and whether a strict reader takes them.
+	# counts of the first and last, and which strict readers take them (a mask: 1, 5.5's, which takes a wider line; 2,
+	# 3.39 to 5.4's, which takes only a line exactly as wide; each keeps its own first and last line taken).
 	live = {}  # key -> slot
 	first, last, firstTaken, lastTaken = array.array('l'), array.array('l'), array.array('l'), array.array('l')
+	firstTakenOld, lastTakenOld = array.array('l'), array.array('l')
 	firstN, lastN = array.array('l'), array.array('l')
 	firstTakes, lastTakes = bytearray(), bytearray()
 	lastFull = bytearray()  # whether the last line is exactly W wide with a value in every cell: no defaults reach it
@@ -2756,11 +2758,14 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 			kind, key, n, takes = _legacyLineKind(text, width, strictActive, delimiter)
 		if firstKeyed is None:
 			firstKeyed = i
+		takesOld = kind in ('delete', 'reset') or (kind == 'row' and width == 1 and n == 1) or n == width or strictActiveOld
+		mask = (1 if takes else 0) | (2 if takesOld else 0)
 		if kind in ('defaults', 'reset'):
 			if boundaries and raw[i] == raw[boundaries[-1]] and i not in protectable:
 				continue  # (the same line again, nothing between them changing the defaults: it changes nothing)
 			boundaries.append(i)
 			strictActive = False if kind == 'reset' else (True if takes else strictActive)
+			strictActiveOld = False if kind == 'reset' else (True if takesOld else strictActiveOld)
 		elif kind == 'delete':
 			slot = live.pop(key, None)
 			if slot is not None:
@@ -2780,17 +2785,23 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 				last.append(i)
 				firstTaken.append(i if takes else -1)
 				lastTaken.append(i if takes else -1)
+				firstTakenOld.append(i if takesOld else -1)
+				lastTakenOld.append(i if takesOld else -1)
 				firstN.append(n)
 				lastN.append(n)
-				firstTakes.append(takes)
-				lastTakes.append(takes)
+				firstTakes.append(mask)
+				lastTakes.append(mask)
 				lastFull.append(full)
 			else:
-				last[slot], lastN[slot], lastTakes[slot], lastFull[slot] = i, n, takes, full
+				last[slot], lastN[slot], lastTakes[slot], lastFull[slot] = i, n, mask, full
 				if takes:
 					if firstTaken[slot] < 0:
 						firstTaken[slot] = i
 					lastTaken[slot] = i
+				if takesOld:
+					if firstTakenOld[slot] < 0:
+						firstTakenOld[slot] = i
+					lastTakenOld[slot] = i
 	kept = bytearray(len(raw))  # (one byte a line: whether it is kept)
 	for i in boundaries:
 		kept[i] = 1
@@ -2805,7 +2816,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 		# The key becomes one line (its value at its place) when the same defaults reach both places (no defaults line
 		# between them), or none can reach its last line (exactly W wide, a value in every cell, for every reader).
 		if ((lastFull[slot] or bisect.bisect_right(boundaries, f) == bisect.bisect_left(boundaries, l))
-				and firstTakes[slot] and lastTakes[slot]
+				and firstTakes[slot] == lastTakes[slot] == 3
 				and f != 0 and (f not in (firstKeyed, after0) or firstN[slot] == lastN[slot])):
 			content[f] = raw[l]
 			continue
@@ -2814,6 +2825,10 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 			kept[firstTaken[slot]] = 1  # (a strict reader's place)
 		if lastTaken[slot] >= 0:
 			kept[lastTaken[slot]] = 1  # (and its value)
+		if firstTakenOld[slot] >= 0:
+			kept[firstTakenOld[slot]] = 1  # (the same for an older strict reader, which takes no wider line)
+		if lastTakenOld[slot] >= 0:
+			kept[lastTakenOld[slot]] = 1
 	protected = [0] if raw else []
 	if after0 is not None and (not line0Keyed or (consumed and not matched)):
 		protected.append(after0)

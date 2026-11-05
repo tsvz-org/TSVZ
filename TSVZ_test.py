@@ -13338,3 +13338,18 @@ def test_tsvzed_rewrites_keep_a_store_with_defaults_the_same_size_round_after_ro
 		t.close()
 		sizes.append(_bytes(p).count(b'\n'))
 	assert sizes == [7, 7, 7], sizes
+
+
+def test_legacy_compact_keeps_the_lines_an_older_strict_reader_takes(tmp_path):
+	# (fuzzer, c*/cs after decision A) a 5.5 strict reader takes a wider line, a 3.39 to 5.4 one does not: the key's
+	# line exactly as wide stays for it.
+	text = 'id\tv\na\t1\na\t1\t2\n'
+	raw = _lines(text.encode())
+	out = _compact(raw, 'id\tv', None, '\t')
+	assert b''.join(line + b'\n' for line in out) == text.encode()
+	for strict in (False, True):
+		p = str(tmp_path / ('s%d.tsv' % strict))
+		_touch(p, text.encode())
+		TSVZ.scrubTabularFile(p, header='id\tv', strict=strict)
+		assert TSVZ_old.readTabularFile(p, header='id\tv', strict=True) == {'a': ['a', '1']}
+		assert TSVZ.readTabularFile(p, header='id\tv', strict=True) == {'a': ['a', '1', '2']}
