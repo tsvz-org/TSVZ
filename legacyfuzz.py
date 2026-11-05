@@ -32,7 +32,7 @@ scrub's own header, defaults and strict):
       readTabularFile(header=H, strict=True) without raising (if it was before)
   6   the scrub raised (judge by exception type / 5.1 on the same input)
 """
-import argparse, collections, contextlib, importlib.util, io, itertools, json, multiprocessing, os, random, shutil, sys, tempfile, threading, time
+import argparse, collections, contextlib, importlib.util, io, itertools, json, multiprocessing, os, random, shutil, signal, sys, tempfile, threading, time
 
 
 
@@ -287,8 +287,18 @@ def track(mod):
 	cls._fuzzTracked = True
 
 
+HARNESS = collections.Counter()  # per worker: 'timeout' (cases stopped by CASE_TIMEOUT), 'unstopped' (threads reap left)
+CASE_TIMEOUT = 60  # seconds a case may take before it is stopped and recorded as a harness timeout
+CHUNK_WAIT = 1800  # seconds without any chunk finishing before the run stops waiting (a worker died or hung)
+
+
+class CaseTimeout(Exception):
+	pass
+
+
 def reap():
-	"""Stop the threads of the TSVZeds the case made (each was closed, or its constructor raised)."""
+	"""Stop the threads of the TSVZeds the case made (each was closed, or its constructor raised); every join is
+	bounded, and a thread that does not stop is counted (HARNESS['unstopped'])."""
 	while LIVE:
 		o = LIVE.pop()
 		event = getattr(o, 'shutdownEvent', None)
@@ -297,13 +307,54 @@ def reap():
 		thread = getattr(o, 'appendThread', None)
 		if thread is not None and thread.is_alive() and thread is not threading.current_thread():
 			thread.join(5)
+			if thread.is_alive():
+				HARNESS['unstopped'] += 1
+
+
+def _alarm(signum, frame):
+	raise CaseTimeout()
 
 
 def check_case(text, args, tsvzed=True, want=None):
+	"""_check_case, stopped after CASE_TIMEOUT seconds (then {'_timeout': True}, counted, never an invariant)."""
+	timed = threading.current_thread() is threading.main_thread()
+	if timed:
+		signal.signal(signal.SIGALRM, _alarm)
+		signal.setitimer(signal.ITIMER_REAL, CASE_TIMEOUT)
 	try:
 		return _check_case(text, args, tsvzed, want)
+	except CaseTimeout:
+		HARNESS['timeout'] += 1
+		return {'_timeout': True}
 	finally:
+		if timed:
+			signal.setitimer(signal.ITIMER_REAL, 0)
 		reap()
+
+
+def results(pool, fn, jobs, **kwargs):
+	"""pool.imap_unordered(fn, jobs), giving up (with a '# harness:' line) when no result arrives for CHUNK_WAIT seconds:
+	a worker that dies takes its task with it, and the pool would wait for it for ever."""
+	it = pool.imap_unordered(fn, jobs, **kwargs)
+	got = 0
+	while True:
+		try:
+			value = it.next(timeout=CHUNK_WAIT)
+		except StopIteration:
+			return
+		except multiprocessing.TimeoutError:
+			print('# harness: no result in %ds: %d of %d tasks lost (a worker died or hung)' % (CHUNK_WAIT, len(jobs) - got, len(jobs)), flush=True)
+			pool.terminate()
+			return
+		got += 1
+		yield value
+
+
+def harness_stats():
+	"""This worker's harness counts since the last call, and reset."""
+	out = dict(HARNESS)
+	HARNESS.clear()
+	return out
 
 
 def _check_case(text, args, tsvzed=True, want=None):
@@ -704,6 +755,8 @@ def work_chunk(job):
 				lst.sort(key=lambda x: (x[0], x[1]))
 				del lst[keep:]
 	stats['secs'] = time.time() - t0
+	for k, v in harness_stats().items():
+		stats['harness_' + k] += v
 	return stats, dict(small)
 
 
@@ -717,22 +770,23 @@ def shrink_job(job):
 
 
 def run(a):
-	ctx = multiprocessing.get_context('fork')
+	ctx = multiprocessing.get_context('spawn')  # (no fork of a process whose TSVZ threads may hold locks)
 	chunk = max(1, a.n // (a.jobs * 8))
 	jobs = [(a.seed, lo, min(a.n, lo + chunk), not a.no_tsvzed, a.keep) for lo in range(0, a.n, chunk)]
 	t0 = time.time()
 	stats = collections.Counter()
 	small = collections.defaultdict(list)
 	with ctx.Pool(a.jobs, initializer=worker_init, initargs=(a.ver,)) as pool:
-		for st, sm in pool.imap_unordered(work_chunk, jobs):
+		for st, sm in results(pool, work_chunk, jobs):
 			secs = st.pop('secs')
 			stats.update(st)
 			for k, v in sm.items():
 				small[k] += v
 				small[k].sort(key=lambda x: (x[0], x[1]))
 				del small[k][a.keep:]
-		print('# version %s seed %s files %d, case-args %d, harness errors %d, fuzz %.0fs' % (
-			label(a.ver), a.seed, stats['files'], stats['cases'], stats['harness_error'], time.time() - t0), flush=True)
+		print('# version %s seed %s files %d, case-args %d, harness errors %d, timeouts %d, unstopped threads %d, fuzz %.0fs' % (
+			label(a.ver), a.seed, stats['files'], stats['cases'], stats['harness_error'], stats['harness_timeout'],
+			stats['harness_unstopped'], time.time() - t0), flush=True)
 		print('# failing counts (raw, per file x arg set): ' + json.dumps({k[5:]: v for k, v in sorted(stats.items()) if k.startswith('fail:')}), flush=True)
 		for k, v in sorted(stats.items()):
 			if k.startswith('harness_error:'):
@@ -740,7 +794,7 @@ def run(a):
 		sj = [(inv, ci, text, exc, not a.no_tsvzed) for (inv, ci), lst in sorted(small.items()) for (_, _, text, exc) in lst]
 		print('# shrinking %d candidates' % len(sj), flush=True)
 		seen = {}
-		for inv, ci, orig, t, args, info, scr in pool.imap_unordered(shrink_job, sj, chunksize=1):
+		for inv, ci, orig, t, args, info, scr in results(pool, shrink_job, sj, chunksize=1):
 			if info is None:
 				continue
 			key = (inv, t, json.dumps(args, sort_keys=True))
@@ -815,6 +869,8 @@ def pair_chunk(job):
 			stats['cases'] += 1
 			ra = cc('a', text, args, tsvzed)
 			rb = cc('b', text, args, tsvzed)
+			if '_timeout' in ra or '_timeout' in rb:
+				continue  # (a harness timeout: counted, compared nowhere)
 			ga = {('1*' if k in SAME else 'c*' if k in CSAME else k) for k in ra if not k.startswith('_')}
 			gb = {('1*' if k in SAME else 'c*' if k in CSAME else k) for k in rb if not k.startswith('_')}
 			for g in gb - ga:
@@ -832,6 +888,8 @@ def pair_chunk(job):
 				lst.append((len(text), i, text))
 				lst.sort(key=lambda x: (x[0], x[1]))
 				del lst[keep:]
+	for k, v in harness_stats().items():
+		stats['harness:' + k] += v
 	return stats, dict(small)
 
 
@@ -864,27 +922,28 @@ def pair_shrink(job):
 
 
 def run_pair(a):
-	ctx = multiprocessing.get_context('fork')
+	ctx = multiprocessing.get_context('spawn')  # (no fork of a process whose TSVZ threads may hold locks)
 	chunk = max(1, a.n // (a.jobs * 8))
 	jobs = [(a.seed, lo, min(a.n, lo + chunk), not a.no_tsvzed, a.keep) for lo in range(0, a.n, chunk)]
 	t0 = time.time()
 	stats = collections.Counter()
 	small = collections.defaultdict(list)
 	with ctx.Pool(a.jobs, initializer=pair_init, initargs=(a.ver, a.ver_b, a.old)) as pool:
-		for st, sm in pool.imap_unordered(pair_chunk, jobs):
+		for st, sm in results(pool, pair_chunk, jobs):
 			stats.update(st)
 			for k, v in sm.items():
 				small[k] += v
 				small[k].sort(key=lambda x: (x[0], x[1]))
 				del small[k][a.keep:]
 		print('# pair a=%s b=%s seed %s files %d, case-args %d, %.0fs' % (label(a.ver), label(a.ver_b), a.seed, stats['files'], stats['cases'], time.time() - t0), flush=True)
+		print('# harness: ' + json.dumps({k[8:]: v for k, v in sorted(stats.items()) if k.startswith('harness:')}), flush=True)
 		print('# regressions (b fails, a passes, per file x arg set): ' + json.dumps({k[4:]: v for k, v in sorted(stats.items()) if k.startswith('reg:')}), flush=True)
 		print('# fixed (a fails, b passes): ' + json.dumps({k[6:]: v for k, v in sorted(stats.items()) if k.startswith('fixed:')}), flush=True)
 		print('# regressions by kind: ' + json.dumps({k[8:]: v for k, v in sorted(stats.items()) if k.startswith('regkind:')}), flush=True)
 		sj = [(inv, ci, text, not a.no_tsvzed) for (inv, ci), lst in sorted(small.items()) for (_, _, text) in lst]
 		print('# shrinking %d candidates' % len(sj), flush=True)
 		seen = {}
-		for inv, text, args, info, sb, sa in pool.imap_unordered(pair_shrink, sj, chunksize=1):
+		for inv, text, args, info, sb, sa in results(pool, pair_shrink, sj, chunksize=1):
 			if info is None:
 				continue
 			key = (inv, text, json.dumps(args, sort_keys=True))
@@ -921,13 +980,13 @@ def views_chunk(job):
 
 
 def run_views(a):
-	ctx = multiprocessing.get_context('fork')
+	ctx = multiprocessing.get_context('spawn')  # (no fork of a process whose TSVZ threads may hold locks)
 	chunk = max(1, a.n // (a.jobs * 8))
 	jobs = [(a.seed, lo, min(a.n, lo + chunk)) for lo in range(0, a.n, chunk)]
 	stats = collections.Counter()
 	ex = {}
 	with ctx.Pool(a.jobs, initializer=pair_init, initargs=(a.ver, a.ver_b)) as pool:
-		for st, e in pool.imap_unordered(views_chunk, jobs):
+		for st, e in results(pool, views_chunk, jobs):
 			stats.update(st)
 			for k, v in e.items():
 				if k not in ex or len(v['text']) < len(ex[k]['text']):
