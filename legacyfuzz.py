@@ -32,7 +32,7 @@ scrub's own header, defaults and strict):
       readTabularFile(header=H, strict=True) without raising (if it was before)
   6   the scrub raised (judge by exception type / 5.1 on the same input)
 """
-import argparse, collections, contextlib, importlib.util, io, itertools, json, multiprocessing, os, random, shutil, signal, sys, tempfile, threading, time
+import argparse, collections, contextlib, faulthandler, importlib.util, io, itertools, json, multiprocessing, os, random, shutil, signal, sys, tempfile, threading, time
 
 
 
@@ -315,23 +315,50 @@ def _alarm(signum, frame):
 	raise CaseTimeout()
 
 
+DUMPS = os.environ.get('FUZZ_DUMPS')  # a folder: a case that times out leaves every thread's stack there
+_dump = None
+
+
+def _dumpFile():
+	global _dump
+	if _dump is None:
+		_dump = open(os.path.join(DUMPS, 'worker-%d.txt' % os.getpid()), 'w+')
+	return _dump
+
+
 def check_case(text, args, tsvzed=True, want=None):
-	"""_check_case, stopped after CASE_TIMEOUT seconds (then {'_timeout': True}, counted, never an invariant)."""
+	"""_check_case, stopped after CASE_TIMEOUT seconds (then {'_timeout': True}, counted, never an invariant). With
+	FUZZ_DUMPS, every thread's stack is dumped 10 s before (faulthandler) and kept as timeout-<pid>-<n>.txt with the
+	case and the modules."""
 	timed = threading.current_thread() is threading.main_thread()
 	if timed:
+		if DUMPS:
+			f = _dumpFile()
+			f.seek(0)
+			f.truncate()
+			f.write(json.dumps({'text': text, 'args': args, 'T': getattr(T, '__file__', None),
+								'OLD': getattr(OLD, '__file__', None)}) + '\n')
+			f.flush()
+			faulthandler.dump_traceback_later(CASE_TIMEOUT - 10, exit=False, file=f)
 		signal.signal(signal.SIGALRM, _alarm)
 		signal.setitimer(signal.ITIMER_REAL, CASE_TIMEOUT)
 	try:
 		return _check_case(text, args, tsvzed, want)
 	except CaseTimeout:
 		HARNESS['timeout'] += 1
+		if DUMPS:
+			shutil.copy(_dump.name, os.path.join(DUMPS, 'timeout-%d-%d.txt' % (os.getpid(), HARNESS['timeout'])))
 		return {'_timeout': True}
 	finally:
 		if timed:
 			signal.setitimer(signal.ITIMER_REAL, 0)
+			if DUMPS:
+				faulthandler.cancel_dump_traceback_later()
 		reap()
 
 
+# A worker is replaced after each chunk (maxtasksperchild=1): the 3.39 TSVZed leaks memory with every store it opens,
+# and workers that grew past the container's memory were OOM-killed, their chunks lost (the "hung" 3.39 runs).
 def results(pool, fn, jobs, **kwargs):
 	"""pool.imap_unordered(fn, jobs), giving up (with a '# harness:' line) when no result arrives for CHUNK_WAIT seconds:
 	a worker that dies takes its task with it, and the pool would wait for it for ever."""
@@ -771,12 +798,12 @@ def shrink_job(job):
 
 def run(a):
 	ctx = multiprocessing.get_context('spawn')  # (no fork of a process whose TSVZ threads may hold locks)
-	chunk = max(1, a.n // (a.jobs * 8))
+	chunk = max(1, min(100, a.n // (a.jobs * 8)))  # (small: each worker is replaced after one chunk)
 	jobs = [(a.seed, lo, min(a.n, lo + chunk), not a.no_tsvzed, a.keep) for lo in range(0, a.n, chunk)]
 	t0 = time.time()
 	stats = collections.Counter()
 	small = collections.defaultdict(list)
-	with ctx.Pool(a.jobs, initializer=worker_init, initargs=(a.ver,)) as pool:
+	with ctx.Pool(a.jobs, initializer=worker_init, initargs=(a.ver,), maxtasksperchild=1) as pool:
 		for st, sm in results(pool, work_chunk, jobs):
 			secs = st.pop('secs')
 			stats.update(st)
@@ -923,12 +950,12 @@ def pair_shrink(job):
 
 def run_pair(a):
 	ctx = multiprocessing.get_context('spawn')  # (no fork of a process whose TSVZ threads may hold locks)
-	chunk = max(1, a.n // (a.jobs * 8))
+	chunk = max(1, min(100, a.n // (a.jobs * 8)))  # (small: each worker is replaced after one chunk)
 	jobs = [(a.seed, lo, min(a.n, lo + chunk), not a.no_tsvzed, a.keep) for lo in range(0, a.n, chunk)]
 	t0 = time.time()
 	stats = collections.Counter()
 	small = collections.defaultdict(list)
-	with ctx.Pool(a.jobs, initializer=pair_init, initargs=(a.ver, a.ver_b, a.old)) as pool:
+	with ctx.Pool(a.jobs, initializer=pair_init, initargs=(a.ver, a.ver_b, a.old), maxtasksperchild=1) as pool:
 		for st, sm in results(pool, pair_chunk, jobs):
 			stats.update(st)
 			for k, v in sm.items():
@@ -981,11 +1008,11 @@ def views_chunk(job):
 
 def run_views(a):
 	ctx = multiprocessing.get_context('spawn')  # (no fork of a process whose TSVZ threads may hold locks)
-	chunk = max(1, a.n // (a.jobs * 8))
+	chunk = max(1, min(100, a.n // (a.jobs * 8)))  # (small: each worker is replaced after one chunk)
 	jobs = [(a.seed, lo, min(a.n, lo + chunk)) for lo in range(0, a.n, chunk)]
 	stats = collections.Counter()
 	ex = {}
-	with ctx.Pool(a.jobs, initializer=pair_init, initargs=(a.ver, a.ver_b)) as pool:
+	with ctx.Pool(a.jobs, initializer=pair_init, initargs=(a.ver, a.ver_b), maxtasksperchild=1) as pool:
 		for st, e in results(pool, views_chunk, jobs):
 			stats.update(st)
 			for k, v in e.items():
