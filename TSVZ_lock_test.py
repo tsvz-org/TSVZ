@@ -1262,7 +1262,7 @@ def test_a_compacting_rewrite_opens_nothing_by_name_and_takes_no_read_lock(tmp_p
 	p = _superseded(tmp_path)
 	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)
 	inside, compacted = [], []
-	real = TSVZ.TSVZed._compactSnapshot
+	real = TSVZ.TSVZed._snapshotForRewrite
 
 	def compacting(self, f):
 		inside.append(True)
@@ -1278,7 +1278,7 @@ def test_a_compacting_rewrite_opens_nothing_by_name_and_takes_no_read_lock(tmp_p
 			assert not inside, name + ' called during the compaction'
 			return call(*args, **kwargs)
 		return guarded
-	monkeypatch.setattr(TSVZ.TSVZed, '_compactSnapshot', compacting)
+	monkeypatch.setattr(TSVZ.TSVZed, '_snapshotForRewrite', compacting)
 	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', guard('openFileAsCompressed', TSVZ.openFileAsCompressed))
 	monkeypatch.setattr(TSVZ, '_readLock', guard('_readLock', TSVZ._readLock))
 	monkeypatch.setattr(TSVZ, 'open', guard('open', open), raising=False)

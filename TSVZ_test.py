@@ -13684,3 +13684,91 @@ def test_a_rewrite_that_failed_is_tried_again_on_its_own(tmp_path, monkeypatch):
 	monkeypatch.setattr(TSVZ, '_openUntruncated', real)
 	assert _wait_for(lambda: _bytes(p) == b'id\tv\na\t2\n', 5)
 	t.close()
+
+
+# --- 5.5: a file made again from memory reads as the store does ---
+def _remade(p, *a, **k):
+	t = TSVZ.TSVZed(p, *a, rewrite_on_load=False, append_check_delay=60, verbose=False, **k)
+	os.remove(p)
+	return t
+
+
+def test_a_file_made_again_keeps_the_column_count_by_writing_a_row_that_wide_first(tmp_path):
+	# (rr2) the dump wrote the wider row first: every reader then took three columns, and a strict one dropped b.
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'a\t1\nb\t2\n')
+	t = _remade(p)
+	t['a'] = ['a', '1', 'x']
+	t.hardMapToFile()
+	assert _bytes(p) == b'\nb\t2\na\t1\tx\n' and list(t) == ['b', 'a']  # (the empty line: a file begun from nothing)
+	t.close()
+	assert TSVZ.readTabularFile(p, strict=True) == {'b': ['b', '2'], 'a': ['a', '1', 'x']}
+
+
+def test_a_file_made_again_with_no_row_that_wide_begins_with_a_reset_that_wide(tmp_path):
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'c\t3\n')
+	t = _remade(p)
+	OrderedDict.__delitem__(t, 'c')
+	OrderedDict.__setitem__(t, 'a', ['a', '1', 'x'])
+	t.hardMapToFile()
+	assert _bytes(p) == b'\n#_defaults_#\t\na\t1\tx\n' and list(t) == ['a']
+	t['b'] = ['b', '2']
+	t.close()
+	assert TSVZ.readTabularFile(p, strict=True) == {'a': ['a', '1', 'x'], 'b': ['b', '2']}  # (b, at the column count)
+
+
+def test_a_file_made_again_with_no_row_keeps_the_column_count(tmp_path):
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'c\t3\n')
+	t = _remade(p)
+	OrderedDict.__delitem__(t, 'c')
+	t.hardMapToFile()
+	assert _bytes(p) == b'\n#_defaults_#\t\n'
+	t.close()
+	t = _quiet_tsvzed(p)
+	assert t.correctColumnNum == 2 and dict(t) == {}
+	t.close()
+
+
+def test_a_one_column_file_made_again_stays_one_column(tmp_path):
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'b\na\tX\nc\n')
+	t = _remade(p)
+	t.move_to_end('b')  # (memory holds a first)
+	t.hardMapToFile()
+	assert _bytes(p).startswith(b'\nc\n') and list(t) == ['c', 'a', 'b']
+	t.close()
+	assert list(TSVZ.readTabularFile(p, strict=False)) == ['c', 'a', 'b']
+
+
+@pytest.mark.parametrize('header, first', [('id\tv\tw', b'id\tv\tw\n'), ('', b'')])
+def test_a_file_made_again_keeps_a_row_the_defaults_would_fill_between_a_reset_and_the_defaults(tmp_path, header, first):
+	# (Step) t['a'] = ['a', '', 'X'], then setDefaults: a dump wrote `a\t\tX` where the store's reader fills it.
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, first + b'b\t1\t2\n')
+	t = TSVZ.TSVZed(p, header=header, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	t['a'] = ['a', '', 'X']
+	t.commitAppendToFile()
+	t.setDefaults(['#_defaults_#', 'NA', ''])
+	os.remove(p)
+	t.hardMapToFile()
+	t.close()
+	assert b'#_defaults_#\n' in _bytes(p) and _bytes(p).endswith(b'a\t\tX\n#_defaults_#\tNA\t\n')
+	back = TSVZ.TSVZed(p, header=header, defaults=['#_defaults_#', 'NA', ''], rewrite_on_load=False, verbose=False)
+	assert back['a'] == ['a', '', 'X'] and back['b'] == ['b', '1', '2'] and back.defaults == ['#_defaults_#', 'NA', '']
+	back.close()
+
+
+def test_a_file_made_again_keeps_a_reset_the_file_held(tmp_path):
+	# Memory read the file's reset over the defaults the program gave: a file made again ends with one too.
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'id\tv\na\t1\n#_defaults_#\n')
+	t = _remade(p, header='id\tv', defaults=['#_defaults_#', 'P'])
+	assert t.defaults == ['#_defaults_#']
+	t.hardMapToFile()
+	t.close()
+	assert _bytes(p) == b'id\tv\na\t1\n#_defaults_#\n'
+	back = _quiet_tsvzed(p, header='id\tv', defaults=['#_defaults_#', 'P'])
+	assert back.defaults == ['#_defaults_#'] and dict(back) == {'a': ['a', '1']}
+	back.close()

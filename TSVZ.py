@@ -5054,7 +5054,7 @@ class _TSVZedLoad(OrderedDict):
 
 
 class _TSVZedDiff(_TSVZedLoad):
-	"""What a compacting ``TSVZed`` rewrite reads its compacted lines into (_compactSnapshot): no rows, only whether
+	"""What a compacting ``TSVZed`` rewrite reads its compacted lines into (_readLines): no rows, only whether
 	each key the lines leave live reads as memory holds it (``flags[key]`` True or False) or is dead in them (None).
 	Memory is looked up without _memLock (a read of one key): a row replaced meanwhile shows as a difference, and is
 	written, which is harmless."""
@@ -6270,21 +6270,13 @@ memoryOnly:{self.memoryOnly}
 								False, self.encoding, reporter)[0]
 		return diff.flags, width
 
-	def _compactSnapshot(self, f):
-		"""``(None, lines, queued)`` for a rewrite of a healthy file (Q-D3): the file's lines, read through the locked
-		``f`` with the queued rows after them and the lines of drop items' keys left out (_legacyDropLines), compacted
-		as a scrub compacts them (_legacyCompact), then what memory holds that they do not say (_RewriteRows): rows that
-		read otherwise (changed in place, put in memory straight), deletion lines of keys memory no longer holds (in a
-		one-column file, those keys' lines left out too), and the store's defaults when the lines do not end with them.
-		None when memory is to be written instead (the dump): the file damaged, made again, missing, not a regular file
-		or holding nothing, or its read meets damage.
-
-		Never opens the file by name nor takes the READ lock: this thread holds the REWRITE lock, and closing another
-		descriptor would drop a lockf lock."""
+	def _fileLines(self, f):
+		"""The lines of the legacy file (bytes, without their newline), read through the locked ``f``; None when it is to be
+		made again from memory instead: damaged, made again, missing, not a regular file or holding nothing, or its
+		read meets damage. Never opens the file by name nor takes the READ lock: this thread holds the REWRITE lock,
+		and closing another descriptor would drop a lockf lock."""
 		if self._damaged or self._remake:
 			return None
-		delimiter, encoding, errors = self.delimiter, self.encoding, self.errors
-		enc = encoding or 'utf8'
 		try:
 			st = os.fstat(f.fileno())
 			if not stat.S_ISREG(st.st_mode) or not os.path.isfile(self._fileName):
@@ -6307,12 +6299,54 @@ memoryOnly:{self.memoryOnly}
 			finally:
 				f.seek(0)
 		except Exception:
-			return None  # (damage met: the dump writes memory, the only good copy)
+			return None  # (damage met: memory is the only good copy)
+		return raw
+
+	def _remadeLines(self, f):
+		"""What a file made again from memory begins with, the lines that keep its reading: the header line (None for
+		none: _headerLine); under no header, a line that keeps the column count: the first row memory holds exactly that
+		wide, moved to the front, else at two columns or more an empty #_defaults_# line as wide (a reset, deleting
+		nothing)."""
+		delimiter, encoding, errors = self.delimiter, self.encoding, self.errors
+		line = self._headerLine(f)
+		lines = [] if line is None else [line]
+		width = self.correctColumnNum
+		if any(self.header) or width <= 0:
+			return lines
+		with self._memLock:
+			key = next((key for key, row in OrderedDict.items(self) if len(row) == width and not str(key).startswith('#')
+						and (width == 1 or any(row[1:]))), None)
+			row = None if key is None else dict.get(self, key)
+			if key is not None:
+				OrderedDict.move_to_end(self, key, last=False)
+		if row is None and width > 1:
+			row = [DEFAULTS_INDICATOR_KEY] + [''] * (width - 1)
+		if row is not None:
+			lines.append(_encodeRow(_sanitize(row,delimiter=delimiter),delimiter,encoding,errors,self.header))
+		return lines
+
+	def _snapshotForRewrite(self, f):
+		"""``(None, lines, queued)``, what a rewrite writes, and the queued rows, taken from the queue (_writeFile puts them
+		back if it stops). A healthy file (Q-D3): its lines (_fileLines) with the queued rows after them and the lines
+		of drop items' keys left out (_legacyDropLines), compacted as a scrub compacts them (_legacyCompact). A file to
+		be made again: only what keeps its reading (_remadeLines); memory holds what was queued. Then, either way, what
+		memory holds that those lines do not say (_RewriteRows, a flat snapshot checked before anything is written: a
+		TSVZEncodeError changes nothing): rows that read otherwise (changed in place, put in memory straight, every row
+		of a file made again), deletion lines of keys memory no longer holds (in a one-column file, those keys' lines
+		left out too), and the store's defaults when the lines do not end with them."""
+		delimiter, encoding, errors = self.delimiter, self.encoding, self.errors
+		enc = encoding or 'utf8'
+		raw = self._fileLines(f)
+		remade = raw is None
 		with self._memLock:
 			queued, self.appendQueue = self.appendQueue, deque()
 		try:
 			dropAt = {}  # key -> the lines of it before this index go (a drop item: its lines so far, not a later row's)
-			for row in queued:  # as the commit would append them: the compaction sees the file as it will be
+			if remade:
+				raw, queuedLines = self._remadeLines(f), ()
+			else:
+				queuedLines = queued
+			for row in queuedLines:  # as the commit would append them: the compaction sees the file as it will be
 				if isinstance(row, _DropKey):
 					dropAt[row[0]] = len(raw)
 				elif row and (row[0] == DEFAULTS_INDICATOR_KEY or not str(row[0]).startswith('#')):
@@ -6365,25 +6399,28 @@ memoryOnly:{self.memoryOnly}
 					if _fileDefaultsAtEnd(itertools.chain(kept, lines), diffWidth, delimiter, encoding, consumed,
 										  self.strict) != goal:
 						lines.insert(0, reset)
-			elif any(own[1:]):
+			elif any(own[1:]) or (remade and any(defaults[1:])):
 				lines = [reset]
 			if lines and _fileDefaultsAtEnd(itertools.chain(kept, lines), diffWidth, delimiter, encoding, consumed,
 											self.strict) == goal:
-				if diffWidth > 0:
+				if diffWidth > 0 and not remade:
 					kept.extend(lines)  # (before memory's rows: they read with the store's defaults)
 				else:
-					tail.extend(lines)  # (no column count yet: after the rows, so a defaults line does not set it)
+					tail.extend(lines)  # (after the rows: a file made again, or no column count yet, so it does not set one)
 			if values and diffWidth > 0:
 				# A row memory adds with an empty cell where the defaults then in effect hold a value would read filled:
 				# those rows go between a reset and the same defaults again (the file still ends with them).
-				end = _fileDefaultsAtEnd(kept, diffWidth, delimiter, encoding, consumed, self.strict)
+				end = _trimmedCells(defaults) if remade else _fileDefaultsAtEnd(kept, diffWidth, delimiter, encoding, consumed, self.strict)
 				if any(i < len(end) and end[i] and not str(row[i]).strip() for row in values for i in range(1, len(row))):
-					again = _encodeRow(_sanitize(_fitRow(end, diffWidth),delimiter=delimiter),delimiter,encoding,errors,
-									   what='defaults')
-					if _fileDefaultsAtEnd(itertools.chain(kept, (reset, again)), diffWidth, delimiter, encoding, consumed,
-										  self.strict) == end:
-						kept.append(reset)
-						tail.insert(0, again)
+					if remade:
+						kept.append(reset)  # (the store's reader starts from its own defaults; the file's line is the tail)
+					else:
+						again = _encodeRow(_sanitize(_fitRow(end, diffWidth),delimiter=delimiter),delimiter,encoding,errors,
+										   what='defaults')
+						if _fileDefaultsAtEnd(itertools.chain(kept, (reset, again)), diffWidth, delimiter, encoding, consumed,
+											  self.strict) == end:
+							kept.append(reset)
+							tail.insert(0, again)
 			rows = _RewriteRows(kept, values, delimiter, encoding, errors, self.header, tail=tail)
 			del values
 			rows.check()
@@ -6392,38 +6429,6 @@ memoryOnly:{self.memoryOnly}
 				self.appendQueue.extendleft(reversed(queued))
 			raise
 		return None, rows, queued
-
-	def _snapshotForRewrite(self, f):
-		"""``(header, lines, queued)``: the compaction of a healthy file (_compactSnapshot), else memory's dump: the
-		header line (None for none), the defaults line and the rows (_RewriteRows, a flat snapshot taken under _memLock
-		and checked: a TSVZEncodeError changes nothing), and the queued rows, taken from the queue: memory holds them,
-		so the rewrite writes them; _writeFile puts them back if it stops."""
-		compact = self._compactSnapshot(f)
-		if compact is not None:
-			return compact
-		delimiter, encoding, errors = self.delimiter, self.encoding, self.errors
-		header = self._headerLine(f)
-		with self._memLock:
-			values = list(self.values())
-			defaults = list(self.defaults)
-			queued, self.appendQueue = self.appendQueue, deque()
-		try:
-			tail = []
-			if defaults and len(defaults) > 1:
-				# The defaults line goes after every row (5.5), so it survives a full rewrite (it is not a regular
-				# mapping key), fills no row memory holds (their cells were filled when set), and is never the first
-				# keyed line a reader takes its column count from (a one-column store read as two columns lost every
-				# key). As wide as the rows: a strict reader takes no defaults line of another width.
-				tail = [_encodeRow(_sanitize(_fitRow(defaults, self.correctColumnNum),delimiter=delimiter),delimiter,
-								   encoding,errors,what='defaults')]
-			rows = _RewriteRows([], values, delimiter, encoding, errors, self.header, tail=tail)
-			del values  # the snapshot holds the cells
-			rows.check()
-		except BaseException:
-			with self._memLock:
-				self.appendQueue.extendleft(reversed(queued))
-			raise
-		return header, rows, queued
 
 	def _openLocked(self, opener, mode=_REWRITE):
 		"""``opener(fileName)``, locked for ``mode`` (_lockFile; closed again when the lock fails)."""
