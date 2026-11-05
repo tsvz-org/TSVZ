@@ -32,7 +32,7 @@ scrub's own header, defaults and strict):
       readTabularFile(header=H, strict=True) without raising (if it was before)
   6   the scrub raised (judge by exception type / 5.1 on the same input)
 """
-import argparse, collections, contextlib, importlib.util, io, itertools, json, multiprocessing, os, random, shutil, sys, tempfile, time
+import argparse, collections, contextlib, importlib.util, io, itertools, json, multiprocessing, os, random, shutil, sys, tempfile, threading, time
 
 
 
@@ -59,6 +59,7 @@ def load(ver):
 	T = importlib.util.module_from_spec(spec)
 	sys.modules[spec.name] = T
 	spec.loader.exec_module(T)
+	track(T)
 	base = '/dev/shm' if os.path.isdir('/dev/shm') and os.access('/dev/shm', os.W_OK) else '/tmp'
 	TMP = tempfile.mkdtemp(prefix='sf', dir=base)
 
@@ -267,7 +268,45 @@ def first_cols(text):
 
 
 # --------------------------------------------------------------------------- the checks
+LIVE = []  # every TSVZed made while a case runs: stopped after it (reap)
+
+
+def track(mod):
+	"""Note every TSVZed ``mod`` makes, so reap() stops its thread. 3.39's close() leaves its append thread running when
+	its final rewrite raises (and a constructor that raises is never closed): the leaked threads filled the container's
+	pids limit and the 3.39 pair run stalled ("can't start new thread")."""
+	cls = getattr(mod, 'TSVZed', None)
+	if cls is None or getattr(cls, '_fuzzTracked', False):
+		return
+	init = cls.__init__
+
+	def tracked(self, *args, **kwargs):
+		LIVE.append(self)
+		return init(self, *args, **kwargs)
+	cls.__init__ = tracked
+	cls._fuzzTracked = True
+
+
+def reap():
+	"""Stop the threads of the TSVZeds the case made (each was closed, or its constructor raised)."""
+	while LIVE:
+		o = LIVE.pop()
+		event = getattr(o, 'shutdownEvent', None)
+		if event is not None:
+			event.set()
+		thread = getattr(o, 'appendThread', None)
+		if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+			thread.join(5)
+
+
 def check_case(text, args, tsvzed=True, want=None):
+	try:
+		return _check_case(text, args, tsvzed, want)
+	finally:
+		reap()
+
+
+def _check_case(text, args, tsvzed=True, want=None):
 	"""-> dict invariant -> info (only the failing ones), plus '_scrubbed' bytes when it ran."""
 	res = {}
 	orig, work, extra = (os.path.join(TMP, n) for n in ('orig.tsv', 'work.tsv', 'extra.tsv'))
@@ -726,6 +765,7 @@ def load_pair(a_ver, b_ver):
 		mod = importlib.util.module_from_spec(spec)
 		sys.modules[spec.name] = mod
 		spec.loader.exec_module(mod)
+		track(mod)
 		MODS[k] = mod
 	base = '/dev/shm' if os.path.isdir('/dev/shm') and os.access('/dev/shm', os.W_OK) else '/tmp'
 	TMP = tempfile.mkdtemp(prefix='sp', dir=base)
@@ -739,6 +779,7 @@ def pair_init(a_ver, b_ver, old_ver=None):
 		mod = importlib.util.module_from_spec(spec)
 		sys.modules[spec.name] = mod
 		spec.loader.exec_module(mod)
+		track(mod)
 		OLD = mod
 	else:
 		OLD = MODS['a']
