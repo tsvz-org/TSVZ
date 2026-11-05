@@ -2758,7 +2758,9 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 			kind, key, n, takes = _legacyLineKind(text, width, strictActive, delimiter)
 		if firstKeyed is None:
 			firstKeyed = i
-		takesOld = kind in ('delete', 'reset') or (kind == 'row' and width == 1 and n == 1) or n == width or strictActiveOld
+		takesOld = kind in ('delete', 'reset') or n == width or strictActiveOld
+		if not takesOld and kind == 'row' and width == 1:  # (a line with no value is a row at width 1, whatever its cells)
+			takesOld = not any(_unsanitize(text.strip('\x00').rstrip('\r\n').split(delimiter), delimiter)[1:])
 		mask = (1 if takes else 0) | (2 if takesOld else 0)
 		if kind in ('defaults', 'reset'):
 			if boundaries and raw[i] == raw[boundaries[-1]] and i not in protectable:

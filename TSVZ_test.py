@@ -13353,3 +13353,13 @@ def test_legacy_compact_keeps_the_lines_an_older_strict_reader_takes(tmp_path):
 		TSVZ.scrubTabularFile(p, header='id\tv', strict=strict)
 		assert TSVZ_old.readTabularFile(p, header='id\tv', strict=True) == {'a': ['a', '1']}
 		assert TSVZ.readTabularFile(p, header='id\tv', strict=True) == {'a': ['a', '1', '2']}
+
+
+@pytest.mark.parametrize('text', ['c\nb\tX\tX\nb\t\t\na\nb\n', 'a\nb\t1\nb\t\t\t\nc\nb\n'])
+def test_legacy_compact_keeps_an_older_strict_readers_place_in_a_one_column_file(tmp_path, text):
+	# (fuzzer, co/cs) at width 1 a line with no value is a row to every reader, whatever its cell count
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, text.encode())
+	views = [list(TSVZ_old.readTabularFile(p, strict=s)) for s in (True, False)]
+	TSVZ.scrubTabularFile(p)
+	assert [list(TSVZ_old.readTabularFile(p, strict=s)) for s in (True, False)] == views
