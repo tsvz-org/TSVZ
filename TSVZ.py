@@ -5109,7 +5109,10 @@ class TSVZed(OrderedDict):
 	version : str
 		Version of the TSVZed implementation.
 	dirty : bool
-		True if the in-memory data differs from the file on disk.
+		True if the file holds more than memory needs, or less: a key twice, a deletion, a row not yet stored.
+		rewrite(force=True), rewrite_on_exit and rewrite_interval write only then. mapToFile() and hardMapToFile() always write;
+		nothing else rewrites the file, except to make a damaged or removed file again from memory
+		and to compact a one-column file after a delete.
 	deSynced : bool
 		True if synchronization with the file has failed or external changes detected.
 	memoryOnly : bool
@@ -6013,12 +6016,16 @@ memoryOnly:{self.memoryOnly}
 
 	def _rewrite(self, force=False, reloadInternalFromFile=None, background=False):
 		"""rewrite() for a legacy file. ``background``: the background writer's tick, which takes in another process's
-		change at every tick, but makes no rewrite while one that failed waits to be tried again (see _failed)."""
-		if not self.deSynced and not force:
-			if not self.dirty:
-				return False
-			if self.rewrite_interval == 0 or time.time() - getFileUpdateTimeNs(self._fileName) / 1e9 < self.rewrite_interval:
-				return False
+		change at every tick, but makes no rewrite while one that failed waits to be tried again (see _failed).
+
+		Following another process's change never rewrites. A rewrite is made only when it is due: asked for (``force``),
+		rewrite_interval set and over with the file holding more than it needs (``dirty``), the file damaged or left
+		damaged with rows after the damage (memory is the only good copy), or one that failed being tried again."""
+		due = (force or self._damaged or (self._remake and self.dirty) or 'rewrite' in self._failures or (
+			self.dirty and self.rewrite_interval != 0
+			and time.time() - getFileUpdateTimeNs(self._fileName) / 1e9 >= self.rewrite_interval))
+		if not self.deSynced and not due:
+			return False
 		try:
 			if reloadInternalFromFile is None:
 				reloadInternalFromFile = self.monitor_external_changes
@@ -6027,12 +6034,14 @@ memoryOnly:{self.memoryOnly}
 			if reloadInternalFromFile and not self._damaged and self._externalChange():
 				self._syncFile()
 			self._worked('sync')
+			if not self._damaged:
+				self.deSynced = False  # (followed; a rewrite that failed is tried again as due, not for this flag)
 			if self.memoryOnly:
 				if self.verbose:
 					self.__teePrintOrNot("Memory only mode. Map to file skipped.")
 				return False
 			made = True
-			if self.dirty or self._damaged:
+			if due and (self.dirty or self._damaged):
 				if not force and not self._closing and self._refusalPending():
 					return False  # the last rewrite was refused (text that cannot be written): try again later, not at every tick
 				if background and self._failing('rewrite'):
@@ -6102,7 +6111,7 @@ memoryOnly:{self.memoryOnly}
 		if stopped:
 			retry = ("None is tried again on its own: this store's writer thread is stopping or stopped (close(), a "
 					 "forked child).")
-		elif self.rewrite_interval or self.deSynced:  # deSynced: the file is to be made again, at any interval
+		elif self.rewrite_interval or self._damaged:  # (damaged: the file is to be made again, at any interval)
 			wait = self._refusalWait()
 			if wait >= _FAILURE_RETRY_MAX:
 				retry = f"A rewrite is tried again at most every {wait:g} s."
@@ -6111,8 +6120,8 @@ memoryOnly:{self.memoryOnly}
 						 f"in a row up to a minute.")
 		else:
 			retry = ("With rewrite_interval=0 none is tried again on its own, only one asked for (mapToFile(), "
-					 "hardMapToFile(), rewrite(force=True), rewrite_on_exit), one made after another process changes the file, or, while "
-					 "damage another writer left is to be made good, one at a later append.")
+					 "hardMapToFile(), rewrite(force=True), rewrite_on_exit) or, while damage another writer left is to be made "
+					 "good, one at a later append.")
 		damaged = (" The file is damaged (a rewrite of this object's failed) or was removed (rows are appended to a new "
 				   "one): until a rewrite gets through, memory holds the only good copy." if self._damaged else "")
 		self.__teePrintOrNot(f"Refused at {where} to {self._fileName}: {message}. The file is left as it is, and rows that can "

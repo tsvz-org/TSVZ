@@ -7487,8 +7487,6 @@ def test_tsvzed_legacy_rewrite_whose_flush_or_fsync_fails_is_made_again(tmp_path
 	p = str(tmp_path / ('buf.' + suffix))
 	t = _stopped(p)
 	rows = _many(t, 20)
-	if method == 'rewrite':
-		t.deSynced = True  # what a tick rewrites with rewrite_interval=0
 	real = TSVZ._openUntruncated
 	monkeypatch.setattr(TSVZ, '_openUntruncated', lambda fileName: _BufferedFullDiskFile(real(fileName), 0 if where == 'flush' else 1 << 20))
 	if where == 'fsync':
@@ -7501,7 +7499,7 @@ def test_tsvzed_legacy_rewrite_whose_flush_or_fsync_fails_is_made_again(tmp_path
 		monkeypatch.setattr(TSVZ, 'openFileAsCompressed', lambda fileName, mode='rb', *a, **k: (
 			_BufferedFullDiskFile(realOpen(fileName, mode, *a, **k), 0 if where == 'flush' else 1 << 20) if mode == 'r+b' else realOpen(fileName, mode, *a, **k)))
 	if method == 'rewrite':
-		t.rewrite()
+		t.rewrite(force=True)
 	else:
 		getattr(t, method)()
 	monkeypatch.undo()
@@ -7548,8 +7546,7 @@ def filling(*args, **kwargs):  # as the rewrite starts: another writer fills the
 
 TSVZ._writeLines = filling
 if method == 'rewrite':
-	t.deSynced = True
-	t.rewrite()
+	t.rewrite(force=True)
 else:
 	getattr(t, method)()
 TSVZ._writeLines = real
@@ -7683,7 +7680,7 @@ def test_tsvzed_legacy_rewrite_that_keeps_failing_still_reloads_another_process_
 
 	monkeypatch.setattr(TSVZ, 'openFileAsCompressed', denying)
 	monkeypatch.setattr(TSVZ, '_openUntruncated', lambda fileName: denying(fileName, 'wb'))
-	t.deSynced = True  # a tick tries the rewrite, and fails
+	t.rewrite(force=True)  # the rewrite is tried, and fails
 	assert _wait_for(lambda: t._failing('rewrite'), 5)
 	for _ in range(10):
 		t._failed('rewrite', 'Permission denied', False)  # it kept failing: the next try is a minute away
@@ -7833,7 +7830,7 @@ def test_tsvzed_legacy_background_writer_never_reloads_a_file_its_failed_rewrite
 	t['k0'] = ['k0', 'w']
 	rows = dict(t)
 	_failing_rewrite(monkeypatch, partial=b'key\tval\n')  # it left the file holding the header
-	t.deSynced = True  # a tick tries the rewrite, and fails
+	t.rewrite(force=True)  # the rewrite is tried, and fails
 	assert _wait_for(lambda: t._failing('rewrite'), 5)
 	for _ in range(10):
 		t._failed('rewrite', 'No space left on device', False)  # it keeps failing: the next try is a minute away
@@ -8104,7 +8101,7 @@ def test_tsvzed_legacy_background_writer_appends_to_a_file_its_rewrite_emptied(t
 	assert _wait_for(lambda: not t.appendQueue)
 	t['k0'] = ['k0', 'w']  # dirty: the rewrite has something to change
 	_failing_rewrite(monkeypatch)
-	t.deSynced = True  # a tick tries the rewrite, and fails
+	t.rewrite(force=True)  # the rewrite is tried, and fails
 	assert _wait_for(lambda: t._failing('rewrite'), 5)
 	for _ in range(10):
 		t._failed('rewrite', 'No space left on device', False)  # the next try is a minute away
@@ -8133,7 +8130,7 @@ def test_tsvzed_legacy_last_writer_wins_after_a_failed_rewrite(tmp_path, monkeyp
 	assert _wait_for(lambda: not t.appendQueue)
 	t['k0'] = ['k0', 'w']
 	_failing_rewrite(monkeypatch, partial=b'key\tval\nk0\tw\n')
-	t.deSynced = True
+	t.rewrite(force=True)  # the rewrite is tried, and fails
 	assert _wait_for(lambda: t._failing('rewrite'), 5)
 	for _ in range(10):
 		t._failed('rewrite', 'No space left on device', False)
@@ -9116,15 +9113,15 @@ def test_tsvzed_legacy_rewrite_on_load_takes_in_a_change_made_after_the_read(tmp
 
 @pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
 def test_tsvzed_legacy_another_process_append_is_read_from_where_the_store_left_off(tmp_path, monkeypatch, suffix):
-	# Another process's change used to reload the whole file over memory, losing what only memory held (an order
-	# set by move_to_end, which rewrite_on_exit then wrote). When the file still begins with the bytes the store
-	# knows it holds, only what follows is read; any other change still reloads it.
+	# Another process's change used to reload the whole file over memory. When the file still begins with the bytes
+	# the store knows it holds, only what follows is read; any other change still reloads it.
 	p = str(tmp_path / ('inc.' + suffix))
 	t = _stopped(p)
 	t['a'] = ['a', '1']
 	t['b'] = ['b', '1']
 	t.commitAppendToFile()
-	t.move_to_end('a')  # an order only memory holds
+	t.move_to_end('a')
+	t.commitAppendToFile()
 	reads = []
 	real = TSVZ.TSVZed._readFrom
 	monkeypatch.setattr(TSVZ.TSVZed, '_readFrom', lambda self, f, locked: reads.append(1) or real(self, f, locked))
@@ -9987,7 +9984,7 @@ def test_tsvzed_legacy_refusal_of_a_store_to_make_again_says_it_is_tried_again_a
 	_touch(p, LEGACY_KEY_ROW)
 	t = _must_write_fffd(TSVZ.TSVZed(p, header='id\tv', encoding='ascii', rewrite_on_load=False, rewrite_interval=0,
 									 append_check_delay=0.01))
-	t.dirty = t.deSynced = True  # as a rewrite that failed leaves it
+	t.dirty = t.deSynced = t._damaged = True  # as a rewrite that failed leaves it
 	refused = []
 	assert _wait_for(lambda: refused.extend(_refusals(capsys)) or refused)
 	first = t._refusedAt
@@ -13363,3 +13360,55 @@ def test_legacy_compact_keeps_an_older_strict_readers_place_in_a_one_column_file
 	views = [list(TSVZ_old.readTabularFile(p, strict=s)) for s in (True, False)]
 	TSVZ.scrubTabularFile(p)
 	assert [list(TSVZ_old.readTabularFile(p, strict=s)) for s in (True, False)] == views
+
+
+# --- 5.5: nothing rewrites a file unless the program asks ---
+
+
+@pytest.mark.parametrize('suffix', ['tsv', 'tsv.gz'])
+def test_following_another_process_does_not_rewrite_a_dirty_store(tmp_path, suffix):
+	# 5.5 up to the redesign: a store dirty when it followed another process's change rewrote the file at its next tick.
+	p = str(tmp_path / ('f.' + suffix))
+	t = TSVZ.TSVZed(p, header='key\tval', append_check_delay=0.01, verbose=False)
+	t['a'] = ['a', '1']
+	t['a'] = ['a', '2']  # the file holds a twice: dirty
+	t.commitAppendToFile()
+	assert t.dirty
+	_append_external(p, _compressedAs(suffix, b'b\t1\n'))
+	assert _wait_for(lambda: 'b' in t and not t.deSynced, 5)
+	before = _bytes(p)
+	time.sleep(0.1)  # many ticks
+	assert _bytes(p) == before and t.dirty and _back(p) == dict(t)
+	lines = _lines(TSVZ._openStreams(TSVZ._fileCodec(p), open(p, 'rb')).read() if suffix != 'tsv' else before)
+	assert lines == [b'key\tval', b'a\t1', b'a\t2', b'b\t1']
+	t.close()
+	assert _bytes(p) == before  # (no rewrite at close either)
+
+
+def test_a_rewrite_interval_the_program_set_still_rewrites_a_dirty_store(tmp_path):
+	p = str(tmp_path / 'i.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.01, rewrite_interval=0.05, verbose=False)
+	t['a'] = ['a', '1']
+	t['a'] = ['a', '2']
+	assert _wait_for(lambda: _bytes(p) == b'id\tv\na\t2\n', 5)
+	assert not t.dirty
+	t.close()
+
+
+def test_a_rewrite_that_failed_is_tried_again_on_its_own(tmp_path, monkeypatch):
+	# The program asked; the rewrite could not open the file. deSynced no longer brings it back: the failure does.
+	p = str(tmp_path / 'r.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', append_check_delay=0.01, verbose=False)
+	t['a'] = ['a', '1']
+	t['a'] = ['a', '2']
+	t.commitAppendToFile()
+	real = TSVZ._openUntruncated
+
+	def denied(fileName):
+		raise PermissionError(13, 'Permission denied')
+	monkeypatch.setattr(TSVZ, '_openUntruncated', denied)
+	t.hardMapToFile()
+	assert t._failing('rewrite') and b'a\t1' in _bytes(p)
+	monkeypatch.setattr(TSVZ, '_openUntruncated', real)
+	assert _wait_for(lambda: _bytes(p) == b'id\tv\na\t2\n', 5)
+	t.close()
