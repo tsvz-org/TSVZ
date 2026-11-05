@@ -162,15 +162,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A rewrite without --x-header can put a row equal to H on line 1
 - Kind: known limitation
-- What the operator sees: a header-less `.tsv`-family file that a `TSVZed` writes from its memory (after
-  `move_to_end`, after a delete in a one-column store, or when it makes a damaged, removed or emptied file again) can
+- What the operator sees: a header-less `.tsv`-family file whose line 1 a `TSVZed` changes (after
+  a delete in a one-column store, or when it makes a damaged, removed or emptied file again) can
   get a row equal to a header H as its line 1 (`a\t1\nid\tv\na\t\n` becomes `id\tv\n`). After that, `tsvz`
   commands with `--x-header H` take that row for the header: `tsvz keys --x-header 'id\tv'` shows nothing, though the
   row stays in the file and reads without `--x-header` show it. Scrubs (`tsvz scrub`, `scrubTabularFile`, a handler)
-  and a `TSVZed` rewrite of a healthy file never change line 1 (a scrub adds a header you pass with
+  and any other `TSVZed` rewrite of a healthy file never change line 1 (a scrub adds a header you pass with
   `verifyHeader=False`, which is not a row).
-- Why: a write from memory does not know the header the CLI is given later.
-- Revisit when: an operator meets it after one of those memory writes.
+- Why: a write from memory, or a delete taking line 1 out, does not know the header the CLI is given later.
+- Revisit when: an operator meets it after one of those writes.
 - Approved: 2026-11-03, the user chose "Known limitation (Recommended)". Narrowed in 5.5 (the scrub and a TSVZed
   rewrite of a healthy file keep line 1).
 

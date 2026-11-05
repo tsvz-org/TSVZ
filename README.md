@@ -311,6 +311,20 @@ writes.
   removed, since its memory is then the only copy. The three automatic-rewrite options
   (`rewrite_on_load`, `rewrite_on_exit`, `rewrite_interval`) are planned to be removed in
   a future version in favour of those explicit calls.
+- **Nothing else rewrites a file unless the program asks.** A store that follows another
+  process's change no longer rewrites the file at its next tick because it holds changes
+  of its own; `rewrite()` without `force=True` only follows such a change, and rewrites
+  when `rewrite_interval` says so. A rewrite happens on `mapToFile()`, `hardMapToFile()`,
+  `rewrite(force=True)` and the options above set explicitly, and on its own in two cases:
+  making again a damaged, removed or emptied file, and the next commit after a delete in a
+  one-column store (below). A row changed in place stays in memory until one of them.
+- **`move_to_end` appends instead of rewriting.** `t.move_to_end(k)` appends `k`'s deletion
+  line, then its row, so every reader sees the new order at once; it no longer turns on the
+  rewrite at exit or warns "Need to resync", and it refuses a row the encoding cannot hold
+  when called. `last=False` cannot be an append for one key: it moves every other key to
+  the end instead, two lines for each, until a compaction takes them out. A key whose row
+  holds no value moves in memory only. In a one-column store a move is a delete (below)
+  and an append.
 - **Rows wider than the file's column count are read whole.** `readTabularFile` (also
   `lastLineOnly`), `read_last_valid_line`, `TSVZed`, `TSVZedLite`, `tsvz read`/`get` and
   their table output, and `tsvz serve`: a row is padded to the column count as before,
@@ -326,9 +340,26 @@ writes.
 - **`TSVZed` reads a one-column file as `readTabularFile` does**: lone keys are rows (3.39
   to 5.4 showed it empty, and the next rewrite erased the keys). A `del` (or `pop`,
   `popitem`) in a one-column store appends nothing (a lone key would read back as a row
-  there); the next rewrite writes the store from memory, and the store rewrites at exit.
+  there). The next commit (the background writer's next tick, `commitAppendToFile()`,
+  `close()`) compacts the file with that key's lines left out: for 100,000 keys about
+  0.9 s and 23 MiB (Python 3.14), once per commit however many deletes it holds, so a
+  program deleting in a loop in such a file pays that once per `append_check_delay`.
   Until then the key stays deleted for the store: a reload, or following another
-  process's rewrite, leaves it out, unless another process writes a line for it.
+  process's rewrite, leaves it out. A write another process makes after that commit stays;
+  one that lands before it loses to this store's delete, as a queued deletion line does
+  at two columns or more. While that rewrite is refused (a row changed in place to text
+  the encoding cannot hold), the store's later writes wait behind it; `close()` appends
+  them and reports the delete as not written. The file keeps its one column: when taking a
+  key's line out would leave a wider line first, the next one-cell line moves up into its
+  place, so that key's position changes. With no one-cell line left, the narrowest line
+  moves up and the file now reads at that many columns (a line with no value moves up as
+  the key alone).
+- **`setDefaults()` can change a header-less store's column count.** Defaults of two cells
+  or more set the column count a reader takes, so defaults with another cell count change
+  how the file reads: the rows narrower than that are padded and filled with them, and a
+  strict reader's check moves with them. The last `setDefaults()` wins, and is what a whole
+  reload starts from. A rewrite changes nothing this store's reader reads, except what
+  memory changed; pass the same defaults to every reader of the file.
 - **A cell that is whitespace once unescaped (`<LF>`) is still filled with the defaults
   when a `TSVZed` loads it** (as 5.4): only the cells its right-strip empties;
   `id\tv\n#_defaults_#\tNA\nk\t<LF>` loads `[k, NA]`.
@@ -371,11 +402,15 @@ writes.
   neither when the store's own reader would not take it), then rows memory holds that the
   file does not read the same (changed in place, put in memory directly; a row with an
   empty cell the defaults in effect would fill goes between a reset and those defaults
-  again), and deletion lines for keys memory no longer holds. A file that is damaged,
-  missing or empty, a store reordered by `move_to_end`, and a one-column store after a
-  delete, are written from memory as before, with the store's defaults line now after
-  the rows (before them, in a one-column file, it read as the file's column count and
-  every key read as a deletion). Every rewrite is written whole: `mapToFile()` no longer
+  again; a row narrower than the column count is padded to it, so a strict reader takes
+  it), and deletion lines for keys memory no longer holds. Only a file that is damaged,
+  missing or empty is written from memory, and it keeps its reading: a header-less store
+  writes first the first row memory holds exactly as wide as the column count (moved to
+  the front), or at two columns or more with no such row, a `#_defaults_#` reset padded to
+  that width; rows with an empty cell the defaults would fill go after a reset, and the
+  store's defaults line goes after the rows (before them, in a one-column file, it read as
+  the file's column count and every key read as a deletion). Every rewrite is written
+  whole: `mapToFile()` no longer
   rewrites in place, which padded a shorter line with spaces. It no longer writes its header over a line
   1 that is not that header (5.4 did, and a reader given no header lost the row line 1
   was); such a file keeps warning "Header mismatch" until it is fixed. It no longer
@@ -384,7 +419,8 @@ writes.
   `t['#_defaults_#']` over and over keeps a line for each change (5.4's rewrite
   collapsed them). It costs a second parse of the compacted lines (one flag per key, not
   the rows): for 100,000 two-cell rows with one changed in place, `hardMapToFile()`
-  peaks at 26 MiB and takes about 0.9 s, where 5.4 took 8.4 MiB and about 0.2 s (Python 3.14).
+  peaks at 25 MiB and takes about 0.8 s, where 5.4 peaks at 19 MiB and takes about 0.2 s
+  (Python 3.14). A scrub of that file takes about 0.6 s (5.4: 0.5 s).
 - **A whole reload starts from the defaults and column count the program gave.** A
   `TSVZed` that follows another process's rewrite (any rewrite, not an append) now reads
   the file as its constructor did (or with the defaults of its last `setDefaults()`), not
@@ -736,14 +772,15 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 | L16 | A scrub writes only if the file is still what its read saw: it reads again up to three times, then writes nothing, with a warning (`tsvz scrub` exits 1, C6); 3.39 wrote over rows appended after its read. |
 | L17 | `scrubTabularFile(lastLineOnly=True)` returns the last row and writes nothing; 3.39 wrote that row back as deletion lines, and the store was gone. |
 | L18 | A scrub keeps every `#_defaults_#` line as the file has it, where it was, so every row reads as it did; 3.39 dropped them, so rows appended later got no defaults. |
-| L19 | A scrub never changes line 1, except that a header you pass with `verifyHeader=False` is added; a `TSVZed` rewrite of a healthy file never changes it; 3.39 put an empty line in front of a header line, and a reader given the header then read the header as a row. |
+| L19 | A scrub never changes line 1, except that a header you pass with `verifyHeader=False` is added; a `TSVZed` rewrite of a healthy file never changes it, unless a delete in a one-column file takes line 1 out; 3.39 put an empty line in front of a header line, and a reader given the header then read the header as a row. |
 | L20 | A row wider than the column count is read whole (only its empty cells past the count go); 3.39 cut it. |
-| L21 | `TSVZed` reads a one-column file's lone keys as rows, as `readTabularFile` does (3.39 showed none); a delete there is written by a rewrite from memory, not as a line. |
+| L21 | `TSVZed` reads a one-column file's lone keys as rows, as `readTabularFile` does (3.39 showed none); a delete there takes the key's lines out at the next commit, not as a line. |
 | L22 | Writes never cut a row: a wider row is written whole; 3.39 cut it to the column count. A strict read takes a wider row whole and drops only a narrower one; a strict store refuses only a narrower row. |
 | L23 | A scrub, and a `TSVZed` rewrite of a healthy file, drop lines and keep the lines they keep byte for byte, in place (a key's last line may move up into its first line's place; a dead key's line readers take their column count from is kept emptied); 3.39 wrote the rows it read. |
 | L24 | A `TSVZed`'s whole reload starts from the defaults the program gave, not those its last read ended with. |
 | L25 | A `TSVZed` rewrite writes its defaults line after the rows: a compacting rewrite after the file's lines and before the rows memory adds, only when the file does not already end with those defaults; a rewrite from memory after every row. 3.39 wrote it after the header. |
 | L26 | `TSVZed` no longer rewrites the file when it opens it: `rewrite_on_load` defaults to `False`; every rewrite is written whole. |
+| L27 | `move_to_end` appends a deletion line and the row; 3.39 reordered memory and rewrote the file. |
 
 ### `.tsvz`, `.csvz`, `.nsvz`, `.psvz`: now tsvz-spec-v1
 
