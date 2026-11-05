@@ -13237,3 +13237,28 @@ def test_a_strict_store_persists_defaults_narrower_than_its_header(tmp_path):
 		t.hardMapToFile()
 		t.close()
 	assert _bytes(p) == b'id\tv\tw\na\tx\ty\n#_defaults_#\tNA\t\n'
+
+
+def test_move_to_end_order_is_written_when_the_rewrite_takes_its_rows_again(tmp_path, monkeypatch):
+	# A writer that takes no lock appended while the rewrite took its rows: it reads it in and takes them again. The
+	# second snapshot did not know memory's order was to be written, compacted the file instead, and the order was lost.
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, b'id\tv\na\t1\nb\t2\nc\t3\n')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=60, verbose=False)
+	t.move_to_end('a')
+	real = TSVZ.TSVZed._snapshotForRewrite
+	calls = []
+
+	def snapshot(self, f):
+		result = real(self, f)
+		if not calls:
+			calls.append(1)
+			with open(p, 'ab') as g:
+				g.write(b'd\t4\n')  # another writer that takes no lock
+		return result
+	monkeypatch.setattr(TSVZ.TSVZed, '_snapshotForRewrite', snapshot)
+	t.rewrite(force=True)  # (a rewrite that takes in another writer's change: rewrite(), the writer thread's)
+	monkeypatch.undo()
+	assert len(calls) == 1
+	assert list(TSVZ.readTabularFile(p, header='id\tv')) == list(t) and list(t)[:3] == ['b', 'c', 'a'] and 'd' in t
+	t.close()

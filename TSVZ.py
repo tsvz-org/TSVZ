@@ -5223,8 +5223,9 @@ class TSVZed(OrderedDict):
 		self.deSynced = False
 		self.memoryOnly = False
 		self._dumpNext = False  # the next rewrite writes memory (move_to_end, a one-column store's delete)
+		self._dumpGen = 0  # counts what sets _dumpNext: one set after a dump's snapshot is not cleared by its write
 		self._unlined = set()  # keys deleted with no line (a one-column store): a whole read leaves them out
-		self._dumpTaken = None  # what the dump being written covers of _unlined (cleared once it is written)
+		self._dumpTaken = None  # (_dumpGen, keys of _unlined) a dump or clear being written covers: cleared once written
 		self.writeLock = threading.Lock()
 		self._memLock = threading.Lock()  # held while memory and appendQueue change together (a set, a delete, reload's swap)
 		self._failures = {}  # legacy writes that fail, by kind: when each is tried again, see _failed()
@@ -5632,6 +5633,7 @@ class TSVZed(OrderedDict):
 		if not self._spec and (self.correctColumnNum == 1 or (self.correctColumnNum == -1 and (
 				len(row) == 1 or any(len(value) == 1 for value in OrderedDict.values(self))))):
 			self._dumpNext = self.dirty = self.rewrite_on_exit = True
+			self._dumpGen += 1
 			self._unlined.add(key)  # (until the dump is written, a whole read of the file still has the key)
 			return self
 		return self.__appendEmptyLine(key)
@@ -5825,7 +5827,7 @@ class TSVZed(OrderedDict):
 			self._dumpTaken = None
 			if dropRows:
 				with self._memLock:
-					self._dumpTaken = set(self._unlined)  # (the file is emptied: no line for them once it is written)
+					self._dumpTaken = (self._dumpGen, set(self._unlined))  # (the file is emptied: once it is written)
 					OrderedDict.clear(self)
 					kept = [row for row in self.appendQueue if row and row[0] == DEFAULTS_INDICATOR_KEY]
 					self.appendQueue.clear()
@@ -5929,7 +5931,9 @@ memoryOnly:{self.memoryOnly}
 					  self.teeLogger)
 			return self
 		self.dirty = True
-		self._dumpNext = True  # memory's order is to be written, not the file compacted
+		with self._memLock:
+			self._dumpNext = True  # memory's order is to be written, not the file compacted
+			self._dumpGen += 1
 		if not self.rewrite_on_exit:
 			self.rewrite_on_exit = True
 			self.__teePrintOrNot("Warning: move_to_end had been called. Need to resync for changes to apply to disk.")
@@ -6278,8 +6282,8 @@ memoryOnly:{self.memoryOnly}
 			values = list(self.values())
 			defaults = list(self.defaults)
 			queued, self.appendQueue = self.appendQueue, deque()
-			dumpNext, self._dumpNext = self._dumpNext, False  # (memory's order is written now)
-			self._dumpTaken = set(self._unlined)
+			self._dumpTaken = (self._dumpGen, set(self._unlined))  # (cleared once this write is done, not before:
+			# a retry takes the rows again, and must write memory's order again)
 		try:
 			tail = []
 			if defaults and len(defaults) > 1:
@@ -6295,7 +6299,6 @@ memoryOnly:{self.memoryOnly}
 		except BaseException:
 			with self._memLock:
 				self.appendQueue.extendleft(reversed(queued))
-				self._dumpNext = self._dumpNext or dumpNext
 			raise
 		return header, rows, queued
 
@@ -6382,8 +6385,11 @@ memoryOnly:{self.memoryOnly}
 				self._damaged = self._remake = False
 				self.dirty = self.deSynced = False
 				if self._dumpTaken:
+					gen, keys = self._dumpTaken
 					with self._memLock:
-						self._unlined -= self._dumpTaken  # (written: the file has no line for them now)
+						self._unlined -= keys  # (written: the file has no line for them now)
+						if gen == self._dumpGen:
+							self._dumpNext = False  # (memory's order is written; one set since is not)
 				self._dumpTaken = None
 			except BaseException:
 				if started:
