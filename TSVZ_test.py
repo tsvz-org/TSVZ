@@ -13299,3 +13299,42 @@ def test_a_row_memory_adds_with_empty_cells_does_not_read_filled_by_the_files_de
 	t = _quiet_tsvzed(p)
 	assert dict(t) == memory and t.defaults == ['#_defaults_#', 'X', '2', '2']
 	t.close()
+
+
+@pytest.mark.parametrize('text, header, expected', [
+	# (7) a key's last line moves up across a defaults line when no defaults can reach it (exactly W, all values)
+	('id\tv\na\t1\n#_defaults_#\tX\na\t2\n', 'id\tv', 'id\tv\na\t2\n#_defaults_#\tX\n'),
+	('id\tv\na\t1\n#_defaults_#\tX\na\t\n\na\t2\n', 'id\tv', 'id\tv\n#_defaults_#\tX\na\t2\n'),  # (deleted, set again)
+	('id\tv\tw\na\t1\t1\n#_defaults_#\tX\na\t2\t\n', 'id\tv\tw', 'id\tv\tw\na\t1\t1\n#_defaults_#\tX\na\t2\t\n'),  # (an empty cell)
+	# (8) a defaults line the same as the one before it, nothing between them changing the defaults, goes
+	('id\tv\n#_defaults_#\tNA\na\t1\n#_defaults_#\tNA\nb\t\n#_defaults_#\tNA\n', 'id\tv', 'id\tv\n#_defaults_#\tNA\na\t1\n'),
+	('id\tv\n#_defaults_#\tNA\n#_defaults_#\n#_defaults_#\tNA\n', 'id\tv', 'id\tv\n#_defaults_#\tNA\n#_defaults_#\n#_defaults_#\tNA\n'),
+])
+def test_legacy_compact_refinements(tmp_path, text, header, expected):
+	raw = _lines(text.encode('utf8'))
+	out = _compact(raw, header, None, '\t')
+	assert b''.join(line + b'\n' for line in out) == expected.encode('utf8')
+	before, after = str(tmp_path / 'b.tsv'), str(tmp_path / 'a.tsv')
+	_touch(before, text.encode('utf8'))
+	_touch(after, expected.encode('utf8'))
+	for strict in (False, True):
+		for defaults in (None, ['#_defaults_#', 'P']):
+			assert _views(TSVZ, after, header, defaults, strict, True) == _views(TSVZ, before, header, defaults, strict, True)
+			assert _views(TSVZ_old, after, header, defaults, strict, False) == _views(TSVZ_old, before, header, defaults, strict, False)
+
+
+def test_tsvzed_rewrites_keep_a_store_with_defaults_the_same_size_round_after_round(tmp_path):
+	# (review p3) a store given defaults that sets every key each round: a defaults line between a key's lines kept
+	# both, and a defaults line went in every round, so the file grew by a round's rows each time.
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'id\tv\n' + b''.join(b'k%d\t%d\n' % (i, i) for i in range(5)))
+	sizes = []
+	for rnd in range(3):
+		t = TSVZ.TSVZed(p, header='id\tv', defaults=['', 'NA'], append_check_delay=0.01, verbose=False)
+		for i in range(5):
+			t['k%d' % i] = ['k%d' % i, 'r%d-%d' % (rnd, i)]
+		t.close()
+		t = TSVZ.TSVZed(p, header='id\tv', defaults=['', 'NA'], rewrite_on_load=True, verbose=False)
+		t.close()
+		sizes.append(_bytes(p).count(b'\n'))
+	assert sizes == [7, 7, 7], sizes

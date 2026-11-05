@@ -2738,6 +2738,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 	first, last, firstTaken, lastTaken = array.array('l'), array.array('l'), array.array('l'), array.array('l')
 	firstN, lastN = array.array('l'), array.array('l')
 	firstTakes, lastTakes = bytearray(), bytearray()
+	lastFull = bytearray()  # whether the last line is exactly W wide with a value in every cell: no defaults reach it
 	pinfo = {}  # protectable index holding a row -> (key, ncells)
 	killer = {}  # protectable index whose key died -> the deletion that ended it
 	lastDelete = {}  # key -> its last deletion
@@ -2756,6 +2757,8 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 		if firstKeyed is None:
 			firstKeyed = i
 		if kind in ('defaults', 'reset'):
+			if boundaries and raw[i] == raw[boundaries[-1]] and i not in protectable:
+				continue  # (the same line again, nothing between them changing the defaults: it changes nothing)
 			boundaries.append(i)
 			strictActive = False if kind == 'reset' else (True if takes else strictActive)
 		elif kind == 'delete':
@@ -2768,6 +2771,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 		else:
 			if i in protectable:
 				pinfo[i] = (key, n)
+			full = n == width and all(c.strip() for c in _unsanitize(text.strip('\x00').rstrip('\r\n').split(delimiter), delimiter)[1:])
 			slot = live.get(key)
 			if slot is None:
 				live[key] = len(first)
@@ -2779,8 +2783,9 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 				lastN.append(n)
 				firstTakes.append(takes)
 				lastTakes.append(takes)
+				lastFull.append(full)
 			else:
-				last[slot], lastN[slot], lastTakes[slot] = i, n, takes
+				last[slot], lastN[slot], lastTakes[slot], lastFull[slot] = i, n, takes, full
 				if takes:
 					if firstTaken[slot] < 0:
 						firstTaken[slot] = i
@@ -2796,9 +2801,12 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 		kept[f] = 1
 		if f == l:
 			continue
-		if (bisect.bisect_right(boundaries, f) == bisect.bisect_left(boundaries, l) and firstTakes[slot] and lastTakes[slot]
+		# The key becomes one line (its value at its place) when the same defaults reach both places (no defaults line
+		# between them), or none can reach its last line (exactly W wide, a value in every cell, for every reader).
+		if ((lastFull[slot] or bisect.bisect_right(boundaries, f) == bisect.bisect_left(boundaries, l))
+				and firstTakes[slot] and lastTakes[slot]
 				and f != 0 and (f not in (firstKeyed, after0) or firstN[slot] == lastN[slot])):
-			content[f] = raw[l]  # (the key is one line: its value, at its place; the same defaults reach it)
+			content[f] = raw[l]
 			continue
 		kept[l] = 1
 		if firstTaken[slot] >= 0:
