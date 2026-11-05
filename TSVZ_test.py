@@ -7751,12 +7751,7 @@ def _failing_rewrite(monkeypatch, partial=b''):
 		file.truncate()
 		raise OSError(errno.ENOSPC, 'No space left on device')
 
-	def inplace(self, file, header, lines):
-		file.truncate()
-		full(file)
-
-	monkeypatch.setattr(TSVZ, '_writeLines', full)
-	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', inplace)
+	monkeypatch.setattr(TSVZ, '_writeLines', full)  # (5.5: every legacy rewrite is whole)
 
 
 @pytest.mark.parametrize('suffix', ALL_SUFFIXES)
@@ -8343,7 +8338,7 @@ def test_tsvzed_legacy_row_changed_in_place_between_the_check_and_the_write_is_w
 	t.commitAppendToFile()
 	t['k1'] = ['k1', 'a longer value than it had']  # an in-place rewrite moves every row after it
 	rows = dict((key, list(row)) for key, row in t.items())
-	realLines, realInPlace = TSVZ._writeLines, TSVZ.TSVZed._writeInPlace
+	realLines = TSVZ._writeLines
 	changed = []
 
 	def change():  # between the check and the write
@@ -8352,7 +8347,6 @@ def test_tsvzed_legacy_row_changed_in_place_between_the_check_and_the_write_is_w
 			t['k2'][1] = 'bad\udcff'  # another thread changes the row in place
 
 	monkeypatch.setattr(TSVZ, '_writeLines', lambda *args, **kwargs: change() or realLines(*args, **kwargs))
-	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', lambda self, *args: change() or realInPlace(self, *args))
 	getattr(t, method)()  # explicit: nothing to refuse, nothing raised
 	monkeypatch.undo()
 	assert changed
@@ -9324,7 +9318,7 @@ def test_tsvzed_legacy_same_size_rewrite_of_the_damage_is_not_merged(tmp_path, m
 	p = str(tmp_path / ('same.' + suffix))
 	t = _stopped(p)
 	rows = _many(t, 5)
-	real_lines, real_inplace = TSVZ._writeLines, TSVZ.TSVZed._writeInPlace
+	real_lines = TSVZ._writeLines
 	_failing_rewrite(monkeypatch, partial=_compressedAs(suffix, b'key\tval\nk0\tv0\n'))
 	t.hardMapToFile()
 	damaged = _bytes(p)
@@ -9336,7 +9330,6 @@ def test_tsvzed_legacy_same_size_rewrite_of_the_damage_is_not_merged(tmp_path, m
 	os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))  # and keeps its modification time
 	capsys.readouterr()
 	monkeypatch.setattr(TSVZ, '_writeLines', real_lines)
-	monkeypatch.setattr(TSVZ.TSVZed, '_writeInPlace', real_inplace)
 	assert t.rewrite()
 	assert 'Overwriting external changes' in capsys.readouterr().out
 	assert dict(t) == rows and _back(p) == rows
@@ -13114,3 +13107,31 @@ def test_tsvzed_memory_dump_writes_its_defaults_line_as_wide_as_the_rows(tmp_pat
 	t.close()
 	assert first == _bytes(p) == b'id\tv\tw\n#_defaults_#\tP\t\n'
 	assert TSVZ.readTabularFile(p, header='id\tv\tw', strict=True, defaults=[]) == {}
+
+
+# --- 5.5 review fixes ---
+@pytest.mark.parametrize('content, act', [
+	(b'\na\nb\n#_defaults_#\tX\nc\n', 'del'),
+	(b'\na\nb\nc\n', 'defaults-key-then-del'),
+	(b'\na\nb\nc\n', 'setDefaults-then-move'),
+])
+def test_tsvzed_memory_dump_writes_its_defaults_line_after_the_rows(tmp_path, content, act):
+	# A defaults line written before the rows was the first keyed line of a one-column file: readers took two columns
+	# from it, so every lone key read as a deletion and the store came back empty.
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, content)
+	t = TSVZ.TSVZed(p, append_check_delay=0.01, verbose=False)
+	if act == 'del':
+		del t['b']
+	elif act == 'defaults-key-then-del':
+		t['#_defaults_#'] = ['#_defaults_#', 'X']
+		del t['b']
+	else:
+		t.setDefaults(['', 'X'])
+		t.move_to_end('a')
+	memory = dict(t)
+	t.close()
+	assert dict(TSVZ.readTabularFile(p, strict=False)) == memory
+	t = _quiet_tsvzed(p)
+	assert dict(t) == memory
+	t.close()

@@ -427,11 +427,8 @@ class _RewriteRows(object):
 	in place after the snapshot is written as it was then.
 	"""
 
-	whole = False  # (a compaction is written whole: _CompactRows)
-
-	def __init__(self, first, values, delimiter, encoding, errors, header, later=(), tail=()):
+	def __init__(self, first, values, delimiter, encoding, errors, header, tail=()):
 		self.first = first
-		self.later = later  # lines written after the first row (or alone, when there is none)
 		self.tail = tail  # lines written after every row
 		cells = []
 		lengths = array.array('I')
@@ -477,23 +474,10 @@ class _RewriteRows(object):
 		for line in self.first:
 			yield line
 		encode, delimiter = self.encode, self.delimiter
-		later = self.later
 		for row in self._rows():
 			yield encode(_sanitize(row,delimiter=delimiter))
-			for line in later:
-				yield line
-			later = ()
-		for line in later:
-			yield line
 		for line in self.tail:
 			yield line
-
-
-class _CompactRows(_RewriteRows):
-	"""What a compacting ``TSVZed`` rewrite writes (_compactSnapshot): the compacted file's lines (``first``), then the
-	rows memory holds that they do not say, then the deletion and defaults lines (``tail``). Always written whole: an
-	in-place write pads a shorter line with spaces, which would change the bytes of a line kept."""
-	whole = True
 
 
 class _LinesFile(object):
@@ -6253,7 +6237,7 @@ memoryOnly:{self.memoryOnly}
 			if line is not None and _fileDefaultsAtEnd(itertools.chain(kept, (line,)), diffWidth, delimiter, encoding,
 														consumed, self.strict) == (_trimmedCells(want) if any(want[1:]) else [DEFAULTS_INDICATOR_KEY]):
 				tail.append(line)
-			rows = _CompactRows(kept, values, delimiter, encoding, errors, self.header, tail=tail)
+			rows = _RewriteRows(kept, values, delimiter, encoding, errors, self.header, tail=tail)
 			del values
 			rows.check()
 		except BaseException:
@@ -6278,17 +6262,15 @@ memoryOnly:{self.memoryOnly}
 			queued, self.appendQueue = self.appendQueue, deque()
 			dumpNext, self._dumpNext = self._dumpNext, False  # (memory's order is written now)
 		try:
-			first = later = []
+			tail = []
 			if defaults and len(defaults) > 1:
-				# The defaults line comes right after the header, so it survives a
-				# full rewrite -- it is not a regular mapping key. With no header line written the first line
-				# is a row (a header, to the store that owns the file): after that.
-				# As wide as the rows (5.5): a strict reader takes no defaults line of another width, and a compacting
-				# rewrite would then append one that it takes.
-				line = _encodeRow(_sanitize(_fitRow(defaults, self.correctColumnNum),delimiter=delimiter),delimiter,
-								  encoding,errors,what='defaults')
-				first, later = ([line], []) if header is not None else ([], [line])
-			rows = _RewriteRows(first, values, delimiter, encoding, errors, self.header, later)
+				# The defaults line goes after every row (5.5), so it survives a full rewrite (it is not a regular
+				# mapping key), fills no row memory holds (their cells were filled when set), and is never the first
+				# keyed line a reader takes its column count from (a one-column store read as two columns lost every
+				# key). As wide as the rows: a strict reader takes no defaults line of another width.
+				tail = [_encodeRow(_sanitize(_fitRow(defaults, self.correctColumnNum),delimiter=delimiter),delimiter,
+								   encoding,errors,what='defaults')]
+			rows = _RewriteRows([], values, delimiter, encoding, errors, self.header, tail=tail)
 			del values  # the snapshot holds the cells
 			rows.check()
 		except BaseException:
@@ -6367,17 +6349,14 @@ memoryOnly:{self.memoryOnly}
 					with self._memLock:
 						self.appendQueue.extendleft(reversed(queued))
 				started = True
-				whole = whole or getattr(lines, 'whole', False)  # (a compaction is written whole: never padded in place)
 				self.dirty = self._damaged = True
 				f.seek(0)
-				if whole:
-					# Written over what the file holds, then cut to its end (spec §19.8): a reader that takes no lock
-					# never meets it emptied, and a write cut short leaves the old bytes after the new ones.
-					_writeLines(f, header, lines, codec=_fileCodec(self._fileName))
-					if stat.S_ISREG(os.fstat(f.fileno()).st_mode):  # /dev/null cannot be cut
-						f.truncate()
-				else:
-					self._writeInPlace(f, header, lines)
+				# Written whole over what the file holds, then cut to its end (spec §19.8): a reader that takes no lock
+				# never meets it emptied, and a write cut short leaves the old bytes after the new ones. (5.5: always;
+				# 5.4's in-place write of mapToFile() padded a shorter line with spaces, which readers show as cells.)
+				_writeLines(f, header, lines, codec=_fileCodec(self._fileName))
+				if stat.S_ISREG(os.fstat(f.fileno()).st_mode):  # /dev/null cannot be cut
+					f.truncate()
 				f.flush()
 				_fsync(f.fileno())
 				end = f.tell()  # its own bytes end here: a writer that takes no lock may append after them
@@ -6641,51 +6620,6 @@ memoryOnly:{self.memoryOnly}
 			self.deSynced = True
 			return self._hardMapToFile(sync, explicit)
 
-	def _writeInPlace(self, file, headerBytes, lines):
-		"""Rewrite the open, locked ``file`` in place to hold ``headerBytes`` and ``lines``: mapToFile()'s write."""
-		overWrite = False
-		if headerBytes is not None:
-			line = file.readline().decode(self.encoding,errors='replace')
-			aftPos = file.tell()
-			# A header line with no newline (the file ends right after it) is written again with one.
-			if not line.endswith('\n') or not _lineContainHeader(self.header,line,verbose = self.verbose,teeLogger = self.teeLogger,strict = self.strict,delimiter = self.delimiter):
-				header = self.delimiter.join(_sanitize(self.header,delimiter=self.delimiter))
-				file.seek(0)
-				file.write(headerBytes+b'\n')
-				# if the header is not the same length as the line, we need to overwrite the file
-				if aftPos != file.tell():
-					overWrite = True
-				if self.verbose:
-					self.__teePrintOrNot(f"Header {header} written to {self._fileName}")
-		# Rows to (re)write, in order: the defaults line first (right after the
-		# header, if set) then every data row.
-		for encoded in lines:
-			if overWrite:
-				if self.verbose:
-					self.__teePrintOrNot(f"Overwriting {encoded!r} to {self._fileName}")
-				file.write(encoded+b'\n')
-				continue
-			pos = file.tell()
-			line = file.readline()
-			aftPos = file.tell()
-			if not line or pos == aftPos:
-				if self.verbose:
-					self.__teePrintOrNot(f"End of file reached. Appending {encoded!r} to {self._fileName}")
-				# L6: 3.39 omitted this newline and glued the row to the next one.
-				file.write(encoded+b'\n')
-				overWrite = True
-				continue
-			strToWrite = encoded.ljust(len(line)-1)+b'\n'
-			if line != strToWrite:
-				if self.verbose:
-					self.__teePrintOrNot(f"Modifing {encoded!r} to {self._fileName}")
-				file.seek(pos)
-				# fill the string with space to write to the correct length
-				file.write(strToWrite)
-				if aftPos != file.tell():
-					overWrite = True
-		file.truncate()
-	
 	def checkExternalChanges(self):
 		if self.deSynced:
 			return self
