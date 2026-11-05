@@ -13185,3 +13185,55 @@ def test_a_queued_one_cell_row_survives_a_whole_read_when_the_program_gave_a_col
 	t.commitAppendToFile()
 	t.close()
 	assert sorted(TSVZ.readTabularFile(p)) == ['a', 'b', 'c']
+
+
+@pytest.mark.parametrize('text, header, kwargs, ops, want', [
+	# p2: defaults switched off: memory's rows read with none (5.4: b = [b, '', 2])
+	(b'id\tv\tw\n#_defaults_#\tNA\t\na\t\t1\n', 'id\tv\tw', {}, [('setDefaults', []), ('set', ['b', '', '2'])],
+	 {'a': ['a', 'NA', '1'], 'b': ['b', '', '2']}),
+	# p9: one line cannot clear a cell the file's defaults set: a reset goes first
+	(b'id\tv\tw\n#_defaults_#\t1\t2\na\tx\ty\n', 'id\tv\tw', {}, [('setDefaults', ['', '', 'P']), ('set', ['b', '', 'z'])],
+	 {'a': ['a', 'x', 'y'], 'b': ['b', '', 'z']}),
+	# p11: the store's defaults of another cell count than the file's (its own reads take their width from the
+	# defaults it gave last, Q-D5; a reader given the first ones is not compared)
+	(b'id\tv\nd\t\tX\nc\t1\t2\n', '', {'defaults': ['#_defaults_#', 'P']},
+	 [('defaults-key', ['#_defaults_#', 'M', 'N']), ('setDefaults', ['', '', 'Q'])], 'reopen only'),
+])
+def test_tsvzed_rewrite_writes_the_stores_defaults_before_the_rows_memory_adds(tmp_path, text, header, kwargs, ops, want):
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, text)
+	t = TSVZ.TSVZed(p, header=header, rewrite_on_load=False, append_check_delay=0.01, verbose=False, **kwargs)
+	for op, arg in ops:
+		if op == 'setDefaults':
+			t.setDefaults(arg)
+		elif op == 'defaults-key':
+			t['#_defaults_#'] = arg
+		else:
+			t[arg[0]] = arg
+	memory = dict(t)
+	if isinstance(want, dict):
+		assert memory == want
+	t.hardMapToFile()
+	given = list(t._givenDefaults)
+	t.close()
+	if want != 'reopen only':
+		assert dict(TSVZ.readTabularFile(p, header=header, strict=False, **kwargs)) == memory
+	kwargs = dict(kwargs, defaults=given) if 'defaults' in kwargs else kwargs
+	t = TSVZ.TSVZed(p, header=header, rewrite_on_load=False, verbose=False, **kwargs)
+	if want == 'reopen only':  # (read at the width of the defaults it gave last, a row gains their cells: Q-D5)
+		assert {k: v[:len(memory[k])] for k, v in t.items()} == memory
+	else:
+		assert dict(t) == memory
+	t.close()
+
+
+def test_a_strict_store_persists_defaults_narrower_than_its_header(tmp_path):
+	# p10: the line is padded to the column count, so a strict reader takes it
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'id\tv\tw\na\tx\ty\n')
+	for _ in range(2):
+		t = TSVZ.TSVZed(p, header='id\tv\tw', strict=True, defaults=['#_defaults_#', 'NA'], rewrite_on_load=False,
+						append_check_delay=0.01, verbose=False)
+		t.hardMapToFile()
+		t.close()
+	assert _bytes(p) == b'id\tv\tw\na\tx\ty\n#_defaults_#\tNA\t\n'

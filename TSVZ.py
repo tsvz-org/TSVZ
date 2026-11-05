@@ -6231,19 +6231,30 @@ memoryOnly:{self.memoryOnly}
 				return None
 			tail = [_encodeRow(_sanitize([key] + [''] * (diffWidth - 1),delimiter=delimiter),delimiter,encoding,errors,self.header)
 					for key in gone]
+			# The store's defaults, when the lines do not end with them (plan Q2, answer c): one line padded to the
+			# column count (a strict reader takes no other width), with a reset in front when one line cannot say them
+			# (a cell the file's defaults set that the store's leave empty: an empty cell takes the one before it).
+			# Kept only when the store's reader then ends with them: a line it does not take (a reset at column count 1
+			# is a row there) would be added again at every rewrite.
 			own = _fileDefaultsAtEnd(kept, diffWidth, delimiter, encoding, consumed, self.strict)
-			line = None
+			goal = _trimmedCells(want) if any(want[1:]) else [DEFAULTS_INDICATOR_KEY]
+			reset = _encodeRow([DEFAULTS_INDICATOR_KEY],delimiter,encoding,errors,what='defaults')
+			lines = []
 			if any(want[1:]):
-				if _trimmedCells(want) != own:
-					line = _encodeRow(_sanitize(want,delimiter=delimiter),delimiter,encoding,errors,what='defaults')
+				if goal != own:
+					lines = [_encodeRow(_sanitize(_fitRow(want, diffWidth),delimiter=delimiter),delimiter,encoding,errors,
+										what='defaults')]
+					if _fileDefaultsAtEnd(itertools.chain(kept, lines), diffWidth, delimiter, encoding, consumed,
+										  self.strict) != goal:
+						lines.insert(0, reset)
 			elif any(own[1:]):
-				line = _encodeRow([DEFAULTS_INDICATOR_KEY],delimiter,encoding,errors,what='defaults')  # (a reset)
-			# Appended only when the file then ends with them for the store's reader: a line that reader does not take
-			# (a reset at column count 1 is a row there; strict drops a line of another width) would be appended again
-			# at every rewrite.
-			if line is not None and _fileDefaultsAtEnd(itertools.chain(kept, (line,)), diffWidth, delimiter, encoding,
-														consumed, self.strict) == (_trimmedCells(want) if any(want[1:]) else [DEFAULTS_INDICATOR_KEY]):
-				tail.append(line)
+				lines = [reset]
+			if lines and _fileDefaultsAtEnd(itertools.chain(kept, lines), diffWidth, delimiter, encoding, consumed,
+											self.strict) == goal:
+				if diffWidth > 0:
+					kept.extend(lines)  # (before memory's rows: they read with the store's defaults)
+				else:
+					tail.extend(lines)  # (no column count yet: after the rows, so a defaults line does not set it)
 			rows = _RewriteRows(kept, values, delimiter, encoding, errors, self.header, tail=tail)
 			del values
 			rows.check()
