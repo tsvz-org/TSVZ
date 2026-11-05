@@ -13168,3 +13168,20 @@ def test_a_one_column_delete_is_undone_by_another_process_setting_the_key_again(
 	assert _wait_for(lambda: 'b' in t)
 	t.close()
 	assert sorted(TSVZ.readTabularFile(p)) == ['a', 'b', 'c']
+
+
+def test_a_queued_one_cell_row_survives_a_whole_read_when_the_program_gave_a_column_count(tmp_path):
+	# The replay of the queue judged a one-cell row by the column count the program gave (2: a deletion), not the
+	# one the read took (1: a row), so b, queued while another process appended c, was lost.
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, b'a\n')
+	t = TSVZ.TSVZed(p, correctColumnNum=2, rewrite_on_load=False, append_check_delay=5, verbose=False)
+	t['b'] = ['b']
+	TSVZ.appendTabularFile(p, ['c'])  # another process appends meanwhile
+	t._call(t._syncFile)  # the store follows it while b is still queued
+	assert 'b' in t
+	t.reload()  # a whole read while b is still queued
+	assert 'b' in t
+	t.commitAppendToFile()
+	t.close()
+	assert sorted(TSVZ.readTabularFile(p)) == ['a', 'b', 'c']

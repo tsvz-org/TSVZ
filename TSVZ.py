@@ -6547,6 +6547,8 @@ memoryOnly:{self.memoryOnly}
 			# No set or delete is half done: each holds _memLock from its change of memory to its queueing. What is
 			# queued is not in the file (appends take writeLock, held here): replayed on what was read, as reading it
 			# once appended will, so memory stays what the file will hold.
+			if width > 0:
+				loaded.columns = width  # (the queue is replayed as reading it back will: at the width the read took)
 			loaded.replay(list(self.appendQueue))
 			for key in self._unlined:  # deleted here with no line: not until the dump is written
 				OrderedDict.pop(loaded, key, None)
