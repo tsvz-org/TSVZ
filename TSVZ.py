@@ -5223,6 +5223,8 @@ class TSVZed(OrderedDict):
 		self.deSynced = False
 		self.memoryOnly = False
 		self._dumpNext = False  # the next rewrite writes memory (move_to_end, a one-column store's delete)
+		self._unlined = set()  # keys deleted with no line (a one-column store): a whole read leaves them out
+		self._dumpTaken = None  # what the dump being written covers of _unlined (cleared once it is written)
 		self.writeLock = threading.Lock()
 		self._memLock = threading.Lock()  # held while memory and appendQueue change together (a set, a delete, reload's swap)
 		self._failures = {}  # legacy writes that fail, by kind: when each is tried again, see _failed()
@@ -5497,6 +5499,7 @@ class TSVZed(OrderedDict):
 				self.dirty = True
 			# update the dictionary,
 			super().__setitem__(key,value)
+			self._unlined.discard(key)
 			if self.memoryOnly:
 				if self.verbose:
 					self.__teePrintOrNot(f"Key {key} updated in memory only")
@@ -5629,6 +5632,7 @@ class TSVZed(OrderedDict):
 		if not self._spec and (self.correctColumnNum == 1 or (self.correctColumnNum == -1 and (
 				len(row) == 1 or any(len(value) == 1 for value in OrderedDict.values(self))))):
 			self._dumpNext = self.dirty = self.rewrite_on_exit = True
+			self._unlined.add(key)  # (until the dump is written, a whole read of the file still has the key)
 			return self
 		return self.__appendEmptyLine(key)
 
@@ -5818,8 +5822,10 @@ class TSVZed(OrderedDict):
 		header = self._headerLine(None, clearing=True)
 
 		def emptied():
+			self._dumpTaken = None
 			if dropRows:
 				with self._memLock:
+					self._dumpTaken = set(self._unlined)  # (the file is emptied: no line for them once it is written)
 					OrderedDict.clear(self)
 					kept = [row for row in self.appendQueue if row and row[0] == DEFAULTS_INDICATOR_KEY]
 					self.appendQueue.clear()
@@ -6153,6 +6159,7 @@ memoryOnly:{self.memoryOnly}
 
 		Never opens the file by name nor takes the READ lock: this thread holds the REWRITE lock, and closing another
 		descriptor would drop a lockf lock."""
+		self._dumpTaken = None
 		if self._damaged or self._remake or self._dumpNext:
 			return None
 		delimiter, encoding, errors = self.delimiter, self.encoding, self.errors
@@ -6261,6 +6268,7 @@ memoryOnly:{self.memoryOnly}
 			defaults = list(self.defaults)
 			queued, self.appendQueue = self.appendQueue, deque()
 			dumpNext, self._dumpNext = self._dumpNext, False  # (memory's order is written now)
+			self._dumpTaken = set(self._unlined)
 		try:
 			tail = []
 			if defaults and len(defaults) > 1:
@@ -6362,6 +6370,10 @@ memoryOnly:{self.memoryOnly}
 				end = f.tell()  # its own bytes end here: a writer that takes no lock may append after them
 				self._damaged = self._remake = False
 				self.dirty = self.deSynced = False
+				if self._dumpTaken:
+					with self._memLock:
+						self._unlined -= self._dumpTaken  # (written: the file has no line for them now)
+				self._dumpTaken = None
 			except BaseException:
 				if started:
 					self.dirty = self.deSynced = True  # made again from memory by the next rewrite
@@ -6469,6 +6481,7 @@ memoryOnly:{self.memoryOnly}
 				return True, False
 			queued = set(row[0] for row in self.appendQueue if row)
 			for key, (row, readded) in changes.items():
+				self._unlined.discard(key)  # (another process wrote a line for it since: that line decides)
 				if key in queued:
 					continue
 				held = dict.get(self, key)
@@ -6535,6 +6548,8 @@ memoryOnly:{self.memoryOnly}
 			# queued is not in the file (appends take writeLock, held here): replayed on what was read, as reading it
 			# once appended will, so memory stays what the file will hold.
 			loaded.replay(list(self.appendQueue))
+			for key in self._unlined:  # deleted here with no line: not until the dump is written
+				OrderedDict.pop(loaded, key, None)
 			self._replaceRows(loaded)
 			self._readWhole = False  # before the defaults: a setDefaults() between the two sets it again
 			self.defaults = loaded.defaults

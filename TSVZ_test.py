@@ -13135,3 +13135,36 @@ def test_tsvzed_memory_dump_writes_its_defaults_line_after_the_rows(tmp_path, co
 	t = _quiet_tsvzed(p)
 	assert dict(t) == memory
 	t.close()
+
+
+@pytest.mark.parametrize('how', ['reload', 'follow-a-scrub', 'writer-thread-follows'])
+def test_a_one_column_delete_is_not_undone_by_a_whole_read_before_the_rewrite(tmp_path, how):
+	# The delete queues no line (a lone key is a row there); a whole read before the next rewrite read b back from
+	# the file, and the dump then wrote it again.
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, b'a\nb\nc\n# note\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	del t['b']
+	if how == 'reload':
+		t.reload()
+	elif how == 'follow-a-scrub':
+		TSVZ.scrubTabularFile(p)  # another process's rewrite (not an append)
+		t._call(t._syncFile)
+	else:
+		TSVZ.scrubTabularFile(p)
+		time.sleep(1.5)
+	assert list(t) == ['a', 'c']
+	t.close()
+	assert list(TSVZ.readTabularFile(p)) == ['a', 'c']
+
+
+def test_a_one_column_delete_is_undone_by_another_process_setting_the_key_again(tmp_path):
+	p = str(tmp_path / 'one.tsv')
+	_touch(p, b'a\nb\nc\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=0.01, verbose=False)
+	del t['b']
+	with open(p, 'ab') as f:
+		f.write(b'b\n')  # another process sets b again (a row at width 1)
+	assert _wait_for(lambda: 'b' in t)
+	t.close()
+	assert sorted(TSVZ.readTabularFile(p)) == ['a', 'b', 'c']
