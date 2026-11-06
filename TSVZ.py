@@ -43,7 +43,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.5'
+version = '5.05'
 __version__ = version
 author = 'pan@zopyr.us'
 COMMIT_DATE = '2026-11-04'
