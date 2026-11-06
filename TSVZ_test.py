@@ -14795,7 +14795,9 @@ def test_a_store_that_changed_something_with_monitoring_off_still_overwrites(tmp
 	p = str(tmp_path / 'm.tsv')
 	_touch(p, b'id\tv\na\t1\nx\t9\n')
 	t = TSVZ.TSVZed(p, header='id\tv', monitor_external_changes=False, verbose=False, append_check_delay=60)
-	del t['x']  # (a delete leaves the store dirty until a rewrite, however soon the writer appends its line)
+	# (A store is dirty once it deleted a key or changed a row it held. Setting a new key never sets `dirty`, whatever the
+	# writer's timing: this test once set one, and failed every time, not by a race.)
+	del t['x']
 	_append_external(p, b'c\t3\n')
 	assert t.rewrite(force=True)
 	t.close()
@@ -15337,3 +15339,17 @@ def test_a_store_under_defaults_of_two_cells_adds_a_row_to_a_file_of_lone_keys_a
 	t.hardMapToFile()
 	t.close()
 	assert list(TSVZ.readTabularFile(p)) == ['a', 'b', 'z']
+
+
+def test_a_rewrite_after_set_defaults_of_two_cells_takes_a_deleted_lone_key_out_and_keeps_the_others(tmp_path):
+	# The store knows its file is of one column; its defaults then say two cells. Deleting `a` leaves `b\t1\t2` first, wider
+	# than the lone `c`, which must move up (at the file's own width it is the first line that sets the count).
+	p = str(tmp_path / 'l.tsv')
+	_touch(p, b'a\nb\t1\t2\nc\n')
+	t = TSVZ.TSVZed(p, verbose=False, append_check_delay=60)
+	assert t.correctColumnNum == 1
+	t.setDefaults(['#_defaults_#', 'P'])
+	del t['a']
+	t.hardMapToFile()
+	t.close()
+	assert set(TSVZ.readTabularFile(p)) == {'b', 'c'}
