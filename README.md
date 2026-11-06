@@ -304,20 +304,27 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 writes.
 
 - **`TSVZed` no longer rewrites a `.tsv`-family file when it opens it.** `rewrite_on_load`
-  now defaults to `False`, as `rewrite_on_exit` and `rewrite_interval` already did; 3.39
-  to 5.4 rewrote a legacy file at every open. Compact a file explicitly: call
-  `mapToFile()` or `hardMapToFile()`, or scrub it (`scrubTabularFile`, `tsvz scrub`), or
-  pass `rewrite_on_load=True`. A store still makes again a file that is damaged or
+  now defaults to `False`, as `rewrite_on_exit` and `rewrite_interval` already did; 5.4
+  rewrote a legacy file at open when it held a superseded line (a key twice, a deletion),
+  and left any other file alone. Compact a file explicitly: call `mapToFile()` or
+  `hardMapToFile()`, or scrub it (`scrubTabularFile`, `tsvz scrub`), or pass
+  `rewrite_on_load=True` (which, like `rewrite(force=True)` and `rewrite_on_exit`, writes
+  only a dirty store: `dirty` is True for a key twice, a deletion or a row not yet
+  stored, not for comment lines). A store still makes again a file that is damaged or
   removed, since its memory is then the only copy. The three automatic-rewrite options
   (`rewrite_on_load`, `rewrite_on_exit`, `rewrite_interval`) are planned to be removed in
   a future version in favour of those explicit calls.
 - **Nothing else rewrites a file unless the program asks.** A store that follows another
   process's change no longer rewrites the file at its next tick because it holds changes
   of its own; `rewrite()` without `force=True` only follows such a change, and rewrites
-  when `rewrite_interval` says so. A rewrite happens on `mapToFile()`, `hardMapToFile()`,
-  `rewrite(force=True)` and the options above set explicitly, and on its own in two cases:
+  when `rewrite_interval` says so. A rewrite happens on `mapToFile()` and `hardMapToFile()`
+  (always), on `rewrite(force=True)` and the options above set explicitly (only when the
+  store is dirty: a key twice, a deletion, a row not yet stored), and on its own in two cases:
   making again a damaged, removed or emptied file, and the next commit after a delete in a
-  one-column store (below). A row changed in place stays in memory until one of them.
+  one-column store (below). A row changed in place does not make the store dirty: `t['a'][1]
+  = 'X'` then `rewrite(force=True)` returns True and writes nothing, and the change is gone
+  after `close()`; only `mapToFile()` and `hardMapToFile()` write it (as in 5.4; planned for
+  5.6, [entry](docs/limitations.md#rewriteforcetrue-on-a-clean-store-writes-nothing)).
 - **`move_to_end` appends instead of rewriting.** `t.move_to_end(k)` appends `k`'s deletion
   line, then its row, so every reader sees the new order at once; it no longer turns on the
   rewrite at exit or warns "Need to resync", and it refuses a row the encoding cannot hold
@@ -363,10 +370,14 @@ writes.
   defaults, and a strict reader's check moves with them. The store itself leaves memory's
   rows as they are and does not change the file at the commit. In a one-column file the
   lone keys are deletions at two columns: a reopen given those defaults can read `{}`, where
-  a plain reopen reads the rows (5.4 read such a file as `{}` from the open, with or without `setDefaults()`, and its rewrite emptied it).
+  a plain reopen reads the rows, and a rewrite of that store then drops the rows from the
+  file (`defaults=['#_defaults_#', 'P']` on `a\nb\n`: `hardMapToFile()` leaves
+  `a\n#_defaults_#\tP\n`) (5.4 read such a file as `{}` from the open, with or without `setDefaults()`, and its rewrite emptied it).
   The last `setDefaults()` wins, and is what a whole reload starts from. A rewrite changes
   nothing this store's reader reads, except what memory changed (it keeps the data and adds
-  the defaults line); pass the same defaults to every reader of the file
+  the defaults line); pass the same defaults to every reader of the file (as a list that
+  starts with `#_defaults_#`, or as tab-joined text: other lists are read differently by
+  `TSVZed` and `readTabularFile`)
   ([entry](docs/limitations.md#setdefaults-to-another-cell-count-changes-how-the-file-reads-not-the-rows-memory-holds)).
 - **A cell that is whitespace once unescaped (`<LF>`) is still filled with the defaults
   when a `TSVZed` loads it** (as 5.4): only the cells its right-strip empties;
@@ -386,13 +397,18 @@ writes.
   header's, the defaults', or the first keyed line's), not the first row's length, which
   a wider row can now exceed.
 - **`TSVZed(correctColumnNum=N)` no longer pads.** The store's column count is the one the
-  read takes (above), whatever `N` says. 5.4 padded every row to an `N` above the file's
-  width, and lost nothing doing it (`N=5` wrote `a\t1` as `a\t1\t\t\t`); 5.5 does not. An `N`
-  below the file's width cut rows at a rewrite in 5.4 (`N=1`: `a\t1` to `a`; `N=2`:
-  `a\t1\t2` to `a\t1`); 5.5 does not either. A program that relied on `N` to pad its rows
-  gives defaults of that width, or a header that line 1 already holds, or pads them
-  itself (a header that line 1 is not leaves the width as the file's).
-  `readTabularFile(correctColumnNum=N)` still pads to `N`.
+  read takes (above), whatever `N` says. In 5.4 a loose store padded every row to an `N`
+  above the file's width (`N=5` wrote `a\t1` as `a\t1\t\t\t`), but a strict one refused
+  those rows: memory was empty and a rewrite emptied the file. An `N` below the file's
+  width cut rows in memory at the open and in the file at a rewrite in a loose store (`N=1`:
+  `a\t1` to `a`; `N=2`: `a\t1\t2` to `a\t1`) and emptied the file in a strict one. 5.5
+  does neither. A program that relied on
+  `N` to pad its rows gives defaults with `N` cells after the `#_defaults_#` key
+  (`['#_defaults_#', '', '', '', '']` for 5, or the same as tab-joined text; `['']*5`
+  collapses to no defaults), or pads them itself. A header that line 1 holds also sets the
+  width; a header that line 1 is not leaves it to the first keyed line after line 1, or to
+  the header when line 1 is the only line. `readTabularFile(correctColumnNum=N,
+  strict=False)` still pads to `N`; its default, strict, drops the rows narrower than `N`.
 - **A scrub compacts by dropping lines.** `scrubTabularFile`, `tsvz scrub` and a handler
   `scrub` drop comments, empty lines, superseded lines and dead keys' lines, and keep
   every other line byte for byte where it was. A `#_defaults_#` line the same as the one

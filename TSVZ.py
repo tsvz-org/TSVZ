@@ -5183,9 +5183,10 @@ class TSVZed(OrderedDict):
 	correctColumnNum : int, default=-1
 		Kept for compatibility, and no longer the store's column count (5.5): that is the header's, the
 		defaults' (two cells or more) or the first keyed line's, whatever this says, and rows are not
-		padded to it or cut to it (5.4 padded them to a count above the file's width, and a count below
-		it cut rows at a rewrite). Pad rows yourself, or give defaults of that width or a header that line
-		1 already holds.
+		padded to it or cut to it (5.4 padded them to a count above the file's width in a loose store and
+		refused them in a strict one; a count below it cut rows in memory at the open and in the file at a rewrite, or in a
+		strict store emptied the file). Pad rows yourself, or give defaults with that many cells after the '#_defaults_#' key
+		(['#_defaults_#', '', '', '', ''] for 5) or a header that line 1 holds.
 	errors : str, default='strict'
 		What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8
 		file name (os.fsdecode). 'strict' raises a ValueError (TSVZEncodeError) naming it, from the

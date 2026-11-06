@@ -339,7 +339,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   and on 5.4, on Linux with open file description locks. Where readers take no read lock (`lockf`-only hosts and
   Windows, see `_readLock`) that reason does not hold: forced `lockf` and `flock` gave 0 of 1500; Windows was not
   measured.
-- Why: the cause is not verified. All 265 misses had a file time that had moved, so "the time did not move" is ruled
+- Why: the cause is not verified. All 258 misses in the runs above had a file time that had moved, so "the time did not move" is ruled
   out; the likely cause is that the time moves before the new bytes land, so a read in between takes the old bytes
   with the new time, but that is not proved. Seeing it for certain would mean reading the file again at every
   tick.
@@ -363,8 +363,21 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   column count a reader takes) leaves memory's rows as they are, and the file unchanged at the commit. A rewrite
   keeps the data and adds the defaults line. A reopen given those defaults then reads the file at the new count,
   which can read `{}` (a one-column file's lone keys are deletions at two columns), while a plain reopen reads the
-  rows. 5.4 read such a file as `{}` from the open, with or without `setDefaults()`, and its rewrite emptied it.
+  rows; a rewrite of that store then drops the rows from the file (`defaults=['#_defaults_#', 'P']` on `a\nb\n`:
+  `hardMapToFile()` leaves `a\n#_defaults_#\tP\n`, so `b` is gone). 5.4 read such a file as `{}` from the open, with or without `setDefaults()`, and its rewrite emptied it.
 - Why: the user chose to allow a `setDefaults()` that changes the column count.
 - Revisit when: someone loses rows to it.
 - Approved: 2026-11-05, the user chose "Allow it, document it (Recommended)" when asked whether `setDefaults()` may
   change the column count.
+
+### rewrite(force=True) on a clean store writes nothing
+- Kind: deferred to 5.6
+- What the operator sees: a program changes a row in place (`t['a'][1] = 'X'`, which does not set `dirty`) and calls
+  `rewrite(force=True)`. It returns True and the file is unchanged, and after `close()` the change is gone. The same
+  holds for `rewrite_on_exit=True`, and `rewrite_on_load=True` leaves an uncompacted file (comment lines) alone while
+  `dirty` is False. `mapToFile()` and `hardMapToFile()` do write the row. 5.4 does the same, and the class
+  docstring says so.
+- Why: `rewrite(force=True)` and the automatic options write only a store that is `dirty`, and a list changed in place
+  cannot tell the store. It matters more once the automatic options are replaced by explicit calls, since the
+  program then asked for the rewrite.
+- Revisit when: 5.6.
