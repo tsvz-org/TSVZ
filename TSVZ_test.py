@@ -13709,7 +13709,7 @@ def test_a_rewrite_interval_the_program_set_still_rewrites_a_dirty_store(tmp_pat
 	t['a'] = ['a', '1']
 	t['a'] = ['a', '2']
 	assert _wait_for(lambda: _bytes(p) == b'id\tv\na\t2\n', 5)
-	assert not t.dirty
+	assert _wait_for(lambda: not t.dirty, 5)  # (the writer clears it after the bytes land)
 	t.close()
 
 
