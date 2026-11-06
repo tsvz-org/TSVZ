@@ -3064,7 +3064,9 @@ def test_tsvzed_spec_sync_keeps_memory_while_writes_fail(tmp_path):
 	d = tmp_path / 'sub'
 	d.mkdir()
 	p = str(d / 'f.tsvz')
-	t = TSVZ.TSVZed(p, append_check_delay=0.01, monitor_external_changes=False)
+	# (no tick of the writer thread meanwhile: with monitor_external_changes off, a tick between the next two
+	# statements ends the sync and clears deSynced)
+	t = TSVZ.TSVZed(p, append_check_delay=60, monitor_external_changes=False)
 	t._activePath = str(d / 'nodir' / 'f.tsvz')
 	t['a'] = ['a', '1']
 	t.deSynced = True
