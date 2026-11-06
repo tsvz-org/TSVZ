@@ -6468,7 +6468,7 @@ memoryOnly:{self.memoryOnly}
 
 	def _remadeLines(self, f):
 		"""What a file made again from memory begins with, the lines that keep its reading: the header line (None for
-		none: _headerLine); under no header, a line that keeps the column count: the first row memory holds exactly that
+		none: _headerLine), its first cell alone for a one-column store holding rows with no value; under no header, a line that keeps the column count: the first row memory holds exactly that
 		wide, moved to the front, else at two columns or more an empty #_defaults_# line as wide (a reset, deleting
 		nothing)."""
 		delimiter, encoding, errors = self.delimiter, self.encoding, self.errors
@@ -6476,6 +6476,10 @@ memoryOnly:{self.memoryOnly}
 		lines = [] if line is None else [line]
 		width = self.correctColumnNum
 		if any(self.header) or width <= 0:
+			with self._memLock:
+				lone = width == 1 and len(self.header) > 1 and any(not any(row[1:]) for row in OrderedDict.values(self))
+			if lone:  # (under the whole header they would read as deletions: _legacyWidened)
+				lines = [_encodeRow(_sanitize(self.header[:1],delimiter=delimiter),delimiter,encoding,errors,what='header')]
 			return lines
 		with self._memLock:
 			key = next((key for key, row in OrderedDict.items(self) if len(row) == width and not str(key).startswith('#')

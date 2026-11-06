@@ -14670,3 +14670,14 @@ def test_a_one_column_header_widens_when_every_row_holds_a_value(tmp_path):
 	assert dict(t) == {'a': ['a', '1'], 'b': ['b', '2']}
 	t.close()
 	assert _bytes(p) == b'id\tv\na\t1\nb\t2\n'
+
+
+def test_a_one_column_file_made_again_under_a_wider_header_keeps_its_lone_rows(tmp_path):
+	# The header went in whole, so the lone keys read back as deletions: `id\tv\na\nb\n` reads {}.
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'id\na\nb\n')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	os.remove(p)
+	t.hardMapToFile()
+	t.close()
+	assert list(TSVZ.readTabularFile(p, header='id\tv', strict=False)) == ['a', 'b']
