@@ -216,8 +216,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   lines are committed (one tick, `append_check_delay`, 10 ms by default) can still lose: the commit order decides,
   as for any queued line. Measured on 3.14 (40 tries each, another process writing `o2` while the store moved
   another key to the front): a write 4 ms and 1 ms before the call, none lost; at the call, 26 lost; 1, 3, 5, 8 and
-  10 ms after it, 5, 7, 9, 13 and 11 lost; 11 and 13 ms after it, none lost. So the window is one tick, and a write
-  in it lost in 45 of 200 tries after the call (more the later in the tick), and 26 of 40 at the call.
+  10 ms after it, 5, 7, 9, 13 and 11 lost; 11 and 13 ms after it, none lost. So the window is about one
+  tick, and a write in it lost in 45 of 200 tries after the call, and 26 of 40 at the call.
 - Why: the moved rows are queued from memory and written at the next tick, and a write that lands in between is
   not read before them; closing the window would mean holding the file from the call to the commit.
 - Revisit when: someone loses a row this way.
@@ -238,9 +238,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### Repeated move_to_end of a row read before the defaults grows the file
 - Kind: known limitation
 - What the operator sees: a row that holds an empty cell the file's defaults would fill (it was read before the
-  `#_defaults_#` line, so it reads empty) adds a reset and a defaults line to the file with each `move_to_end`: 600
-  moves took a 28-byte file to 9037 bytes, and neither a rewrite nor a scrub takes them out. Reads stay correct. Rows
-  filled when the file is opened are stable.
+  `#_defaults_#` line, so it reads empty) adds a reset and a defaults line to the file with each `move_to_end`: 300
+  moves took a 28-byte file to 11,728 bytes and 600 moves to 23,428. A rewrite takes out about a quarter of that
+  (9,037 and 18,037 bytes), and a scrub nothing further. Reads stay correct. Rows filled when the file is opened
+  are stable.
 - Why: the compaction keeps every `#_defaults_#` line, and changing that rule for this corner adds risk to every
   file.
 - Revisit when: someone sees a file grow this way.
@@ -251,7 +252,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: `tsvz delete FILE b` on a file `a\nb\nc\n` exits 0 and the file grows to `a\nb\nc\nb\n`:
   `b` stays, since a lone key is a row in a one-column file. `TSVZedLite`'s `del` appends the same line. 5.4 writes
   the same bytes. `TSVZed` now deletes in such a file (it takes the key's lines out), so the two differ. `tsvz
-  serve` was not run on this.
+  serve` does the same on 5.5 and 5.4 (exit 0, the key stays, `has` exits 0).
 - Why: both append a deletion line, as in 5.4, and a lone key is a row in a one-column file; 5.5's change was to
   `TSVZed`.
 - Revisit when: right after 5.5.
@@ -269,7 +270,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### Deleting many keys of a big one-column file rewrites it once per commit
 - Kind: known limitation
 - What the operator sees: a `TSVZed` on a one-column file does one whole-file rewrite per commit however many
-  deletes that commit holds: about 0.7 s per commit at 100,000 keys. A program deleting all the time pays that once
+  deletes that commit holds: about 1 s per commit at 100,000 keys. A program deleting all the time pays that once
   per `append_check_delay`.
 - Why: a one-column file cannot write a deletion as a line.
 - Revisit when: someone deletes often in a big one-column store.
@@ -284,3 +285,61 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: the first keyed line sets the column count, and a lone key at two columns is a deletion in every version.
 - Revisit when: someone hits it.
 - Approved: 2026-11-05, the user chose "Known limitation (Recommended)".
+
+### A header wider than the file's line 1 is not written into line 1
+- Kind: deferred to 5.6
+- What the operator sees: a program gives a header wider than the file's line 1 (it added a column: line 1
+  `id\tv`, header `id\tv\tw`). 5.5 keeps the file's width and prints "Header mismatch" at every open. Rows already in
+  the file, and rows whose last cell is empty, raise IndexError when the program reads the new column. Even
+  `hardMapToFile()` leaves line 1 as it is, so the way out today is editing line 1 by hand. 5.4 widened line 1 at a
+  rewrite. No data is lost.
+- Why: 5.5 no longer writes its header over a line 1 that is not that header (5.4 did, and a reader given no header
+  lost the row line 1 was).
+- Revisit when: 5.6, which lets a rewrite widen line 1 to the header the program gives.
+- Approved: 2026-11-05, the user chose "README now, fix in 5.6 (Recommended)".
+
+### move_to_end follows the file first, so it waits for the lock and slows beside a busy writer
+- Kind: known limitation
+- What the operator sees: `move_to_end` reads what another process changed before it queues the rows it moves, so it
+  waits while another process holds the file's lock (3.000 s against 0.000 s in a test), and slows when another
+  process writes: on 100,000 rows with a writer at 20 Hz, 28 moves/s and a slowest call of 1.774 s (5.4: 1.2 million
+  moves/s and 0.008 s). The wait is bounded and nothing livelocks. It also raises KeyError for a key another process
+  has deleted, as its docstring says (5.4 succeeded).
+- Why: without that read the rows it appends again undo the other process's change (the entry on a write between a
+  `move_to_end` and its commit).
+- Revisit when: a program starts calling it on a busy store.
+- Approved: 2026-11-05, the user chose "Known limitation (Recommended)".
+
+### A same-size change by a writer that takes no lock can be missed by a running TSVZed
+- Kind: known limitation
+- What the operator sees: a running `TSVZed` notices another process's change by the file's modification time and
+  size. A change that keeps the size, made by a writer that takes no lock (another tool, TSVZ before 5.1), can go
+  unseen: 39 of 6000 changes at a 1 ms tick (43 of 6000 on 5.4, so it is not new). Memory then stays stale until the
+  file changes again. TSVZ's own writers are not exposed: their rewrites run behind the read lock.
+- Why: the cause is not verified; the likely one is that the file's time moves before the new bytes land, so a read
+  in between takes the old bytes with the new time. Seeing it for certain would mean reading the file again at every
+  tick.
+- Revisit when: a real store is edited by such a tool.
+- Approved: 2026-11-05, the user chose "Known limitation (Recommended)".
+
+### A one-cell set after another process empties a one-column file acts as a delete
+- Kind: deferred to 5.6
+- What the operator sees: another process empties a one-column file while the store has nothing queued. The store's
+  column count becomes unknown, and its next one-cell `set` acts as a delete with a warning, so that write is lost.
+  1 of 8000 fuzz cases (`bdel o0; async; aset a2` at one column); 5.4 does the same.
+- Why: a lone key is a deletion unless the column count says one column, and it says nothing after the file is
+  emptied.
+- Revisit when: 5.6, with the one-column delete fix deferred there.
+- Approved: 2026-11-05, the user chose "Deferred to 5.6 (Recommended)".
+
+### setDefaults() to another cell count changes how the file reads, not the rows memory holds
+- Kind: known limitation
+- What the operator sees: `setDefaults()` with another cell count than the file's rows (two cells or more set the
+  column count a reader takes) leaves memory's rows as they are, and the file unchanged at the commit. A rewrite
+  keeps the data and adds the defaults line. A reopen given those defaults then reads the file at the new count,
+  which can read `{}` (a one-column file's lone keys are deletions at two columns), while a plain reopen reads the
+  rows. 5.4 was worse: memory was `{}` after the call, and its rewrite wiped the file.
+- Why: the user chose to allow a `setDefaults()` that changes the column count.
+- Revisit when: someone loses rows to it.
+- Approved: 2026-11-05, the user chose "Allow it, document it (Recommended)" when asked whether `setDefaults()` may
+  change the column count.

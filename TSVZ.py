@@ -5181,7 +5181,10 @@ class TSVZed(OrderedDict):
 	strict : bool, default=False
 		If True, enforces strict validation of column counts and raises errors on mismatch.
 	correctColumnNum : int, default=-1
-		Expected number of columns. -1 means auto-detect from header or first record.
+		Kept for compatibility, and no longer the store's column count (5.5): that is the header's, the
+		defaults' (two cells or more) or the first keyed line's, whatever this says, and rows are not
+		padded to it or cut to it (5.4 padded them, and a count that did not fit the file lost data at a
+		rewrite). Pad rows yourself, or give a header or defaults.
 	errors : str, default='strict'
 		What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8
 		file name (os.fsdecode). 'strict' raises a ValueError (TSVZEncodeError) naming it, from the

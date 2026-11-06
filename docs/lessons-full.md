@@ -121,3 +121,18 @@ entries go last, in the same commit as the change:
   write goes through, so reads and retries keep it with no extra part. And when a fuzzer's invariant keeps flagging
   what the design allows ("reopen == memory" against defaults the program changed), restate it as what the operator
   relies on (the rewrite changes nothing the same reader reads) before patching code to it.
+
+## 2026-11-05 TSVZ 5.5: correctColumnNum= on a TSVZed no longer pads
+- Changed: `TSVZed(correctColumnNum=N)` no longer makes `N` the store's column count: the count is the one the read
+  takes (the header's, the defaults' of two cells or more, or the first keyed line's), rows are not padded to `N`
+  or cut to it, and no rewrite writes them that way. `readTabularFile(correctColumnNum=N)` still pads to `N`.
+- Why we had to change: a caller's `N` that did not fit the file lost data in 5.4. `N=1` on a file `a\t1\nb\t2\n` cut
+  every row to its key at the next rewrite, and `N=3` on a file `a\nb\n` left memory empty (`a` and `b` read as
+  deletions at three columns) and its rewrite emptied the file. A caller's `N` that fitted changed nothing the file
+  did not already say.
+- Original design was wrong because: a number the caller gives about the file's layout was trusted over the file,
+  and the rewrite then made the file say it. The width is a fact of the layout, found by one rule from the file
+  (see 5.2 and 5.5 above), so a second source for it could only agree with the file or lose data.
+- Lesson: an argument that restates a fact of the file the library can read for itself is a hint at best: read the
+  file, and never let the hint rewrite it. A caller who wants padded rows pads them (or gives a header or defaults),
+  and the library's padding is the file's own rule.

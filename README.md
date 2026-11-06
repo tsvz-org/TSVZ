@@ -359,10 +359,15 @@ writes.
   the key alone).
 - **`setDefaults()` can change a header-less store's column count.** Defaults of two cells
   or more set the column count a reader takes, so defaults with another cell count change
-  how the file reads: the rows narrower than that are padded and filled with them, and a
-  strict reader's check moves with them. The last `setDefaults()` wins, and is what a whole
-  reload starts from. A rewrite changes nothing this store's reader reads, except what
-  memory changed; pass the same defaults to every reader of the file.
+  how the file reads: a reader pads the rows narrower than that and fills them with the
+  defaults, and a strict reader's check moves with them. The store itself leaves memory's
+  rows as they are and does not change the file at the commit. In a one-column file the
+  lone keys are deletions at two columns: a reopen given those defaults can read `{}`, where
+  a plain reopen reads the rows (5.4 showed `{}` at once, and its rewrite emptied the file).
+  The last `setDefaults()` wins, and is what a whole reload starts from. A rewrite changes
+  nothing this store's reader reads, except what memory changed (it keeps the data and adds
+  the defaults line); pass the same defaults to every reader of the file
+  ([entry](docs/limitations.md#setdefaults-to-another-cell-count-changes-how-the-file-reads-not-the-rows-memory-holds)).
 - **A cell that is whitespace once unescaped (`<LF>`) is still filled with the defaults
   when a `TSVZed` loads it** (as 5.4): only the cells its right-strip empties;
   `id\tv\n#_defaults_#\tNA\nk\t<LF>` loads `[k, NA]`.
@@ -380,6 +385,12 @@ writes.
 - **`TSVZed.correctColumnNum` after a load is the column count the read took** (the
   header's, the defaults', or the first keyed line's), not the first row's length, which
   a wider row can now exceed.
+- **`TSVZed(correctColumnNum=N)` no longer pads, and no longer cuts.** The store's column
+  count is the one the read takes (above), whatever `N` says: 5.4 padded every row to `N`
+  in memory and at the next rewrite, and a wrong `N` lost data (`N=1` cut `a\t1` to `a` at
+  a rewrite; `N=3` on a file `a\nb\n` left memory empty, and its rewrite emptied the file).
+  A program that relied on `N` to pad its rows pads them itself, or gives a header or
+  defaults. `readTabularFile(correctColumnNum=N)` still pads to `N`.
 - **A scrub compacts by dropping lines.** `scrubTabularFile`, `tsvz scrub` and a handler
   `scrub` drop comments, empty lines, superseded lines and dead keys' lines, and keep
   every other line byte for byte where it was. A `#_defaults_#` line the same as the one
@@ -439,15 +450,15 @@ writes.
 - **A file whose first keyed line is a bare `#_defaults_#` reads as one column without
   defaults**: pass the defaults the file's program uses
   ([docs/limitations.md](docs/limitations.md#a-file-whose-first-keyed-line-is-a-bare-_defaults_-reads-as-one-column-without-defaults)).
-- **A `TSVZed` given a header that line 1 is not takes its column count from the first
-  keyed line, as readers do** (it took the header's, and a delete in a one-column file
-  was written as a row). A `.nsv` file's compaction keeps the empty cells at the end of a
+- **A `TSVZed` given a header that line 1 is not takes its column count as readers do**:
+  from the defaults when they have two cells or more, else from the first keyed line (it
+  took the header's, and a delete in a one-column file was written as a row). A `.nsv` file's compaction keeps the empty cells at the end of a
   line, which its reader keeps (it took them off and could drop a row).
 - **Known limitations of one-column files and moves** (each has an entry in
   [docs/limitations.md](docs/limitations.md)):
   - a delete in a one-column file can undo another process's write that lands just
     before it ([entry](docs/limitations.md#a-one-column-delete-can-undo-another-processs-write-that-lands-just-before-it));
-  - deleting many keys of a big one-column file rewrites it once per commit, about 0.7 s
+  - deleting many keys of a big one-column file rewrites it once per commit, about 1 s
     at 100,000 keys
     ([entry](docs/limitations.md#deleting-many-keys-of-a-big-one-column-file-rewrites-it-once-per-commit));
   - a store emptied at one column and then given a wider row first loses the lone keys
@@ -459,7 +470,25 @@ writes.
   - repeated `move_to_end` of a row read before the defaults grows the file
     ([entry](docs/limitations.md#repeated-move_to_end-of-a-row-read-before-the-defaults-grows-the-file));
   - a wider row that a move writes again is lost to 3.39 to 5.4 strict readers
-    ([entry](docs/limitations.md#a-wider-row-that-a-move-writes-again-is-lost-to-old-strict-readers)).
+    ([entry](docs/limitations.md#a-wider-row-that-a-move-writes-again-is-lost-to-old-strict-readers));
+  - a one-cell `set` after another process empties a one-column file acts as a delete, with a
+    warning, so that write is lost (as in 5.4; planned for 5.6)
+    ([entry](docs/limitations.md#a-one-cell-set-after-another-process-empties-a-one-column-file-acts-as-a-delete)).
+- **A header wider than the file's line 1 is not written into line 1** (planned for 5.6;
+  5.4 widened it at a rewrite). A program that adds a column to its header finds that 5.5
+  keeps the file's width: "Header mismatch" prints at every open, and rows already in the
+  file (and rows whose last cell is empty) raise IndexError on the new column. Nothing is
+  lost. Until 5.6, edit line 1 of the file by hand to add the column
+  ([entry](docs/limitations.md#a-header-wider-than-the-files-line-1-is-not-written-into-line-1)).
+- **`move_to_end` follows the file first**, so it waits while another process holds the
+  file's lock and slows beside a busy writer (100,000 rows and a writer at 20 Hz: 28
+  moves/s, 5.4: 1.2 million), and it raises `KeyError` for a key another process has
+  deleted, as its docstring says (5.4 succeeded)
+  ([entry](docs/limitations.md#move_to_end-follows-the-file-first-so-it-waits-for-the-lock-and-slows-beside-a-busy-writer)).
+- **A running `TSVZed` can miss a same-size change by a writer that takes no lock** (another
+  tool, TSVZ before 5.1): memory stays stale until the file changes again. TSVZ's own writers
+  are not exposed
+  ([entry](docs/limitations.md#a-same-size-change-by-a-writer-that-takes-no-lock-can-be-missed-by-a-running-tsvzed)).
 
 ## Upgrading to 5.4 from 5.3
 
