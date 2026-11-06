@@ -715,13 +715,14 @@ def test_a_handler_pop_during_another_process_locked_rewrite_returns_and_deletes
 # Hangs and starvation
 # ---------------------------------------------------------------------------
 STORE = r'''
-import signal
+import atexit, signal
 p, queued = ARGS[0], ARGS[1] == 'queued'
 if queued:
 	t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
 	say('open')
 	released(p + '.go')
 	t['new'] = ['new', 'N']
+	atexit.register(say, 'exiting')  # (runs before TSVZ's own: the last registered runs first)
 	say('closing')
 	t.close()
 else:
@@ -760,27 +761,40 @@ def test_ctrl_c_at_close_of_a_store_with_a_queued_row_ends_after_three(tmp_path,
 	# 3.9 to 3.12 ended at one: a Ctrl-C in Thread.join() marks the thread as stopped while it runs, so the exit did not
 	# wait for it and dropped the row.
 	p = _tsv(tmp_path, 20)
-	store = _child(STORE, p, 'queued', kind=kind)
+	# (unbuffered: before 3.9 stderr into a pipe holds its text until the exit, and the test goes by it)
+	store = _child(STORE, p, 'queued', kind=kind, env=dict(os.environ, PYTHONUNBUFFERED='1'))
 	holder = None
 	try:
 		_expect(store, 'open')
 		holder = _hold(p, 'native', kind=kind)
 		open(p + '.go', 'w').close()
 		_expect(store, 'closing')
+		seen = []
+
+		def read():
+			for line in iter(store.stderr.readline, b''):
+				seen.append(line)
+		reader = threading.Thread(target=read)
+		reader.daemon = True
+		reader.start()
+		# Each Ctrl-C goes in once the last one has shown: a second sent before the first is taken would be lost.
 		time.sleep(0.5)
-		signals = 0
-		for _ in range(3):
-			if store.poll() is not None:
-				break
-			store.send_signal(signal.SIGINT)
-			signals += 1
-			try:
-				store.wait(3)
-			except subprocess.TimeoutExpired:
-				pass
-		assert store.poll() is not None, 'three Ctrl-Cs did not end the program'
-		err = store.stderr.read() + store.stdout.read()
-		assert signals == 3 and b'being finished' in err, (signals, err)
+		store.send_signal(signal.SIGINT)
+		_expect(store, 'exiting', timeout=120)
+		time.sleep(0.5)
+		assert store.poll() is None, b''.join(seen)
+		store.send_signal(signal.SIGINT)
+		deadline = time.time() + 120
+		while time.time() < deadline and not any(b'being finished' in line for line in seen):
+			time.sleep(0.02)
+		assert any(b'being finished' in line for line in seen), b''.join(seen)
+		time.sleep(0.5)
+		assert store.poll() is None, b''.join(seen)
+		store.send_signal(signal.SIGINT)
+		try:
+			store.wait(120)
+		except subprocess.TimeoutExpired:
+			raise AssertionError('three Ctrl-Cs did not end the program')
 	finally:
 		_release(p)
 		_kill(store, holder)
@@ -1032,14 +1046,13 @@ def test_a_rewrite_is_not_starved_by_two_appending_stores(tmp_path, kind):
 	children = []
 	try:
 		for _ in range(2):
-			children.append(_child(SETTER, p, 15, kind=kind))
+			children.append(_child(SETTER, p, 300, kind=kind))
 		for child in children:
 			_expect(child, 'started', timeout=60)
 		time.sleep(1)
-		start = time.time()
 		a.hardMapToFile()
-		took = time.time() - start
-		assert took < 10, 'the rewrite was starved: {:.1f} s'.format(took)
+		# (no deadline: how long a rewrite takes is the machine's load. Starved, it would end after they do.)
+		assert [child.poll() for child in children] == [None, None], 'the rewrite was starved'
 	finally:
 		_kill(*children)
 		a.close()
@@ -1195,17 +1208,17 @@ def test_overlapping_one_shot_reads_do_not_hold_off_a_rewrite_or_the_appends_beh
 	readers, appender = [], None
 	try:
 		for _ in range(3):
-			readers.append(_child(LOOP_READER, p, 20, kind='ofd'))
+			readers.append(_child(LOOP_READER, p, 300, kind='ofd'))
 		for reader in readers:
 			_expect(reader, 'reading')
 		time.sleep(1)
 		appender = _child('time.sleep(0.5)\n' + APPEND_TIMED, p, kind='ofd')
-		start = time.time()
 		t.hardMapToFile()
-		took = time.time() - start
-		out, err = appender.communicate(timeout=30)
-		assert took < 5, 'the rewrite was held off by reads: {:.1f} s'.format(took)
-		assert float(out.decode().split()[-1]) < 5, 'an append waited behind the held-off rewrite: ' + out.decode()
+		# (no deadline: held off, the rewrite and the append would end only after the readers do)
+		assert [reader.poll() for reader in readers] == [None, None, None], 'the rewrite was held off by reads'
+		out, err = appender.communicate(timeout=300)
+		assert appender.returncode == 0, err
+		assert [reader.poll() for reader in readers] == [None, None, None], 'an append waited behind the held-off rewrite'
 	finally:
 		_kill(appender, *readers)
 		t.close()

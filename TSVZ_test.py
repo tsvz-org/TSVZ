@@ -7015,6 +7015,8 @@ while not os.path.exists(stop):
 		g.flush()
 		fcntl.lockf(g, fcntl.LOCK_UN)
 	n += 1
+	if n == 11:
+		open(path + '.ran', 'w').close()
 	time.sleep(0.003)
 print(n)
 '''
@@ -7028,14 +7030,18 @@ def test_tsvzed_legacy_rows_survive_rewrites_and_reloads_for_another_process_str
 	stop = str(tmp_path / 'stop')
 	t = TSVZ.TSVZed(p, header='key\tv', append_check_delay=0.0005, rewrite_interval=0.0001, rewrite_on_load=False)
 	other = subprocess.Popen([sys.executable, '-c', _OTHER_WRITER, p, stop], stdout=subprocess.PIPE)
+	written = 0
 	try:
 		time.sleep(0.1)
-		for i in range(2000):
+		# (until the other writer has written too: on a loaded host 2000 sets can end before it starts)
+		while written < 2000 or not (os.path.exists(p + '.ran') or other.poll() is not None):
+			i = written
 			t['a%d' % i] = ['a%d' % i, 'A']
 			if i % 5 == 0:
 				t['a0'] = ['a0', str(i)]  # an overwrite keeps it dirty, so rewrites happen
 			if i % 10 == 0:
 				time.sleep(0.0005)
+			written += 1
 	finally:
 		_touch(stop)
 		count = int(other.communicate(timeout=30)[0])
@@ -7043,7 +7049,7 @@ def test_tsvzed_legacy_rows_survive_rewrites_and_reloads_for_another_process_str
 	t.close()
 	back = TSVZ.readTabularFile(p, header='key\tv')
 	assert count > 10
-	assert [k for k in ('a%d' % i for i in range(2000)) if k not in back] == []
+	assert [k for k in ('a%d' % i for i in range(written)) if k not in back] == []
 	assert [k for k in ('ext%d' % j for j in range(count)) if k not in back] == []
 
 
@@ -7701,9 +7707,7 @@ def test_tsvzed_legacy_rewrite_that_keeps_failing_still_reloads_another_process_
 	for _ in range(10):
 		t._failed('rewrite', 'Permission denied', False)  # it kept failing: the next try is a minute away
 	_append_external(p)
-	started = time.time()
-	assert _wait_for(lambda: 'ext' in t, 3), 'another process\'s change was not reloaded while the rewrite waits'
-	assert time.time() - started < 3
+	assert _wait_for(lambda: 'ext' in t, 50), 'another process\'s change was not reloaded while the rewrite waits'
 	monkeypatch.undo()
 	t._worked('rewrite')
 	t.close()
