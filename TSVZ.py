@@ -525,7 +525,8 @@ def _fileDefaultsAtEnd(lines, width, delimiter, encoding, consumed, strict, star
 	enc = encoding or 'utf8'
 	for line in (itertools.islice(lines, 1, None) if consumed else lines):
 		if line.lstrip(b'\x00').startswith(DEFAULTS_INDICATOR_KEY.encode(enc)):
-			_processLine(line.decode(enc, errors='replace'), {}, width, strict=strict, delimiter=delimiter, defaults=defaults)
+			_processLine(line.decode(enc, errors='replace') + '\n', {}, width, strict=strict, delimiter=delimiter,
+						 defaults=defaults)  # (a line with its newline, as the reader gets it)
 	return _trimmedCells(defaults)
 
 

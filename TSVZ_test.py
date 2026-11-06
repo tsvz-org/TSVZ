@@ -13927,6 +13927,27 @@ def test_a_nsv_drop_keeps_a_line_with_trailing_empty_cells_a_row(tmp_path):
 	assert list(TSVZ.readTabularFile(p)) == ['b'] and list(_quiet_tsvzed(p)) == ['b']
 
 
+@pytest.mark.parametrize('ext, d', [('.tsv', '\t'), ('.nsv', '\0')])
+def test_a_rewrite_puts_a_reset_before_the_stores_defaults_also_in_a_nsv_file(tmp_path, ext, d):
+	# The defaults the file's lines end with were read without the newline, so a .nsv line `#_defaults_#<NUL>2<NUL>X<NUL>`
+	# lost its last cell, a strict reader dropped it as narrow, and no reset went in front of the store's defaults:
+	# c read filled by the file's defaults (2).
+	p = str(tmp_path / ('d' + ext))
+	_touch(p, 'a\t\t\n#_defaults_#\t\t\t\na\t\t\nc\t\t1\n#_defaults_#\t2\tX\t\n'.replace('\t', d).encode())
+	kw = dict(strict=True, defaults=['#_defaults_#', '', ''], rewrite_on_load=False, monitor_external_changes=False, verbose=False)
+	t = TSVZ.TSVZed(p, append_check_delay=60, **kw)
+	t.setDefaults(['', '', 'Q'])
+	t['e'] = ['e', '', '1', '2']
+	t.commitAppendToFile()
+	t.hardMapToFile()
+	given = list(t._givenDefaults)
+	t.close()
+	kw['defaults'] = given
+	t = TSVZ.TSVZed(p, **kw)
+	assert dict(t) == {'e': ['e', '', '1', '2'], 'c': ['c', '', '1', 'Q']}
+	t.close()
+
+
 def test_a_nsv_last_line_without_a_newline_is_kept_as_the_reader_takes_it(tmp_path):
 	# The reader strips the NULs at the end of a last line that has no newline (`a\0` is the key a, one cell); the
 	# rewrite and the scrub end every line with a newline, and then the NUL is a cell: a two-cell line, a deletion.
