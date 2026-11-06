@@ -14022,6 +14022,34 @@ def test_set_defaults_during_a_whole_read_stays(tmp_path, monkeypatch):
 	t.close()
 
 
+def test_set_defaults_during_the_read_of_an_appended_defaults_line_stays(tmp_path, monkeypatch):
+	# _applyAppended put the defaults another process appended over the ones setDefaults() gave while it read them
+	# (_readFrom already kept them): a row set next was filled with the other process's defaults.
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, b'key\tval\tx\na\t1\t2\n')
+	t = _stopped(p, header='key\tval\tx')
+	_append_external(p, b'#_defaults_#\tO\tOX\n')  # another process's defaults line
+	new = ['#_defaults_#', 'N', 'NX']
+	real = TSVZ._legacyReadLoop
+	calls = []
+
+	def loop(stream, fileName, *args, **kwargs):
+		result = real(stream, fileName, *args, **kwargs)
+		if fileName == '':  # (_applyAppended's read of the tail)
+			calls.append(1)
+			t.setDefaults(new)  # (from another thread, between its unlocked read of memory's defaults and its apply)
+		return result
+	monkeypatch.setattr(TSVZ, '_legacyReadLoop', loop)
+	t.checkExternalChanges()
+	t.rewrite()  # follows it
+	monkeypatch.undo()
+	assert calls == [1]
+	assert t.defaults == new and t._readWhole
+	t['z'] = ['z', '', '']
+	assert dict(t)['z'] == ['z', 'N', 'NX']
+	t.close()
+
+
 def test_the_rewrite_survives_a_key_deleted_while_its_line_moves_up(tmp_path, monkeypatch, capsys):
 	# _snapshotForRewrite tested the key in memory, then read its row under the lock: a caller deleting it between
 	# the two made the rewrite fail with a TypeError.

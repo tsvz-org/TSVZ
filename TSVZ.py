@@ -6663,6 +6663,7 @@ memoryOnly:{self.memoryOnly}
 				if first and not _headerMatches(self.header, line, self.delimiter):
 					return line, False
 			defaults = list(self.defaults)
+			given = self._givenDefaults
 			changes = _TSVZedMerge(self, self.correctColumnNum, list(defaults))
 			width = _legacyReadLoop(io.BytesIO(rest), '', changes, self.correctColumnNum, 0, self.strict, self.delimiter,
 									changes.defaults, False, self.encoding, reporter)[0]
@@ -6687,8 +6688,8 @@ memoryOnly:{self.memoryOnly}
 					OrderedDict.__setitem__(self, key, row)
 					if readded:  # deleted and set again: a read of the file has it at the end, not in its old place
 						OrderedDict.move_to_end(self, key)
-			if changes.defaults != defaults and DEFAULTS_INDICATOR_KEY not in queued:
-				self.defaults = changes.defaults
+			if changes.defaults != defaults and DEFAULTS_INDICATOR_KEY not in queued and self._givenDefaults is given:
+				self.defaults = changes.defaults  # (not when setDefaults() gave others during the read: they stay)
 			if self.correctColumnNum == -1 and self:
 				self.correctColumnNum = width if width > 0 else len(self[next(iter(self))])
 		if self.verbose:
