@@ -684,7 +684,13 @@ while True:
 '''
 
 
-def test_a_handler_that_stops_answering_times_out(tmp_path):
+def test_a_handler_that_stops_answering_times_out(tmp_path, monkeypatch):
+	# (the `-V` probe and the handler's start share the 2 s timeout; on a loaded host the probe timed out and the
+	# implementation was skipped, or the handler was not up in time. The loads' own 2 s socket timeout, which is what
+	# this proves, is the harness's timeout and is unchanged.)
+	real_probe, real_handler = tb.probe, tb.Handler
+	monkeypatch.setattr(tb, 'probe', lambda impl, directory, timeout: real_probe(impl, directory, 60.0))
+	monkeypatch.setattr(tb, 'Handler', lambda impl, store, directory, wait=None: real_handler(impl, store, directory, 60.0))
 	script = tmp_path / 'mute.py'
 	script.write_text(MUTE)
 	command = '%s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)))
