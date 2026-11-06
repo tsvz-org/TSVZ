@@ -152,3 +152,17 @@ entries go last, in the same commit as the change:
 - Lesson: an argument is an input: work on a copy, and give what the read found its own way out (a return value, an
   attribute). Before making two entry points agree by routing both through one normaliser, check what each form means
   to each: a shared helper here would have moved every list that does not begin with `#_defaults_#` one cell over.
+
+## 2026-11-06 TSVZ 5.6: rewrite(force=True) always writes
+- Changed: `rewrite(force=True)` writes the file whatever `dirty` says, as `mapToFile()` does, and so do `rewrite_on_load`
+  and `rewrite_on_exit` (not over damage in a compressed file that no row went after). `rewrite()` without `force` is
+  unchanged: it follows another process's change.
+- Why we had to change: a row changed in place does not set `dirty`, so `rewrite(force=True)` returned True, wrote nothing,
+  and the change went with the store; `rewrite_on_load=True` left comment lines alone. Rewrites are moving to explicit
+  calls only, and an explicit call must do what it says.
+- Original design was wrong because: `force` in 3.39 meant "do not skip the sync", and the write inside stayed behind
+  `dirty`, a flag that says what the store knows it changed, not what the caller asked for. It returned True all the
+  same.
+- Lesson: a flag named for doing something does it. `dirty` may schedule automatic work; it never gates a call that
+  asked for the work. Check what an automatic path would now destroy: a forced write must not ride along into a path
+  that never asked (a close over damage).

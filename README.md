@@ -312,6 +312,17 @@ The file formats are unchanged.
   (`['', 'X']` fills cell 1), as every reader since 3.39 has, and `TSVZed` puts
   `#_defaults_#` in front of it (`['', 'X']` fills cell 2).
 
+- **`rewrite(force=True)` always writes.** On a clean store it returned True and wrote
+  nothing, so a row changed in place (`t['a'][1] = 'X'`, which does not make the store
+  dirty) was gone after `close()`. It now writes as `mapToFile()` does, and compacts the file,
+  whatever `dirty` says. `rewrite_on_load=True` and `rewrite_on_exit=True` do the same, each
+  at its one moment, with one exception: over damage in a compressed file that no row was
+  written after, they leave the file as it is, since the bytes past the damage hold rows no
+  read reached (`rewrite(force=True)`, `mapToFile()` and `hardMapToFile()` write there too).
+  A program that called `rewrite(force=True)` only to follow another process's change now
+  pays a whole rewrite for it: `rewrite()` follows it and writes nothing. `rewrite_interval`
+  still writes only a dirty store. A `.tsvz` still ignores all of these.
+
 ## Upgrading to 5.5 from 5.4
 
 The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family file 5.5
@@ -322,9 +333,7 @@ writes.
   rewrote a legacy file at open only when it held a superseded line (a key restated with
   another row, a deletion of a live key). Compact a file explicitly: call `mapToFile()` or
   `hardMapToFile()`, or scrub it (`scrubTabularFile`, `tsvz scrub`), or pass
-  `rewrite_on_load=True` (which, like `rewrite(force=True)` and `rewrite_on_exit`, writes
-  only a dirty store: `dirty` is True for a key restated with another row or a deletion of
-  a live key, not for a new row or comment lines). A store still makes again a file that
+  `rewrite_on_load=True`. A store still makes again a file that
   is damaged or removed, since its memory is then the only copy. The three automatic-rewrite options
   (`rewrite_on_load`, `rewrite_on_exit`, `rewrite_interval`) are planned to be removed in
   a future version in favour of those explicit calls.
@@ -332,14 +341,12 @@ writes.
   process's change no longer rewrites the file at its next tick because it holds changes
   of its own; `rewrite()` without `force=True` only follows such a change, and rewrites
   when `rewrite_interval` says so. A rewrite happens on `mapToFile()` and `hardMapToFile()`
-  (always), on `rewrite(force=True)` and the options above set explicitly (only when the
-  store is dirty), and on its own in two cases:
+  (always), on `rewrite(force=True)` and the options above set explicitly (in 5.5 only when
+  the store is dirty: `dirty` is True for a key restated with another row or a deletion of a
+  live key; from 5.6 `rewrite(force=True)`, `rewrite_on_load` and `rewrite_on_exit` always
+  write, see [Upgrading to 5.6](#upgrading-to-56-from-55)), and on its own in two cases:
   making again a damaged, removed or emptied file, and the next commit after a delete in a
-  one-column store (below). A row changed in place does not make the store dirty: on a clean
-  store, `t['a'][1] = 'X'` then `rewrite(force=True)` returns True and writes nothing, the
-  change is gone after `close()`, and only `mapToFile()` and `hardMapToFile()` write it (as
-  in 5.4; planned for 5.6,
-  [entry](docs/limitations.md#rewriteforcetrue-on-a-clean-store-writes-nothing)).
+  one-column store (below).
 - **`move_to_end` appends instead of rewriting.** `t.move_to_end(k)` appends `k`'s deletion
   line, then its row, so every reader sees the new order at once; it no longer turns on the
   rewrite at exit or warns "Need to resync", and it refuses a row the encoding cannot hold

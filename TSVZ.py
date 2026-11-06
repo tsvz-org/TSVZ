@@ -5175,11 +5175,11 @@ class TSVZed(OrderedDict):
 	verifyHeader : bool, default=True
 		If True, verifies that the file header matches the provided header.
 	rewrite_on_load : bool, default=False
-		If True, rewrites (compacts) the file when loading. 5.5 turned the default off (3.39 to 5.4: on); call
+		If True, rewrites (compacts) the file when loading, dirty or not (5.6). 5.5 turned the default off (3.39 to 5.4: on); call
 		mapToFile() or hardMapToFile(), or scrub the file, to compact it. The three automatic rewrites
 		(rewrite_on_load, rewrite_on_exit, rewrite_interval) are planned to go in a future version, for explicit calls.
 	rewrite_on_exit : bool, default=False
-		If True, rewrites the entire file when closing/exiting.
+		If True, rewrites the entire file when closing/exiting, dirty or not (5.6).
 	rewrite_interval : float, default=0
 		Minimum time interval (in seconds) between full file rewrites. 0 means do not rewrite.
 	append_check_delay : float, default=0.01
@@ -5218,9 +5218,10 @@ class TSVZed(OrderedDict):
 	dirty : bool
 		True once a key is restated with another row or a live key is deleted, in the file or by this store, and
 		after some failed writes. A new row does not set it.
-		rewrite(force=True), rewrite_on_exit and rewrite_interval write only then. mapToFile() and hardMapToFile() always write;
-		nothing else rewrites the file, except to make a damaged or removed file again from memory
-		and to compact a one-column file after a delete.
+		rewrite_interval writes only then. mapToFile(), hardMapToFile(), rewrite(force=True), rewrite_on_load and
+		rewrite_on_exit always write (the last two not over damage no row went after: see _rewrite); nothing else
+		rewrites the file, except to make a damaged or removed file again from memory and to compact a one-column file
+		after a delete.
 	deSynced : bool
 		True if synchronization with the file has failed or external changes detected.
 	memoryOnly : bool
@@ -5241,7 +5242,8 @@ class TSVZed(OrderedDict):
 		Refresh data from the TSV file, discarding in-memory changes. Unsafe after a failed rewrite
 		(see Notes): it replaces memory, the only good copy then, with the damaged file, and warns.
 	rewrite(force=False, reloadInternalFromFile=None)
-		Rewrite the entire file with current in-memory data.
+		Follow another process's change; force=True then rewrites the entire file with current in-memory data, always,
+		as mapToFile() does (it returns False when it could not, and reports why, where mapToFile() raises a refusal).
 	mapToFile()
 		Synchronize in-memory data to the file using in-place updates.
 	hardMapToFile()
@@ -5414,7 +5416,9 @@ class TSVZed(OrderedDict):
 	def load(self):
 		self.reload()
 		if self.rewrite_on_load and not self._spec:
-			self.rewrite(force = True)  # it takes in a change another process made since the read
+			# It takes in a change another process made since the read. Over damage no row went after, only an explicit
+			# call rewrites: the bytes past it hold rows no read reached.
+			self.rewrite(force = not self._remake)
 		return self
 
 	def reload(self):
@@ -6152,9 +6156,10 @@ memoryOnly:{self.memoryOnly}
 		"""rewrite() for a legacy file. ``background``: the background writer's tick, which takes in another process's
 		change at every tick, but makes no rewrite while one that failed waits to be tried again (see _failed).
 
-		Following another process's change never rewrites. A rewrite is made only when it is due: asked for (``force``),
-		rewrite_interval set and over with the file holding more than it needs (``dirty``), the file damaged or left
-		damaged with rows after the damage (memory is the only good copy), or one that failed being tried again."""
+		Following another process's change never rewrites. A rewrite is made when it is asked for (``force``: always,
+		dirty or not), and otherwise only when it is due and the file holds more than memory needs (``dirty``) or is
+		damaged: rewrite_interval set and over, the file damaged or left damaged with rows after the damage (memory is the
+		only good copy), or one that failed being tried again."""
 		due = (force or self._damaged or (self._remake and self.dirty) or 'rewrite' in self._failures or (
 			self.dirty and self.rewrite_interval != 0
 			and time.time() - getFileUpdateTimeNs(self._fileName) / 1e9 >= self.rewrite_interval))
@@ -6175,7 +6180,7 @@ memoryOnly:{self.memoryOnly}
 					self.__teePrintOrNot("Memory only mode. Map to file skipped.")
 				return False
 			made = True
-			if due and (self.dirty or self._damaged):
+			if force or (due and (self.dirty or self._damaged)):
 				if not force and not self._closing and self._refusalPending():
 					return False  # the last rewrite was refused (text that cannot be written): try again later, not at every tick
 				if background and self._failing('rewrite'):
@@ -7146,8 +7151,9 @@ memoryOnly:{self.memoryOnly}
 					try:
 						# A damaged file, or one another writer left damaged that rows went after (_remake and dirty), is
 						# tried once more, however lately a rewrite was refused (no failed one's back-off is waited out
-						# here either): memory holds the only good copy, and goes with the store.
-						self.rewrite(force=self.rewrite_on_exit or self._damaged or self._remake)  # Ensure any final sync operations are performed
+						# here either): memory holds the only good copy, and goes with the store. Over damage no row went
+						# after, only an explicit call rewrites: the bytes past it hold rows no read reached.
+						self.rewrite(force=self.rewrite_on_exit and not self._remake)  # Ensure any final sync operations are performed
 						if self._letGo:
 							self._commit()  # (the writer thread appends nothing more: the queued rows, here)
 					except BaseException:

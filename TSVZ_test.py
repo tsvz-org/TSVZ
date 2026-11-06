@@ -14166,3 +14166,81 @@ def test_tsvzedlite_still_takes_the_files_defaults_line(tmp_path):
 	t = TSVZ.TSVZedLite(p, strict=False)
 	assert t.defaults == ['#_defaults_#', 'P', 'Q'] and t['x'] == ['x', 'P', '1']
 	t.close()
+
+
+# --------------------------------------------------------------------------
+# 5.6: an explicit rewrite writes
+# --------------------------------------------------------------------------
+def test_rewrite_force_writes_a_row_changed_in_place_on_a_clean_store(tmp_path):
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'a\t1\nb\t2\n')
+	t = TSVZ.TSVZed(p, verbose=False)
+	assert not t.dirty
+	t['a'][1] = 'X'
+	assert t.rewrite(force=True) is True
+	assert b'a\tX\n' in _bytes(p)
+	t.close()
+	assert TSVZ.readTabularFile(p)['a'] == ['a', 'X']
+
+
+def test_rewrite_force_compacts_a_clean_store(tmp_path):
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'a\t1\n# note\n\nb\t2\n')
+	t = TSVZ.TSVZed(p, verbose=False)
+	assert not t.dirty
+	assert t.rewrite(force=True) is True
+	t.close()
+	assert _bytes(p) == b'a\t1\nb\t2\n'
+
+
+def test_rewrite_without_force_still_writes_nothing_on_a_clean_store(tmp_path):
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'a\t1\n# note\n\nb\t2\n')
+	t = TSVZ.TSVZed(p, verbose=False)
+	t['a'][1] = 'X'
+	assert t.rewrite() is False
+	t.close()
+	assert _bytes(p) == b'a\t1\n# note\n\nb\t2\n'
+
+
+def test_rewrite_on_exit_writes_a_clean_store(tmp_path):
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'a\t1\n# note\nb\t2\n')
+	t = TSVZ.TSVZed(p, rewrite_on_exit=True, verbose=False)
+	t['a'][1] = 'X'
+	t.close()
+	assert b'# note' not in _bytes(p) and TSVZ.readTabularFile(p) == {'a': ['a', 'X'], 'b': ['b', '2']}
+
+
+def test_rewrite_on_load_compacts_a_clean_file(tmp_path):
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'a\t1\n# note\nb\t2\n')
+	TSVZ.TSVZed(p, rewrite_on_load=True, verbose=False).close()
+	assert _bytes(p) == b'a\t1\nb\t2\n'
+
+
+def _damaged_gz(p):
+	"""A .tsv.gz whose later rows no read reaches: a whole member, then bytes that do not decode, then a whole member."""
+	_touch(p, gzip.compress(b'a\t1\n') + b'\x1f\x8b\x08garbage' + gzip.compress(b'b\t2\n'))
+
+
+@pytest.mark.parametrize('option', ['rewrite_on_exit', 'rewrite_on_load'])
+def test_an_automatic_rewrite_leaves_damage_alone_when_no_row_went_after_it(tmp_path, option):
+	# Only memory's rows would be left of the file, and the bytes past the damage hold rows no read reached. A store with
+	# nothing to add does not make that choice for the program: only an explicit call does.
+	p = str(tmp_path / 'r.tsv.gz')
+	_damaged_gz(p)
+	before = _bytes(p)
+	t = TSVZ.TSVZed(p, verbose=False, **{option: True})
+	assert t._remake
+	t.close()
+	assert _bytes(p) == before
+
+
+def test_rewrite_force_makes_a_file_with_damage_again_as_mapToFile_does(tmp_path):
+	p = str(tmp_path / 'r.tsv.gz')
+	_damaged_gz(p)
+	t = TSVZ.TSVZed(p, verbose=False)
+	assert t._remake and t.rewrite(force=True) is True
+	t.close()
+	assert gzip.decompress(_bytes(p)) == b'a\t1\n'

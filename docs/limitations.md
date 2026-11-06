@@ -364,8 +364,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   then keeps those rows and adds the defaults line. At two columns a lone key is a deletion, so a store opened with
   such defaults, or given them by `setDefaults()` and then `reload()`, does not hold a one-column file's lone keys
   (`a\nb\n` reads `{}`; a plain open reads the rows). A rewrite of that store takes all but the first lone key out
-  of the file, with no output: `mapToFile()` and `hardMapToFile()` always; `rewrite_on_exit`, `rewrite_interval`,
-  `rewrite_on_load` and `rewrite(force=True)` once the store is dirty. A commit does not. With
+  of the file, with no output: `mapToFile()`, `hardMapToFile()`, `rewrite(force=True)`, `rewrite_on_load` and
+  `rewrite_on_exit` always; `rewrite_interval` once the store is dirty. A commit does not. With
   `defaults=['#_defaults_#', 'P']`, `a\nb\n` becomes `a\n#_defaults_#\tP\n` and `a\nb\nc\t1\n` becomes
   `a\nc\t1\n#_defaults_#\tP\n`. 5.4 did worse on every route tried: its `TSVZed` read such a file as `{}` with no
   defaults at all, and its rewrite took out the first lone key too.
@@ -373,18 +373,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone loses rows to it.
 - Approved: 2026-11-05, the user chose "Allow it, document it (Recommended)" when asked whether `setDefaults()` may
   change the column count.
-
-### rewrite(force=True) on a clean store writes nothing
-- Kind: deferred to 5.6
-- What the operator sees: on a clean store a program changes a row in place (`t['a'][1] = 'X'`, which does not set
-  `dirty`) and calls `rewrite(force=True)`. It returns True and the file is unchanged, and after `close()` the change
-  is gone. The same holds for `rewrite_on_exit=True`, and `rewrite_on_load=True` leaves an uncompacted file (comment
-  lines) alone while `dirty` is False. `mapToFile()` and `hardMapToFile()` do write the row. 5.4 does the same, and the class
-  docstring says so.
-- Why: `rewrite(force=True)` and the automatic options write only a store that is `dirty`, and a list changed in place
-  cannot tell the store. It matters more once the automatic options are replaced by explicit calls, since the
-  program then asked for the rewrite.
-- Revisit when: 5.6.
 
 ### Some tests fail under heavy parallel load only
 - Kind: deferred to 5.6
