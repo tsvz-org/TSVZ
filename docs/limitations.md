@@ -206,3 +206,79 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: an operator meets such a file read without its defaults, or when every reader of these files can be
   changed at once.
 - Approved: 2026-11-04, the user chose "Known limitation (Recommended)".
+
+### A write by another process between a move_to_end and its commit can be lost
+- Kind: known limitation
+- What the operator sees: `move_to_end` follows the file first, so a change another process made before the call is
+  kept (5.5 without that read lost it on 8 of 8 tries). A write that lands after the call and before the move's
+  lines are committed (one tick, `append_check_delay`, 10 ms by default) can still lose: the commit order decides,
+  as for any queued line. Measured on 3.14 (40 tries each, another process writing `o2` while the store moved
+  another key to the front): a write 4 ms and 1 ms before the call, none lost; at the call, 26 lost; 1, 3, 5, 8 and
+  10 ms after it, 5, 7, 9, 13 and 11 lost; 11 and 13 ms after it, none lost. So the window is one tick, and a write
+  in it lost in 45 of 200 tries after the call (more the later in the tick), and 26 of 40 at the call.
+- Why: the moved rows are queued from memory and written at the next tick, and a write that lands in between is
+  not read before them; closing the window would mean holding the file from the call to the commit.
+- Revisit when: someone loses a row this way.
+- Approved: 2026-11-05, the user chose "Known limitation (Recommended)".
+
+### A one-column delete can undo another process's write that lands just before it
+- Kind: known limitation
+- What the operator sees: in a one-column `.tsv`-family file a `TSVZed` delete is not a line: the next commit
+  takes the key's lines out of the file (a whole rewrite). Another process's write of the same key that lands after
+  the delete reached the file survives; one that lands before that, within one tick (`append_check_delay`, 10 ms by
+  default), is undone by the delete, and a refused rewrite stretches that window to the refusal. After another process's
+  whole rewrite the order cannot be told. This is the rule for a queued deletion line at two or more columns too.
+- Why: a one-column file cannot write a deletion as a line (a lone key is a row there), so the delete is carried out
+  on the file as it is when the commit takes it.
+- Revisit when: someone loses a row to another process's delete or write this way.
+- Approved: 2026-11-05, the user chose "Known limitation (Recommended)".
+
+### Repeated move_to_end of a row read before the defaults grows the file
+- Kind: known limitation
+- What the operator sees: a row that holds an empty cell the file's defaults would fill (it was read before the
+  `#_defaults_#` line, so it reads empty) adds a reset and a defaults line to the file with each `move_to_end`: 600
+  moves took a 28-byte file to 9037 bytes, and neither a rewrite nor a scrub takes them out. Reads stay correct. Rows
+  filled when the file is opened are stable.
+- Why: the compaction keeps every `#_defaults_#` line, and changing that rule for this corner adds risk to every
+  file.
+- Revisit when: someone sees a file grow this way.
+- Approved: 2026-11-05, the user chose "Known limitation (Recommended)".
+
+### tsvz delete and TSVZedLite's delete in a one-column file do not delete
+- Kind: deferred to 5.6
+- What the operator sees: `tsvz delete FILE b` on a file `a\nb\nc\n` exits 0 and the file grows to `a\nb\nc\nb\n`:
+  `b` stays, since a lone key is a row in a one-column file. `TSVZedLite`'s `del` appends the same line. 5.4 writes
+  the same bytes. `TSVZed` now deletes in such a file (it takes the key's lines out), so the two differ. `tsvz
+  serve` was not run on this.
+- Why: both append a deletion line, as in 5.4, and a lone key is a row in a one-column file; 5.5's change was to
+  `TSVZed`.
+- Revisit when: right after 5.5.
+- Approved: 2026-11-05, the user chose "Deferred to 5.6 (Recommended)".
+
+### A wider row that a move writes again is lost to old strict readers
+- Kind: known limitation
+- What the operator sees: for a file `a\t1\na\t1\t2\nb\t3\n`, `move_to_end('a')` appends `a\t` then `a\t1\t2`. 5.5's
+  strict readers see `a`; 3.39 to 5.4 strict readers (which take only a line exactly as wide as the column count)
+  lose it. Upgrading the readers cures it.
+- Why: only 5.5's readers take a row wider than the column count whole; the move writes the row as it is.
+- Revisit when: a mixed fleet of 5.5 writers and older strict readers hits it.
+- Approved: 2026-11-05, the user chose "Known limitation (Recommended)".
+
+### Deleting many keys of a big one-column file rewrites it once per commit
+- Kind: known limitation
+- What the operator sees: a `TSVZed` on a one-column file does one whole-file rewrite per commit however many
+  deletes that commit holds: about 0.7 s per commit at 100,000 keys. A program deleting all the time pays that once
+  per `append_check_delay`.
+- Why: a one-column file cannot write a deletion as a line.
+- Revisit when: someone deletes often in a big one-column store.
+- Approved: 2026-11-05, the user chose "Known limitation (Recommended)".
+
+### A store emptied at one column, then given a wider row first, loses the lone keys after it
+- Kind: known limitation
+- What the operator sees: after every key of a one-column store was deleted, `t['x'] = ['x', '1']; t['y'] = ['y']`
+  writes `x\t1\ny\n`, and a reopened store takes two columns from the first line, so `y` is a deletion there and is
+  gone. A lone cell in a two-column file has meant delete in every version. From an empty file 5.4 and 5.5 both drop
+  `y` the same way.
+- Why: the first keyed line sets the column count, and a lone key at two columns is a deletion in every version.
+- Revisit when: someone hits it.
+- Approved: 2026-11-05, the user chose "Known limitation (Recommended)".

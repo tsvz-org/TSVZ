@@ -324,7 +324,10 @@ writes.
   when called. `last=False` cannot be an append for one key: it moves every other key to
   the end instead, two lines for each, until a compaction takes them out. A key whose row
   holds no value moves in memory only. In a one-column store a move is a delete (below)
-  and an append.
+  and an append. A move follows another process's change to the file first, so the rows it
+  appends again do not undo it; a write that lands between the move and its commit (one
+  tick) can still lose, as any queued line can
+  ([limits](docs/limitations.md#a-write-by-another-process-between-a-move_to_end-and-its-commit-can-be-lost)).
 - **Rows wider than the file's column count are read whole.** `readTabularFile` (also
   `lastLineOnly`), `read_last_valid_line`, `TSVZed`, `TSVZedLite`, `tsvz read`/`get` and
   their table output, and `tsvz serve`: a row is padded to the column count as before,
@@ -429,12 +432,34 @@ writes.
   periodic or open-time rewrite) can misread a file whose meaning depends on its
   defaults (a bare `#_defaults_#` first line, defaults the program gives):
   `#_defaults_#\na\tX\nb` read with defaults `['', 'P']` shows `{a: [a, X]}`, and 5.2
-  showed `{}` after following such a rewrite. Upgrade those processes.
+  showed `{}` after following such a rewrite. Upgrade those processes. A `setDefaults()`
+  made during such a read stays: the read no longer puts back the defaults it started with.
 - **Readers given other arguments than the scrub's can see a different file after a scrub
   or a `TSVZed` rewrite**: see [docs/limitations.md](docs/limitations.md#readers-given-other-arguments-than-the-scrubs-can-see-a-different-file-after-a-scrub-or-a-rewrite).
 - **A file whose first keyed line is a bare `#_defaults_#` reads as one column without
   defaults**: pass the defaults the file's program uses
   ([docs/limitations.md](docs/limitations.md#a-file-whose-first-keyed-line-is-a-bare-_defaults_-reads-as-one-column-without-defaults)).
+- **A `TSVZed` given a header that line 1 is not takes its column count from the first
+  keyed line, as readers do** (it took the header's, and a delete in a one-column file
+  was written as a row). A `.nsv` file's compaction keeps the empty cells at the end of a
+  line, which its reader keeps (it took them off and could drop a row).
+- **Known limitations of one-column files and moves** (each has an entry in
+  [docs/limitations.md](docs/limitations.md)):
+  - a delete in a one-column file can undo another process's write that lands just
+    before it ([entry](docs/limitations.md#a-one-column-delete-can-undo-another-processs-write-that-lands-just-before-it));
+  - deleting many keys of a big one-column file rewrites it once per commit, about 0.7 s
+    at 100,000 keys
+    ([entry](docs/limitations.md#deleting-many-keys-of-a-big-one-column-file-rewrites-it-once-per-commit));
+  - a store emptied at one column and then given a wider row first loses the lone keys
+    after it: `t['x']=['x','1']; t['y']=['y']` reopens without `y`
+    ([entry](docs/limitations.md#a-store-emptied-at-one-column-then-given-a-wider-row-first-loses-the-lone-keys-after-it));
+  - `tsvz delete` and `TSVZedLite`'s delete in a one-column file do not delete (as in
+    5.4; planned for 5.6)
+    ([entry](docs/limitations.md#tsvz-delete-and-tsvzedlites-delete-in-a-one-column-file-do-not-delete));
+  - repeated `move_to_end` of a row read before the defaults grows the file
+    ([entry](docs/limitations.md#repeated-move_to_end-of-a-row-read-before-the-defaults-grows-the-file));
+  - a wider row that a move writes again is lost to 3.39 to 5.4 strict readers
+    ([entry](docs/limitations.md#a-wider-row-that-a-move-writes-again-is-lost-to-old-strict-readers)).
 
 ## Upgrading to 5.4 from 5.3
 
