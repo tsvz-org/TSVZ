@@ -339,8 +339,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   and on 5.4, on Linux with open file description locks. Where readers take no read lock (`lockf`-only hosts and
   Windows, see `_readLock`) that reason does not hold: forced `lockf` and `flock` gave 0 of 1500; Windows was not
   measured.
-- Why: the cause is not verified. All 258 misses in the runs above had a file time that had moved, so "the time did not move" is ruled
-  out; the likely cause is that the time moves before the new bytes land, so a read in between takes the old bytes
+- Why: the cause is not verified. The misses checked had a file time that had moved, so "the time did not move" is ruled
+  out for them; the likely cause is that the time moves before the new bytes land, so a read in between takes the old bytes
   with the new time, but that is not proved. Seeing it for certain would mean reading the file again at every
   tick.
 - Revisit when: a real store is edited by such a tool.
@@ -361,10 +361,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: known limitation
 - What the operator sees: `setDefaults()` with another cell count than the file's rows (two cells or more set the
   column count a reader takes) leaves memory's rows as they are, and the file unchanged at the commit. A rewrite
-  keeps the data and adds the defaults line. A reopen given those defaults then reads the file at the new count,
-  which can read `{}` (a one-column file's lone keys are deletions at two columns), while a plain reopen reads the
-  rows; a rewrite of that store then drops the rows from the file (`defaults=['#_defaults_#', 'P']` on `a\nb\n`:
-  `hardMapToFile()` leaves `a\n#_defaults_#\tP\n`, so `b` is gone). 5.4 read such a file as `{}` from the open, with or without `setDefaults()`, and its rewrite emptied it.
+  then keeps those rows and adds the defaults line. At two columns a lone key is a deletion, so a store opened with
+  such defaults, or given them by `setDefaults()` and then `reload()`, does not hold a one-column file's lone keys
+  (`a\nb\n` reads `{}`; a plain open reads the rows). A rewrite of that store takes all but the first lone key out
+  of the file, with no output: `mapToFile()` and `hardMapToFile()` always; `rewrite_on_exit`, `rewrite_interval`,
+  `rewrite_on_load` and `rewrite(force=True)` once the store is dirty. A commit does not. With
+  `defaults=['#_defaults_#', 'P']`, `a\nb\n` becomes `a\n#_defaults_#\tP\n` and `a\nb\nc\t1\n` becomes
+  `a\nc\t1\n#_defaults_#\tP\n`. 5.4 did worse on every route tried: its `TSVZed` read such a file as `{}` with no
+  defaults at all, and its rewrite took out the first lone key too.
 - Why: the user chose to allow a `setDefaults()` that changes the column count.
 - Revisit when: someone loses rows to it.
 - Approved: 2026-11-05, the user chose "Allow it, document it (Recommended)" when asked whether `setDefaults()` may
@@ -372,12 +376,30 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### rewrite(force=True) on a clean store writes nothing
 - Kind: deferred to 5.6
-- What the operator sees: a program changes a row in place (`t['a'][1] = 'X'`, which does not set `dirty`) and calls
-  `rewrite(force=True)`. It returns True and the file is unchanged, and after `close()` the change is gone. The same
-  holds for `rewrite_on_exit=True`, and `rewrite_on_load=True` leaves an uncompacted file (comment lines) alone while
-  `dirty` is False. `mapToFile()` and `hardMapToFile()` do write the row. 5.4 does the same, and the class
+- What the operator sees: on a clean store a program changes a row in place (`t['a'][1] = 'X'`, which does not set
+  `dirty`) and calls `rewrite(force=True)`. It returns True and the file is unchanged, and after `close()` the change
+  is gone. The same holds for `rewrite_on_exit=True`, and `rewrite_on_load=True` leaves an uncompacted file (comment
+  lines) alone while `dirty` is False. `mapToFile()` and `hardMapToFile()` do write the row. 5.4 does the same, and the class
   docstring says so.
 - Why: `rewrite(force=True)` and the automatic options write only a store that is `dirty`, and a list changed in place
   cannot tell the store. It matters more once the automatic options are replaced by explicit calls, since the
   program then asked for the rewrite.
+- Revisit when: 5.6.
+
+### readTabularFile does not read text defaults as TSVZed does
+- Kind: deferred to 5.6
+- What the operator sees: on `x\t\t1`, `TSVZed(p, defaults='#_defaults_#\tP')` gives `['x', 'P', '1']`, and
+  `readTabularFile(p, defaults='#_defaults_#\tP')` gives `['x', '_', '1', 'e', 'f', ...]`: it takes the text as a
+  sequence of characters. Its reading on 5.4 is the same. A list that starts with `#_defaults_#` reads the same on both.
+- Why: `TSVZed` turns text defaults into a list and `readTabularFile` does not.
+- Revisit when: 5.6.
+
+### Three tests fail under heavy parallel load only
+- Kind: deferred to 5.6
+- What the operator sees: under heavy parallel load these fail on a deadline or a precondition, with no behaviour
+  failure: `tsvzconform_test.py::test_a_hang_is_a_timeout_and_leaves_nothing_running` (the `-V` probe shares
+  `--timeout 2`), `tsvzconform_test.py::test_a_handler_that_ignores_stop_is_killed` (`wait=1`) and
+  `TSVZ_test.py::test_tsvzed_legacy_rows_survive_rewrites_and_reloads_for_another_process_stress` (`assert count > 10`,
+  the other writer starved).
+- Why: a busy machine misses those deadlines and starves that writer.
 - Revisit when: 5.6.

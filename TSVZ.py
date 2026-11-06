@@ -5185,7 +5185,7 @@ class TSVZed(OrderedDict):
 		defaults' (two cells or more) or the first keyed line's, whatever this says, and rows are not
 		padded to it or cut to it (5.4 padded them to a count above the file's width in a loose store and
 		refused them in a strict one; a count below it cut rows in memory at the open and in the file at a rewrite, or in a
-		strict store emptied the file). Pad rows yourself, or give defaults with that many cells after the '#_defaults_#' key
+		strict store emptied the file). Pad rows yourself, or give defaults with that many cells counting the '#_defaults_#' key
 		(['#_defaults_#', '', '', '', ''] for 5) or a header that line 1 holds.
 	errors : str, default='strict'
 		What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8
@@ -5200,7 +5200,8 @@ class TSVZed(OrderedDict):
 	version : str
 		Version of the TSVZed implementation.
 	dirty : bool
-		True if the file holds more than memory needs, or less: a key twice, a deletion, a row not yet stored.
+		True once a key is restated with another row or a live key is deleted, in the file or by this store, and
+		after some failed writes. A new row does not set it.
 		rewrite(force=True), rewrite_on_exit and rewrite_interval write only then. mapToFile() and hardMapToFile() always write;
 		nothing else rewrites the file, except to make a damaged or removed file again from memory
 		and to compact a one-column file after a delete.

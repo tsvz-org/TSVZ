@@ -126,7 +126,7 @@ entries go last, in the same commit as the change:
 - Changed: `TSVZed(correctColumnNum=N)` no longer makes `N` the store's column count: the count is the one the read
   takes (the header's, the defaults' of two cells or more, or the first keyed line's), rows are not padded to `N`
   or cut to it, and no rewrite writes them that way. `readTabularFile(correctColumnNum=N, strict=False)` still
-  pads to `N` (its default, strict, drops the rows narrower than `N`).
+  pads to `N`.
 - Why we had to change: in 5.4 an `N` below the file's width cut rows in memory at the open and in the file at a rewrite in a loose store
   (`N=1` on `a\t1` held `a`, then wrote `a`; `N=2` on `a\t1\t2` wrote `a\t1`) and emptied the file in a strict one, which is data loss on a number
   the caller gave. An `N` above the width padded in a loose store (`N=5` wrote `a\t1` as `a\t1\t\t\t`) and, in a
@@ -137,5 +137,5 @@ entries go last, in the same commit as the change:
   (see 5.2 and 5.5 above), so a second source for it is a way to disagree with the file.
 - Lesson: an argument that restates a fact of the file the library can read for itself is a hint at best: read the
   file, and never let the hint rewrite it. A caller who wants padded rows pads them (or gives defaults with that many
-  cells after the `#_defaults_#` key, or a header line 1 already holds), and the library's padding is the file's own
+  cells, counting the `#_defaults_#` key, or a header line 1 already holds), and the library's padding is the file's own
   rule.
