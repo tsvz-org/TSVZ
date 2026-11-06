@@ -4209,10 +4209,11 @@ def test_cli_table_shows_control_characters_as_escapes(tmp_path):
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='needs a control character in a file name')
-def test_cli_parts_table_shows_control_characters_in_paths_as_escapes(tmp_path):
+def test_cli_parts_table_shows_control_characters_in_paths_as_escapes(tmp_path, monkeypatch):
+	monkeypatch.chdir(tmp_path)  # (a short path: the table cuts one past the terminal's width, as a long temp directory is)
 	d = tmp_path / 'a\rb'
 	d.mkdir()
-	p = str(d / 'c.tsvz')
+	p = os.path.join('a\rb', 'c.tsvz')
 	_touch(p, b'k\tv\n')
 	status, out, _ = _run('parts', p, '--format', 'table')
 	assert status == 0 and '\r' not in out and 'a\\rb' in out
@@ -12624,7 +12625,9 @@ def _kind_corpus():
 
 
 def test_legacy_line_kind_agrees_with_processLine():
-	"""_legacyLineKind classifies a line as _processLine reads it; the guard against the two drifting apart."""
+	"""_legacyLineKind classifies a line as _processLine reads it; the guard against the two drifting apart. (The reader
+	is given the line with its newline, which keeps the trailing NULs of a .nsv line; the compaction works on lines without
+	it.)"""
 	D = TSVZ.DEFAULTS_INDICATOR_KEY
 	for delimiter in ('\t', '\x00'):
 		for text in _kind_corpus():
@@ -12640,7 +12643,7 @@ def test_legacy_line_kind_agrees_with_processLine():
 							taskDic = dict(seeded)
 							defaults = [D, 'Z'] if strictActive else [D]
 							reporter = TSVZ._Reporter('x', None)
-							TSVZ._processLine(line, taskDic, width, strict=strict, delimiter=delimiter,
+							TSVZ._processLine(line + '\n', taskDic, width, strict=strict, delimiter=delimiter,
 											  defaults=defaults, reporter=reporter)
 							results[strict] = (taskDic, defaults, reporter.has('strict-drop'))
 						where = (line, width, strictActive)
@@ -13591,7 +13594,9 @@ def test_move_to_end_order_is_written_when_the_rewrite_takes_its_rows_again(tmp_
 	t.rewrite(force=True)  # (a rewrite that takes in another writer's change: rewrite(), the writer thread's)
 	monkeypatch.undo()
 	assert len(calls) == 1
-	assert list(TSVZ.readTabularFile(p, header='id\tv')) == list(t) and list(t)[:3] == ['b', 'c', 'a'] and 'd' in t
+	order = list(t)  # (where the writer that took no lock's row d lands in it is the race's: b and c come before a)
+	assert list(TSVZ.readTabularFile(p, header='id\tv')) == order and 'd' in t
+	assert order.index('b') < order.index('a') and order.index('c') < order.index('a')
 	t.close()
 
 
@@ -13850,3 +13855,186 @@ def test_a_store_on_a_file_with_no_keyed_line_takes_the_column_count_of_the_defa
 	back = _quiet_tsvzed(p, defaults=['#_defaults_#', '', ''], strict=strict)
 	assert dict(back) == memory
 	back.close()
+
+
+# --- 5.5 third review: fixes ---
+@pytest.mark.parametrize('line, key, last, o2', [
+	(b'o2\t7\n', 'a3', False, ['o2', '7']),  # another process changed a row the move puts again
+	(b'o2\t\n', 'a3', False, None),  # ... deleted one
+	(b'o2\t7\n', 'o2', True, ['o2', '7']),  # ... changed the row that moves
+])
+def test_move_to_end_follows_the_file_first_so_it_does_not_undo_another_processs_write(tmp_path, line, key, last, o2):
+	# The move queues the rows memory holds again, so the old o2 = 0 landed after the other process's line.
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, b'a3\t0\no2\t0\nz\t0\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	with open(p, 'ab') as f:
+		f.write(line)  # another process
+	t.move_to_end(key, last)
+	assert dict.get(t, 'o2') == o2
+	t.commitAppendToFile()
+	t.close()
+	assert TSVZ.readTabularFile(p).get('o2') == o2
+	assert set(TSVZ.readTabularFile(p)) == ({'a3', 'z'} | ({'o2'} if o2 else set()))
+
+
+def test_a_queued_one_cell_row_is_a_row_when_another_store_emptied_a_one_column_file(tmp_path):
+	# `a1` was replayed as a deletion (no line was read, so no column count): the program's key was lost.
+	p = str(tmp_path / 'e.tsv')
+	_touch(p, b'o0\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	b = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	del b['o0']
+	b.close()
+	assert _bytes(p) == b''
+	t['a1'] = ['a1']
+	t.checkExternalChanges()
+	t.rewrite()
+	assert dict(t) == {'a1': ['a1']} and t.correctColumnNum == 1
+	t.commitAppendToFile()
+	assert _bytes(p) == b'a1\n'
+	t.rewrite(force=True)
+	t.close()
+	assert _bytes(p) == b'a1\n' and list(TSVZ.readTabularFile(p)) == ['a1']
+
+
+def test_a_nsv_compaction_keeps_the_trailing_empty_cells_the_reader_keeps(tmp_path):
+	# The lines were classified without their newline, so their trailing NULs were taken off: `b\0\0` read as a key
+	# alone, the compaction dropped the earlier line `b\0`, and a strict reader then saw another column count.
+	p = str(tmp_path / 'n.nsv')
+	text = b'\nb\x00\na\x002\nb\x00\x00\n'
+	_touch(p, text)
+	before = {s: dict(TSVZ.readTabularFile(p, strict=s)) for s in (False, True)}
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	memory = dict(t)
+	t.hardMapToFile()
+	t.close()
+	assert {s: dict(TSVZ.readTabularFile(p, strict=s)) for s in (False, True)} == before
+	assert dict(TSVZ.readTabularFile(p, strict=True)) == memory and 'a' in memory
+
+
+def test_a_nsv_drop_keeps_a_line_with_trailing_empty_cells_a_row(tmp_path):
+	# `b\0` is a row at one column; the drop of c took the NUL off it, read it as the key alone and moved it up
+	# in place of the first line, and a reopened store lost b.
+	p = str(tmp_path / 'n.nsv')
+	_touch(p, b'c\nb\x00\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	del t['c']
+	memory = dict(t)
+	t.commitAppendToFile()
+	t.close()
+	assert list(memory) == ['b']
+	assert list(TSVZ.readTabularFile(p)) == ['b'] and list(_quiet_tsvzed(p)) == ['b']
+
+
+def test_a_nsv_last_line_without_a_newline_is_kept_as_the_reader_takes_it(tmp_path):
+	# The reader strips the NULs at the end of a last line that has no newline (`a\0` is the key a, one cell); the
+	# rewrite and the scrub end every line with a newline, and then the NUL is a cell: a two-cell line, a deletion.
+	for how in ('rewrite', 'scrub'):
+		p = str(tmp_path / (how + '.nsv'))
+		_touch(p, b'a\x00')
+		before = {s: dict(TSVZ.readTabularFile(p, strict=s)) for s in (False, True)}
+		assert 'a' in before[False]
+		if how == 'rewrite':
+			t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, verbose=False)
+			memory = dict(t)
+			t.hardMapToFile()
+			t.close()
+			assert memory == before[False]
+		else:
+			TSVZ.scrubTabularFile(p)
+		assert {s: dict(TSVZ.readTabularFile(p, strict=s)) for s in (False, True)} == before
+		t = _quiet_tsvzed(p)
+		assert dict(t) == before[False]
+		t.close()
+
+
+def test_a_header_that_line_1_is_not_does_not_set_the_stores_column_count(tmp_path):
+	# Readers take the column count from the first keyed line when line 1 is not the header; memory took the header's,
+	# so a deletion of a key of a one-column file was written as a row and the key came back.
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'x\na\nb\n')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=60, verbose=False)
+	assert dict(t) == {'a': ['a'], 'b': ['b']} and t.correctColumnNum == 1
+	del t['a']
+	t.commitAppendToFile()
+	t.close()
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=60, verbose=False)
+	assert list(t) == ['b']
+	t.hardMapToFile()
+	t.close()
+	assert list(TSVZ.readTabularFile(p, header='id\tv', strict=False)) == ['b']
+
+
+def test_a_header_that_line_1_is_not_gives_rows_the_width_readers_take(tmp_path):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'x\ta\nb\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv\tw', rewrite_on_load=False, append_check_delay=60, verbose=False)
+	assert t.correctColumnNum == 2
+	t['c'] = ['c', '3']
+	assert dict(t)['c'] == ['c', '3']
+	t.commitAppendToFile()
+	t.close()
+	assert dict(TSVZ.readTabularFile(p, header='id\tv\tw', strict=False)) == {'b': ['b', '1'], 'c': ['c', '3']}
+
+
+def test_set_defaults_during_a_whole_read_stays(tmp_path, monkeypatch):
+	# The read's swap put the defaults it started with over the ones setDefaults() gave meanwhile: a row filled by the
+	# new ones was a deletion until the next whole read.
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, b'id\tv\na\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, append_check_delay=60, verbose=False)
+	new = ['#_defaults_#', 'N']
+	real = TSVZ._legacyReadLoop
+
+	def loop(*args, **kwargs):
+		result = real(*args, **kwargs)
+		t.setDefaults(new)  # (from another thread, in the middle of the read)
+		return result
+	monkeypatch.setattr(TSVZ, '_legacyReadLoop', loop)
+	t.reload()
+	monkeypatch.undo()
+	assert t.defaults == new and t._readWhole
+	t['z'] = ['z', '']
+	assert dict(t)['z'] == ['z', 'N']
+	t.close()
+
+
+def test_the_rewrite_survives_a_key_deleted_while_its_line_moves_up(tmp_path, monkeypatch, capsys):
+	# _snapshotForRewrite tested the key in memory, then read its row under the lock: a caller deleting it between
+	# the two made the rewrite fail with a TypeError.
+	p = str(tmp_path / 'u.tsv')
+	_touch(p, b'a\nb\t1\nc\n')
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, append_check_delay=60, verbose=False)
+	real = TSVZ._legacyDropLines
+	moved = []
+
+	class Lock(object):
+		def __init__(self, lock):
+			self.lock = lock
+
+		def __enter__(self):
+			if moved:
+				key = moved.pop()
+				if dict.__contains__(t, key):
+					OrderedDict.__delitem__(t, key)  # a caller deleting the key meanwhile
+			return self.lock.__enter__()
+
+		def __exit__(self, *args):
+			return self.lock.__exit__(*args)
+
+	def drop(*args):
+		result = real(*args)
+		if result[1] is not None:
+			moved.append(result[1])
+		return result
+	monkeypatch.setattr(TSVZ, '_legacyDropLines', drop)
+	t._memLock = Lock(t._memLock)
+	capsys.readouterr()
+	del t['a']
+	assert t.rewrite(force=True) is not False
+	assert not moved
+	t.close()
+	captured = capsys.readouterr()
+	assert 'Failed' not in captured.out + captured.err and 'TypeError' not in captured.out + captured.err  # (the failback hides it)
+	assert list(TSVZ.readTabularFile(p)) == ['b']

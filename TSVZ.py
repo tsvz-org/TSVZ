@@ -2551,7 +2551,7 @@ def _isRowLine(text, delimiter):
 	"""True when the line ``text`` is a data row to a reader told no header: not what ``_processLine`` skips (empty, a
 	comment, a line with no key) and not a defaults line. A first line that is not one is where a reader given a header
 	the file lacks loses nothing: it takes that line for the header."""
-	line = text.strip('\x00').rstrip('\r\n')
+	line = _legacyLineBody(text)
 	if not line or (line.startswith('#') and not line.startswith(DEFAULTS_INDICATOR_KEY)):
 		return False
 	cells = _unsanitize(line.split(delimiter),delimiter)
@@ -2697,13 +2697,28 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 						defaults=defaults,correctColumnNum = correctColumnNum,errors = errors)[0]
 
 
+def _legacyLineBody(text):
+	"""``text`` (a legacy line, with or without its newline) as the reader sees it: _processLine strips NULs from the
+	start of a line that ends in a newline, and from the end too only when it has none (a file's last line). The
+	compaction and the drop work on lines without their newline, so one is put back for them (a .nsv line ends in
+	cells that are empty, and the reader keeps those)."""
+	return (text + '\n').strip('\x00').rstrip('\r\n')
+
+
+def _legacyRawLine(line):
+	"""A line of a legacy file as the compaction and the drop hold it: bytes without the newline. A file's last line
+	may have none, and then the reader strips the NULs at its end (_legacyLineBody): they go here, as the line is
+	written with a newline and would otherwise read with them."""
+	return line[:-1] if line.endswith(b'\n') else line.rstrip(b'\x00')
+
+
 def _legacyLineKind(text, width, strictActive, delimiter):
 	"""What a read at column count ``width`` makes of the legacy line ``text``, as _processLine decides it, changing
 	nothing: ``(kind, key, ncells, strictTakes)``. ``kind`` is 'skip' (comment, empty, no key), 'row', 'delete',
 	'defaults' or 'reset' (a #_defaults_# line with no value); ``strictTakes`` whether a strict read applies it, with
 	defaults that hold a value in effect where it stands (``strictActive``). A bare #_defaults_# line is a 'reset' at
 	every width (at width 1 it is also the row '#_defaults_#' to the reader: the compaction keeps every such line)."""
-	line = text.strip('\x00').rstrip('\r\n')
+	line = _legacyLineBody(text)
 	if not line or (line.startswith('#') and not line.startswith(DEFAULTS_INDICATOR_KEY)):
 		return 'skip', None, 0, False
 	cells = _unsanitize(line.split(delimiter), delimiter)
@@ -2766,7 +2781,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 			firstKeyed = i
 		takesOld = kind in ('delete', 'reset') or n == width or strictActiveOld
 		if not takesOld and kind == 'row' and width == 1:  # (a line with no value is a row at width 1, whatever its cells)
-			takesOld = not any(_unsanitize(text.strip('\x00').rstrip('\r\n').split(delimiter), delimiter)[1:])
+			takesOld = not any(_unsanitize(_legacyLineBody(text).split(delimiter), delimiter)[1:])
 		mask = (1 if takes else 0) | (2 if takesOld else 0)
 		if kind in ('defaults', 'reset'):
 			if boundaries and raw[i] == raw[boundaries[-1]] and i not in protectable:
@@ -2785,7 +2800,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 			if i in protectable:
 				pinfo[i] = (key, n)
 			full = bool(boundaries) and n == width and all(  # (only a defaults line before it can matter)
-				c.strip() for c in _unsanitize(text.strip('\x00').rstrip('\r\n').split(delimiter), delimiter)[1:])
+				c.strip() for c in _unsanitize(_legacyLineBody(text).split(delimiter), delimiter)[1:])
 			slot = live.get(key)
 			if slot is None:
 				live[key] = len(first)
@@ -2920,7 +2935,7 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	for j in range(place, len(out)):
 		kind, _, n, _ = kindOf(out[j])
 		if kind == 'row':
-			n = n if any(out[j].strip(b'\x00').rstrip(b'\r\n').split(d)[1:]) else 1
+			n = n if any(_legacyLineBody(out[j].decode(enc, errors='replace')).split(delimiter)[1:]) else 1
 			if narrowest is None or n < narrowest:
 				best, narrowest = j, n
 				if n == 1:
@@ -2944,7 +2959,7 @@ class _RawTap(object):
 
 	def _keep(self, line):
 		if line:
-			self.raw.append(line[:-1] if line.endswith(b'\n') else line)
+			self.raw.append(_legacyRawLine(line))
 		return line
 
 	def readline(self, *args):
@@ -5364,13 +5379,14 @@ class TSVZed(OrderedDict):
 			# #_defaults_#, so new defaults are written as that marker.
 			self._specSetMarker(DEFAULTS_INDICATOR_KEY, defaults)
 			return
-		self._givenDefaults = list(defaults)  # (the defaults a whole read starts from)
-		if not self._constructed:
+		if not self._constructed:  # (no lock exists yet)
+			self._givenDefaults = list(defaults)
 			self.defaults = defaults
 			return
-		self._readWhole = True  # memory's defaults now differ from the file's: another process's change is read whole
-		self.defaults = defaults
-		self._readWhole = True  # again: a read that ended in between cleared it
+		with self._memLock:  # (a read's swap sees either both of these or neither)
+			self._givenDefaults = list(defaults)  # (the defaults a whole read starts from)
+			self._readWhole = True  # memory's defaults now differ from the file's: another process's change is read whole
+			self.defaults = defaults
 
 	def load(self):
 		self.reload()
@@ -5935,7 +5951,7 @@ class TSVZed(OrderedDict):
 			return header, [], ()
 
 		try:
-			if not self._writeFile(whole=True, sync=None, snapshot=emptied):
+			if not self._writeFile(sync=None, snapshot=emptied):
 				return self  # reported; tried again later
 			if self.verbose:
 				self.__teePrintOrNot(f"File {self._fileName} cleared, size: {os.path.getsize(self._fileName)}")
@@ -6032,6 +6048,13 @@ memoryOnly:{self.memoryOnly}
 					  'move_to_end only reorders memory for .tsvz; the file keeps first-appearance order',
 					  self.teeLogger)
 			return self
+		if (not self.memoryOnly and self.monitor_external_changes and not self._failing('sync')
+				and (self.deSynced or self._externalChange())):
+			# The move queues rows memory holds again, so memory must be the file first: another process's change since
+			# the last tick would be undone by those rows. What the writer thread's tick does: follow the change, and
+			# rewrite only when one is due. (A stat, so a loop of moves stays cheap.)
+			self.checkExternalChanges()
+			self._call(self._rewrite, False, None, True)
 		with self._memLock:
 			if not dict.__contains__(self, key):
 				raise KeyError(key)
@@ -6314,7 +6337,7 @@ memoryOnly:{self.memoryOnly}
 				stream = _openStreams(codec, f) if codec else f
 				try:
 					for line in stream:
-						raw.append(line[:-1] if line.endswith(b'\n') else line)
+						raw.append(_legacyRawLine(line))
 				finally:
 					if codec:
 						stream.close()
@@ -6383,11 +6406,13 @@ memoryOnly:{self.memoryOnly}
 			for _ in range(2):  # (twice when the lines say keys are live that are gone from memory, in a one-column file)
 				if dropAt:
 					raw, moved = _legacyDropLines(raw, dropAt, consumed, width == -1, delimiter, encoding)
-					if moved is not None and dict.__contains__(self, moved):
+					if moved is not None:
 						with self._memLock:  # (its line moved up, the key alone if it held no value: memory stays the file)
-							if not any(dict.get(self, moved)[1:]):
-								OrderedDict.__setitem__(self, moved, [moved])
-							OrderedDict.move_to_end(self, moved, last=False)
+							row = dict.get(self, moved)  # (a caller may have deleted it meanwhile)
+							if row is not None:
+								if not any(row[1:]):
+									OrderedDict.__setitem__(self, moved, [moved])
+								OrderedDict.move_to_end(self, moved, last=False)
 				kept = _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched)
 				del raw
 				flags, diffWidth = self._readLines(kept, header, consumed, matched)
@@ -6477,19 +6502,19 @@ memoryOnly:{self.memoryOnly}
 		return (known is None or st.st_size != known[1] or _updateTimeNs(st) != self.externalFileUpdateTime
 				or (known[0][1] is not None and _fileIdentity(st) != known[0]))
 
-	def _writeFile(self, whole, sync=True, snapshot=None):
+	def _writeFile(self, sync=True, snapshot=None):
 		"""_writeFileStarted, unless the exit has let go of the store (False: nothing is written)."""
 		if not self._startWrite():
 			return False
 		try:
-			return self._writeFileStarted(whole, sync, snapshot)
+			return self._writeFileStarted(sync, snapshot)
 		finally:
 			self._endWrite()
 
-	def _writeFileStarted(self, whole, sync=True, snapshot=None):
-		"""Write memory (or ``snapshot()``'s, a clear's) over the legacy file in place, or whole (``whole``, a compressed
-		file, written as whole members, or a missing one: written over the file, then cut to its end): True when all of
-		it is on disk, False when the file could not be opened or locked (reported); what stops it raises.
+	def _writeFileStarted(self, sync=True, snapshot=None):
+		"""Write memory (or ``snapshot()``'s, a clear's) over the legacy file, whole (a compressed file as whole members;
+		written over the file, then cut to its end): True when all of it is on disk, False when the file could not be
+		opened or locked (reported); what stops it raises.
 
 		The file is locked before anything is read and until all of it is on disk. Another process's change is taken
 		in first (``sync``; False: overwritten with a warning; None, a clear: not looked for) and again if it lands
@@ -6502,7 +6527,6 @@ memoryOnly:{self.memoryOnly}
 				# refusal wait (_refusalWait) is over, without waiting for the file to keep still for rewrite_interval.
 				self.dirty = self.deSynced = self._damaged = True
 				self._known, self._unseen = _KNOWN_NOTHING, False  # merged whatever is there, whichever file it is
-				whole = True
 			try:
 				f = self._openLocked(_openUntruncated)
 			except Exception as e:
@@ -6675,7 +6699,8 @@ memoryOnly:{self.memoryOnly}
 		read apart from memory, then memory is changed in place under _memLock, never emptied (a key the file still
 		holds is never missing for another thread) and takes the file's order. _known is then the bytes read."""
 		seen = getFileUpdateTimeNs(self._fileName)  # before the read: a change during or after it is seen by the next check
-		loaded = _TSVZedLoad(self, self._givenColumns, list(self._givenDefaults))  # (as the first read did)
+		given = self._givenDefaults
+		loaded = _TSVZedLoad(self, self._givenColumns, list(given))  # (as the first read did)
 		width = -1
 		known = _KNOWN_NOTHING
 		damaged = False
@@ -6716,16 +6741,19 @@ memoryOnly:{self.memoryOnly}
 			# once appended will, so memory stays what the file will hold.
 			if width > 0:
 				loaded.columns = width  # (the queue is replayed as reading it back will: at the width the read took)
+			elif self.correctColumnNum == 1:
+				loaded.columns = 1  # (no line read, an emptied store: its rows read back at one column, not as deletions)
 			loaded.replay(list(self.appendQueue))
 			self._replaceRows(loaded)
-			self._readWhole = False  # before the defaults: a setDefaults() between the two sets it again
-			self.defaults = loaded.defaults
+			if self._givenDefaults is given:  # (not when setDefaults() gave others during the read: they stay)
+				self._readWhole = False
+				self.defaults = loaded.defaults
 			if loaded.dirty:
 				self.dirty = True  # a key the file holds twice
-			if self.header and any(self.header) and self.verifyHeader:
-				self.correctColumnNum = len(self.header)
-			elif width > 0:
-				self.correctColumnNum = width  # the column count the read took (a row read whole can be wider)
+			if width > 0:
+				self.correctColumnNum = width  # the column count the read took (the header's, when line 1 holds it)
+			elif self.header and any(self.header) and self.verifyHeader:
+				self.correctColumnNum = len(self.header)  # (no keyed line: the header's, which the next line written follows)
 			elif len(self._givenDefaults) > 1:
 				self.correctColumnNum = len(self._givenDefaults)  # (no keyed line: what the store's reader will take)
 			elif self:
@@ -6771,7 +6799,7 @@ memoryOnly:{self.memoryOnly}
 	def _hardMapToFile(self, sync=False, explicit=False):
 		"""hardMapToFile(); ``sync``: see _writeFile, ``explicit``: see _refuse. True when the file is written."""
 		try:
-			return self._writeFile(whole=True, sync=sync) and self._rewritten()
+			return self._writeFile(sync=sync) and self._rewritten()
 		except TSVZEncodeError as e:
 			self._refuse('hardMapToFile()', e, explicit)
 		except Exception as e:
@@ -6794,7 +6822,7 @@ memoryOnly:{self.memoryOnly}
 		if _isCompressedFile(self._fileName):
 			return self._hardMapToFile(sync, explicit)  # a compressed file is rewritten whole; it reports its own errors
 		try:
-			return self._writeFile(whole=False, sync=sync) and self._rewritten()
+			return self._writeFile(sync=sync) and self._rewritten()
 		except TSVZEncodeError as e:
 			self._refuse('mapToFile()', e, explicit)
 			return False
