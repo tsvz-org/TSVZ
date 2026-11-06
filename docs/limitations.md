@@ -394,12 +394,20 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: `TSVZed` turns text defaults into a list and `readTabularFile` does not.
 - Revisit when: 5.6.
 
-### Three tests fail under heavy parallel load only
+### readTabularFile changes the caller's defaults list
+- Kind: deferred to 5.6
+- What the operator sees: on a file with its own defaults line, `readTabularFile(p, defaults=D, strict=False)` puts that
+  line's cells into the list `D`, so the same call then reads differently. `TSVZed` leaves the list alone.
+- Why: the reader works on the list it was given.
+- Revisit when: 5.6, with the text defaults entry above.
+
+### Some tests fail under heavy parallel load only
 - Kind: deferred to 5.6
 - What the operator sees: under heavy parallel load these fail on a deadline or a precondition, with no behaviour
   failure: `tsvzconform_test.py::test_a_hang_is_a_timeout_and_leaves_nothing_running` (the `-V` probe shares
   `--timeout 2`), `tsvzconform_test.py::test_a_handler_that_ignores_stop_is_killed` (`wait=1`) and
   `TSVZ_test.py::test_tsvzed_legacy_rows_survive_rewrites_and_reloads_for_another_process_stress` (`assert count > 10`,
-  the other writer starved).
+  the other writer starved). At a load of 130 or more about 16 others in `tsvzconform_test.py` and `tsvzbench_test.py`
+  failed too, mostly on a deadline; each passes alone.
 - Why: a busy machine misses those deadlines and starves that writer.
 - Revisit when: 5.6.
