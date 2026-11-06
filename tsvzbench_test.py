@@ -611,7 +611,10 @@ def test_every_case_passes_with_the_reference(tmp_path):
 	('sleep', 'cold', 'len 100', tb.TIMEOUT),
 	('corrupt', 'bulk', 'set - new 100', tb.WRONG),
 ])
-def test_the_gate_catches_a_misbehaving_implementation(tmp_path, mode, family, label, kind):
+def test_the_gate_catches_a_misbehaving_implementation(tmp_path, monkeypatch, mode, family, label, kind):
+	# (the `-V` probe shares the 3 s timeout; on a loaded host it timed out and every mark was n/a)
+	real_probe = tb.probe
+	monkeypatch.setattr(tb, 'probe', lambda impl, directory, timeout: real_probe(impl, directory, 60.0))
 	bench, _ = run_suite(tmp_path, [('bad', fake(tmp_path, mode))], '--only', family, '--timeout', '3')
 	result = next(r for r in bench.results if (r.case.family, r.case.label) == (family, label))
 	assert result.mark[0] == kind
