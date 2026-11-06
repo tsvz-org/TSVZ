@@ -1303,6 +1303,7 @@ def test_a_compacting_rewrite_opens_nothing_by_name_and_takes_no_read_lock(tmp_p
 	assert data.count(b'\n') == 21 and b'k0001\tagain\n' in data and b'k0001\tvalue' not in data
 
 
+@linux_only
 def test_a_compacting_rewrite_on_the_lockf_fallback_holds_its_lock_while_it_writes(tmp_path, monkeypatch):
 	import fcntl
 	monkeypatch.setattr(TSVZ, '_LOCK_KIND', 'ofd', raising=False)
