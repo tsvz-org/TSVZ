@@ -14560,6 +14560,7 @@ def test_every_reader_keeps_the_rows_after_line_1_is_widened(tmp_path, strict, h
 	_touch(p, b'id\tv\na\t1\n#_defaults_#\tP\nb\t\nc\t3\n')
 	want = {'a': ['a', '1', ''], 'c': ['c', '3', '']}
 	_widened(p).close()
+	assert b'#_defaults_#\tP\t\n' in _bytes(p)  # (the defaults line is padded as the rows are)
 	rows = dict(TSVZ.readTabularFile(p, header=header, strict=strict))
 	rows.pop('id', None)
 	assert rows == want
@@ -14926,6 +14927,10 @@ def test_tsvzedlite_reload_takes_the_count_a_fresh_open_does(tmp_path):
 	t.switchFile(other)
 	assert t.correctColumnNum == 1 and list(t) == ['x', 'y']
 	t.close()
+	t = TSVZ.TSVZedLite(p, strict=False, correctColumnNum=2)
+	t.switchFile(other)  # (the caller's count is for the new file too)
+	assert t.correctColumnNum == 2 and list(t) == ['x', 'y']
+	t.close()
 
 
 def test_tsvzedlite_set_defaults_is_what_a_reload_starts_from(tmp_path):
@@ -15015,11 +15020,11 @@ def test_a_handler_does_not_take_a_row_it_is_still_writing_for_one_to_leave(tmp_
 
 def test_a_handler_delete_of_the_defaults_key_is_a_line_in_a_one_column_file(tmp_path):
 	p = str(tmp_path / 'o.tsv')
-	_touch(p, b'a\n')
+	_touch(p, b'a\n#_defaults_#\tP\n')  # (a defaults line is not the key's row: it stays, and the reset is a line after it)
 	store = TSVZ._ServeStore(p, create=True)
 	assert store.delete(store._tombstone(TSVZ.DEFAULTS_INDICATOR_KEY), False, None)
 	store.close()
-	assert _bytes(p) == b'a\n#_defaults_#\n'
+	assert _bytes(p) == b'a\n#_defaults_#\tP\n#_defaults_#\n'
 
 
 def _widen_by_another_program(p, header):
