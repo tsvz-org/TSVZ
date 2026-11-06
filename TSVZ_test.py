@@ -14439,15 +14439,6 @@ def test_a_handler_deletes_in_a_one_column_file(tmp_path, served):
 	assert _bytes(p) == b'a\nd\n'
 
 
-def test_a_delete_that_keeps_meeting_another_writer_says_so_and_writes_nothing(tmp_path, monkeypatch):
-	p = str(tmp_path / 'o.tsv')
-	_touch(p, b'a\nb\n')
-	monkeypatch.setattr(TSVZ, '_legacyReplace', lambda *args, **kwargs: None)
-	with pytest.raises(OSError, match='kept changing'):
-		TSVZ._legacyDropKeys(p, ['a'], [''], True, [], 'utf8', '\t', 'strict')
-	assert _bytes(p) == b'a\nb\n'
-
-
 @pytest.mark.parametrize('how', ['del', 'pop', 'popitem', 'lone'])
 def test_tsvzedlite_delete_in_a_one_column_file(tmp_path, how):
 	p = str(tmp_path / 'o.tsv')
@@ -14685,3 +14676,461 @@ def test_a_one_column_file_made_again_under_a_wider_header_keeps_its_lone_rows(t
 	t.hardMapToFile()
 	t.close()
 	assert list(TSVZ.readTabularFile(p, header='id\tv', strict=False)) == ['a', 'b']
+
+
+# --------------------------------------------------------------------------
+# 5.6 fix round: a delete changes no other row; the clean-store rewrite; Lite's memory; strict follows a widening
+# --------------------------------------------------------------------------
+def _norm(rows):
+	"""The rows of a read as the file's readers agree on them: no empty cell at a row's end, no '#_defaults_#' row (what a
+	bare defaults line is at one column: it is a reset at two or more)."""
+	out = {}
+	for key, row in rows.items():
+		row = list(row)
+		while len(row) > 1 and not row[-1].strip():
+			row.pop()
+		if key != '#_defaults_#':
+			out[key] = row
+	return out
+
+
+DROP_SHAPES = [
+	# (name, file, the key deleted)
+	('a defaults line, then a row', b'a\n#_defaults_#\tP\nb\t\t1\n', 'a'),
+	('a wider defaults line', b'a\n#_defaults_#\tP\tQ\tR\nb\t\t1\n', 'a'),
+	('a wider row, then the defaults', b'a\nc\t1\t2\t3\n#_defaults_#\tP\nb\t\t1\n', 'a'),
+	('rows after the defaults', b'a\nc\t1\t2\t3\n#_defaults_#\tP\nb\t\t1\nd\t\t2\n', 'a'),
+	('a lone key after the defaults', b'a\n#_defaults_#\tP\nb\nc\t\t1\n', 'a'),
+	('a bare defaults line', b'a\nc\t1\t2\t3\n#_defaults_#\nb\t4\t5\n', 'a'),
+	('empty cells at the end of a row', b'a\n#_defaults_#\tD\tE\tE\ne\tP\tx\t\t \n', 'a'),
+	('a whitespace value', b'c\nb\t \n', 'c'),
+	('a whitespace value after the defaults', b'e\n#_defaults_#\tD\tD\t\na\t \tP\n', 'e'),
+]
+
+
+def _delete_through(door, p, key):
+	"""Delete ``key`` through a door (the CLI, TSVZedLite, TSVZed); return the store's memory, None for the CLI."""
+	if door == 'cli':
+		assert _run('delete', p, key)[0] == 0
+		return None
+	if door == 'lite':
+		t = TSVZ.TSVZedLite(p, strict=False)
+		del t[key]
+		mem = {k: list(t[k]) for k in t}
+		t.close()
+		fresh = TSVZ.TSVZedLite(p, strict=False)
+		assert mem == {k: list(fresh[k]) for k in fresh}  # (what a fresh open of the file holds)
+		fresh.close()
+		return mem
+	t = TSVZ.TSVZed(p, verbose=False, rewrite_on_load=False, append_check_delay=0.001)
+	del t[key]
+	mem = dict(t)
+	t.close()
+	return mem
+
+
+@pytest.mark.parametrize('door', ['cli', 'lite', 'tsvzed'])
+@pytest.mark.parametrize('name,data,key', DROP_SHAPES, ids=[s[0] for s in DROP_SHAPES])
+def test_a_delete_in_a_one_column_file_changes_no_other_row(tmp_path, door, name, data, key):
+	# `a\n#_defaults_#\tP\nb\t\t1\n`, `tsvz delete f a` left `b\t\t1\n#_defaults_#\tP\n`: b went from [b, P, 1] to [b, '', 1].
+	# A row that moves up carries the cells it read; a row that need not move stays; for loose and strict readers.
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, data)
+	before = [_norm(TSVZ.readTabularFile(p, strict=strict)) for strict in (False, True)]
+	mem = _delete_through(door, p, key)
+	for strict, was in zip((False, True), before):
+		was.pop(key)
+		assert _norm(TSVZ.readTabularFile(p, strict=strict)) == was
+	if door == 'tsvzed':  # (TSVZedLite reads a row at its offset with the defaults the file ends with: its memory is a fresh open's)
+		assert _norm(mem) == before[0]
+
+
+def test_a_delete_in_a_one_column_file_moves_a_row_up_only_when_it_is_narrower(tmp_path):
+	# The layout: no move when the first line left is no wider than any row; a row that moves carries its cells, and the
+	# defaults lines narrower than it are padded (a strict reader would drop them).
+	for data, key, want in [
+			(b'a\n#_defaults_#\tP\nb\t\t1\n', 'a', b'#_defaults_#\tP\nb\t\t1\n'),
+			(b'a\n#_defaults_#\tP\tQ\tR\nb\t\t1\n', 'a', b'b\tP\t1\n#_defaults_#\tP\tQ\tR\n'),
+			(b'a\nc\t1\t2\t3\n#_defaults_#\tP\nb\t\t1\n', 'a', b'b\tP\t1\nc\t1\t2\t3\n#_defaults_#\tP\t\n'),
+			(b'a\n#_defaults_#\tP\nb\nc\t\t1\n', 'a', b'b\n#_defaults_#\tP\nc\t\t1\n'),
+			(b'a\n#_defaults_#\tD\tE\tE\ne\tP\tx\t\t \n', 'a', b'e\tP\tx\n#_defaults_#\tD\tE\tE\n')]:
+		p = str(tmp_path / 'o.tsv')
+		_touch(p, data)
+		assert _run('delete', p, key)[0] == 0
+		assert _bytes(p) == want
+
+
+@pytest.mark.parametrize('how', ['force', 'exit'])
+def test_a_clean_store_with_monitoring_off_keeps_a_row_another_process_appended(tmp_path, how):
+	# monitor_external_changes=False overwrites what the store changed itself; a store that changed nothing holds nothing the
+	# file lacks, so a rewrite of it (rewrite(force=True), rewrite_on_exit) wrote a deletion line for the other process's row.
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, b'id\tv\na\t1\nb\t2\n')
+	t = TSVZ.TSVZed(p, header='id\tv', monitor_external_changes=False, rewrite_on_exit=(how == 'exit'), verbose=False,
+					append_check_delay=60)
+	t.get('a')
+	_append_external(p, b'c\t3\n')
+	if how == 'force':
+		assert t.rewrite(force=True)
+	t.close()
+	assert b'c\t\n' not in _bytes(p)
+	assert list(TSVZ.readTabularFile(p, header='id\tv')) == ['a', 'b', 'c']
+
+
+def test_a_store_that_changed_something_with_monitoring_off_still_overwrites(tmp_path, capsys):
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, b'id\tv\na\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv', monitor_external_changes=False, verbose=False, append_check_delay=60)
+	t['b'] = ['b', '2']
+	_append_external(p, b'c\t3\n')
+	assert t.rewrite(force=True)
+	t.close()
+	assert list(TSVZ.readTabularFile(p, header='id\tv')) == ['a', 'b']
+	assert 'Overwriting external changes' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('how', ['load', 'force', 'exit'])
+def test_a_clean_store_given_createIfNotExist_false_does_not_make_the_file(tmp_path, how):
+	p = str(tmp_path / 'missing.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', createIfNotExist=False, verbose=False, append_check_delay=60,
+					rewrite_on_load=(how == 'load'), rewrite_on_exit=(how == 'exit'))
+	if how == 'force':
+		assert t.rewrite(force=True) is not False
+	t.close()
+	assert not os.path.exists(p)
+
+
+def test_a_store_given_createIfNotExist_false_still_makes_the_file_for_a_row(tmp_path):
+	p = str(tmp_path / 'missing.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', createIfNotExist=False, verbose=False, append_check_delay=60)
+	t['a'] = ['a', '1']
+	t.close()
+	assert list(TSVZ.readTabularFile(p, header='id\tv')) == ['a']
+
+
+def test_tsvzedlite_one_column_delete_keeps_memory_what_a_fresh_open_holds(tmp_path):
+	# Reading the file again for its offsets started from the defaults the last read ended with: a file whose defaults line
+	# came last was then read at two columns, and `a` (a lone key there) was gone from memory but not from the file.
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\nb\n#_defaults_#\tP\nc\t\t1\n')
+	t = TSVZ.TSVZedLite(p, strict=False)
+	del t['b']
+	assert list(t) == ['a', 'c'] and t['a'] == ['a'] and t['c'] == ['c', 'P', '1'] and t.correctColumnNum == 1
+	del t['a']  # (was a silent no-op)
+	assert list(t) == ['c']
+	t.close()
+	assert list(TSVZ.readTabularFile(p)) == ['c']
+
+
+def test_tsvzedlite_one_column_delete_beside_a_defaults_line_with_no_value(tmp_path, capsys):
+	# The bare line is what `tsvz delete f '#_defaults_#'` writes. Memory held its old offset and read the wrong line.
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'b\n#_defaults_#\n')
+	t = TSVZ.TSVZedLite(p, strict=False)
+	capsys.readouterr()
+	del t['b']
+	assert 'mismatch' not in capsys.readouterr().err
+	assert 'b' not in t and b'b' not in _bytes(p).split(b'\n')
+	assert {k: list(t[k]) for k in t} == {k: list(v) for k, v in TSVZ.TSVZedLite(p, strict=False).items()}
+	t.close()
+
+
+def test_tsvzedlite_keeps_the_rows_memory_alone_holds_through_a_one_column_delete(tmp_path):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\nb\n')
+	t = TSVZ.TSVZedLite(p, strict=False)
+	t['#note'] = ['#note', 'x']
+	del t['a']
+	assert list(t) == ['b', '#note'] or set(t) == {'b', '#note'}
+	assert t['#note'] == ['#note', 'x']
+	t.close()
+
+
+@pytest.mark.parametrize('how', ['del', 'pop', 'popitem'])
+def test_tsvzedlite_delete_that_fails_leaves_the_key_in_memory_and_in_the_file(tmp_path, monkeypatch, how):
+	# The index was changed first: after the failure `'a' in t` was False, a retry was a silent no-op, and the file kept `a`.
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\nb\n')
+	t = TSVZ.TSVZedLite(p, strict=False)
+	real = TSVZ._specRewriteInPlace
+
+	def fail(*args, **kwargs):
+		raise OSError(28, 'No space left on device')
+	monkeypatch.setattr(TSVZ, '_specRewriteInPlace', fail)
+	key = 'b' if how == 'popitem' else 'a'
+	with pytest.raises(OSError):
+		if how == 'del':
+			del t['a']
+		elif how == 'pop':
+			t.pop('a')
+		else:
+			t.popitem()
+	monkeypatch.setattr(TSVZ, '_specRewriteInPlace', real)
+	assert key in t and list(t) == ['a', 'b'] and _bytes(p) == b'a\nb\n'
+	if how == 'del':
+		del t['a']
+	elif how == 'pop':
+		t.pop('a')
+	else:
+		t.popitem()
+	assert key not in t and key.encode() not in _bytes(p)
+	t.close()
+
+
+@pytest.mark.parametrize('suffix', ['.tsv', '.tsv.gz'])
+def test_tsvzedlite_reads_after_a_one_column_delete_are_not_served_from_what_it_had_read_ahead(tmp_path, suffix):
+	# The file was written under the store's open descriptor: what that had read ahead is stale, and a read at a new offset
+	# inside it returned another line (the delete seeks to the end to drop it).
+	p = str(tmp_path / ('o' + suffix))
+	data = ''.join('k%d\n' % i for i in range(20)).encode()
+	if suffix == '.tsv.gz':
+		_touch(p, gzip.compress(data))
+	else:
+		_touch(p, data)
+	t = TSVZ.TSVZedLite(p, strict=False)
+	assert t['k1'] == ['k1'] and t['k8'] == ['k8']
+	del t['k0']
+	assert [t[k] for k in ('k5', 'k6', 'k9')] == [['k5'], ['k6'], ['k9']]
+	t.close()
+
+
+def test_tsvzedlite_emptied_one_column_store_stays_one_column_and_a_given_count_stays(tmp_path):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\n')
+	t = TSVZ.TSVZedLite(p, strict=False)
+	del t['a']
+	assert t.correctColumnNum == 1 and len(t) == 0
+	t['x'] = ['x']
+	assert list(t) == ['x'] and _bytes(p) == b'x\n'
+	t.close()
+	q = str(tmp_path / 'two.tsv')
+	_touch(q, b'a\nb\t1\n')
+	t = TSVZ.TSVZedLite(q, strict=False, correctColumnNum=2)  # (the caller's count: the file is read as it is, the count is for writes)
+	assert list(t) == ['a', 'b'] and t.correctColumnNum == 2
+	t.reload()
+	assert list(t) == ['a', 'b'] and t.correctColumnNum == 2
+	t.close()
+
+
+def test_tsvzedlite_reload_takes_the_count_a_fresh_open_does(tmp_path):
+	# A store that was one column and finds another file wider reads as a fresh open: the count is not kept from before.
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\nb\n')
+	t = TSVZ.TSVZedLite(p, strict=False)
+	assert t.correctColumnNum == 1
+	_touch(p, b'a\t1\nb\t2\n')
+	t.reload()
+	assert t.correctColumnNum == -1 and t['a'] == ['a', '1']
+	other = str(tmp_path / 'p.tsv')
+	_touch(other, b'x\ny\n')
+	t.switchFile(other)
+	assert t.correctColumnNum == 1 and list(t) == ['x', 'y']
+	t.close()
+
+
+def test_tsvzedlite_set_defaults_is_what_a_reload_starts_from(tmp_path):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\t\t1\nb\t\t2\n')
+	t = TSVZ.TSVZedLite(p, strict=False)
+	t.setDefaults(['#_defaults_#', 'P', 'Q'])
+	t.reload()
+	assert t.defaults == ['#_defaults_#', 'P', 'Q'] and t['a'] == ['a', 'P', '1']
+	t.close()
+
+
+_DROP_APPENDER = r'''
+import os, sys, time
+sys.path.insert(0, %r)
+import TSVZ as T
+p, stop = sys.argv[1], sys.argv[2]
+n = 0
+while not os.path.exists(stop):
+	T.appendTabularFile(p, ['z%%d' %% n])
+	n += 1
+	time.sleep(0.005)
+print(n)
+''' % HERE
+
+
+def test_a_one_column_delete_beside_a_busy_writer_succeeds_and_loses_no_row(tmp_path):
+	# The delete read the file outside the lock and wrote only if it was unchanged, three tries: beside an appender at 200 Hz
+	# 147 of 147 failed. It reads under the lock it writes under now, so another process's row cannot fall between.
+	p = str(tmp_path / 'o.tsv')
+	stop = str(tmp_path / 'stop')
+	_touch(p, b''.join(b'k%d\n' % i for i in range(5000)))
+	child = subprocess.Popen([sys.executable, '-c', _DROP_APPENDER, p, stop], stdout=subprocess.PIPE)
+	deleted = 0
+	try:
+		deadline = time.time() + 120
+		while b'\nz0\n' not in _bytes(p) and time.time() < deadline:  # (the appender is running)
+			time.sleep(0.01)
+		started = time.time()
+		while deleted < 400 and (time.time() - started < 1.5 or deleted < 40):
+			assert _run('delete', p, 'k%d' % deleted)[0] == 0
+			deleted += 1
+	finally:
+		_touch(stop)
+		out = child.communicate(timeout=60)[0]
+	appended = int(out)
+	assert appended >= 40 and deleted >= 40
+	keys = list(TSVZ.readTabularFile(p, verifyHeader=False))
+	assert keys == ['k%d' % i for i in range(deleted, 5000)] + ['z%d' % i for i in range(appended)]
+
+
+def test_tsvzedlite_one_column_delete_message_names_the_file_once(tmp_path, monkeypatch):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\nb\n')
+	monkeypatch.setattr(TSVZ, '_specRewriteInPlace', lambda *a, **k: (_ for _ in ()).throw(OSError(5, 'Input/output error')))
+	out, err = io.StringIO(), io.StringIO()
+	assert TSVZ._cliMain(['delete', p, 'a'], stdin=io.StringIO(''), stdout=out, stderr=err) != 0
+	assert err.getvalue().count(p) <= 1 and _bytes(p) == b'a\nb\n'
+
+
+def test_a_delete_in_a_one_column_file_damaged_after_its_first_member_says_it_cannot_be_read(tmp_path, capsys):
+	# The rows of the first member are read, and the key stays: a deletion line deletes nothing in one column, and the
+	# exit status was 0 with nothing said.
+	p = str(tmp_path / 'o.tsv.gz')
+	_touch(p, gzip.compress(b'a\nb\n') + b'not a member at all')
+	assert _run('delete', p, 'a')[0] == 0
+	assert 'the file cannot be read' in capsys.readouterr().err
+
+
+def test_a_handler_does_not_take_a_row_it_is_still_writing_for_one_to_leave(tmp_path, monkeypatch):
+	# The keys' lines are taken out once everything queued is in the file (writer.barrier()): a row queued and not yet
+	# written would land after the delete and keep the key.
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\nd\n')
+	store = TSVZ._ServeStore(p, create=True)
+	real = store._append
+
+	def slow(payload, durable):
+		time.sleep(0.4)
+		return real(payload, durable)
+	monkeypatch.setattr(store, '_append', slow)
+	store.write([(['e'], False)], False, None)
+	assert store.delete(store._tombstone('e'), False, None)
+	store.close()
+	assert list(TSVZ.readTabularFile(p)) == ['a', 'd']
+
+
+def test_a_handler_delete_of_the_defaults_key_is_a_line_in_a_one_column_file(tmp_path):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\n')
+	store = TSVZ._ServeStore(p, create=True)
+	assert store.delete(store._tombstone(TSVZ.DEFAULTS_INDICATOR_KEY), False, None)
+	store.close()
+	assert _bytes(p) == b'a\n#_defaults_#\n'
+
+
+def _widen_by_another_program(p, header):
+	"""Another program that adds a column: a TSVZed with the wider ``header`` rewrites the file, widening line 1."""
+	other = TSVZ.TSVZed(p, header=header, strict=False, verbose=False, append_check_delay=60)
+	other.hardMapToFile()
+	return other
+
+
+def test_a_strict_store_follows_another_programs_widening_of_the_header(tmp_path, capsys):
+	# It raised "Header mismatch" once with a traceback, stayed deSynced and stale for good, and its own later sets landed
+	# narrow for a strict reader to drop (5.5: strict takes wider rows).
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, b'id\tv\na\t1\nb\t2\n')
+	t = _stopped(p, header='id\tv', strict=True)
+	other = _widen_by_another_program(p, 'id\tv\tw')
+	assert _bytes(p) == b'id\tv\tw\na\t1\t\nb\t2\t\n'
+	capsys.readouterr()
+	t.checkExternalChanges()
+	t.rewrite()
+	assert dict(t) == {'a': ['a', '1', ''], 'b': ['b', '2', '']} and t.correctColumnNum == 3 and not t.deSynced
+	assert 'Header mismatch' not in capsys.readouterr().out + capsys.readouterr().err
+	t['c'] = ['c', '3', 'x']
+	t.commitAppendToFile()
+	assert dict(TSVZ.readTabularFile(p, header='id\tv\tw', strict=True))['c'] == ['c', '3', 'x']
+	t.close()
+	other.close()
+
+
+def test_a_strict_store_opened_on_a_file_with_a_wider_header_takes_it(tmp_path):
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, b'id\tv\tw\na\t1\t2\n')
+	t = TSVZ.TSVZed(p, header='id\tv', strict=True, verbose=False, append_check_delay=60)
+	assert dict(t) == {'a': ['a', '1', '2']} and t.correctColumnNum == 3
+	t.close()
+
+
+@pytest.mark.parametrize('line1', [b'xx\tyy\n', b'id\tother\tw\n', b'id\tv\t\n', b'id\n'])
+def test_a_strict_store_still_refuses_a_header_that_is_not_its_own_widened(tmp_path, line1):
+	# Only the same leading cells and then named ones are a widening: the rest is a mismatch, as before.
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, line1 + b'a\t1\n')
+	with pytest.raises(ValueError, match='Header mismatch'):
+		TSVZ.TSVZed(p, header='id\tv', strict=True, verbose=False, append_check_delay=60)
+
+
+def test_a_rewrite_with_errors_replace_widens_a_header_ascii_cannot_write(tmp_path):
+	# The widened header line was encoded with errors='strict' whatever the store's errors: TSVZEncodeError.
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, b'id\tv\na\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv\tcafé', encoding='ascii', errors='replace', strict=False, verbose=False,
+					append_check_delay=60)
+	t.mapToFile()
+	t.close()
+	assert _bytes(p) == b'id\tv\tcaf?\na\t1\t\n'
+
+
+def test_a_file_made_again_under_a_header_wider_than_memory_is_followed_by_memory(tmp_path):
+	# The rows are padded in the file; memory kept the old width, so the next row set went in narrow and a strict
+	# reader dropped it (the README says a rewrite of any kind follows at once).
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, b'id\tv\na\t1\nb\t2\n')
+	t = TSVZ.TSVZed(p, header='id\tv\tw', strict=False, verbose=False, append_check_delay=60)
+	assert t.correctColumnNum == 2
+	os.remove(p)
+	t.hardMapToFile()
+	assert _bytes(p) == b'id\tv\tw\na\t1\t\nb\t2\t\n'
+	assert dict(t) == {'a': ['a', '1', ''], 'b': ['b', '2', '']} and t.correctColumnNum == 3
+	t['c'] = ['c', '3']
+	t.close()
+	assert dict(TSVZ.readTabularFile(p, header='id\tv\tw', strict=True)) == {
+		'a': ['a', '1', ''], 'b': ['b', '2', ''], 'c': ['c', '3', '']}
+
+
+def test_a_file_made_again_keeps_the_whole_header_when_every_row_holds_a_value(tmp_path):
+	# A one-column store whose rows all hold a value is made again under the whole header, not its first cell alone
+	# (only rows with no value, which read as deletions under it, keep the narrow line).
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'id\na\nb\n')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '2']
+	t.commitAppendToFile()
+	os.remove(p)
+	t.hardMapToFile()
+	t.close()
+	assert _bytes(p).split(b'\n')[0] == b'id\tv'
+	assert dict(TSVZ.readTabularFile(p, header='id\tv')) == {'a': ['a', '1'], 'b': ['b', '2']}
+
+
+def test_a_widening_reads_line_1_with_empty_cells_at_its_end_as_the_headers_beginning(tmp_path):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'id\tv\t\t\na\t1\n')
+	t = _widened(p, header='id\tv\tw')
+	t.close()
+	assert _bytes(p) == b'id\tv\tw\na\t1\t\n'
+
+
+def test_get_file_obj_that_fails_after_the_lock_lets_go_of_it(tmp_path, monkeypatch):
+	# Closing a locked file without unlocking it left its descriptor in _HELD, and a later file that got the same number
+	# looked locked: a random failure in the lock tests' teardown.
+	p = str(tmp_path / 'g.tsv.gz')
+	_touch(p, gzip.compress(b'a\t1\n'))
+	t = TSVZ.TSVZed(p, verbose=False, append_check_delay=60)
+	before = dict(TSVZ._HELD)
+
+	def refuse(*args, **kwargs):
+		raise OSError(24, 'Too many open files')
+	monkeypatch.setattr(TSVZ, '_compressedWriter', refuse)
+	assert t.get_file_obj('ab') is None
+	monkeypatch.undo()
+	assert TSVZ._HELD == before
+	assert not t.writeLock.locked()
+	t.close()

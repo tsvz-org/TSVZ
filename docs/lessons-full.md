@@ -193,3 +193,32 @@ entries go last, in the same commit as the change:
   test rather than by forbidding the operation. A fact that changes how every row reads moves all at once: line 1 alone
   would have made strict readers drop the rows, and from one column it would have turned every lone key into a deletion.
 
+
+## 2026-11-06 TSVZ 5.6: a delete reads the file under the lock it writes under
+- Changed: the one-column delete (`_legacyDropKeys`) takes the rewrite lock first and reads the file through it, then
+  writes in place; it has no retry loop, stamp or second look at the width. A row that must move up past a defaults line
+  moves with the cells it read; a delete that would change what another row reads (a valued row moved above a
+  `#_defaults_#` line) moves nothing. `TSVZedLite` changes its memory only once the file is written, and loads with the
+  defaults it was constructed with.
+- Why we had to change: the first 5.6 delete read the file, then asked for the lock, and checked a stamp to see whether
+  another writer had come between; beside an appender at 200 Hz it failed at every try. It could also change another
+  row's value by moving it across a defaults line, and left Lite's memory changed when the write failed.
+- Original design was wrong because: the read and the write were two steps with a gap, and the code defended the gap.
+  The gap is the cause; the defence added a stamp, a retry and an error path, each its own place to fail.
+- Lesson: when a decision is made on a read and acted on with a write, read through the lock that the write holds. Check
+  the fix by removing parts: if the retry, the stamp and the error path can go, the design was right.
+
+## 2026-11-06 TSVZ 5.6: a strict store follows a widening header, and a clean store takes in what others wrote
+- Changed: a strict `TSVZed` takes a line 1 that extends its header (the same leading cells, then named ones) for another
+  program's widening, at open and whenever it follows the file, and its column count becomes the wider header's; it used
+  to raise "Header mismatch" and stop following. Any other line 1 is refused as before. A rewrite of a store that has
+  changed nothing takes in another process's change first, also with `monitor_external_changes=False`, so it no longer
+  deletes a row another process appended; with `createIfNotExist=False` it makes no file where there is none.
+  `errors=` is honoured when a widened file is read back.
+- Why we had to change: a program that widened its header made every strict reader refuse the file for good, and a
+  `monitor_external_changes=False` store deleted another process's row on its next clean rewrite.
+- Original design was wrong because: "line 1 is not my header" was read as "the file is not mine". The flag that turns off
+  following was also used as the guard against writing over unseen rows, which it was never meant to be.
+- Lesson: when a check stops a good case that looks like the bad one, compare exactly (prefix cells, then named ones)
+  instead of forbidding both. A flag that turns a check off must not turn off the guard against deleting what the program
+  never held.

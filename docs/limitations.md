@@ -340,3 +340,35 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone loses rows to it.
 - Approved: 2026-11-05, the user chose "Allow it, document it (Recommended)" when asked whether `setDefaults()` may
   change the column count.
+
+
+### A one-column delete on TSVZedLite looks at the file every time
+- Kind: deferred
+- What the operator sees: with the default read gate (`W=-1`) each `delete`, `pop` and `popitem` on a file of one column
+  reads the file under the rewrite lock to learn the width, then rewrites it. On a 200k-row file a delete costs 34 us
+  against 6.3 us on a `.tsv`, and 2.8 ms against 12 us on a `.tsv.gz`.
+- Why: the width is a fact of the file and another writer can change it, so the delete asks the file; a cached width
+  would be a second answer to the same question.
+- Revisit when: a store deletes in a hot loop on a large one-column file.
+
+### mapToFile() at 20 Hz beside an appender loses rows
+- Kind: deferred
+- What the operator sees: a `TSVZed` calling `mapToFile()` 20 times a second while another process appends to the file
+  without taking the lock loses some of the appended rows (733 of 4068 in the test), the same as 5.5.
+- Why: a rewrite replaces the file's contents from memory; a row appended between the rewrite's snapshot and its write is not in
+  the snapshot. Not verified: whether appenders that take the kernel lock are safe.
+- Revisit when: a program mixes forced rewrites at a high rate with lock-free appenders.
+
+### No deterministic test of the read gate
+- Kind: deferred
+- What the operator sees: nothing; the gate that keeps a reader out while a rewrite is mid-way (byte 2 of the lock layout)
+  is covered by stress runs and the conformance cases, not by a test that forces the interleaving.
+- Why: forcing it needs a hook inside the rewrite, which is a part only the test would use.
+- Revisit when: the lock layout changes or a stress run fails in the gate.
+
+### legacyfuzz does not know the widening exception
+- Kind: deferred
+- What the operator sees: nothing in the library; the reviewer's fuzzer reports a mismatch when a rewrite widens line 1,
+  because it still holds the 5.5 rule that a rewrite of a healthy file only drops lines.
+- Why: the fuzzer is a development tool; the exception is documented in the README and tested directly.
+- Revisit when: the fuzzer is next used for a release.

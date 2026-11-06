@@ -370,7 +370,8 @@ def test_run_command_exit_output_and_timeout(tmp_path):
 
 def test_processes_left_in_the_group_are_killed(tmp_path):
 	pidfile = tmp_path / 'pid'
-	code = ('import subprocess, sys; p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]); '
+	# (the child sleeps far past what wait_gone waits: one that ends by itself would pass a kill of the leader alone)
+	code = ('import subprocess, sys; p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"]); '
 		'open(%r, "w").write(str(p.pid))' % str(pidfile))
 	ran = tc.run_command([sys.executable, '-c', code], str(tmp_path), 10, b'', str(tmp_path))
 	assert ran.exit == 0
@@ -507,7 +508,7 @@ def test_a_serve_that_forks_and_exits_leaves_nothing_running(tmp_path):
 	store = tmp_path / 's.tsvz'
 	store.write_text('')
 	pidfile = tmp_path / 'child.pid'
-	code = ('import os, sys, time\nif os.fork() == 0:\n\topen(%r, "w").write(str(os.getpid()))\n\ttime.sleep(30)\n\tos._exit(0)\n'
+	code = ('import os, sys, time\nif os.fork() == 0:\n\topen(%r, "w").write(str(os.getpid()))\n\ttime.sleep(600)\n\tos._exit(0)\n'
 		'time.sleep(0.5)\nsys.exit(0)\n' % str(pidfile))
 	script = tmp_path / 'forky.py'
 	script.write_text(code)
@@ -569,10 +570,10 @@ ops = ('read', 'get', 'set', 'append', 'delete', 'clear', 'scrub', 'verify', 'pa
 op = next((a for a in args if a in ops), None)
 store = args[args.index(op) + 1] if op and args.index(op) + 1 < len(args) else None
 if mode == 'hang' and op == 'read':
-	child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+	child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])
 	with open(os.environ['FAKE_PIDFILE'], 'w') as f:
 		f.write(str(child.pid))
-	time.sleep(60)
+	time.sleep(600)
 if mode == 'crash' and op == 'len':
 	raise RuntimeError('crashed')
 if mode == 'ttyhang' and op == 'read' and os.isatty(1):
@@ -915,11 +916,11 @@ def test_the_reference_passes_the_small_corpus(small_corpus, tmp_path, capsys):
 
 def test_a_hang_is_a_timeout_and_leaves_nothing_running(small_corpus, tmp_path, capsys, monkeypatch):
 	monkeypatch.setenv('FAKE_PIDFILE', str(tmp_path / 'pid'))
-	code, results = run_main(tmp_path, fake(tmp_path, 'hang'), '--only', '9.2-lone-key-deletes', '--mode', 'files', '--timeout', '2')
+	# (the timeout is long enough for the fake to start and write its child's pid even on a loaded host: without that
+	# pid there is nothing to see gone, and the child sleeps far past wait_gone)
+	code, results = run_main(tmp_path, fake(tmp_path, 'hang'), '--only', '9.2-lone-key-deletes', '--mode', 'files', '--timeout', '15')
 	assert code == 1 and 'timed out' in ' '.join(results[('9.2-lone-key-deletes', 'files')]['detail'])
-	pid = tmp_path / 'pid'  # (on a loaded host the 2 s can end the fake before it gets as far as writing this)
-	if pid.exists() and pid.read_text():
-		wait_gone(int(pid.read_text()))
+	wait_gone(int((tmp_path / 'pid').read_text()))
 
 
 def test_a_work_directory_with_spaces_and_non_ascii(small_corpus, tmp_path, capsys):

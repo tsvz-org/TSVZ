@@ -321,7 +321,11 @@ The file formats are unchanged.
   read reached (`rewrite(force=True)`, `mapToFile()` and `hardMapToFile()` write there too).
   A program that called `rewrite(force=True)` only to follow another process's change now
   pays a whole rewrite for it: `rewrite()` follows it and writes nothing. `rewrite_interval`
-  still writes only a dirty store. A `.tsvz` still ignores all of these.
+  still writes only a dirty store. A `.tsvz` still ignores all of these. A store that has
+  changed nothing takes in another process's change before it writes, also with
+  `monitor_external_changes=False` (which is for overwriting what the store changed itself:
+  a row another process appended is kept, not deleted), and one given `createIfNotExist=False`
+  makes no file where there is none (a row set makes it, as before).
 
 - **A one-column store stays one column when another process empties its file.** Its
   column count was lost, so the next one-cell `set` acted as a delete and the write was
@@ -332,14 +336,20 @@ The file formats are unchanged.
   `a\nb\nc\n` exited 0 and appended `b`, a row there; `TSVZedLite`'s `del` did the same, and
   `tsvz serve`. `delete`, `pop` and `popitem` of a `tsvz` command, a handler or a
   `TSVZedLite` now take the key's lines out, as `TSVZed` does: the file keeps its one
-  column (the next one-cell line moves up when a wider line would come first) and only
-  those lines go, the rest copied as they are. Each delete there is a whole rewrite, and
-  `TSVZedLite` then reads the file again for its offsets; at two columns or more a delete
-  is still one appended line. A file with no keyed line yet takes no line either: a
-  `delete` used to write the lone key, which then read as a row, and it now writes nothing
-  (a store that did not exist is still created). A delete that keeps meeting another writer
-  fails (exit 1, `OSError` from `TSVZedLite`) with nothing written; a damaged file that
-  cannot be read gets the line, as before.
+  column (a row that must move up, because it is narrower than the first line left, moves
+  with the cells it read, and the other rows read as before) and only those lines go, the
+  rest copied as they are. Each delete there is a whole rewrite, and `TSVZedLite` then reads
+  the file again for its offsets, as a fresh open would; at two columns or more a delete is
+  still one appended line. A file with no keyed line yet and no header of two columns or
+  more takes no line either: a `delete` used to write the lone key, which then read as a
+  row, and it now writes nothing (a store that did not exist is still created; under
+  `--x-header` with two columns or more a lone key is a deletion, and `id\tv\n` becomes
+  `id\tv\na\t\n`). The delete reads the file under the rewrite lock it writes under, as
+  `TSVZed` does, so a writer beside it neither makes it fail nor loses its rows (it failed at
+  every try beside an appender at 200 Hz); `TSVZedLite` changes its memory only once the
+  file is written, so a delete that fails (an `OSError`) leaves the key where it was. A
+  damaged file that cannot be read gets the line, as before, and a warning on stderr: in a
+  file of one column the line deletes nothing.
 - **`TSVZedLite` knows a one-column file from its load.** So a one-cell row is a row there
   (it was a delete of a key it did not hold), and a row read at its offset has its cell
   (`t['a']` read as `[]`).
@@ -347,17 +357,20 @@ The file formats are unchanged.
 - **A rewrite widens line 1 to the header the program gives.** A program that adds a column
   (line 1 `id\tv`, `header='id\tv\tw'`) no longer has to edit line 1 by hand: a `TSVZed`
   rewrite of any kind (`mapToFile()`, `hardMapToFile()`, `rewrite(force=True)`, the automatic
-  ones) writes the header as line 1, pads every narrower row and `#_defaults_#` line to it,
-  and the store's rows and column count follow at once, so `t['a'][2]` holds `''` and the
-  "Header mismatch" at each open ends. The padding is the one thing besides dropping lines
+  ones, and one that makes a removed or damaged file again) writes the header as line 1, pads
+  every narrower row and `#_defaults_#` line to it, and the store's rows and column count
+  follow at once, so `t['a'][2]` holds `''` and the "Header mismatch" at each open ends. The padding is the one thing besides dropping lines
   that a rewrite does to a line: without it a strict reader, which drops a narrower line,
   would lose the rows. The rule is exact: line 1 must be the header's beginning, the same
   cells without the whitespace around them, and fewer of them. `idaho\tvalue`, which the
   read's looser check takes for `id\tv`, stays, as does a line 1 that is a row, or one wider
   than the header (writes never cut), and a header given with `verifyHeader=False`. A strict
-  `TSVZed` refuses a header line 1 does not match at open, as before: open the store loose
-  once to widen it. A program still on the old header then sees "Header mismatch" in its
-  turn, and a strict reader given it raises; it does not narrow line 1. A one-column file
+  `TSVZed` takes a line 1 that extends its header (the same leading cells, then named ones)
+  for another program's widening, at open and whenever it follows the file, and its column
+  count becomes the wider header's; it used to raise "Header mismatch" and stop following.
+  Any other line 1 that is not its header is refused as before. A program still on the old
+  header then sees "Header mismatch" in its turn, and a strict reader given it raises; it
+  does not narrow line 1. A one-column file
   with rows that hold no value is not widened, with a warning, and stays as it is: a lone
   key is a deletion at two columns or more, so widening would delete it. A scrub
   still never changes line 1.
@@ -967,7 +980,7 @@ Conformance testing).
 - §19.4: a scrub whose rows would read differently under the final markers writes them with stripping and fill-empty off, then restores the final markers after the rows.
 - §20.7: `-q` also silences informational messages ("Created …"); only errors remain.
 - §20.2: `scrub` of a multi-part store, and `clear` of one part of one, are refused with exit 1; `read`, `get` and `parts` of a numbered part read that part alone, with a warning.
-- §20.2.4: on `.tsv`-family files `get` prints nothing for a missing key, `verify` checks nothing, and `parts` lists the file.
+- §20.2.4: on `.tsv`-family files `get` prints nothing for a missing key, `verify` checks nothing, `parts` lists the file, and in a file of one column (where a lone key is a row, so a deletion line deletes nothing) `delete`, `pop` and `popitem` take the key's lines out of the file, a whole rewrite, not an appended line.
 - §20.3: a bulk input line with an empty key is skipped, with a warning.
 - §20.6: a write whose store cannot be created, and a `read`, `get` or `verify` that cannot read every part, or whose parts kept changing through three reads, exit 1 with an error that `-q` keeps.
 - §21: a served `.tsv` file with a header line shows that line as a row, as `tsvz read` does (`TSVZed` hides it when given the header).
