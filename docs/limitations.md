@@ -337,7 +337,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `a\nc\t1\n#_defaults_#\tP\n`. 5.4 did worse on every route tried: its `TSVZed` read such a file as `{}` with no
   defaults at all, and its rewrite took out the first lone key too.
 - Why: the user chose to allow a `setDefaults()` that changes the column count.
-- Revisit when: someone loses rows to it.
+- Revisit when: 5.6, which keeps the rows (2026-11-06, the user chose "Fix in 5.6 (Recommended)").
 - Approved: 2026-11-05, the user chose "Allow it, document it (Recommended)" when asked whether `setDefaults()` may
   change the column count.
 
