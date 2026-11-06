@@ -264,17 +264,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-11-05, the user chose "Known limitation (Recommended)" on the wider shape (a first keyed line of one
   cell, not only a bare `#_defaults_#`).
 
-### tsvz delete and TSVZedLite's delete in a one-column file do not delete
-- Kind: deferred to 5.6
-- What the operator sees: `tsvz delete FILE b` on a file `a\nb\nc\n` exits 0 and the file grows to `a\nb\nc\nb\n`:
-  `b` stays, since a lone key is a row in a one-column file. `TSVZedLite`'s `del` appends the same line. 5.4 writes
-  the same bytes. `TSVZed` now deletes in such a file (it takes the key's lines out), so the two differ. `tsvz
-  serve` does the same on 5.5 and 5.4 (exit 0, the key stays, `has` exits 0).
-- Why: both append a deletion line, as in 5.4, and a lone key is a row in a one-column file; 5.5's change was to
-  `TSVZed`.
-- Revisit when: right after 5.5.
-- Approved: 2026-11-05, the user chose "Deferred to 5.6 (Recommended)".
-
 ### A wider row that a move writes again is lost to old strict readers
 - Kind: known limitation
 - What the operator sees: for a file `a\t1\na\t1\t2\nb\t3\n`, `move_to_end('a')` appends `a\t` then `a\t1\t2`. 5.5's

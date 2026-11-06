@@ -14340,3 +14340,187 @@ def test_correctColumnNum_1_on_an_empty_file_is_no_column_count(tmp_path):
 	t = TSVZ.TSVZed(p, correctColumnNum=1, verbose=False)
 	assert t.correctColumnNum == -1
 	t.close()
+
+
+# --------------------------------------------------------------------------
+# 5.6: tsvz and TSVZedLite delete in a one-column file
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize('text, argv, expected, rows', [
+	(b'a\nb\nc\n', ('delete', '{p}', 'b'), b'a\nc\n', ['a', 'c']),
+	(b'a\nb\nc\nb\n', ('delete', '{p}', 'b'), b'a\nc\n', ['a', 'c']),  # (every line of the key)
+	(b'a\nb\nc\n', ('delete', '{p}', 'a', 'c'), b'b\n', ['b']),
+	(b'a\nb\n', ('delete', '{p}', 'a', 'b'), b'', []),
+	(b'a\nb\n', ('delete', '{p}', 'zz'), b'a\nb\n', ['a', 'b']),  # (no key, no line: the file is left as it is)
+	(b'a\nb\t1\nc\n', ('delete', '{p}', 'a'), b'c\nb\t1\n', ['c', 'b']),  # (the one column stays: the next one-cell line moves up)
+	(b'# note\na\nb\n', ('delete', '{p}', 'a'), b'# note\nb\n', ['b']),  # (only that key's lines go)
+	(b'id\na\nb\n', ('delete', '{p}', 'a', '--x-header', 'id'), b'id\nb\n', ['b']),
+	(b'', ('delete', '{p}', 'a'), b'', []),  # (a lone key written here would be a row: nothing to delete)
+])
+def test_tsvz_delete_in_a_one_column_file_takes_the_keys_lines_out(tmp_path, text, argv, expected, rows):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, text)
+	argv = [arg.format(p=p) for arg in argv]
+	assert _run(*argv)[0] == 0
+	assert _bytes(p) == expected
+	assert list(TSVZ.readTabularFile(p, header='id' if text.startswith(b'id') else '')) == rows
+
+
+def test_tsvz_delete_of_a_missing_one_makes_no_row(tmp_path):
+	p = str(tmp_path / 'o.tsv')
+	assert _run('delete', p, 'a')[0] == 0
+	assert TSVZ.readTabularFile(p) == {} and _run('has', p, 'a')[0] == 3
+
+
+def test_tsvz_bulk_delete_in_a_one_column_file(tmp_path):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\nb\nc\n')
+	assert _run('delete', p, '-', stdin='a\nc\n')[0] == 0
+	assert _bytes(p) == b'b\n'
+
+
+@pytest.mark.parametrize('argv, printed, expected', [
+	(('pop', '{p}', 'b'), 'b\n', b'a\nc\n'),
+	(('popitem', '{p}'), 'c\n', b'a\nb\n'),
+	(('popitem', '{p}', 'first'), 'a\n', b'b\nc\n'),
+])
+def test_tsvz_pop_in_a_one_column_file_takes_the_keys_lines_out(tmp_path, argv, printed, expected):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\nb\nc\n')
+	assert _run(*[arg.format(p=p) for arg in argv])[:2] == (0, printed)
+	assert _bytes(p) == expected
+
+
+def test_tsvz_delete_in_a_compressed_one_column_file(tmp_path):
+	p = str(tmp_path / 'o.tsv.gz')
+	_touch(p, gzip.compress(b'a\nb\nc\n'))
+	assert _run('delete', p, 'b')[0] == 0
+	assert list(TSVZ.readTabularFile(p)) == ['a', 'c']
+
+
+def test_tsvz_delete_at_two_columns_still_appends_one_line(tmp_path):
+	p = str(tmp_path / 't.tsv')
+	_touch(p, b'a\t1\nb\t2\n')
+	assert _run('delete', p, 'a')[0] == 0
+	assert _bytes(p) == b'a\t1\nb\t2\na\n'
+
+
+def test_tsvz_delete_of_every_key_of_a_compressed_one_column_file(tmp_path):
+	p = str(tmp_path / 'o.tsv.gz')
+	_touch(p, gzip.compress(b'a\nb\n'))
+	assert _run('delete', p, 'a', 'b')[0] == 0
+	assert TSVZ.readTabularFile(p) == {}
+	assert _run('set', p, 'c')[0] == 0
+	assert list(TSVZ.readTabularFile(p)) == ['c']
+
+
+def test_tsvz_delete_of_the_defaults_key_in_a_one_column_file_still_resets_them(tmp_path):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\n')
+	assert _run('delete', p, '#_defaults_#')[0] == 0
+	assert _bytes(p) == b'a\n#_defaults_#\n'
+
+
+def test_a_handler_deletes_in_a_one_column_file(tmp_path, served):
+	if not hasattr(__import__('socket'), 'AF_UNIX'):
+		pytest.skip('Unix sockets')
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\nb\nc\nd\n')
+	served(p)
+	assert _run('delete', p, 'b')[0] == 0
+	assert _run('has', p, 'b')[0] == 3
+	assert _run('pop', p, 'c')[:2] == (0, 'c\n')
+	assert _run('set', p, 'e')[0] == 0  # (queued behind nothing the drop could lose)
+	assert _run('delete', p, 'e')[0] == 0  # (the row it just queued is in the file first)
+	assert _run('keys', p)[1] == 'a\nd\n'
+	assert _bytes(p) == b'a\nd\n'
+
+
+def test_a_delete_that_keeps_meeting_another_writer_says_so_and_writes_nothing(tmp_path, monkeypatch):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\nb\n')
+	monkeypatch.setattr(TSVZ, '_legacyReplace', lambda *args, **kwargs: None)
+	with pytest.raises(OSError, match='kept changing'):
+		TSVZ._legacyDropKeys(p, ['a'], [''], True, [], 'utf8', '\t', 'strict')
+	assert _bytes(p) == b'a\nb\n'
+
+
+@pytest.mark.parametrize('how', ['del', 'pop', 'popitem', 'lone'])
+def test_tsvzedlite_delete_in_a_one_column_file(tmp_path, how):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\nb\nc\n')
+	t = TSVZ.TSVZedLite(p, strict=False)
+	key = 'c' if how == 'popitem' else 'b'
+	if how == 'del':
+		del t['b']
+	elif how == 'pop':
+		assert t.pop('b') == ['b']
+	elif how == 'popitem':
+		assert t.popitem() == ('c', ['c'])
+	else:
+		_touch(p, b'a\nb\t1\nc\n')
+		t.close()
+		t = TSVZ.TSVZedLite(p, strict=False)
+		del t['b']
+	assert key not in t and 'a' in t and t['a'] == ['a']  # (read at its offset: the offsets moved)
+	t.close()
+	assert key.encode() not in _bytes(p)
+	assert list(TSVZ.readTabularFile(p, strict=False)) == [k for k in 'abc' if k != key]
+
+
+def test_tsvzedlite_keeps_its_offsets_and_memory_rows_after_a_one_column_delete(tmp_path):
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\nb\nc\n')
+	t = TSVZ.TSVZedLite(p, strict=False)
+	t['#note'] = ['#note', 'x']
+	del t['a']
+	assert t['b'] == ['b'] and t['c'] == ['c'] and t['#note'] == ['#note', 'x']
+	t['d'] = ['d']  # (appended after what is left, not over it)
+	assert t['d'] == ['d'] and t['c'] == ['c']
+	t.close()
+	assert _bytes(p) == b'b\nc\nd\n'
+
+
+def test_tsvzedlite_takes_a_one_cell_row_in_a_one_column_file(tmp_path):
+	# It knew no column count until a read at an offset, so the row was a delete of a key it did not hold.
+	p = str(tmp_path / 'o.tsv')
+	_touch(p, b'a\n')
+	t = TSVZ.TSVZedLite(p, strict=False)
+	assert t.correctColumnNum == 1
+	t['b'] = ['b']
+	assert t['b'] == ['b']
+	t.close()
+	assert _bytes(p) == b'a\nb\n'
+
+
+def test_tsvzedlite_delete_in_a_compressed_one_column_file(tmp_path):
+	p = str(tmp_path / 'o.tsv.gz')
+	_touch(p, gzip.compress(b'a\nb\nc\n'))
+	t = TSVZ.TSVZedLite(p, strict=False)
+	del t['b']
+	assert list(t) == ['a', 'c']
+	t.close()
+	assert list(TSVZ.readTabularFile(p)) == ['a', 'c']
+
+
+def test_tsvzedlite_delete_at_two_columns_still_appends_one_line(tmp_path):
+	p = str(tmp_path / 't.tsv')
+	_touch(p, b'a\t1\nb\t2\n')
+	t = TSVZ.TSVZedLite(p, strict=False)
+	del t['a']
+	t.close()
+	assert TSVZ.readTabularFile(p) == {'b': ['b', '2']} and _bytes(p).startswith(b'a\t1\nb\t2\n')
+
+
+def test_tsvzedlite_switchFile_takes_the_new_files_column_count(tmp_path):
+	one, two = str(tmp_path / 'o.tsv'), str(tmp_path / 't.tsv')
+	_touch(one, b'a\nb\n')
+	_touch(two, b'x\t1\ny\t2\n')
+	t = TSVZ.TSVZedLite(one, strict=False)
+	assert t.correctColumnNum == 1
+	t.switchFile(two)
+	assert t.correctColumnNum == -1
+	t.switchFile(one)
+	assert t.correctColumnNum == 1
+	del t['a']
+	t.close()
+	assert _bytes(one) == b'b\n'

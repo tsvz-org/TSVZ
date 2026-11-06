@@ -166,3 +166,16 @@ entries go last, in the same commit as the change:
 - Lesson: a flag named for doing something does it. `dirty` may schedule automatic work; it never gates a call that
   asked for the work. Check what an automatic path would now destroy: a forced write must not ride along into a path
   that never asked (a close over damage).
+
+## 2026-11-06 TSVZ 5.6: a delete is the same act through every door
+- Changed: `tsvz delete`, `pop` and `popitem`, a handler's, and `TSVZedLite`'s take a key's lines out of a one-column file
+  (`_legacyDropKeys`, on `_legacyDropLines`, which `TSVZed`'s rewrite uses) instead of appending the lone key. Where the file
+  has no keyed line nothing is written. `TSVZedLite` takes its column count from its load, and reads a lone row at its
+  offset.
+- Why we had to change: the lone key is a row there, so a delete exited 0, grew the file, and left the key (and on an
+  empty file it created the key). 5.5 fixed `TSVZed` alone, so two APIs disagreed on one file.
+- Original design was wrong because: "a delete is an appended line" was each writer's own rule. It is true only at two
+  columns or more, and only a reader knows the width: a writer that appends blind cannot tell.
+- Lesson: when one rule depends on a fact of the file, every writer asks the file, through one function. Fixing the one
+  writer that a test found leaves the others saying the opposite. Ask the first lines, so the common case stays one append.
+

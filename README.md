@@ -328,6 +328,22 @@ The file formats are unchanged.
   gone. The count now holds until a line in the file says otherwise; a lone key in a store
   of two columns or more emptied this way stays a delete.
 
+- **`tsvz delete` and `TSVZedLite` delete in a one-column file.** `tsvz delete FILE b` on
+  `a\nb\nc\n` exited 0 and appended `b`, a row there; `TSVZedLite`'s `del` did the same, and
+  `tsvz serve`. `delete`, `pop` and `popitem` of a `tsvz` command, a handler or a
+  `TSVZedLite` now take the key's lines out, as `TSVZed` does: the file keeps its one
+  column (the next one-cell line moves up when a wider line would come first) and only
+  those lines go, the rest copied as they are. Each delete there is a whole rewrite, and
+  `TSVZedLite` then reads the file again for its offsets; at two columns or more a delete
+  is still one appended line. A file with no keyed line yet takes no line either: a
+  `delete` used to write the lone key, which then read as a row, and it now writes nothing
+  (a store that did not exist is still created). A delete that keeps meeting another writer
+  fails (exit 1, `OSError` from `TSVZedLite`) with nothing written; a damaged file that
+  cannot be read gets the line, as before.
+- **`TSVZedLite` knows a one-column file from its load.** So a one-cell row is a row there
+  (it was a delete of a key it did not hold), and a row read at its offset has its cell
+  (`t['a']` read as `[]`).
+
 ## Upgrading to 5.5 from 5.4
 
 The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family file 5.5
@@ -511,13 +527,10 @@ writes.
   - a store emptied at one column and then given a wider row first loses the lone keys
     after it: `t['x']=['x','1']; t['y']=['y']` reopens without `y`
     ([entry](docs/limitations.md#a-store-emptied-at-one-column-then-given-a-wider-row-first-loses-the-lone-keys-after-it));
-  - `tsvz delete` and `TSVZedLite`'s delete in a one-column file do not delete (as in
-    5.4; planned for 5.6)
-    ([entry](docs/limitations.md#tsvz-delete-and-tsvzedlites-delete-in-a-one-column-file-do-not-delete));
   - repeated `move_to_end` of a row read before the defaults grows the file
     ([entry](docs/limitations.md#repeated-move_to_end-of-a-row-read-before-the-defaults-grows-the-file));
   - a wider row that a move writes again is lost to 3.39 to 5.4 strict readers
-    ([entry](docs/limitations.md#a-wider-row-that-a-move-writes-again-is-lost-to-old-strict-readers));
+    ([entry](docs/limitations.md#a-wider-row-that-a-move-writes-again-is-lost-to-old-strict-readers)).
 - **A late `setDefaults()` on a file whose first keyed line has one cell grows it at each
   rewrite** (a bare `#_defaults_#` or a lone key, and a row with an empty cell the defaults
   fill): 28 bytes per `hardMapToFile()` with one default. Reads do not change
@@ -876,7 +889,7 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 | L18 | A scrub keeps every `#_defaults_#` line as the file has it, where it was, so every row reads as it did; 3.39 dropped them, so rows appended later got no defaults. |
 | L19 | A scrub never changes line 1, except that a header you pass with `verifyHeader=False` is added; a `TSVZed` rewrite of a healthy file never changes it, unless a delete in a one-column file takes line 1 out; 3.39 put an empty line in front of a header line, and a reader given the header then read the header as a row. |
 | L20 | A row wider than the column count is read whole (only its empty cells past the count go); 3.39 cut it. |
-| L21 | `TSVZed` reads a one-column file's lone keys as rows, as `readTabularFile` does (3.39 showed none); a delete there takes the key's lines out at the next commit, not as a line. |
+| L21 | `TSVZed` reads a one-column file's lone keys as rows, as `readTabularFile` does (3.39 showed none); a delete there takes the key's lines out at the next commit, not as a line; from 5.6 so do `tsvz delete`, `pop`, `popitem`, a handler and `TSVZedLite`, at once. |
 | L22 | Writes never cut a row: a wider row is written whole; 3.39 cut it to the column count. A strict read takes a wider row whole and drops only a narrower one; a strict store refuses only a narrower row. |
 | L23 | A scrub, and a `TSVZed` rewrite of a healthy file, drop lines and keep the lines they keep byte for byte, in place (a key's last line may move up into its first line's place; a dead key's line readers take their column count from is kept emptied); 3.39 wrote the rows it read. |
 | L24 | A `TSVZed`'s whole reload starts from the defaults the program gave, not those its last read ended with. |

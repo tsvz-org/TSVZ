@@ -2957,6 +2957,70 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	return out[:place] + [line] + rest + out[best + 1:], name
 
 
+def _legacyLinesWidth(lines, header, consumed, defaults, encoding, delimiter):
+	"""The column count a whole read of the legacy lines ``lines`` (bytes, without their newline) takes, reading no
+	further than it must: the header's or the defaults' (_legacyWidthOf), else the first keyed line's; -1 for no keyed
+	line. ``consumed``: the read takes line 1 for its header, whether that is the header or not."""
+	lines = iter(lines)
+	line0 = next(lines, None)
+	width = _legacyWidthOf(line0, header, consumed, defaults, encoding, delimiter)
+	if width != -1 or line0 is None:
+		return width
+	for line in (lines if consumed else itertools.chain((line0,), lines)):
+		kind, _, cells, _ = _legacyLineKind(line.decode(encoding or 'utf8', errors='replace'), 1, False, delimiter)
+		if kind != 'skip':
+			return cells
+	return -1
+
+
+def _legacyWidthNow(fileName, header, verifyHeader, defaults, encoding, delimiter):
+	"""_legacyLinesWidth of the legacy file as it is now, under the READ lock; None when it could not be read that far
+	(missing, not a file, damage)."""
+	try:
+		if _fileHoldsNothing(fileName):
+			return -1
+		with _readLock(fileName), openFileAsCompressed(fileName, mode='rb', encoding=encoding) as f:
+			return _legacyLinesWidth(map(_legacyRawLine, f), header, bool(any(header) and verifyHeader), defaults, encoding,
+									 delimiter)
+	except Exception:
+		return None
+
+
+def _legacyDropKeys(fileName, keys, header, verifyHeader, defaults, encoding, delimiter, errors):
+	"""Delete ``keys`` from the legacy file where no line can: a file of one column, where a lone key is a row (and of
+	no column count yet, where it would make one). True when that is done: their lines are out of the file
+	(_legacyDropLines, which keeps the one column), or there were none. False when the file reads at two columns or more,
+	or could not be read: a deletion line says it there. ``header`` is formatted and ``delimiter`` resolved; ``defaults``
+	are those a whole read starts from. Only those lines go: this compacts nothing, and copies the others as bytes.
+
+	Written only if the file is still what the read saw, as a scrub is, and read again if not; OSError, nothing written,
+	when it kept changing."""
+	consumed = bool(any(header) and verifyHeader)
+	dropped = [key.rstrip() for key in keys]
+	for _ in range(_SPEC_REWRITE_ATTEMPTS):
+		width = _legacyWidthNow(fileName, header, verifyHeader, defaults, encoding, delimiter)
+		if width is None or width > 1:
+			return False
+		if width == -1:
+			return True
+		stamp = _specFileStamp(fileName)
+		try:
+			with _readLock(fileName), openFileAsCompressed(fileName, mode='rb', encoding=encoding) as f:
+				raw = [_legacyRawLine(line) for line in f]
+		except Exception:
+			return False
+		if _legacyLinesWidth(raw, header, consumed, defaults, encoding, delimiter) != 1:
+			continue  # (another writer changed it between the two looks)
+		fromLines = _legacyWidthOf(raw[0], header, consumed, defaults, encoding, delimiter) == -1
+		kept = _legacyDropLines(raw, dict.fromkeys(dropped, len(raw)), consumed, fromLines, delimiter, encoding)[0]
+		if kept == raw:
+			return True
+		if _legacyReplace(fileName, [], False, encoding, delimiter, errors, b''.join(line + b'\n' for line in kept),
+						  expect=stamp) is not None:
+			return True
+	raise OSError('{}: the delete is not written: the file kept changing'.format(fileName))
+
+
 class _RawTap(object):
 	"""The open binary legacy file ``f`` as a read takes it (readline, iteration, tell), keeping each line it hands
 	over in ``raw`` (bytes, the newline taken off): what a scrub compacts is what its read took, from the same bytes."""
@@ -7280,7 +7344,8 @@ class TSVZedLite(MutableMapping):
 	- Does not support automatic file rewriting on load / exit / periodically.
 	- Does not support append worker thread for background writes.
 	- Does not support external file change monitoring.
-	- Does not support in-place updates; updates are append-only.
+	- Does not support in-place updates; updates are append-only (a delete in a one-column file takes the key's lines
+	  out instead, a whole rewrite each, and reads the file again).
 	- Does not support logging via teeLogger.
 	- Does not support move_to_end method.
 	- Does not support in-memory only mode. ( please just use a dict )
@@ -7352,7 +7417,8 @@ class TSVZedLite(MutableMapping):
 	- Empty values in rows are automatically filled with defaults if available.
 	- The class implements the MutableMapping interface, providing dict-like operations.
 	- File operations are buffered and written immediately (append-only for updates).
-	- Deleted entries are marked by writing a row with only the key (empty values).
+	- Deleted entries are marked by writing a row with only the key (empty values), except in a one-column file, where
+	  that is a row: there the key's lines are taken out of the file.
 	Examples
 	--------
 	>>> db = TSVZedLite('data.tsv', header='id\tname\tage')
@@ -7394,6 +7460,7 @@ class TSVZedLite(MutableMapping):
 		self.header = _formatHeader(header,verbose = verbose,delimiter=self.delimiter)
 		_checkRow(self.header, self.delimiter, self.encoding, self.errors, what='header')  # before a file is created
 		self.correctColumnNum = correctColumnNum
+		self._givenColumns = correctColumnNum
 		self.createIfNotExist = createIfNotExist
 		self.verifyHeader = verifyHeader
 		self.verbose = verbose
@@ -7615,9 +7682,11 @@ class TSVZedLite(MutableMapping):
 		if self.verbose:
 			eprint(f"Loading {self._fileName}")
 		# (the read works on self.defaults: a row is read at its offset with the defaults the file ends with)
-		_legacyRead(self._fileName, None, self.header, self.createIfNotExist, False, self.verifyHeader, self.verbose,
-					self.indexes, self.encoding if self.encoding else None, self.strict, self.delimiter, self.defaults, -1,
-					not self._inMemoryRows, self.errors)
+		width = _legacyRead(self._fileName, None, self.header, self.createIfNotExist, False, self.verifyHeader, self.verbose,
+							self.indexes, self.encoding if self.encoding else None, self.strict, self.delimiter, self.defaults,
+							-1, not self._inMemoryRows, self.errors)[1]
+		if self._givenColumns == -1 and width > 0 and (width == 1 or self.correctColumnNum == 1):
+			self.correctColumnNum = width  # (a one-column file, known from here on; emptied, it stays one column)
 		return self
 
 	def positions(self):
@@ -7662,6 +7731,7 @@ class TSVZedLite(MutableMapping):
 		if self.fileObj is not None:
 			self.fileObj.close()
 		self._fileName = newFileName
+		self.correctColumnNum = self._givenColumns  # (the new file's is read from it)
 		self._spec = _isSpecPath(newFileName)
 		if self._spec:
 			self.delimiter = _EXTENSION_DELIMITERS[_parsePartName(newFileName).ext]
@@ -7738,6 +7808,15 @@ class TSVZedLite(MutableMapping):
 			if self.verbose:
 				eprint(f"Key {key} deleted in memory")
 			return
+		if self.correctColumnNum <= 1 and _legacyDropKeys(self._fileName, [key], self.header, self.verifyHeader,
+														  self._constructorDefaults, self.encoding, self.delimiter, self.errors):
+			# A lone key is a row in a one-column file: its lines went instead, and every offset after them moved.
+			held = [(k, v) for k, v in self.indexes.items() if k.startswith('#')]
+			self.reload()
+			self.indexes.update(held)
+			if self.fileObj is not None:
+				self.fileObj.seek(0, os.SEEK_END)  # (and drops what it had read ahead)
+			return
 		if self.verbose:
 			eprint(f"Writing tombstone line for {key}")
 		self.__writeValues([key])
@@ -7747,15 +7826,16 @@ class TSVZedLite(MutableMapping):
 			return self._specReadAt(pos, key)
 		self.fileObj.seek(pos)
 		line = self.fileObj.readline().decode(self.encoding,errors='replace')
+		held = {}
 		self.correctColumnNum, segments = _processLine(
 						line=line,
-						taskDic={},
+						taskDic=held,
 						correctColumnNum=self.correctColumnNum,
 						strict=self.strict,
 						delimiter=self.delimiter,
 						defaults=self.defaults,
-						storeOffset=True,
 					)
+		segments = segments or next(iter(held.values()), [])  # (_processLine returns no row for a lone key in a one-column file)
 		if self.verbose:
 			eprint(f"Read at position {pos}: {segments}")
 		if key is not ...:
@@ -8552,6 +8632,23 @@ class _ServeStore(object):
 		"""Rows that delete ``key``: written with stripping off when it would strip ``key`` (spec §9.6)."""
 		return _specTombstones([key], self.delimiter, self.state.strip) if self.spec else [([key], False)]
 
+	def _dropKeys(self, rows, log):
+		"""The deletions ``rows`` that are still to be written as lines (caller holds the lock). In a loose file of one
+		column, where a lone key is a row, the keys' lines are taken out of the file instead (_legacyDropKeys), once
+		everything queued is in it. A reset of the defaults is a line at every width."""
+		if self.spec:
+			return rows
+		keys = [cells[0] for cells, marker in rows if cells[0] != DEFAULTS_INDICATOR_KEY]
+		header = self._legacyHeaderNow(log)
+		width = _legacyWidthNow(self.path, header, True, self.defaults, 'utf8', self.delimiter)
+		if not keys or width is None or width > 1:
+			return rows  # (a look at the first lines: what is queued cannot change them, so no wait for it)
+		self.writer.barrier()
+		if not _legacyDropKeys(self.path, keys, header, True, self.defaults, 'utf8', self.delimiter, 'strict'):
+			return rows
+		self.parts = None  # read again at the next request
+		return [row for row in rows if row[0][0] == DEFAULTS_INDICATOR_KEY]
+
 	def _durable(self, sync):
 		return sync or (self.spec and self.state is not None and self.state.writeAck == 'disk')
 
@@ -8584,7 +8681,8 @@ class _ServeStore(object):
 			log.teelog('Appended {} lines to {}'.format(len(rows), self.path) if rows else 'No lines to append to ' + self.path)
 
 	def delete(self, rows, sync, log, written=False):
-		"""Append the tombstones of ``delete`` (``[(cells, marker), ...]``) as one batch (spec §20.2.7).
+		"""Append the tombstones of ``delete`` (``[(cells, marker), ...]``) as one batch (spec §20.2.7), or in a loose file
+		of one column take the keys' lines out (_dropKeys).
 
 		Naming a key a reader would strip needs the store as it is now, read
 		under the lock, so that delete is atomic (spec §21.8.2). Returns False,
@@ -8596,6 +8694,7 @@ class _ServeStore(object):
 				if self.unreadable:
 					return False
 				rows = _specDeleteRows(rows, self.delimiter, self.state.strip, self.data)
+			rows = self._dropKeys(rows, log)
 			queued = self._submit(rows, sync, log)
 		self._ack(queued, written)
 		self._wrote(rows, log)
@@ -8612,7 +8711,7 @@ class _ServeStore(object):
 			if row is None:
 				return None
 			row = list(row)
-			queued = self._submit(self._tombstone(key), sync, log)
+			queued = self._submit(self._dropKeys(self._tombstone(key), log), sync, log)
 		self._ack(queued, written=True)  # the row is only popped once its tombstone is written
 		return row
 
@@ -8629,7 +8728,7 @@ class _ServeStore(object):
 			else:  # a dict is reversible from Python 3.8
 				key = next(reversed(self.data)) if hasattr(self.data, '__reversed__') else list(self.data)[-1]
 			row = list(self.data[key])
-			queued = self._submit(self._tombstone(key), sync, log)
+			queued = self._submit(self._dropKeys(self._tombstone(key), log), sync, log)
 		self._ack(queued, written=True)
 		return row
 
