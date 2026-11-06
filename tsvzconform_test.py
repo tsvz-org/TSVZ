@@ -749,12 +749,17 @@ def test_every_procedural_check_passes_with_the_reference(check, tmp_path):
 	assert result.result in (tc.PASS, tc.SKIP), result.detail
 
 
-def test_the_terminal_check_obeys_the_timeout(tmp_path):
+def test_the_terminal_check_obeys_the_timeout(tmp_path, monkeypatch):
 	check = next(c for c in tc.CHECKS if c.id == '20.4.3-terminal-output-is-a-table')
 	ctx = tc.Context(tc.Impl(fake(tmp_path, 'ttyhang')), str(tmp_path), 2.0, frozenset())
+	# The check's first step (`read --format records`, two Python startups: the fake and the reference) shares the
+	# 2 s timeout, and on a loaded host it was killed (exit -9) before the terminal step ran. Only the terminal
+	# step's own deadline is under test, so the other step gets a long one.
+	real = tc.run_command
+	monkeypatch.setattr(tc, 'run_command', lambda argv, cwd, timeout, *args, **kwargs: real(argv, cwd, 120, *args, **kwargs))
 	started = time.time()
 	result = tc.run_case(check, 'files', ctx)
-	assert time.time() - started < 15
+	assert time.time() - started < 35  # (the fake sleeps 40 s: a check that waited for it would end later)
 	assert result.result == tc.WARN and 'timed out' in ' '.join(result.detail)
 
 
