@@ -629,7 +629,14 @@ def test_an_unreadable_part_fails_its_cell_without_stopping_the_run(tmp_path):
 	assert bench.exit_status() == 1
 
 
-def test_a_timed_out_call_ends_its_calls_workload(tmp_path):
+def test_a_timed_out_call_ends_its_calls_workload(tmp_path, monkeypatch):
+	# The `-V` probe and the handler's start (the fake plus the reference: two Python startups each) share the 2 s
+	# timeout; on a loaded host the probe timed out and the whole implementation was skipped ("-V failed: timed
+	# out", every mark n/a), or the handler did not answer in time (wrong). Only the call's own 2 s deadline is
+	# under test, so those get a long one.
+	real_probe, real_handler = tb.probe, tb.Handler
+	monkeypatch.setattr(tb, 'probe', lambda impl, directory, timeout: real_probe(impl, directory, 60.0))
+	monkeypatch.setattr(tb, 'Handler', lambda impl, store, directory, wait=None: real_handler(impl, store, directory, 60.0))
 	bench, _ = run_suite(tmp_path, [('hang', fake(tmp_path, 'hangset'))], '--only', 'perop', '--timeout', '2')
 	found = marks(bench, 'hang')
 	assert found[('perop', 'cli 100')][0] == tb.TIMEOUT
