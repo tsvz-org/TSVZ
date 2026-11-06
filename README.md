@@ -407,9 +407,9 @@ The file formats are unchanged.
   refused as before. A program still on the old
   header then sees "Header mismatch" in its turn, and a strict reader given it raises; it
   does not narrow line 1. A one-column file
-  with a line that holds no value is not widened, with a warning, and keeps every row: a lone
-  key is a deletion at two columns or more, so widening would delete it. Such a line that a later
-  row of its key supersedes goes in the rewrite, and the next rewrite then widens. A scrub
+  with a row that holds no value is not widened, with a warning, and keeps every row: a lone
+  key is a deletion at two columns or more, so widening would delete it. A key's earlier line
+  with no value does not count when a later line gives the key one. A scrub
   still never changes line 1.
 
 ## Upgrading to 5.5 from 5.4

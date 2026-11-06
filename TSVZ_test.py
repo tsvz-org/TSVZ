@@ -15622,6 +15622,26 @@ def test_line_1_with_whitespace_around_its_cells_is_still_the_header_it_widens(t
 	assert _bytes(p) == b'id\tv\na\t1\n'
 
 
+@pytest.mark.parametrize('data', [b'id\nd\t\nd\tx\n', b'id\na\t1\nd\nd\tx\n', b'id\n#_defaults_#\t\tE\nd\t\nd\tx\n'],
+						 ids=['alone', 'after a row', 'below a defaults line'])
+def test_a_line_with_no_value_a_later_line_of_its_key_supersedes_does_not_stop_the_widening(tmp_path, data):
+	# "The file widens once every row holds a value": `d` holds one. Its first line kept the file one column for good, since
+	# the compaction keeps both lines of a key that first set the column count.
+	p = str(tmp_path / 's.tsv')
+	_touch(p, data)
+	_rewritten(p, 'hardMapToFile', header='id\tv\tw')
+	assert _bytes(p).startswith(b'id\tv\tw\n')
+	assert TSVZ.readTabularFile(p, header='id\tv\tw', verbose=False)['d'][:2] == ['d', 'x']
+
+
+def test_a_key_whose_last_line_holds_no_value_stops_the_widening(tmp_path):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'id\nd\tx\nd\n')
+	_rewritten(p, 'hardMapToFile', header='id\tv')
+	assert _bytes(p).startswith(b'id\n')
+	assert 'd' in TSVZ.readTabularFile(p, header='id', verbose=False)
+
+
 @pytest.mark.parametrize('data,kwargs,keys', [(b'a\nb\nc\n', dict(defaults=['#_defaults_#', 'P']), {'a', 'b', 'c'}),
 											  (b'id\na\nb\n', dict(header='id\tv', defaults=['#_defaults_#', 'P']), {'id', 'a', 'b'}),
 											  (b'id\na\t1\nb\n', dict(header='id\tv'), {'id', 'a', 'b'})],

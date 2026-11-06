@@ -3126,8 +3126,8 @@ def _legacyWidened(raw, header, encoding, delimiter, errors):
 	header's beginning: the same cells, each without the whitespace around it, and fewer of them (empty cells at its end
 	not counted). This exact rule, not the containment of _lineContainHeader: a line 1 that only resembles the header may
 	be a row, and is left alone. None when it does not apply; False when it would lose rows: in a file of one column
-	(_legacyFileWidth) a line with no value is a row, it reads as a deletion at the header's width, and no line can hold it
-	there.
+	(_legacyFileWidth) a key whose last line holds no value is a row with no value, that line reads as a deletion at the
+	header's width, and no line can hold it there. An earlier line of a key that a later one gives a value loses nothing.
 
 	The lines a reader takes that are narrower than ``header`` are padded with it, each as a loose read already pads it: a
 	strict reader, which drops a narrower line, then takes them as it did at the old column count. Nothing else changes."""
@@ -3135,15 +3135,17 @@ def _legacyWidened(raw, header, encoding, delimiter, errors):
 	cells = _trimmedCells(cell.strip() for cell in raw[0].decode(enc, errors='replace').rstrip('\r\n').lstrip('\ufeff').split(delimiter)) if raw else []
 	if not cells or len(cells) >= len(header) or not _sameCells(cells, header[:len(cells)]):
 		return None
-	oneColumn = _legacyFileWidth(raw, header, True, encoding, delimiter) == 1
 	pad = delimiter.encode(enc)
 	out = [_encodeRow(_sanitize(list(header),delimiter=delimiter),delimiter,encoding,errors,what='header')]
+	valueless = set()  # (the keys whose last line so far holds no value)
 	for line in raw[1:]:
-		kind, _, count, _ = _legacyLineKind(line.decode(enc, errors='replace'), len(header), False, delimiter)
-		if kind == 'delete' and oneColumn:
-			return False
+		kind, key, count, _ = _legacyLineKind(line.decode(enc, errors='replace'), len(header), False, delimiter)
+		if kind == 'delete':
+			valueless.add(key.rstrip())
+		elif kind == 'row':
+			valueless.discard(key.rstrip())
 		out.append(line.rstrip(b'\r') + pad * (len(header) - count) if kind in ('row', 'defaults') and count < len(header) else line)
-	return out
+	return False if valueless and _legacyFileWidth(raw, header, True, encoding, delimiter) == 1 else out
 
 
 class _RawTap(object):
