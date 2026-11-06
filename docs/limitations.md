@@ -452,7 +452,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### The `TSVZ` spelling in a venv with a space in its path
 - Kind: known limitation
-- What the operator sees: In a venv whose path has a space, or is too long for the kernel's `#!` line, the `TSVZ` spelling fails with "bad interpreter", because pip gives a script file a plain `#!` line: use `tsvz`. uv and system or `--user` installs are not affected.
-- Why: pip writes a plain `#!<python>` line into a script file and a `/bin/sh` wrapper only for an entry point, and a launcher that delegates to the lowercase twin overwrites it on a case-insensitive disk under uv.
+- What the operator sees: With pip 10 or later, in a venv whose path has a space or is too long for the kernel's `#!` line, the `TSVZ` spelling does not start (the error varies: "bad interpreter", `import: command not found`), because pip gives a script file a plain `#!` line: use `tsvz`. With pip 9 no spelling starts in such a venv, as in 5.5. uv and system or `--user` installs are not affected.
+- Why: pip writes a plain `#!<python>` line into a script file and a `/bin/sh` wrapper only for an entry point. A launcher that delegates to the lowercase twin overwrites it on a case-insensitive disk under uv. One that execs `mcmd` or `mssh` works, but prints that name for `-V`, breaks `python3 $(which multiCMD)`, and TSVZ has no such sibling.
 - Revisit when: someone hits it.
 - Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
