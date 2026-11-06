@@ -192,7 +192,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: an operator reads one file with several header or defaults settings and loses rows after a scrub
   or a rewrite. Scrub, and open `TSVZed`s, with the arguments the file's readers use.
 - Approved: 2026-11-04, the user chose "Known limitation (Recommended)", and "One entry for both (Recommended)"
-  for covering `TSVZed` rewrites of a healthy file in the same entry. Narrowed in 5.6 (a file of one column).
+  for covering `TSVZed` rewrites of a healthy file in the same entry; 2026-11-06, "Keep it (Recommended)" for narrowing it in
+  5.6 (a file of one column).
 
 ### A file whose first keyed line is a bare #_defaults_# reads as one column without defaults
 - Kind: known limitation
@@ -442,7 +443,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: a program whose exit handler, run after TSVZ's own, uses a store can end with SIGABRT and
   `Fatal Python error: _enter_buffered_busy: could not acquire lock for <_io.BufferedWriter name='<stdout>'> at interpreter
   shutdown`: the writer thread is printing to stdout while the interpreter finalizes. The rows are written: no data was lost
-  in any run. In the review's runs 9 of 2,400 and 1 of 2,700 under load; `TSVZ_lock_test.py::test_an_exit_handler_that_runs_after_tsvz_still_writes[close]`
+  in any run. In the review's runs 9 of 2,400 and 1 of 2,700 under load, then 5 of 2,400 on each of 3.14 and 3.6; `TSVZ_lock_test.py::test_an_exit_handler_that_runs_after_tsvz_still_writes[close]`
   fails on it now and then. It is older than 5.6.
 - Why: the fix belongs in the writer thread's print (`__teePrintOrNot` reached from `_checkExternalChanges`), which must not
   touch a buffered stream while the interpreter is finalizing; this version does not change that path.
