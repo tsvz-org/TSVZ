@@ -5902,6 +5902,7 @@ def test_tsvzed_set_refuses_an_unencodable_key_at_once(tmp_path, suffix):
 	assert list(t) == ['ok'] and t.correctColumnNum == 2
 	t['after'] = ['after', '2']  # the store is still usable
 	t.close()
+	t.appendThread.join(10)  # (close() returns once _workerDone is set, which is just before the thread ends)
 	assert t.appendThread.is_alive() is False
 	assert _bytes(p) == _hash(suffix) + b'id\tv\nok\t1\nafter\t2\n'
 
