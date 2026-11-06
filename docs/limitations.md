@@ -184,7 +184,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   ones can see another file afterwards: one given a header that line 1 is not, which
   takes its column count from a line the scrub may have dropped. A file of one column is the exception, from 5.6: line 1 or
   the first keyed line after it being one cell, it is compacted as one whatever the scrub was given, so a reader that takes it
-  as one column keeps its lone keys. Every reader given the scrub's own arguments, of
+  as one column keeps its lone keys. A widening or a rewrite can move a cell's value the same way, with no row lost: a store with
+  defaults wider than its header writes them into a row (`id`, `a<TAB>1`, header `id<TAB>v`, three-cell defaults gives
+  `a<TAB>1<TAB>Q`, so a reader given no defaults gains Q); a bare `#_defaults_#` in a one-column file becomes a reset once it
+  widens, so a plain reader's default-filled cell turns empty; and a store with no header, whose defaults are narrower than the
+  file, leaves a plain reader without a default-filled cell. Every reader given the scrub's own arguments, of
   any version from 3.39, sees what it saw before. In fuzzing, about 1% of random files and argument sets, where 5.4
   changed far more of these readers' views.
 - Why: what is dead depends on the reader; keeping every line any reader could need would keep most of the lines a
@@ -193,7 +197,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   or a rewrite. Scrub, and open `TSVZed`s, with the arguments the file's readers use.
 - Approved: 2026-11-04, the user chose "Known limitation (Recommended)", and "One entry for both (Recommended)"
   for covering `TSVZed` rewrites of a healthy file in the same entry; 2026-11-06, "Keep it (Recommended)" for narrowing it in
-  5.6 (a file of one column).
+  5.6 (a file of one column); 2026-11-06, "Known limitation (Recommended)" for each of the three cell cases above.
 
 ### A file whose first keyed line is a bare #_defaults_# reads as one column without defaults
 - Kind: known limitation
