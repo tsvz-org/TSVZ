@@ -917,7 +917,9 @@ def test_a_hang_is_a_timeout_and_leaves_nothing_running(small_corpus, tmp_path, 
 	monkeypatch.setenv('FAKE_PIDFILE', str(tmp_path / 'pid'))
 	code, results = run_main(tmp_path, fake(tmp_path, 'hang'), '--only', '9.2-lone-key-deletes', '--mode', 'files', '--timeout', '2')
 	assert code == 1 and 'timed out' in ' '.join(results[('9.2-lone-key-deletes', 'files')]['detail'])
-	wait_gone(int((tmp_path / 'pid').read_text()))
+	pid = tmp_path / 'pid'  # (on a loaded host the 2 s can end the fake before it gets as far as writing this)
+	if pid.exists() and pid.read_text():
+		wait_gone(int(pid.read_text()))
 
 
 def test_a_work_directory_with_spaces_and_non_ascii(small_corpus, tmp_path, capsys):

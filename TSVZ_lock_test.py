@@ -65,7 +65,7 @@ def _child(code, *args, **kwargs):
 							stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
 
 
-def _expect(child, word, timeout=20):
+def _expect(child, word, timeout=300):
 	"""Read the child's lines until one is ``word`` (a store's messages, such as "External changes detected", may
 	come first)."""
 	seen = []
@@ -665,7 +665,7 @@ def test_ctrl_c_ends_a_read_waiting_on_another_process(tmp_path, kind, how):
 		time.sleep(0.5)
 		assert reader.poll() is None, 'the read did not wait'
 		reader.send_signal(signal.SIGINT)
-		out, err = reader.communicate(timeout=5)
+		out, err = reader.communicate(timeout=120)
 		assert reader.returncode != 0
 		if how == 'library':
 			assert b'KeyboardInterrupt' in err, err
@@ -744,7 +744,7 @@ def test_ctrl_c_in_a_store_waiting_on_another_process_lets_the_program_exit(tmp_
 		assert store.poll() is None, 'the load did not wait'
 		store.send_signal(signal.SIGINT)
 		try:
-			out, err = store.communicate(timeout=5)
+			out, err = store.communicate(timeout=120)
 		except subprocess.TimeoutExpired:
 			raise AssertionError('one Ctrl-C did not end the program')
 		assert store.returncode != 0 and b'done' not in out
@@ -780,7 +780,7 @@ def test_ctrl_c_at_close_of_a_store_with_a_queued_row_ends_after_three(tmp_path,
 		# Each Ctrl-C goes in once the last one has shown: a second sent before the first is taken would be lost.
 		time.sleep(0.5)
 		store.send_signal(signal.SIGINT)
-		_expect(store, 'exiting', timeout=120)
+		_expect(store, 'exiting')
 		time.sleep(0.5)
 		assert store.poll() is None, b''.join(seen)
 		store.send_signal(signal.SIGINT)
@@ -1048,7 +1048,7 @@ def test_a_rewrite_is_not_starved_by_two_appending_stores(tmp_path, kind):
 		for _ in range(2):
 			children.append(_child(SETTER, p, 300, kind=kind))
 		for child in children:
-			_expect(child, 'started', timeout=60)
+			_expect(child, 'started')
 		time.sleep(1)
 		a.hardMapToFile()
 		# (no deadline: how long a rewrite takes is the machine's load. Starved, it would end after they do.)

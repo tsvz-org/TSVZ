@@ -546,8 +546,19 @@ def fake(tmp_path, mode):
 	return '%s %s %s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)), mode, shlex.quote(REFERENCE))
 
 
+@pytest.fixture(autouse=True)
+def patient_probe(monkeypatch):
+	"""The `-V` probe shares --timeout and the handler probe has its own 10 s; no test here is about either being
+	slow, and on a loaded host each marked an implementation n/a before the case under test."""
+	real = tb.probe
+	monkeypatch.setattr(tb, 'probe', lambda impl, directory, timeout: real(impl, directory, 300.0))
+	monkeypatch.setattr(tb, 'HANDLER_WAIT', 300.0)
+
+
 def bench_argv(tmp_path, impls, extra):
-	argv = ['--suite', 'smoke', '--work-dir', str(tmp_path / 'work')] + list(extra)
+	"""A run ends when it ends, so a timeout no test is about must not end it first: a test about one gives its own
+	--timeout (the last one counts)."""
+	argv = ['--suite', 'smoke', '--work-dir', str(tmp_path / 'work'), '--timeout', '300'] + list(extra)
 	for name, command in impls:
 		argv += ['--impl', '%s=%s' % (name, command)]
 	return argv
@@ -594,8 +605,6 @@ def test_every_case_passes_with_the_reference(tmp_path):
 def test_the_gate_catches_a_misbehaving_implementation(tmp_path, monkeypatch, mode, family, label, kind):
 	# (the `-V` probe, and every step but the one under test, share the --timeout; on a loaded host they timed out:
 	# n/a for the probe, 'timeout' where 'wrong' was expected. Only the sleep case needs a short timeout.)
-	real_probe = tb.probe
-	monkeypatch.setattr(tb, 'probe', lambda impl, directory, timeout: real_probe(impl, directory, 60.0))
 	bench, _ = run_suite(tmp_path, [('bad', fake(tmp_path, mode))], '--only', family,
 		'--timeout', '3' if kind == tb.TIMEOUT else '60')
 	result = next(r for r in bench.results if (r.case.family, r.case.label) == (family, label))
@@ -619,8 +628,7 @@ def test_a_timed_out_call_ends_its_calls_workload(tmp_path, monkeypatch):
 	# timeout; on a loaded host the probe timed out and the whole implementation was skipped ("-V failed: timed
 	# out", every mark n/a), or the handler did not answer in time (wrong). Only the call's own 2 s deadline is
 	# under test, so those get a long one.
-	real_probe, real_handler = tb.probe, tb.Handler
-	monkeypatch.setattr(tb, 'probe', lambda impl, directory, timeout: real_probe(impl, directory, 60.0))
+	real_handler = tb.Handler
 	monkeypatch.setattr(tb, 'Handler', lambda impl, store, directory, wait=None: real_handler(impl, store, directory, 60.0))
 	real_child, sets = tb.run_child, []
 	def counted(argv, *args, **kwargs):
@@ -676,8 +684,7 @@ def test_a_handler_that_stops_answering_times_out(tmp_path, monkeypatch):
 	# (the `-V` probe and the handler's start share the 2 s timeout; on a loaded host the probe timed out and the
 	# implementation was skipped, or the handler was not up in time. The loads' own 2 s socket timeout is the
 	# harness's timeout and is unchanged.)
-	real_probe, real_handler = tb.probe, tb.Handler
-	monkeypatch.setattr(tb, 'probe', lambda impl, directory, timeout: real_probe(impl, directory, 60.0))
+	real_handler = tb.Handler
 	monkeypatch.setattr(tb, 'Handler', lambda impl, store, directory, wait=None: real_handler(impl, store, directory, 60.0))
 	script = tmp_path / 'mute.py'
 	script.write_text(MUTE)
