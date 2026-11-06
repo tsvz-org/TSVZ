@@ -3017,9 +3017,13 @@ def test_tsvzed_spec_survives_a_failed_external_reload(tmp_path, capsys):
 	_touch(p, b'#id\tv\n')
 	t = TSVZ.TSVZed(p, header='id\tv', strict=True, append_check_delay=0.01)
 	time.sleep(0.05)
-	_touch(p, b'#other\tcols\n')
+	# One external change: another file, with its time already later, replaces the store (a touch and then a utime
+	# are two changes, and under load a tick of the writer thread between them reports the failed reload twice)
+	other = str(tmp_path / 'next.tsvz')
+	_touch(other, b'#other\tcols\n')
 	st = os.stat(p)
-	os.utime(p, (st.st_atime + 1, st.st_mtime + 1))
+	os.utime(other, (st.st_atime + 1, st.st_mtime + 1))
+	os.replace(other, p)
 	assert _wait_for(lambda: not t.deSynced and t._specLoaded)
 	time.sleep(0.3)
 	t['k'] = ['k', 'v']
