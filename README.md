@@ -15,6 +15,12 @@ pip install tsvz          # from PyPI
 pip install -e .          # editable, from this directory
 ```
 
+Upgrading from TSVZ 5.5 (5.05) or earlier with pip 9, the pip of EL7 and EL8
+(`pip3 --version`), fails with `configparser.DuplicateOptionError: ... option 'tsvz' in
+section 'console_scripts' already exists`, and so does `pip3 uninstall TSVZ` for those
+releases; the installed release keeps working. Run `pip3 install -U pip` once (`--user`
+for a user install), then upgrade; from 5.6 on, pip 9 upgrades and uninstalls as anywhere.
+
 ## Two file dialects, one API
 
 | Extension | Rules |
@@ -349,7 +355,9 @@ The file formats are unchanged.
   more takes no line either: a `delete` used to write the lone key, which then read as a
   row, and it now writes nothing (a store that did not exist is still created; under
   `--x-header` with two columns or more a lone key is a deletion, and `id\tv\n` becomes
-  `id\tv\na\t\n`). The delete reads the file under the rewrite lock it writes under, as
+  `id\tv\na\t\n`). The file's own lines decide this, never the defaults a command is given:
+  `tsvz delete --x-defaults 'K\tP' F b` takes b's line out of `a\nb\nc\t1\n`, and in a file with
+  no keyed line it writes nothing. The delete reads the file under the rewrite lock it writes under, as
   `TSVZed` does, so a writer beside it neither makes it fail nor loses its rows (it failed at
   every try beside an appender at 200 Hz); `TSVZedLite` changes its memory only once the
   file is written, so a delete that fails (an `OSError`) leaves the key where it was. A
@@ -358,13 +366,17 @@ The file formats are unchanged.
 - **A rewrite keeps the lone keys of a one-column file under defaults of two cells or more.**
   `a\nb\nc\n` opened with `defaults=['#_defaults_#', 'P']` read as `{}` and any rewrite left
   `a\n#_defaults_#\tP\n`: b and c were deleted as deletion lines at the store's width, with no
-  output. A file is now compacted at its own width, its first keyed line's, so it stays one
-  column, keeps every key (`a\nb\nc\n#_defaults_#\tP\n`) and gets the defaults line; a plain open
-  reads the same keys before and after, on every route (`mapToFile()`, `hardMapToFile()`,
-  `rewrite(force=True)`, `rewrite_on_load`, `rewrite_on_exit`). The store itself still reads none
-  of the lone keys, and the file does not widen to the defaults or to a wider header until
-  every row holds a value
-  ([entry](docs/limitations.md#a-file-of-lone-keys-does-not-widen)).
+  output. A file is now compacted at its own width: its header's when line 1 holds it, else one
+  column when line 1 is one cell, else its first keyed line's. So it stays one column, keeps every
+  key (`a\nb\nc\n#_defaults_#\tP\n`) and gets the defaults line; a plain open reads the same keys
+  before and after, on every route (`mapToFile()`, `hardMapToFile()`, `rewrite(force=True)`,
+  `rewrite_on_load`, `rewrite_on_exit`), and so does a scrub. The same holds under a wider header:
+  `id\na\nb\n` with `header='id\tv'` and those defaults keeps a and b, and `id\na\t1\nb\n` with
+  that header keeps b. The store itself still reads none of the lone keys its width makes
+  deletions, and the file does not widen to the defaults or to a wider header until every row
+  holds a value ([entry](docs/limitations.md#a-file-of-lone-keys-does-not-widen)). A row with a
+  value that such a store deletes stays in the file as its key and an empty cell
+  ([entry](docs/limitations.md#a-row-deleted-from-a-one-column-file-under-wider-defaults-stays-as-its-key)).
 - **`TSVZedLite` knows a one-column file from its load.** So a one-cell row is a row there
   (it was a delete of a key it did not hold), and a row read at its offset has its cell
   (`t['a']` read as `[]`).
@@ -385,15 +397,19 @@ The file formats are unchanged.
   `TSVZed` takes a line 1 that extends its header (the same leading cells, then named ones)
   for another program's widening, at open and whenever it follows the file, and its column
   count becomes the wider header's; it used to raise "Header mismatch" and stop following. It
-  reads the rows of such a file loose, padded, and the file stays as it is (a strict read
-  dropped every row narrower than the new count, and a rewrite then deleted them), and its
-  `set`s that are narrower than the file are padded and written, where a strict store that
-  never met a widening still refuses them. Any other line 1 that is not its header is
+  reads the rows of such a file loose, padded, what another process appends to it too, and a
+  rewrite leaves the rows and the file's defaults lines as they are, adding only the store's own
+  defaults if it was given others (a strict read dropped every row narrower than the new count,
+  and a rewrite then deleted them). Its `set`s that are narrower than the file are padded and
+  written, where a strict store that never met a widening still refuses them. Each whole read
+  decides this afresh: once line 1 no longer extends its header, such a `set` is refused again.
+  A wider row or a header-less file is no widening. Any other line 1 that is not its header is
   refused as before. A program still on the old
   header then sees "Header mismatch" in its turn, and a strict reader given it raises; it
   does not narrow line 1. A one-column file
-  with rows that hold no value is not widened, with a warning, and stays as it is: a lone
-  key is a deletion at two columns or more, so widening would delete it. A scrub
+  with a line that holds no value is not widened, with a warning, and keeps every row: a lone
+  key is a deletion at two columns or more, so widening would delete it. Such a line that a later
+  row of its key supersedes goes in the rewrite, and the next rewrite then widens. A scrub
   still never changes line 1.
 
 ## Upgrading to 5.5 from 5.4

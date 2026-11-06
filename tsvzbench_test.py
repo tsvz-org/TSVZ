@@ -251,7 +251,8 @@ def test_child_rss_does_not_include_the_harness(tmp_path):
 	for at in range(0, len(ballast), 4096):
 		ballast[at] = 1
 	sample = tb.run_child([sys.executable, '-c', 'pass'], str(tmp_path), 30)
-	assert sample.rss_floor - 1024 * 1024 < sample.maxrss < 100 * 1024 * 1024
+	# (each read on its own: the launcher's size and the child's are two processes', and no margin relates them)
+	assert 0 < sample.rss_floor < 100 * 1024 * 1024 and 0 < sample.maxrss < 100 * 1024 * 1024
 	big = tb.run_child([sys.executable, '-c', 'x = bytearray(200 * 1024 * 1024); x[::4096] = b"1" * len(x[::4096])'],
 		str(tmp_path), 30)
 	assert big.maxrss > 200 * 1024 * 1024

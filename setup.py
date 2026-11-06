@@ -9,9 +9,11 @@ setup(
     author='Yufei Pan',
     author_email='pan@zopyr.us',
     url='https://github.com/tsvz-org/TSVZ',  # URL to the project’s homepage
+    # The mixed-case command is a script file and not an entry point: pip 9 (stock on EL7 and EL8) reads entry_points.txt with a
+    # parser that folds case, so two commands that differ only in case make it fail to upgrade or uninstall the package.
+    scripts=['scripts/TSVZ'],
     entry_points={
         'console_scripts': [
-            'TSVZ = TSVZ:__main__',
             'tsvz = TSVZ:__main__',
         ],
     },

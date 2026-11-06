@@ -181,9 +181,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: a scrub (`scrubTabularFile`, `tsvz scrub`, a `tsvz serve` handler), and a `TSVZed`
   rewrite of a healthy file (which compacts it the same way), decide which lines are dead with their own reader:
   its header, defaults and column count. A reader given other
-  ones can see another file afterwards: one that takes the file as one column (its first keyed line is one cell),
-  for which lone keys are rows the scrub dropped as deletions, and one given a header that line 1 is not, which
-  takes its column count from a line the scrub may have dropped. Every reader given the scrub's own arguments, of
+  ones can see another file afterwards: one given a header that line 1 is not, which
+  takes its column count from a line the scrub may have dropped. A file of one column is the exception, from 5.6: line 1 or
+  the first keyed line after it being one cell, it is compacted as one whatever the scrub was given, so a reader that takes it
+  as one column keeps its lone keys. Every reader given the scrub's own arguments, of
   any version from 3.39, sees what it saw before. In fuzzing, about 1% of random files and argument sets, where 5.4
   changed far more of these readers' views.
 - Why: what is dead depends on the reader; keeping every line any reader could need would keep most of the lines a
@@ -191,7 +192,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: an operator reads one file with several header or defaults settings and loses rows after a scrub
   or a rewrite. Scrub, and open `TSVZed`s, with the arguments the file's readers use.
 - Approved: 2026-11-04, the user chose "Known limitation (Recommended)", and "One entry for both (Recommended)"
-  for covering `TSVZed` rewrites of a healthy file in the same entry.
+  for covering `TSVZed` rewrites of a healthy file in the same entry. Narrowed in 5.6 (a file of one column).
 
 ### A file whose first keyed line is a bare #_defaults_# reads as one column without defaults
 - Kind: known limitation
@@ -404,12 +405,45 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A file of lone keys does not widen
 - Kind: known limitation
-- What the operator sees: with a wider header or defaults on a one-column file of lone keys, a rewrite leaves it one
+- What the operator sees: with a wider header or defaults on a one-column file with lone keys, a rewrite leaves it one
   column and keeps every key. With defaults of two cells or more, a store reads none of the lone keys (they are deletions
   at its width) and the rewrite adds the defaults line. With a wider header, line 1 is not widened (a warning says the file
-  holds rows with no value), and the store reads the lone keys as rows and prints "Header mismatch" at each open. No row is
-  lost. The file widens once every row holds a value.
+  holds rows with no value), and the store prints "Header mismatch" at each open; it reads the lone keys as rows unless its
+  defaults or the first row after line 1 give it a wider count (`id\na\t1\nb\n`), when it reads them as deletions and the
+  file keeps them all the same. No row is lost. The file widens once every row holds a value.
 - Why: a value-less row at two columns is a deletion, so marking one needs a format change that every reader, the spec and
   tsvz-rs would have to learn.
 - Revisit when: the format next changes.
 - Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
+
+### A row deleted from a one-column file under wider defaults stays as its key
+- Kind: known limitation
+- What the operator sees: on a one-column file opened by a `TSVZed` with wider defaults (`a\nb\nc\t1\n`,
+  `defaults=['#_defaults_#', 'P']`), a deleted row that held a value stays as `c<TAB>` after a rewrite
+  (`a\nb\nc\t\n#_defaults_#\tP\n`): the store shows it gone, a plain reader shows c with an empty value. `tsvz delete`, a
+  handler and a `TSVZedLite` ask the file, so they take the key's lines out and leave nothing.
+- Why: a file that stays one column has no way to mark that deletion, so it needs a format change.
+- Revisit when: the next format change.
+- Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
+
+### pip 9 cannot upgrade from or uninstall 5.5 and earlier
+- Kind: known limitation
+- What the operator sees: upgrading from TSVZ 5.5 (5.05) or earlier with pip 9, the pip of EL7 and EL8 (`pip3 --version`),
+  fails with `configparser.DuplicateOptionError: ... option 'tsvz' in section 'console_scripts' already exists`, and so does
+  `pip3 uninstall TSVZ` for those releases; the installed release keeps working. `pip3 install -U pip` once (`--user` for a
+  user install), then the upgrade works; from 5.6 on, pip 9 upgrades and uninstalls as anywhere.
+- Why: pip 9 parses the installed release's `entry_points.txt` with a parser that folds case, and nothing in a new release can
+  change the old metadata.
+- Revisit when: EL's stock pip stops being 9, or never.
+- Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
+
+### A thread's print at interpreter shutdown can abort the program
+- Kind: deferred
+- What the operator sees: a program whose exit handler, run after TSVZ's own, uses a store can end with SIGABRT and
+  `Fatal Python error: _enter_buffered_busy: could not acquire lock for <_io.BufferedWriter name='<stdout>'> at interpreter
+  shutdown`: the writer thread is printing to stdout while the interpreter finalizes. The rows are written: no data was lost
+  in any run. In the review's runs 9 of 2,400 and 1 of 2,700 under load; `TSVZ_lock_test.py::test_an_exit_handler_that_runs_after_tsvz_still_writes[close]`
+  fails on it now and then. It is older than 5.6.
+- Why: the fix belongs in the writer thread's print (`__teePrintOrNot` reached from `_checkExternalChanges`), which must not
+  touch a buffered stream while the interpreter is finalizing; this version does not change that path.
+- Revisit when: the next version: fix it at the writer thread's print.

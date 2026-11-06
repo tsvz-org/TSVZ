@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+# The mixed-case command, installed as a script and not as an entry point (see setup.py).
+import sys
+import TSVZ
+if __name__ == '__main__':
+    sys.exit(TSVZ.__main__())

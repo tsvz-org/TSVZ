@@ -2025,6 +2025,15 @@ def _sameCells(a, b):
 	return len(a) == len(b) and all(x.strip() == y.strip() for x, y in zip(a, b))
 
 
+def _legacyExtendsHeader(header, line, delimiter):
+	"""The cell count of ``line``, a legacy line 1, when it is ``header`` widened by a program: the same leading cells
+	(_sameCells), then others that are named; else 0. A store reads such a file at that count, loose: what its whole read
+	does (_legacyReadHeader) and its rewrite's look at the same lines (_snapshotForRewrite) both ask here."""
+	cells = _formatHeader(line, delimiter=delimiter)
+	return len(cells) if (len(cells) > len(header) and _sameCells(header, cells[:len(header)])
+						  and all(cells[len(header):])) else 0
+
+
 def _headerMatches(header, line, delimiter):
 	"""Whether ``line`` holds ``header``, as ``_lineContainHeader`` judges it, saying nothing."""
 	return _headerCellsMatch(header, _formatHeader(line, delimiter=get_delimiter(delimiter)))
@@ -2271,11 +2280,9 @@ def _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, 
 	except UnicodeDecodeError:
 		line = raw.decode(encoding=encoding,errors='replace')
 		reporter.note('decode', 'line 1', 'invalid {} replaced with U+FFFD'.format(encoding))
-	if widening and raw:
-		cells = _formatHeader(line, delimiter=delimiter)
-		if (len(cells) > len(header) and _sameCells(header, cells[:len(header)])
-				and all(cells[len(header):])):
-			return (len(cells) if correctColumnNum == -1 else correctColumnNum), 1
+	wider = _legacyExtendsHeader(header, line, delimiter) if widening and raw else 0
+	if wider:
+		return (wider if correctColumnNum == -1 else correctColumnNum), 1
 	# A file that holds nothing (no byte, or only empty compressed streams) is an empty store with this header, as
 	# an append to it takes it (it writes the header first): not a header mismatch.
 	if (not raw or _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter)) and correctColumnNum == -1:
@@ -2914,15 +2921,10 @@ def _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched)
 	return raw
 
 
-def _legacyWidthOf(line0, header, consumed, defaults, encoding, delimiter):
-	"""The column count a whole read with ``header`` (taken for line 1 when ``consumed``) and ``defaults`` starts from,
-	given line 1 (bytes, or None): the header's when line 1 holds it, else the defaults' (two or more cells), else -1
-	(from the first keyed line)."""
-	if consumed and line0 is not None and _headerMatches(header, line0.decode(encoding or 'utf8', errors='replace').rstrip('\r\n'), delimiter):
-		return len(header)
-	if defaults and defaults is not ... and len(defaults) > 1:
-		return len(defaults)
-	return -1
+def _legacyHoldsHeader(line0, header, consumed, encoding, delimiter):
+	"""Whether line 1 (bytes, or None) holds ``header`` to a reader that takes line 1 for it (``consumed``)."""
+	return bool(consumed and line0 is not None
+				and _headerMatches(header, line0.decode(encoding or 'utf8', errors='replace').rstrip('\r\n'), delimiter))
 
 
 def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding):
@@ -3010,20 +3012,29 @@ def _legacyMoved(lines, place, best, delimiter, encoding):
 	return d.join(cells)
 
 
-def _legacyLinesWidth(lines, header, consumed, defaults, encoding, delimiter):
-	"""The column count a whole read of the legacy lines ``lines`` (bytes, without their newline) takes, reading no
-	further than it must: the header's or the defaults' (_legacyWidthOf), else the first keyed line's; -1 for no keyed
-	line. ``consumed``: the read takes line 1 for its header, whether that is the header or not."""
+def _legacyFileWidth(lines, header, consumed, encoding, delimiter):
+	"""The column count the legacy lines ``lines`` (bytes, without their newline) say themselves, reading no further than
+	it must. Every writer asks this before it treats a line with no value as a row (at 1) or a deletion (at any other): a
+	rewrite that widens or compacts, a scrub, a delete. Decided here once, and no reader's defaults count: they say how that
+	reader reads, not what the file holds.
+
+	The header's when line 1 holds it (``consumed``: a reader takes line 1 for its header). Else 1 when line 1 is one cell:
+	its lone keys are rows to a reader given no header, or given that cell for one. Else the first keyed line's, line 1 left
+	out when ``consumed``. -1 for no keyed line."""
 	lines = iter(lines)
 	line0 = next(lines, None)
-	width = _legacyWidthOf(line0, header, consumed, defaults, encoding, delimiter)
-	if width != -1 or line0 is None:
-		return width
-	for line in (lines if consumed else itertools.chain((line0,), lines)):
+	if line0 is None:
+		return -1
+	if _legacyHoldsHeader(line0, header, consumed, encoding, delimiter):
+		return len(header)
+
+	def cellsOf(line):
 		kind, _, cells, _ = _legacyLineKind(line.decode(encoding or 'utf8', errors='replace'), 1, False, delimiter)
-		if kind != 'skip':
-			return cells
-	return -1
+		return -1 if kind == 'skip' else cells
+	opening = cellsOf(line0)
+	if opening == 1 or (opening != -1 and not consumed):
+		return opening
+	return next((cells for cells in map(cellsOf, lines) if cells != -1), -1)
 
 
 @contextlib.contextmanager
@@ -3055,26 +3066,25 @@ def _legacyLinesIn(f, fileName):
 		return list(lines)
 
 
-def _legacyWidthNow(fileName, header, verifyHeader, defaults, encoding, delimiter):
-	"""_legacyLinesWidth of the legacy file as it is now, under the READ lock; None when it could not be read that far
+def _legacyWidthNow(fileName, header, verifyHeader, encoding, delimiter):
+	"""_legacyFileWidth of the legacy file as it is now, under the READ lock; None when it could not be read that far
 	(missing, not a file, damage)."""
 	try:
 		if _fileHoldsNothing(fileName):
 			return -1
 		with _readLock(fileName), openFileAsCompressed(fileName, mode='rb', encoding=encoding) as f:
-			return _legacyLinesWidth(map(_legacyRawLine, f), header, bool(any(header) and verifyHeader), defaults, encoding,
-									 delimiter)
+			return _legacyFileWidth(map(_legacyRawLine, f), header, bool(any(header) and verifyHeader), encoding, delimiter)
 	except Exception:
 		return None
 
 
-def _legacyDropKeys(fileName, keys, header, verifyHeader, defaults, encoding, delimiter):
+def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter):
 	"""Delete ``keys`` from the legacy file where no line can: a file of one column, where a lone key is a row (and of
 	no column count yet, where it would make one). True when that is done: their lines are out of the file
-	(_legacyDropLines, which keeps the one column), or there were none. False when the file reads at two columns or more,
-	or could not be read (a deletion line says it there; damage is reported): nothing is written. ``header`` is
-	formatted and ``delimiter`` resolved; ``defaults`` are those a whole read starts from. Only those lines go: this
-	compacts nothing, and copies the others as bytes.
+	(_legacyDropLines, which keeps the one column), or there were none. False when the file is of two columns or more
+	(_legacyFileWidth), or could not be read (a deletion line says it there; damage is reported): nothing is written.
+	``header`` is formatted and ``delimiter`` resolved. Only those lines go: this compacts nothing, and copies the others
+	as bytes.
 
 	Read through the file's REWRITE lock and written under it, as ``TSVZed`` writes, so another process's write
 	(an append beside it) cannot fall between the read and the write: no retry, and none is lost. OSError when the
@@ -3092,7 +3102,7 @@ def _legacyDropKeys(fileName, keys, header, verifyHeader, defaults, encoding, de
 					for line in lines:
 						seen.append(line)
 						yield line
-				width = _legacyLinesWidth(tap(), header, consumed, defaults, encoding, delimiter)
+				width = _legacyFileWidth(tap(), header, consumed, encoding, delimiter)
 				raw = seen + list(lines) if width == 1 else None
 		except Exception as e:
 			_warn('TSVZ warning: {}: the file cannot be read ({}): the delete is written as a deletion line, which deletes '
@@ -3102,7 +3112,7 @@ def _legacyDropKeys(fileName, keys, header, verifyHeader, defaults, encoding, de
 		done.append(width <= 1)
 		if width != 1:
 			return None
-		fromLines = _legacyWidthOf(raw[0], header, consumed, defaults, encoding, delimiter) == -1
+		fromLines = not _legacyHoldsHeader(raw[0], header, consumed, encoding, delimiter)
 		kept = _legacyDropLines(raw, dict.fromkeys((key.rstrip() for key in keys), len(raw)), consumed, fromLines, delimiter, encoding)[0]
 		return None if kept == raw else b''.join(line + b'\n' for line in kept)
 	if not os.path.isfile(fileName):
@@ -3111,12 +3121,13 @@ def _legacyDropKeys(fileName, keys, header, verifyHeader, defaults, encoding, de
 	return done[0]
 
 
-def _legacyWidened(raw, header, defaults, encoding, delimiter, errors):
+def _legacyWidened(raw, header, encoding, delimiter, errors):
 	"""The legacy lines ``raw`` (bytes, without their newline) with line 1 widened to ``header``, when line 1 is that
 	header's beginning: the same cells, each without the whitespace around it, and fewer of them (empty cells at its end
 	not counted). This exact rule, not the containment of _lineContainHeader: a line 1 that only resembles the header may
-	be a row, and is left alone. None when it does not apply; False when it would lose rows: a row with no value (one
-	column) reads as a deletion at two columns or more, and no line can hold it there.
+	be a row, and is left alone. None when it does not apply; False when it would lose rows: in a file of one column
+	(_legacyFileWidth) a line with no value is a row, it reads as a deletion at the header's width, and no line can hold it
+	there.
 
 	The lines a reader takes that are narrower than ``header`` are padded with it, each as a loose read already pads it: a
 	strict reader, which drops a narrower line, then takes them as it did at the old column count. Nothing else changes."""
@@ -3124,13 +3135,12 @@ def _legacyWidened(raw, header, defaults, encoding, delimiter, errors):
 	cells = _trimmedCells(cell.strip() for cell in raw[0].decode(enc, errors='replace').rstrip('\r\n').lstrip('\ufeff').split(delimiter)) if raw else []
 	if not cells or len(cells) >= len(header) or not _sameCells(cells, header[:len(cells)]):
 		return None
-	before = _legacyLinesWidth(raw, header, True, defaults, encoding, delimiter)
+	oneColumn = _legacyFileWidth(raw, header, True, encoding, delimiter) == 1
 	pad = delimiter.encode(enc)
 	out = [_encodeRow(_sanitize(list(header),delimiter=delimiter),delimiter,encoding,errors,what='header')]
 	for line in raw[1:]:
-		text = line.decode(enc, errors='replace')
-		kind, _, count, _ = _legacyLineKind(text, before, False, delimiter)
-		if kind == 'row' and before == 1 and _legacyLineKind(text, 2, False, delimiter)[0] == 'delete':
+		kind, _, count, _ = _legacyLineKind(line.decode(enc, errors='replace'), len(header), False, delimiter)
+		if kind == 'delete' and oneColumn:
 			return False
 		out.append(line.rstrip(b'\r') + pad * (len(header) - count) if kind in ('row', 'defaults') and count < len(header) else line)
 	return out
@@ -3226,6 +3236,8 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 		matched = consumed and line0 is not None and _headerMatches(formatted, line0, dlm)
 		if consumed and line0 is not None and not matched and not tries:
 			__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
+		if _legacyFileWidth(raw, formatted, consumed, encoding, dlm) == 1:
+			width = 1  # (a file of one column is compacted as one, as a TSVZed rewrite does: its lone keys are rows)
 		lines = _legacyCompact(raw, width, consumed, givenDefaults, dlm, encoding, matched)
 		del raw
 		if any(formatted) and (not verifyHeader or not lines) and (line0 is None or not _isHeaderLine(formatted, line0, dlm)):
@@ -6414,7 +6426,9 @@ memoryOnly:{self.memoryOnly}
 	# A read under the file lock met damage another writer left (a compressed file: every read of it stops there, L5).
 	# Rows appended after it would be lost to the next read, so the next commit makes the file again from memory.
 	_remake = False
-	_followedWidening = False  # a read met a line 1 that widens this store's header (_readFrom): a narrower set is padded
+	# The last whole read took line 1 for a widening of this store's header (_legacyExtendsHeader): the file reads loose, what
+	# is appended to it too, and a narrower set is padded. Set by that read alone, and every whole read sets it again.
+	_followedWidening = False
 	# A commit appended after another process's change it has not read: the file holds unread bytes after _known, so
 	# the next read is whole. _known still says how the file begins (a commit looks for damage after it).
 	_unseen = False
@@ -6527,17 +6541,16 @@ memoryOnly:{self.memoryOnly}
 			return None
 		return _encodeRow(_sanitize(list(self.header),delimiter=self.delimiter),self.delimiter,self.encoding,self.errors,what='header')
 
-	def _readLines(self, kept, header, consumed, matched):
+	def _readLines(self, kept, consumed, start, strict):
 		"""What the legacy lines ``kept`` say, as this store's whole read takes them, streamed (no rows):
-		``(flags, width)``, one flag per key (_TSVZedDiff) and the column count the read ended with."""
+		``(flags, width)``, one flag per key (_TSVZedDiff) and the column count the read ended with. ``start`` and ``strict``
+		are the count that read starts from and how it reads, which _snapshotForRewrite takes from line 1."""
 		diff = _TSVZedDiff(self, self._givenColumns, list(self._givenDefaults))
 		reporter = _Reporter(self._fileName, None)  # (never flushed: the store's own reads report)
 		stream = _LinesFile(kept)
-		start = (-1, 0)
 		if consumed:  # (as _legacyReadHeader takes line 1, saying nothing: the store's own reads warn)
 			stream.readline()
-			start = (len(header) if not kept or matched else -1, 1)
-		width = _legacyReadLoop(stream, '', diff, start[0], start[1], self.strict, self.delimiter, diff.defaults,
+		width = _legacyReadLoop(stream, '', diff, start, 1 if consumed else 0, strict, self.delimiter, diff.defaults,
 								False, self.encoding, reporter)[0]
 		return diff.flags, width
 
@@ -6614,25 +6627,29 @@ memoryOnly:{self.memoryOnly}
 			defaults = list(self._givenDefaults)
 			widened = None
 			if consumed and not remade:
-				widened = _legacyWidened(raw, header, defaults, encoding, delimiter, errors)
+				widened = _legacyWidened(raw, header, encoding, delimiter, errors)
 				if widened:
 					raw = widened
 				elif widened is False:
 					_warnOnce(self, 'not-widened', self._fileName, 'line 1 is not widened to the header given: the file holds rows '
 							  'with no value, which read as deletions at two columns or more', self.teeLogger)
 			line0 = raw[0] if raw else None
-			matched = consumed and line0 is not None and _headerMatches(header, line0.decode(enc, errors='replace').rstrip('\r\n'), delimiter)
-			width = _legacyWidthOf(line0, header, consumed, defaults, encoding, delimiter)
-			fromLines = width == -1  # (the file's first keyed line sets the column count)
-			if width > 1 and not matched and _legacyLinesWidth(raw, header, consumed, [], encoding, delimiter) == 1:
-				# A file of one column is compacted as one: its width is its first keyed line's, not the store's defaults'.
-				# Its lone keys are rows, and at the store's width they are deletions the compaction would carry out (a\nb\nc
-				# under defaults of two cells lost b and c). The rewrite adds the defaults line, and the file stays one column.
-				width, fromLines = 1, True
+			matched = _legacyHoldsHeader(line0, header, consumed, encoding, delimiter)
+			# A file of one column is compacted as one, whatever the store's defaults say: its lone keys are rows, and at their
+			# width they are deletions the compaction would carry out (a\nb\nc under defaults of two cells lost b and c). At
+			# two columns or more the defaults set the width of the reader the compaction keeps what it reads for.
+			width = _legacyFileWidth(raw, header, consumed, encoding, delimiter)
+			if width != 1 and not matched and len(defaults) > 1:
+				width = len(defaults)
+			# How the store's read takes these lines: the same width and strictness, or the rewrite takes rows the read kept
+			# for rows memory lacks, and adds them again.
+			wider = _legacyExtendsHeader(header, line0.decode(enc, errors='replace'), delimiter) if consumed and raw else 0
+			start = wider or (len(header) if consumed and (matched or not raw) else -1)
+			strict = self.strict and not wider
 			del line0
 			for _ in range(2):  # (twice when the lines say keys are live that are gone from memory, in a one-column file)
 				if dropAt:
-					raw, moved = _legacyDropLines(raw, dropAt, consumed, fromLines, delimiter, encoding)
+					raw, moved = _legacyDropLines(raw, dropAt, consumed, not matched, delimiter, encoding)
 					if moved is not None:
 						with self._memLock:  # (its line moved up, the key alone if it held no value: memory stays the file)
 							row = dict.get(self, moved)  # (a caller may have deleted it meanwhile)
@@ -6642,7 +6659,7 @@ memoryOnly:{self.memoryOnly}
 								OrderedDict.move_to_end(self, moved, last=False)
 				kept = _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched)
 				del raw
-				flags, diffWidth = self._readLines(kept, header, consumed, matched)
+				flags, diffWidth = self._readLines(kept, consumed, start, strict)
 				with self._memLock:
 					values = [row for key, row in OrderedDict.items(self) if flags.get(key) is not True and not str(key).startswith('#')]
 					gone = [key for key, flag in flags.items() if flag is not None and not dict.__contains__(self, key)]
@@ -6666,8 +6683,8 @@ memoryOnly:{self.memoryOnly}
 			# (a cell the file's defaults set that the store's leave empty: an empty cell takes the one before it).
 			# Kept only when the store's reader then ends with them: a line it does not take (a reset at column count 1
 			# is a row there) would be added again at every rewrite.
-			def endOf(lines, start=()):
-				return _fileDefaultsAtEnd(lines, diffWidth, delimiter, encoding, consumed, self.strict, start)
+			def endOf(lines, begin=()):
+				return _fileDefaultsAtEnd(lines, diffWidth, delimiter, encoding, consumed, strict, begin)
 			own = endOf(kept)
 			goal = _trimmedCells(want) if any(want[1:]) else [DEFAULTS_INDICATOR_KEY]
 			reset = _encodeRow([DEFAULTS_INDICATOR_KEY],delimiter,encoding,errors,what='defaults')
@@ -6907,8 +6924,9 @@ memoryOnly:{self.memoryOnly}
 			defaults = list(self.defaults)
 			given = self._givenDefaults
 			changes = _TSVZedMerge(self, self.correctColumnNum, list(defaults))
-			width = _legacyReadLoop(io.BytesIO(rest), '', changes, self.correctColumnNum, 0, self.strict, self.delimiter,
-									changes.defaults, False, self.encoding, reporter)[0]
+			width = _legacyReadLoop(io.BytesIO(rest), '', changes, self.correctColumnNum, 0,
+									self.strict and not self._followedWidening,  # (as the whole read took this file)
+									self.delimiter, changes.defaults, False, self.encoding, reporter)[0]
 		finally:
 			reporter.flush()
 		with self._memLock:
@@ -6948,6 +6966,7 @@ memoryOnly:{self.memoryOnly}
 		width = -1
 		known = _KNOWN_NOTHING
 		damaged = False
+		widened = False
 		if f is not None:
 			codec = _fileCodec(self._fileName)
 			reader = _HashingReader(f)
@@ -6967,8 +6986,8 @@ memoryOnly:{self.memoryOnly}
 						if start is not None:
 							# (the rows of a file another program widened are read loose, padded, the file untouched: a strict
 							# reader would drop every row narrower than the new count, and a rewrite then delete them)
-							width = _legacyReadLoop(stream, self._fileName, loaded, start[0], start[1],
-													self.strict and not (self.header and start[0] > len(self.header)),
+							widened = start[0] > len(self.header)
+							width = _legacyReadLoop(stream, self._fileName, loaded, start[0], start[1], self.strict and not widened,
 													self.delimiter, loaded.defaults, False, self.encoding, reporter)[0]
 					finally:
 						if codec:
@@ -6998,10 +7017,9 @@ memoryOnly:{self.memoryOnly}
 				self.defaults = loaded.defaults
 			if loaded.dirty:
 				self.dirty = True  # a key the file holds twice
+			self._followedWidening = widened
 			if width > 0:
 				self.correctColumnNum = width  # the column count the read took (the header's, when line 1 holds it)
-				if self.header and width > len(self.header) and self.verifyHeader:
-					self._followedWidening = True
 			elif self.header and any(self.header) and self.verifyHeader:
 				self.correctColumnNum = len(self.header)  # (no keyed line: the header's, which the next line written follows)
 			elif len(self._givenDefaults) > 1:
@@ -7975,10 +7993,7 @@ class TSVZedLite(MutableMapping):
 			if self.verbose:
 				eprint(f"Key {key} deleted in memory")
 			return
-		# (a store known to be of one column asks the file with its own width: defaults of two cells or more, set after the
-		# load, do not make the file's lone keys deletions to the readers that open it without them)
 		if self.correctColumnNum <= 1 and _legacyDropKeys(self._fileName, [key], self.header, self.verifyHeader,
-														  [] if self.correctColumnNum == 1 else self._constructorDefaults,
 														  self.encoding, self.delimiter):
 			# A lone key is a row in a one-column file: its lines went instead, and every offset after them moved.
 			held = [(k, v) for k, v in self.indexes.items() if k.startswith('#') and k != DEFAULTS_INDICATOR_KEY]  # (the rows memory alone holds)
@@ -8808,11 +8823,11 @@ class _ServeStore(object):
 			return rows
 		keys = [cells[0] for cells, marker in rows if cells[0] != DEFAULTS_INDICATOR_KEY]
 		header = self._legacyHeaderNow(log)
-		width = _legacyWidthNow(self.path, header, True, self.defaults, 'utf8', self.delimiter)
+		width = _legacyWidthNow(self.path, header, True, 'utf8', self.delimiter)
 		if not keys or width is None or width > 1:
 			return rows  # (a look at the first lines: what is queued cannot change them, so no wait for it)
 		self.writer.barrier()
-		if not _legacyDropKeys(self.path, keys, header, True, self.defaults, 'utf8', self.delimiter):
+		if not _legacyDropKeys(self.path, keys, header, True, 'utf8', self.delimiter):
 			return rows
 		self.parts = None  # read again at the next request
 		return [row for row in rows if row[0][0] == DEFAULTS_INDICATOR_KEY]
