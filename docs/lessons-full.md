@@ -139,3 +139,16 @@ entries go last, in the same commit as the change:
   file, and never let the hint rewrite it. A caller who wants padded rows pads them (or gives defaults with that many
   cells, counting the `#_defaults_#` key, or a header line 1 already holds), and the library's padding is the file's own
   rule.
+
+## 2026-11-06 TSVZ 5.6: a reader works on its own copy of defaults
+- Changed: `readTabularFile`, `readTSV`, `scrubTabularFile` and `scrubTSV` split text `defaults=` as `TSVZed` does, and read
+  a copy, so the file's `#_defaults_#` lines no longer change the caller's list, of a `.tsv` or a `.tsvz`. A sequence keeps
+  3.39's meaning (its first cell stands in the key's column).
+- Why we had to change: the same call read differently the second time, with the file's defaults taken for the
+  preamble; and `defaults='#_defaults_#\tP'` read one character per cell.
+- Original design was wrong because: the read used its argument as its working state. `TSVZedLite` then came to rely on
+  that to learn the file's defaults, and a `.tsvz` test pinned it as "updated in place", so an argument became an output
+  nobody had designed.
+- Lesson: an argument is an input: work on a copy, and give what the read found its own way out (a return value, an
+  attribute). Before making two entry points agree by routing both through one normaliser, check what each form means
+  to each: a shared helper here would have moved every list that does not begin with `#_defaults_#` one cell over.

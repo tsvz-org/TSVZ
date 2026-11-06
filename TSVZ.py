@@ -43,7 +43,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.05'
+version = '5.06'
 __version__ = version
 author = 'pan@zopyr.us'
 COMMIT_DATE = '2026-11-04'
@@ -2148,7 +2148,7 @@ def readTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, last
 	- encoding (str, optional): The encoding of the file. Defaults to 'utf8'.
 	- strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to True.
 	- delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t'.
-	- defaults (list, optional): The default values to use for missing columns. Defaults to [].
+	- defaults (list or str, optional): The default values to use for missing columns: a list, whose first cell stands in the key's column, or text, which TSVZed reads the same (split at the delimiter, '#_defaults_#' first or not). The caller's list is left as it is. Defaults to [].
 	- correctColumnNum (int, optional): The expected number of columns in the file. If -1, it will be determined from the first valid line. Defaults to -1.
 
 	Returns:
@@ -2182,7 +2182,7 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 	- encoding (str, optional): The encoding of the file. Defaults to 'utf8'.
 	- strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to True.
 	- delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
-	- defaults (list, optional): The default values to use for missing columns. Defaults to [].
+	- defaults (list or str, optional): The default values to use for missing columns: a list, whose first cell stands in the key's column, or text, which TSVZed reads the same (split at the delimiter, '#_defaults_#' first or not). The caller's list is left as it is. Defaults to [].
 	- correctColumnNum (int, optional): The expected number of columns in the file. If -1, it will be determined from the first valid line. Defaults to -1.
 	- storeOffset (bool, optional): Instead of storing the data in taskDic, store the offset of each line. Defaults to False.
 	- errors (str, optional): Reading replaces invalid UTF-8 with U+FFFD whatever this is; it applies only to the header written when createIfNotExist creates the file: 'strict' (the default) raises a ValueError for text the encoding cannot hold, 'replace' writes '?'.
@@ -2201,18 +2201,26 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 									taskDic=taskDic, encoding=encoding, strict=strict, delimiter=delimiter,
 									defaults=defaults, correctColumnNum=correctColumnNum, storeOffset=storeOffset,
 									errors=errors)
+	delimiter = get_delimiter(delimiter,file_name=fileName)
+	return _legacyRead(fileName, teeLogger, header, createIfNotExist, lastLineOnly, verifyHeader, verbose, taskDic, encoding,
+					   strict, delimiter, _readerDefaults(defaults, delimiter), correctColumnNum, storeOffset, errors)[0]
+
+
+def _legacyRead(fileName, teeLogger, header, createIfNotExist, lastLineOnly, verifyHeader, verbose, taskDic, encoding, strict,
+				delimiter, defaults, correctColumnNum, storeOffset, errors):
+	"""readTabularFile for a legacy file: ``(what it returns, the column count the read took)``, -1 for none.
+
+	``delimiter`` is resolved, and ``defaults`` a list (_readerDefaults) that the read works on, so it ends as the
+	defaults in effect at the end of the file: a caller who needs those (TSVZedLite) passes its own."""
 	if taskDic is None:
 		taskDic = {}
-	if defaults is ...:
-		defaults = []
-	delimiter = get_delimiter(delimiter,file_name=fileName)
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger, delimiter = delimiter)
 	if not _verifyFileExistence(fileName,createIfNotExist = createIfNotExist,teeLogger = teeLogger,header = header,encoding = encoding,strict = strict,delimiter=delimiter,errors = errors):
-		return taskDic
+		return taskDic, -1
 	if _isCompressedFile(fileName) and _fileHoldsNothing(fileName):
 		# No byte, or only empty streams: an empty store, as an empty uncompressed file is (below), not a damaged
 		# stream (BZ2File and LZMAFile fail on a file with no byte).
-		return (-1 if storeOffset else []) if lastLineOnly else taskDic
+		return ((-1 if storeOffset else []) if lastLineOnly else taskDic), -1
 	reporter = _Reporter(fileName, teeLogger)
 	try:
 		# Under the READ lock: another process's rewrite is waited out (a nested read of the file takes no second lock).
@@ -2220,15 +2228,15 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 			start = _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, strict, delimiter,
 									  correctColumnNum, encoding, reporter, lastLineOnly)
 			if start is None:
-				return taskDic
+				return taskDic, -1
 			correctColumnNum, lineNo = start
 			if lastLineOnly:
-				return read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter, defaults=defaults,storeOffset=storeOffset)
-			_legacyReadLoop(file, fileName, taskDic, correctColumnNum, lineNo, strict, delimiter, defaults,
-							storeOffset, encoding, reporter)
+				return read_last_valid_line(fileName, taskDic, correctColumnNum, verbose=verbose, teeLogger=teeLogger, strict=strict, delimiter=delimiter, defaults=defaults,storeOffset=storeOffset), correctColumnNum
+			correctColumnNum = _legacyReadLoop(file, fileName, taskDic, correctColumnNum, lineNo, strict, delimiter, defaults,
+											   storeOffset, encoding, reporter)[0]
 	finally:
 		reporter.flush()
-	return taskDic
+	return taskDic, correctColumnNum
 
 
 def _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, strict, delimiter, correctColumnNum,
@@ -2635,7 +2643,7 @@ def scrubTSV(fileName,teeLogger = None,header = '',createIfNotExist = False, las
 	- encoding (str, optional): The encoding of the file. Defaults to 'utf8'.
 	- strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to False.
 	- delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
-	- defaults (list, optional): The default values to use for missing columns. Defaults to [].
+	- defaults (list or str, optional): The default values to use for missing columns: a list, whose first cell stands in the key's column, or text, which TSVZed reads the same (split at the delimiter, '#_defaults_#' first or not). The caller's list is left as it is. Defaults to [].
 	- errors (str, optional): What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8 file name (os.fsdecode). 'strict' (the default) raises a ValueError (TSVZEncodeError) naming it, before anything is written; 'replace' writes '?' instead.
 
 	Returns:
@@ -2672,7 +2680,7 @@ def scrubTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fa
 	- encoding (str, optional): The encoding of the file. Defaults to 'utf8'.
 	- strict (bool, optional): Whether to raise an exception if there is a data format error. Defaults to False.
 	- delimiter (str, optional): The delimiter used in the Tabular file. Defaults to '\t' for TSV, ',' for CSV, '\0' for NSV.
-	- defaults (list, optional): The default values to use for missing columns. Defaults to [].
+	- defaults (list or str, optional): The default values to use for missing columns: a list, whose first cell stands in the key's column, or text, which TSVZed reads the same (split at the delimiter, '#_defaults_#' first or not). The caller's list is left as it is. Defaults to [].
 	- correctColumnNum (int, optional): The expected number of columns in the file. If -1, it will be determined from the first valid line. Defaults to -1.
 	- errors (str, optional): What to do with text the encoding cannot hold, such as a lone surrogate from a non-UTF-8 file name (os.fsdecode). 'strict' (the default) raises a ValueError (TSVZEncodeError) naming it, before anything is written; 'replace' writes '?' instead.
 
@@ -3017,8 +3025,8 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 	given = list(taskDic.items()) if taskDic else []
 	if taskDic is None:
 		taskDic = {}
-	givenDefaults = list(defaults) if defaults not in (..., None) else []
 	dlm = get_delimiter(delimiter,file_name=fileName)
+	givenDefaults = _readerDefaults(defaults, dlm)
 	formatted = _formatHeader(header,delimiter=dlm)
 	consumed = bool(any(formatted) and verifyHeader)
 	enc = encoding or 'utf8'
@@ -3384,6 +3392,16 @@ def _normalizeDefaults(defaults, delimiter):
 	if defaults[0] != DEFAULTS_INDICATOR_KEY:
 		defaults = [DEFAULTS_INDICATOR_KEY] + defaults
 	return defaults
+
+
+def _readerDefaults(defaults, delimiter):
+	"""The ``defaults=`` of a legacy reader or scrub as the list it works on, the caller's never: text as TSVZed takes it
+	(_normalizeDefaults), a sequence copied as it is. The first cell of a sequence stands in the key's column whatever
+	it holds, as in every reader from 3.39 (``['', 'X']`` fills cell 1), where TSVZed puts #_defaults_# in front of one
+	that does not begin with it."""
+	if isinstance(defaults, str):
+		return _normalizeDefaults(defaults, delimiter)
+	return list(defaults) if defaults and defaults is not ... else []
 
 
 def _cellText(item):
@@ -4307,8 +4325,6 @@ def _specReadTabularFile(fileName, teeLogger=None, header='', createIfNotExist=F
 						 teeLogger=teeLogger, verbose=verbose)
 	finally:
 		reporter.flush()
-	if isinstance(defaults, list):
-		defaults[:] = load.state.defaults
 	if lastLineOnly:
 		if load.lastLine is None:
 			return -1 if storeOffset else []
@@ -7590,11 +7606,10 @@ class TSVZedLite(MutableMapping):
 			return self._specLiteLoad(self.indexes)
 		if self.verbose:
 			eprint(f"Loading {self._fileName}")
-		readTabularFile(self._fileName, header = self.header, createIfNotExist = self.createIfNotExist,
-				   verifyHeader = self.verifyHeader, verbose = self.verbose, taskDic = self.indexes,
-				   encoding = self.encoding if self.encoding else None, strict = self.strict, 
-				   delimiter = self.delimiter, defaults=self.defaults,storeOffset=not self._inMemoryRows,
-				   errors = self.errors)
+		# (the read works on self.defaults: a row is read at its offset with the defaults the file ends with)
+		_legacyRead(self._fileName, None, self.header, self.createIfNotExist, False, self.verifyHeader, self.verbose,
+					self.indexes, self.encoding if self.encoding else None, self.strict, self.delimiter, self.defaults, -1,
+					not self._inMemoryRows, self.errors)
 		return self
 
 	def positions(self):

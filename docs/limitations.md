@@ -386,21 +386,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   program then asked for the rewrite.
 - Revisit when: 5.6.
 
-### readTabularFile does not read text defaults as TSVZed does
-- Kind: deferred to 5.6
-- What the operator sees: on `x\t\t1`, `TSVZed(p, defaults='#_defaults_#\tP')` gives `['x', 'P', '1']`, and
-  `readTabularFile(p, defaults='#_defaults_#\tP')` gives `['x', '_', '1', 'e', 'f', ...]`: it takes the text as a
-  sequence of characters. Its reading on 5.4 is the same. A list that starts with `#_defaults_#` reads the same on both.
-- Why: `TSVZed` turns text defaults into a list and `readTabularFile` does not.
-- Revisit when: 5.6.
-
-### readTabularFile changes the caller's defaults list
-- Kind: deferred to 5.6
-- What the operator sees: on a file with its own defaults line, `readTabularFile(p, defaults=D, strict=False)` puts that
-  line's cells into the list `D`, so the same call then reads differently. `TSVZed` leaves the list alone.
-- Why: the reader works on the list it was given.
-- Revisit when: 5.6, with the text defaults entry above.
-
 ### Some tests fail under heavy parallel load only
 - Kind: deferred to 5.6
 - What the operator sees: under heavy parallel load these fail on a deadline or a precondition, with no behaviour

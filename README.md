@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.1**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.6**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -298,6 +298,20 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
+## Upgrading to 5.6 from 5.5
+
+The file formats are unchanged.
+
+- **The readers take text defaults, and leave the caller's list alone.**
+  `readTabularFile`, `readTSV`, `scrubTabularFile` and `scrubTSV` split `defaults=` given as
+  text as `TSVZed` does (they took it as a sequence of characters, one cell each). They read
+  a copy: the file's `#_defaults_#` lines no longer go into the caller's list, of a `.tsv`
+  or a `.tsvz` file, so a second read with that list reads as the first did. To know the
+  file's defaults, open a `TSVZed` and read `.defaults`. A list that does not start with
+  `#_defaults_#` still differs: a reader takes its first cell for the key's column
+  (`['', 'X']` fills cell 1), as every reader since 3.39 has, and `TSVZed` puts
+  `#_defaults_#` in front of it (`['', 'X']` fills cell 2).
+
 ## Upgrading to 5.5 from 5.4
 
 The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family file 5.5
@@ -378,8 +392,9 @@ writes.
   no defaults at all, and its rewrite took out the first lone key too.
   The last `setDefaults()` wins, and is what a whole reload starts from. A rewrite changes
   nothing this store's reader reads, except what memory changed; pass the same defaults to
-  every reader of the file, as a list that starts with `#_defaults_#`, because `TSVZed` and
-  `readTabularFile` read other forms differently
+  every reader of the file, as text or as a list that starts with `#_defaults_#` (from 5.6
+  those read alike; a list that does not start with it does not: see
+  [Upgrading to 5.6](#upgrading-to-56-from-55))
   ([entry](docs/limitations.md#setdefaults-to-another-cell-count-changes-how-the-file-reads-not-the-rows-memory-holds)).
 - **A cell that is whitespace once unescaped (`<LF>`) is still filled with the defaults
   when a `TSVZed` loads it** (as 5.4): only the cells its right-strip empties;

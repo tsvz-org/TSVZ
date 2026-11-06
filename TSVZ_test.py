@@ -268,8 +268,8 @@ def test_basic_roundtrip():
 
 def test_version():
 	# (the scripts report the full form; pip and PyPI show it as 5.5)
-	assert TSVZ.version == '5.05'
-	assert TSVZ.__version__ == '5.05'
+	assert TSVZ.version == '5.06'
+	assert TSVZ.__version__ == '5.06'
 	assert not hasattr(TSVZ, 'WalStore')
 
 
@@ -2498,13 +2498,13 @@ def test_spec_conflicting_delimiter_and_encoding(tmp_path, capsys):
 	assert _tsvz_warnings(capsys) == []
 
 
-def test_spec_defaults_argument_is_a_preamble_updated_in_place(tmp_path):
+def test_spec_defaults_argument_is_a_preamble_left_as_the_caller_gave_it(tmp_path):
 	p = str(tmp_path / 'p.tsvz')
 	_touch(p, b'a\t1\n#_defaults_#\tX\tY\nb\t2\n')
 	defaults = ['#_defaults_#', 'P', 'Q']
 	data = TSVZ.readTabularFile(p, defaults=defaults)
 	assert data['a'] == ['a', '1', 'Q'] and data['b'] == ['b', '2', 'Y']
-	assert defaults == ['#_defaults_#', 'X', 'Y']
+	assert defaults == ['#_defaults_#', 'P', 'Q']
 
 
 def test_spec_last_line_only_and_offsets(tmp_path):
@@ -11147,7 +11147,8 @@ def _read_defaults(p, header, strict, defaults):
 	given = list(defaults) if defaults else [K]
 	try:
 		with contextlib.redirect_stdout(io.StringIO()):
-			rows = dict(TSVZ.readTabularFile(p, header=header, verifyHeader=bool(header), strict=strict, defaults=given))
+			rows = dict(TSVZ._legacyRead(p, None, header, False, False, bool(header), False, None, 'utf8', strict, '\t', given, -1,
+										 False, 'strict')[0])
 	except Exception as e:
 		return type(e).__name__
 	return {k: list(v) for k, v in rows.items()}, given[1:]
@@ -14101,3 +14102,67 @@ def test_the_rewrite_survives_a_key_deleted_while_its_line_moves_up(tmp_path, mo
 	captured = capsys.readouterr()
 	assert 'Failed' not in captured.out + captured.err and 'TypeError' not in captured.out + captured.err  # (the failback hides it)
 	assert list(TSVZ.readTabularFile(p)) == ['b']
+
+
+# --------------------------------------------------------------------------
+# 5.6: the readers take defaults as TSVZed does, and leave the caller's alone
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize('suffix', ['tsv', 'tsvz'])
+@pytest.mark.parametrize('strict', [False, True], ids=['loose', 'strict'])
+def test_readTabularFile_leaves_the_callers_defaults_list_alone(tmp_path, suffix, strict):
+	# The file's own defaults line went into the caller's list, so the same call then read `x` otherwise.
+	p = str(tmp_path / ('d.' + suffix))
+	_touch(p, b'x\t\t1\n#_defaults_#\tP\tQ\ny\t\t2\n')
+	given = ['#_defaults_#', 'A', 'B']
+	first = dict(TSVZ.readTabularFile(p, defaults=given, strict=strict))
+	assert given == ['#_defaults_#', 'A', 'B']
+	assert dict(TSVZ.readTabularFile(p, defaults=given, strict=strict)) == first
+
+
+@pytest.mark.parametrize('read', [TSVZ.readTabularFile, TSVZ.readTSV, TSVZ.scrubTabularFile])
+def test_a_reader_takes_text_defaults_as_TSVZed_does(tmp_path, read):
+	# Text was taken as a sequence of characters: ['x', '_', '1', 'e', 'f', ...].
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, b'x\t\t1\n')
+	t = TSVZ.TSVZed(p, defaults='#_defaults_#\tP\t', verbose=False)
+	row = t['x']
+	t.close()
+	assert row == ['x', 'P', '1']
+	for given in ('#_defaults_#\tP\t', 'P\t', ['#_defaults_#', 'P', ''], ('#_defaults_#', 'P', '')):
+		_touch(p, b'x\t\t1\n')
+		assert read(p, defaults=given, strict=False)['x'] == row, given
+
+
+def test_a_readers_sequence_keeps_its_first_cell_for_the_key_column(tmp_path):
+	# Every reader from 3.39: a first cell that is not #_defaults_# stands in the key's column, it is no default.
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, b'x\t\t1\n')
+	for given in (['', 'P', ''], ('k', 'P', '')):
+		assert TSVZ.readTabularFile(p, defaults=given, strict=False)['x'] == ['x', 'P', '1']
+
+
+def test_the_last_line_reader_takes_text_defaults_too(tmp_path):
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, b'x\t\t1\n')
+	assert TSVZ.readTabularFile(p, defaults='#_defaults_#\tP\t', lastLineOnly=True, strict=False) == ['x', 'P', '1']
+
+
+def test_a_scrub_given_text_defaults_compacts_as_with_the_list(tmp_path):
+	# The compaction took the text's characters for defaults: as many columns as characters.
+	text = b'x\t\t1\n# c\nx\t2\t3\ny\t\t4\n'
+	out = []
+	for given in ('#_defaults_#\tP\t', ['#_defaults_#', 'P', '']):
+		p = str(tmp_path / 'd.tsv')
+		_touch(p, text)
+		TSVZ.scrubTabularFile(p, defaults=given, strict=False)
+		out.append(_bytes(p))
+	assert out[0] == out[1] and b'# c' not in out[0]
+
+
+def test_tsvzedlite_still_takes_the_files_defaults_line(tmp_path):
+	# TSVZedLite reads a row at its offset with the defaults the load ended with.
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, b'#_defaults_#\tP\tQ\nx\t\t1\n')
+	t = TSVZ.TSVZedLite(p, strict=False)
+	assert t.defaults == ['#_defaults_#', 'P', 'Q'] and t['x'] == ['x', 'P', '1']
+	t.close()
