@@ -201,13 +201,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   from that line: one. The reader then shows a row named `#_defaults_#`; a strict read (`readTabularFile`'s default)
   drops every row of more than one cell, and a loose one shows them whole. Read with the defaults the file's
   program uses (or its header) it reads right. Scrubs and rewrites keep such a file as it is, so it does not get
-  worse.
+  worse, with one exception: when the program calls `setDefaults()` after opening such a file (a `TSVZed` opened
+  with no defaults), each `hardMapToFile()` adds one more reset and defaults pair, 28 bytes with one default `P`
+  (60, 88, 116, 144, 172 bytes over five rewrites). Reads stay correct. Defaults given to the constructor, or any
+  file without the bare line, do not grow. 5.4's size stays flat there, but after its rewrite a reopen does not
+  match memory.
 - Why: the column count comes from the first keyed line in every version from 3.39, and old and new readers must
   agree on it; skipping a bare defaults line there would make 5.5 readers see other rows than older readers of the
-  same bytes.
+  same bytes. The growth takes that rare file shape plus a late `setDefaults()`, and with automatic rewrites off by
+  default it only happens when a program calls a rewrite. Its cause is not verified.
 - Revisit when: an operator meets such a file read without its defaults, or when every reader of these files can be
-  changed at once.
-- Approved: 2026-11-04, the user chose "Known limitation (Recommended)".
+  changed at once, or a real store shows the growth.
+- Approved: 2026-11-04, the user chose "Known limitation (Recommended)"; the growth with `setDefaults()` added
+  2026-11-05, the user chose "Known limitation (Recommended)".
 
 ### A write by another process between a move_to_end and its commit can be lost
 - Kind: known limitation

@@ -345,7 +345,7 @@ writes.
   `popitem`) in a one-column store appends nothing (a lone key would read back as a row
   there). The next commit (the background writer's next tick, `commitAppendToFile()`,
   `close()`) compacts the file with that key's lines left out: for 100,000 keys about
-  0.9 s and 23 MiB (Python 3.14), once per commit however many deletes it holds, so a
+  1 s and 23 MiB (Python 3.14), once per commit however many deletes it holds, so a
   program deleting in a loop in such a file pays that once per `append_check_delay`.
   Until then the key stays deleted for the store: a reload, or following another
   process's rewrite, leaves it out. A write another process makes after that commit stays;
