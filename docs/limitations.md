@@ -347,16 +347,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-11-05, the user chose "Known limitation (Recommended)"; 2026-11-05, "Known limitation
   (Recommended)" again on the default-tick figures.
 
-### A one-cell set after another process empties a one-column file acts as a delete
-- Kind: deferred to 5.6
-- What the operator sees: another process empties a one-column file while the store has nothing queued. The store's
-  column count becomes unknown, and its next one-cell `set` acts as a delete with a warning, so that write is lost.
-  1 of 8000 fuzz cases (`bdel o0; async; aset a2` at one column); 5.4 does the same.
-- Why: a lone key is a deletion unless the column count says one column, and it says nothing after the file is
-  emptied.
-- Revisit when: 5.6, with the one-column delete fix deferred there.
-- Approved: 2026-11-05, the user chose "Deferred to 5.6 (Recommended)".
-
 ### setDefaults() to another cell count changes how the file reads, not the rows memory holds
 - Kind: known limitation
 - What the operator sees: `setDefaults()` with another cell count than the file's rows (two cells or more set the

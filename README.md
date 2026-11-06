@@ -323,6 +323,11 @@ The file formats are unchanged.
   pays a whole rewrite for it: `rewrite()` follows it and writes nothing. `rewrite_interval`
   still writes only a dirty store. A `.tsvz` still ignores all of these.
 
+- **A one-column store stays one column when another process empties its file.** Its
+  column count was lost, so the next one-cell `set` acted as a delete and the write was
+  gone. The count now holds until a line in the file says otherwise; a lone key in a store
+  of two columns or more emptied this way stays a delete.
+
 ## Upgrading to 5.5 from 5.4
 
 The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family file 5.5
@@ -513,9 +518,6 @@ writes.
     ([entry](docs/limitations.md#repeated-move_to_end-of-a-row-read-before-the-defaults-grows-the-file));
   - a wider row that a move writes again is lost to 3.39 to 5.4 strict readers
     ([entry](docs/limitations.md#a-wider-row-that-a-move-writes-again-is-lost-to-old-strict-readers));
-  - a one-cell `set` after another process empties a one-column file acts as a delete, with a
-    warning, so that write is lost (as in 5.4; planned for 5.6)
-    ([entry](docs/limitations.md#a-one-cell-set-after-another-process-empties-a-one-column-file-acts-as-a-delete)).
 - **A late `setDefaults()` on a file whose first keyed line has one cell grows it at each
   rewrite** (a bare `#_defaults_#` or a lone key, and a row with an empty cell the defaults
   fill): 28 bytes per `hardMapToFile()` with one default. Reads do not change

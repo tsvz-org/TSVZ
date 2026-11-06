@@ -14244,3 +14244,99 @@ def test_rewrite_force_makes_a_file_with_damage_again_as_mapToFile_does(tmp_path
 	assert t._remake and t.rewrite(force=True) is True
 	t.close()
 	assert gzip.decompress(_bytes(p)) == b'a\t1\n'
+
+
+# --------------------------------------------------------------------------
+# 5.6: a one-column store emptied by another process stays one column
+# --------------------------------------------------------------------------
+def _follower(p):
+	"""A store whose writer does not tick: the test says when it follows the file."""
+	return TSVZ.TSVZed(p, append_check_delay=60, verbose=False)
+
+
+def _follow(t):
+	t.checkExternalChanges()
+	t.rewrite()
+
+
+@pytest.mark.parametrize('emptied', ['delete', 'clear'])
+def test_a_one_cell_set_after_another_store_emptied_a_one_column_file_is_a_row(tmp_path, emptied):
+	# `bdel o0; async; aset a2`: the read found no line, so no column count, and the lone key was a deletion.
+	p = str(tmp_path / 'e.tsv')
+	_touch(p, b'o0\n')
+	t, b = _follower(p), _follower(p)
+	if emptied == 'delete':
+		del b['o0']
+	else:
+		b.clear()
+	b.close()
+	_follow(t)
+	assert dict(t) == {} and t.correctColumnNum == 1
+	t['a2'] = ['a2']
+	assert dict(t) == {'a2': ['a2']}
+	t.close()
+	assert TSVZ.readTabularFile(p) == {'a2': ['a2']}
+
+
+def test_a_one_cell_set_after_reload_of_an_emptied_one_column_file_is_a_row(tmp_path):
+	p = str(tmp_path / 'e.tsv')
+	_touch(p, b'o0\n')
+	t = _follower(p)
+	_touch(p, b'')
+	t.reload()
+	t['a2'] = ['a2']
+	t.close()
+	assert _bytes(p) == b'a2\n'
+
+
+def test_a_lone_key_after_another_store_emptied_a_wider_file_stays_a_delete(tmp_path):
+	p = str(tmp_path / 'e.tsv')
+	_touch(p, b'o0\t1\n')
+	t, b = _follower(p), _follower(p)
+	b.clear()
+	b.close()
+	_follow(t)
+	assert t.correctColumnNum == -1
+	t['a2'] = ['a2']
+	assert dict(t) == {}
+	t.close()
+	assert TSVZ.readTabularFile(p) == {}
+
+
+@pytest.mark.parametrize('emptied', [b'', b'\n'])
+def test_what_another_process_appends_to_an_emptied_one_column_file_sets_its_column_count(tmp_path, emptied):
+	# Read on from where the store left off, at the one column it held, `y` was a row; a reopen takes two from `x`.
+	p = str(tmp_path / 'e.tsv')
+	_touch(p, b'o0\n')
+	t = _follower(p)
+	_touch(p, emptied)
+	_follow(t)
+	with open(p, 'ab') as f:
+		f.write(b'x\t1\ny\n')
+	_follow(t)
+	assert dict(t) == {'x': ['x', '1']} and t.correctColumnNum == 2
+	t.close()
+	assert TSVZ.readTabularFile(p, strict=False) == {'x': ['x', '1']}
+
+
+def test_a_store_that_emptied_its_own_one_column_file_reads_what_another_process_appends_as_a_reopen_does(tmp_path):
+	p = str(tmp_path / 'e.tsv')
+	_touch(p, b'o0\n')
+	t = _follower(p)
+	del t['o0']
+	t.commitAppendToFile()
+	assert _bytes(p) == b'' and t.correctColumnNum == 1
+	with open(p, 'ab') as f:
+		f.write(b'x\t1\ny\n')
+	_follow(t)
+	assert dict(t) == {'x': ['x', '1']} and t.correctColumnNum == 2
+	t.close()
+
+
+def test_correctColumnNum_1_on_an_empty_file_is_no_column_count(tmp_path):
+	# 5.5: the argument is no fact of the file. Only a one-column file a store has read keeps its count through emptying.
+	p = str(tmp_path / 'e.tsv')
+	_touch(p, b'')
+	t = TSVZ.TSVZed(p, correctColumnNum=1, verbose=False)
+	assert t.correctColumnNum == -1
+	t.close()

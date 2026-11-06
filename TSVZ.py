@@ -6649,9 +6649,10 @@ memoryOnly:{self.memoryOnly}
 		header = None  # True: a row was queued while what follows was read
 		# A last line with no newline is read again: what is appended may complete it (a compressed file's appends
 		# are members of their own). Not while rows are queued (unless the file is damaged): what follows would go after
-		# them in memory, where the file will hold them after it.
+		# them in memory, where the file will hold them after it. Nor when a store holds no row at one column (the file
+		# was emptied): its first keyed line sets the column count, which a whole read takes.
 		if (found is not None and (found[2] or self._damaged or _isCompressedFile(self._fileName))
-				and (self._damaged or (not self.appendQueue and not self._readWhole))):
+				and (self._damaged or (not self.appendQueue and not self._readWhole and (self or self.correctColumnNum != 1)))):
 			rest, known, _ = found
 			header, torn = self._applyAppended(f, rest, self._known[1])
 			if header is None:
@@ -6787,8 +6788,9 @@ memoryOnly:{self.memoryOnly}
 				self.correctColumnNum = len(self._givenDefaults)  # (no keyed line: what the store's reader will take)
 			elif self:
 				self.correctColumnNum = len(self[next(iter(self))])
-			else:
+			elif self.correctColumnNum != 1 or not self._constructed:  # (the constructor's 1 is correctColumnNum=, no fact of the file)
 				self.correctColumnNum = -1
+			# (else a one-column file another process emptied: a lone key stays a row, until a line says otherwise, _syncFrom)
 		self._known, self._unseen = known, False
 		self._damaged = False  # memory is what the file holds, damaged or not
 		self._remake = locked and damaged
