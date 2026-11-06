@@ -429,10 +429,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### pip 9 cannot upgrade from or uninstall 5.5 and earlier
 - Kind: known limitation
-- What the operator sees: upgrading from TSVZ 5.5 (5.05) or earlier with pip 9, the pip of EL7 and EL8 (`pip3 --version`),
-  fails with `configparser.DuplicateOptionError: ... option 'tsvz' in section 'console_scripts' already exists`, and so does
-  `pip3 uninstall TSVZ` for those releases; the installed release keeps working. `pip3 install -U pip` once (`--user` for a
-  user install), then the upgrade works; from 5.6 on, pip 9 upgrades and uninstalls as anywhere.
+- What the operator sees: With pip 9, the pip of EL7 and EL8 (`pip3 --version`), upgrading from 5.5 (5.05) or earlier and `pip3 uninstall TSVZ` of those releases stop with `configparser.DuplicateOptionError: ... option 'tsvz' in section 'console_scripts' already exists`, and nothing changes: the installed release keeps working. Run `pip3 install -U pip` once, then upgrade or uninstall. With `--user` the same happens, except that `pip3 install --user -U TSVZ` with no version does not stop: it installs the new release, which works, and leaves the old release's metadata behind. `pip3 list` then shows the old release after `pip3 uninstall TSVZ`, and the next uninstall stops with that error. To avoid this, run `pip3 install --user -U pip` once first. If it has already happened, run that, run `pip3 uninstall TSVZ` until it says TSVZ is not installed, and install again.
 - Why: pip 9 parses the installed release's `entry_points.txt` with a parser that folds case, and nothing in a new release can
   change the old metadata.
 - Revisit when: EL's stock pip stops being 9, or never.
@@ -448,3 +445,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: the fix belongs in the writer thread's print (`__teePrintOrNot` reached from `_checkExternalChanges`), which must not
   touch a buffered stream while the interpreter is finalizing; this version does not change that path.
 - Revisit when: the next version: fix it at the writer thread's print.
+
+### The `TSVZ` spelling in a venv with a space in its path
+- Kind: known limitation
+- What the operator sees: In a venv whose path has a space, or is too long for the kernel's `#!` line, the `TSVZ` spelling fails with "bad interpreter", because pip gives a script file a plain `#!` line: use `tsvz`. uv and system or `--user` installs are not affected.
+- Why: pip writes a plain `#!<python>` line into a script file and a `/bin/sh` wrapper only for an entry point, and a launcher that delegates to the lowercase twin overwrites it on a case-insensitive disk under uv.
+- Revisit when: someone hits it.
+- Approved: 2026-11-06, the user chose "Known limitation (Recommended)".

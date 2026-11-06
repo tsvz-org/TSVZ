@@ -15,11 +15,9 @@ pip install tsvz          # from PyPI
 pip install -e .          # editable, from this directory
 ```
 
-Upgrading from TSVZ 5.5 (5.05) or earlier with pip 9, the pip of EL7 and EL8
-(`pip3 --version`), fails with `configparser.DuplicateOptionError: ... option 'tsvz' in
-section 'console_scripts' already exists`, and so does `pip3 uninstall TSVZ` for those
-releases; the installed release keeps working. Run `pip3 install -U pip` once (`--user`
-for a user install), then upgrade; from 5.6 on, pip 9 upgrades and uninstalls as anywhere.
+- With pip 9, the pip of EL7 and EL8 (`pip3 --version`), upgrading from 5.5 (5.05) or earlier and `pip3 uninstall TSVZ` of those releases stop with `configparser.DuplicateOptionError: ... option 'tsvz' in section 'console_scripts' already exists`, and nothing changes: the installed release keeps working. Run `pip3 install -U pip` once, then upgrade or uninstall.
+- With `--user` the same happens, except that `pip3 install --user -U TSVZ` with no version does not stop: it installs the new release, which works, and leaves the old release's metadata behind. `pip3 list` then shows the old release after `pip3 uninstall TSVZ`, and the next uninstall stops with that error. To avoid this, run `pip3 install --user -U pip` once first. If it has already happened, run that, run `pip3 uninstall TSVZ` until it says TSVZ is not installed, and install again.
+- In a venv whose path has a space, or is too long for the kernel's `#!` line, the `TSVZ` spelling fails with "bad interpreter", because pip gives a script file a plain `#!` line: use `tsvz`. uv and system or `--user` installs are not affected.
 
 ## Two file dialects, one API
 
