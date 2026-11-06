@@ -756,10 +756,19 @@ def test_the_terminal_check_obeys_the_timeout(tmp_path, monkeypatch):
 	# 2 s timeout, and on a loaded host it was killed (exit -9) before the terminal step ran. Only the terminal
 	# step's own deadline is under test, so the other step gets a long one.
 	real = tc.run_command
-	monkeypatch.setattr(tc, 'run_command', lambda argv, cwd, timeout, *args, **kwargs: real(argv, cwd, 120, *args, **kwargs))
-	started = time.time()
+	ended = []
+
+	def run(argv, cwd, timeout, *args, **kwargs):
+		try:
+			return real(argv, cwd, 120, *args, **kwargs)
+		finally:
+			ended.append(time.time())
+	monkeypatch.setattr(tc, 'run_command', run)
 	result = tc.run_case(check, 'files', ctx)
-	assert time.time() - started < 35  # (the fake sleeps 40 s: a check that waited for it would end later)
+	# The terminal step alone, from the end of the last run_command: it ends at its 2 s deadline, not at the fake's
+	# 40 s sleep, and not at a hard-coded 30 s.
+	assert ended and time.time() - ended[-1] < 15
+
 	assert result.result == tc.WARN and 'timed out' in ' '.join(result.detail)
 
 
