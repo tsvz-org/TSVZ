@@ -200,20 +200,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   header that line 1 holds (`readTabularFile(p)`, `tsvz read`, a `TSVZed` given no defaults), takes its column count
   from that line: one. The reader then shows a row named `#_defaults_#`; a strict read (`readTabularFile`'s default)
   drops every row of more than one cell, and a loose one shows them whole. Read with the defaults the file's
-  program uses (or its header) it reads right. Scrubs and rewrites keep such a file as it is, so it does not get
-  worse, with one exception: when the program calls `setDefaults()` after opening such a file (a `TSVZed` opened
-  with no defaults), each `hardMapToFile()` adds one more reset and defaults pair, 28 bytes with one default `P`
-  (60, 88, 116, 144, 172 bytes over five rewrites). Reads stay correct. Defaults given to the constructor, or any
-  file without the bare line, do not grow. 5.4's size stays flat there, but after its rewrite a reopen does not
-  match memory.
+  program uses (or its header) it reads right. Scrubs and rewrites keep such a file as it is. (A late `setDefaults()` on
+  such a file makes a rewrite grow it: see the entry after the move-growth one, "A late setDefaults() on a file whose
+  first keyed line has one cell grows it at each rewrite".)
 - Why: the column count comes from the first keyed line in every version from 3.39, and old and new readers must
   agree on it; skipping a bare defaults line there would make 5.5 readers see other rows than older readers of the
-  same bytes. The growth takes that rare file shape plus a late `setDefaults()`, and with automatic rewrites off by
-  default it only happens when a program calls a rewrite. Its cause is not verified.
+  same bytes.
 - Revisit when: an operator meets such a file read without its defaults, or when every reader of these files can be
-  changed at once, or a real store shows the growth.
-- Approved: 2026-11-04, the user chose "Known limitation (Recommended)"; the growth with `setDefaults()` added
-  2026-11-05, the user chose "Known limitation (Recommended)".
+  changed at once.
+- Approved: 2026-11-04, the user chose "Known limitation (Recommended)".
 
 ### A write by another process between a move_to_end and its commit can be lost
 - Kind: known limitation
@@ -252,6 +247,22 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   file.
 - Revisit when: someone sees a file grow this way.
 - Approved: 2026-11-05, the user chose "Known limitation (Recommended)".
+
+### A late setDefaults() on a file whose first keyed line has one cell grows it at each rewrite
+- Kind: known limitation
+- What the operator sees: a program opens a `.tsv`-family file with no defaults, the file's first keyed line has one
+  cell (a bare `#_defaults_#`, or a lone key: `a\nb\t\n`), and the file has a row with an empty cell that the
+  defaults would fill. The program then calls `setDefaults()`. Each `hardMapToFile()` after that adds one more reset
+  and defaults pair, 28 bytes with one default `P`: 60, 88, 116, 144, 172 bytes over five rewrites of the bare-line
+  file, and 50 to 162 of `a\nb\t\n`. In a probe, 59 of 76 files of that shape grew and none of 3,124 others did.
+  Reads never changed across the rewrites. Defaults given to the constructor never grew (0 of 5,716). 5.4's size
+  stays flat, but after its rewrite a reopen does not match memory. Automatic rewrites are off by default, so it
+  takes a program that rewrites.
+- Why: the cause is not verified. It looks like the compaction keeping every `#_defaults_#` line, as in the
+  move-growth entry above.
+- Revisit when: a real store shows the growth.
+- Approved: 2026-11-05, the user chose "Known limitation (Recommended)" on the wider shape (a first keyed line of one
+  cell, not only a bare `#_defaults_#`).
 
 ### tsvz delete and TSVZedLite's delete in a one-column file do not delete
 - Kind: deferred to 5.6
@@ -307,9 +318,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### move_to_end follows the file first, so it waits for the lock and slows beside a busy writer
 - Kind: known limitation
 - What the operator sees: `move_to_end` reads what another process changed before it queues the rows it moves, so it
-  waits while another process holds the file's lock (3.000 s against 0.000 s in a test), and slows when another
-  process writes: on 100,000 rows with a writer at 20 Hz, 28 moves/s and a slowest call of 1.774 s (5.4: 1.2 million
-  moves/s and 0.008 s). The wait is bounded and nothing livelocks. It also raises KeyError for a key another process
+  waits for as long as another process holds the file's lock (the read lock has no timeout: 3.000 s in a test where
+  the other process held it for 3 s, against 0.000 s with no holder), and slows when another process writes: on
+  100,000 rows with a writer at 20 Hz, 28 moves/s and a slowest call of 1.774 s (5.4: 1.2 million moves/s and
+  0.008 s). That cost beside a writer is bounded, and nothing livelocks. It also raises KeyError for a key another process
   has deleted, as its docstring says (5.4 succeeded).
 - Why: without that read the rows it appends again undo the other process's change (the entry on a write between a
   `move_to_end` and its commit).
@@ -320,13 +332,20 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: known limitation
 - What the operator sees: a running `TSVZed` notices another process's change by the file's modification time and
   size. A change that keeps the size, made by a writer that takes no lock (another tool, TSVZ before 5.1), can go
-  unseen: 39 of 6000 changes at a 1 ms tick (43 of 6000 on 5.4, so it is not new). Memory then stays stale until the
-  file changes again. TSVZ's own writers are not exposed: their rewrites run behind the read lock.
-- Why: the cause is not verified; the likely one is that the file's time moves before the new bytes land, so a read
-  in between takes the old bytes with the new time. Seeing it for certain would mean reading the file again at every
+  unseen. At a 1 ms tick: 39 of 6000 changes in one run and 90 of 4000 in another (43 of 6000 on 5.4, so it is not
+  new). At the default 10 ms tick: 44 of 4000 on 5.5 and 42 on 5.4 in one run, 0 of 2500 in another, so the rate
+  moves with the state of the machine. Memory then stays stale until the file changes again. TSVZ's own writers
+  were not exposed where readers take the read lock, since their rewrites run behind it: 0 of 8000 on 5.5
+  and on 5.4, on Linux with open file description locks. Where readers take no read lock (`lockf`-only hosts and
+  Windows, see `_readLock`) that reason does not hold: forced `lockf` and `flock` gave 0 of 1500; Windows was not
+  measured.
+- Why: the cause is not verified. All 265 misses had a file time that had moved, so "the time did not move" is ruled
+  out; the likely cause is that the time moves before the new bytes land, so a read in between takes the old bytes
+  with the new time, but that is not proved. Seeing it for certain would mean reading the file again at every
   tick.
 - Revisit when: a real store is edited by such a tool.
-- Approved: 2026-11-05, the user chose "Known limitation (Recommended)".
+- Approved: 2026-11-05, the user chose "Known limitation (Recommended)"; 2026-11-05, "Known limitation
+  (Recommended)" again on the default-tick figures.
 
 ### A one-cell set after another process empties a one-column file acts as a delete
 - Kind: deferred to 5.6
@@ -344,7 +363,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   column count a reader takes) leaves memory's rows as they are, and the file unchanged at the commit. A rewrite
   keeps the data and adds the defaults line. A reopen given those defaults then reads the file at the new count,
   which can read `{}` (a one-column file's lone keys are deletions at two columns), while a plain reopen reads the
-  rows. 5.4 was worse: memory was `{}` after the call, and its rewrite wiped the file.
+  rows. 5.4 read such a file as `{}` from the open, with or without `setDefaults()`, and its rewrite emptied it.
 - Why: the user chose to allow a `setDefaults()` that changes the column count.
 - Revisit when: someone loses rows to it.
 - Approved: 2026-11-05, the user chose "Allow it, document it (Recommended)" when asked whether `setDefaults()` may
