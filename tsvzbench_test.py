@@ -612,10 +612,12 @@ def test_every_case_passes_with_the_reference(tmp_path):
 	('corrupt', 'bulk', 'set - new 100', tb.WRONG),
 ])
 def test_the_gate_catches_a_misbehaving_implementation(tmp_path, monkeypatch, mode, family, label, kind):
-	# (the `-V` probe shares the 3 s timeout; on a loaded host it timed out and every mark was n/a)
+	# (the `-V` probe, and every step but the one under test, share the --timeout; on a loaded host they timed out:
+	# n/a for the probe, 'timeout' where 'wrong' was expected. Only the sleep case needs a short timeout.)
 	real_probe = tb.probe
 	monkeypatch.setattr(tb, 'probe', lambda impl, directory, timeout: real_probe(impl, directory, 60.0))
-	bench, _ = run_suite(tmp_path, [('bad', fake(tmp_path, mode))], '--only', family, '--timeout', '3')
+	bench, _ = run_suite(tmp_path, [('bad', fake(tmp_path, mode))], '--only', family,
+		'--timeout', '3' if kind == tb.TIMEOUT else '60')
 	result = next(r for r in bench.results if (r.case.family, r.case.label) == (family, label))
 	assert result.mark[0] == kind
 	assert bench.exit_status() == 1
@@ -644,7 +646,10 @@ def test_a_timed_out_call_ends_its_calls_workload(tmp_path, monkeypatch):
 	found = marks(bench, 'hang')
 	assert found[('perop', 'cli 100')][0] == tb.TIMEOUT
 	assert found[('perop', 'cli via handler 100')][0] == tb.TIMEOUT
-	assert open(str(tmp_path / 'hung.log')).read().count('set') == 2
+	# (at most one set per cell: the workload ended at the first. Under load a call can be killed before the fake
+	# logs it, so the count is not exactly 2; both cells' marks above show that both timed out.)
+	log = tmp_path / 'hung.log'
+	assert (log.read_text().count('set') if log.exists() else 0) <= 2
 
 
 def test_a_refusal_that_writes_a_part_is_wrong(tmp_path):
@@ -686,8 +691,8 @@ while True:
 
 def test_a_handler_that_stops_answering_times_out(tmp_path, monkeypatch):
 	# (the `-V` probe and the handler's start share the 2 s timeout; on a loaded host the probe timed out and the
-	# implementation was skipped, or the handler was not up in time. The loads' own 2 s socket timeout, which is what
-	# this proves, is the harness's timeout and is unchanged.)
+	# implementation was skipped, or the handler was not up in time. The loads' own 2 s socket timeout is the
+	# harness's timeout and is unchanged.)
 	real_probe, real_handler = tb.probe, tb.Handler
 	monkeypatch.setattr(tb, 'probe', lambda impl, directory, timeout: real_probe(impl, directory, 60.0))
 	monkeypatch.setattr(tb, 'Handler', lambda impl, store, directory, wait=None: real_handler(impl, store, directory, 60.0))

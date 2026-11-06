@@ -6078,8 +6078,14 @@ def _must_write_fffd(t):
 def _open_refused(p, **kwargs):
 	"""A TSVZed whose open-time rewrite (rewrite_on_load: rewrite(force=True)) is refused, as 5.4's was for the U+FFFD
 	row of the file; 5.5 refuses it for that row changed in place (_must_write_fffd)."""
-	t = TSVZ.TSVZed(p, rewrite_on_load=False, **kwargs)
-	_must_write_fffd(t).rewrite(force=True)
+	# (rewrite_interval is set after the row changes: the file is dirty at open, and with the interval already set and
+	# the file older than it, the writer's first tick rewrote it before the row changed, leaving nothing to refuse)
+	interval = kwargs.pop('rewrite_interval', None)
+	t = TSVZ.TSVZed(p, rewrite_on_load=False, rewrite_interval=0, **kwargs)
+	_must_write_fffd(t)
+	if interval is not None:
+		t.rewrite_interval = interval
+	t.rewrite(force=True)
 	return t
 
 
