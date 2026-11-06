@@ -36,9 +36,13 @@ scrub's own header, defaults and strict):
       changes nothing the store's reader reads, but for memory's own changes: a TSVZed reopened on the file (with the
       defaults the program gave last) reads, per key, what the same reopen read before the rewrite, or what memory
       holds; a key changed in place reads what memory holds; a key both hold is not lost, and the keys they share keep
-      their order. Files whose line 1 is not the header given are left out (line 1 is kept, by decision).
+      their order; a key memory holds that neither reopen reads is flagged. Files whose line 1 is not the header given are
+      left out (line 1 is kept, by decision). Run on the file as .tsv and as .nsv (the same text with NUL for tab).
   mk  the same ops, no defaults change among them: the reopen before the rewrite already holds memory's keys in memory's
-      order and, but for a key changed in place, its cells (what the commit wrote: moves and one-column deletes included).
+      order and, but for a key changed in place, its cells (what the commit wrote: moves and one-column deletes
+      included). With a defaults change the keys cannot be compared: memory is not read again, the reopen reads at the
+      column count the defaults give. (m does flag a key memory holds that neither reopen reads.)
+  7*  (a TSVZed rewrite) also run on the file as .nsv; 7r (raw cells, parsed on tabs) is .tsv only.
 """
 import argparse, collections, contextlib, faulthandler, importlib.util, io, itertools, json, multiprocessing, os, random, shutil, signal, sys, tempfile, threading, time, zlib
 
@@ -410,8 +414,10 @@ def _check_case(text, args, tsvzed=True, want=None):
 	old_other = with_module(OLD, reader, orig, args, not args['strict']) if want_cs else None
 	if want is None or want & SEVEN:
 		check_rewrite(text, args, res)
+		check_rewrite(text, args, res, '.nsv')
 	if want is None or 'm' in want or 'mk' in want:
 		check_memory_ops(text, args, res)
+		check_memory_ops(text, args, res, '.nsv')
 
 	write(work, text)
 	st, val = scrub(work, args)
@@ -643,9 +649,17 @@ def memory_ops(rng):
 
 
 def _mreads(row, held, defaults, was=()):
-	"""True when the row ``row`` (normalized) is memory's ``held`` as a read shows it: the same cells, then what a read
-	pads a row with: empty, the defaults at that place, or what the same reader read there before the rewrite (``was``:
-	the defaults then in effect, which memory's row has no cell for)."""
+	"""True when the row ``row`` (normalized) is memory's ``held`` as a read shows it: the same cells, then, past memory's
+	cells (it has none there), only what a read pads a row with. Three allowances, each measured on 3000 files x 24
+	argument sets (72000 cases, seed 1; 83 `m` failures with all three):
+	  - empty;
+	  - the store's defaults at that place: a row set before a setDefaults() or a defaults key is short in memory, and
+	    every reader pads a short row with the defaults it holds. Without it 323 more cases fail (the 6 shrunk ones read: all of that kind);
+	  - what the same reopen read there before the rewrite (``was``): the rewrite is to change nothing but memory's own
+	    changes, and those cells came from the defaults in effect where the row stands in the file. Without it 12 more
+	    cases fail (all 12 shrunk ones read: rows changed in place or set short, whose cells past memory's are such
+	    defaults).
+	Without both, 644 more fail."""
 	if held is None:
 		return False
 	return row[:len(held)] == held and all(
@@ -660,12 +674,25 @@ def _mnorm(row):
 	return row
 
 
-def check_memory_ops(text, args, res):
-	"""m, mk: memory ops, a commit, then hardMapToFile(); see the module docstring."""
+def check_memory_ops(text, args, res, ext='.tsv'):
+	"""m, mk: memory ops, a commit, then hardMapToFile(); see the module docstring. Also as a .nsv file (``ext``): its
+	failures are kept under the same names when the .tsv one passes, marked ``ext``."""
 	if args['header'] and text.split('\n', 1)[0] != args['header']:
 		return
 	ops = memory_ops(random.Random(zlib.crc32((text + json.dumps(args, sort_keys=True)).encode('utf8'))))
-	p = os.path.join(TMP, 'mem.tsv')
+	if ext == '.nsv':
+		text, args = nsv_case(text, args)
+		mine = {}
+		check_memory_ops_in(text, args, mine, ext, ops)
+		for k, v in mine.items():
+			if k not in res:
+				res[k] = dict(v, ext=ext)
+		return
+	check_memory_ops_in(text, args, res, ext, ops)
+
+
+def check_memory_ops_in(text, args, res, ext, ops):
+	p = os.path.join(TMP, 'mem' + ext)
 	write(p, text)
 	kw = dict(header=args['header'], defaults=None if args['defaults'] is None else list(args['defaults']), strict=args['strict'])
 	OD = collections.OrderedDict
@@ -732,22 +759,46 @@ def check_memory_ops(text, args, res):
 			break
 	if why is None:
 		lost = [k for k in befored if k in memd and k not in afterd] + [k for k in changed if k in memd and k not in afterd]
+		missing = [k for k in memd if k not in befored and k not in afterd]  # (memory's key neither reopen reads)
 		if lost:
 			why = 'lost %r' % (lost,)
+		elif missing:
+			why = 'memory holds %r, neither reopen reads it' % (missing,)
 		elif [k for k, _ in after if k in befored] != [k for k, _ in before if k in afterd]:
 			why = 'the order changed'
 	if why:
 		res['m'] = {'why': why, 'ops': ops, 'mem': mem, 'before': before, 'after': after, 'file': readb(p).decode('utf8', 'replace')}
-	if not any(op[0] in ('setdefaults',) for op in ops) and any(op[0] == 'move' or op[0] == 'del' for op in ops):
+	if not any(op[0] == 'setdefaults' for op in ops) and any(op[0] == 'move' or op[0] == 'del' for op in ops):
+		# (not after a setDefaults(): memory is not read again, so the keys it holds and the reopen's differ by the
+		# column count the defaults give: a reopen reads keys memory does not hold, and the cells by the defaults given last)
 		if [k for k, _ in before] != [k for k, _ in mem]:
 			res['mk'] = {'why': 'keys or order', 'ops': ops, 'mem': mem, 'before': before, 'file': readb(p).decode('utf8', 'replace')}
 		elif any(not _mreads(row, memd[k], defaultsSeen[0]) for k, row in before if k not in changed):
 			res['mk'] = {'why': 'cells', 'ops': ops, 'mem': mem, 'before': before, 'file': readb(p).decode('utf8', 'replace')}
 
 
-def check_rewrite(text, args, res):
-	"""7*: a TSVZed (same args) opened on the file and rewritten whole (hardMapToFile)."""
-	p = os.path.join(TMP, 'rw.tsv')
+def nsv_case(text, args):
+	"""The case as a .nsv file: NUL for tab, in the text and in the header."""
+	return text.replace('\t', '\0'), dict(args, header=args['header'].replace('\t', '\0'))
+
+
+def check_rewrite(text, args, res, ext='.tsv'):
+	"""7*: a TSVZed (same args) opened on the file and rewritten whole (hardMapToFile). Also as a .nsv file (the cells
+	separated by NUL): its failures are kept under the same names when the .tsv one passes, the raw-cell check (7r) is
+	left to .tsv."""
+	if ext == '.nsv':
+		text, args = nsv_case(text, args)
+		mine = {}
+		check_rewrite_in(text, args, mine, ext)
+		for k, v in mine.items():
+			if not k.startswith('_') and k not in res:
+				res[k] = dict(v, ext='.nsv')
+		return
+	check_rewrite_in(text, args, res, ext)
+
+
+def check_rewrite_in(text, args, res, ext):
+	p = os.path.join(TMP, 'rw' + ext)
 	write(p, text)
 	tv_before = tsvzed_view(p, args)
 	loose_before = reader(p, args, False)
@@ -766,7 +817,7 @@ def check_rewrite(text, args, res):
 		miss = cells_missing(loose_before[1], la[1]) if la[0] == 'ok' else 'raised'
 		if miss:
 			res['7l'] = {'before': loose_before[1], 'after': la[1], 'lost': miss, 'rewritten': b1}
-	lost = raw_lost(text, b1)
+	lost = raw_lost(text, b1) if ext == '.tsv' else None
 	if lost:
 		res['7r'] = {'lost': lost, 'rewritten': b1}
 	if old_before is not None and old_before[0] == 'ok':
