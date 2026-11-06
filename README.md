@@ -322,10 +322,14 @@ The file formats are unchanged.
   A program that called `rewrite(force=True)` only to follow another process's change now
   pays a whole rewrite for it: `rewrite()` follows it and writes nothing. `rewrite_interval`
   still writes only a dirty store. A `.tsvz` still ignores all of these. A store that has
-  changed nothing takes in another process's change before it writes, also with
-  `monitor_external_changes=False` (which is for overwriting what the store changed itself:
-  a row another process appended is kept, not deleted), and one given `createIfNotExist=False`
-  makes no file where there is none (a row set makes it, as before).
+  deleted no key and changed no row it held (setting a new key leaves `dirty` False: the
+  writer appends it, and it is in the file) takes in another process's change before it
+  writes, also with `monitor_external_changes=False` (which is for overwriting what the
+  store changed itself: a row another process appended is kept, not deleted), and one given
+  `createIfNotExist=False` makes no file where there is none (a row set makes it, as
+  before). A writer that takes no lock (a shell `>>`) can still lose rows to a rewrite
+  ([entry](docs/limitations.md#a-writer-with-no-lock-loses-rows-to-a-rewrite)): at 10 Hz on
+  10k rows 229 of 1174 appended rows were lost.
 
 - **A one-column store stays one column when another process empties its file.** Its
   column count was lost, so the next one-cell `set` acted as a delete and the write was
@@ -340,7 +344,8 @@ The file formats are unchanged.
   with the cells it read, and the other rows read as before) and only those lines go, the
   rest copied as they are. Each delete there is a whole rewrite, and `TSVZedLite` then reads
   the file again for its offsets, as a fresh open would; at two columns or more a delete is
-  still one appended line. A file with no keyed line yet and no header of two columns or
+  still one appended line, after a look at the file's first lines under the rewrite lock
+  (29 us on a `.tsv` of 200k rows or 2M, 2.5 ms on a 200k-row `.tsv.gz` of one member). A file with no keyed line yet and no header of two columns or
   more takes no line either: a `delete` used to write the lone key, which then read as a
   row, and it now writes nothing (a store that did not exist is still created; under
   `--x-header` with two columns or more a lone key is a deletion, and `id\tv\n` becomes
@@ -350,6 +355,16 @@ The file formats are unchanged.
   file is written, so a delete that fails (an `OSError`) leaves the key where it was. A
   damaged file that cannot be read gets the line, as before, and a warning on stderr: in a
   file of one column the line deletes nothing.
+- **A rewrite keeps the lone keys of a one-column file under defaults of two cells or more.**
+  `a\nb\nc\n` opened with `defaults=['#_defaults_#', 'P']` read as `{}` and any rewrite left
+  `a\n#_defaults_#\tP\n`: b and c were deleted as deletion lines at the store's width, with no
+  output. A file is now compacted at its own width, its first keyed line's, so it stays one
+  column, keeps every key (`a\nb\nc\n#_defaults_#\tP\n`) and gets the defaults line; a plain open
+  reads the same keys before and after, on every route (`mapToFile()`, `hardMapToFile()`,
+  `rewrite(force=True)`, `rewrite_on_load`, `rewrite_on_exit`). The store itself still reads none
+  of the lone keys, and the file does not widen to the defaults or to a wider header until
+  every row holds a value
+  ([entry](docs/limitations.md#a-file-of-lone-keys-does-not-widen)).
 - **`TSVZedLite` knows a one-column file from its load.** So a one-cell row is a row there
   (it was a delete of a key it did not hold), and a row read at its offset has its cell
   (`t['a']` read as `[]`).
@@ -359,7 +374,9 @@ The file formats are unchanged.
   rewrite of any kind (`mapToFile()`, `hardMapToFile()`, `rewrite(force=True)`, the automatic
   ones, and one that makes a removed or damaged file again) writes the header as line 1, pads
   every narrower row and `#_defaults_#` line to it, and the store's rows and column count
-  follow at once, so `t['a'][2]` holds `''` and the "Header mismatch" at each open ends. The padding is the one thing besides dropping lines
+  follow at once, so `t['a'][2]` holds `''` (a default the file already holds for the new
+  column, if it has a `#_defaults_#` line that reaches it, is what a row below that line reads;
+  the rows above it read `''`) and the "Header mismatch" at each open ends. The padding is the one thing besides dropping lines
   that a rewrite does to a line: without it a strict reader, which drops a narrower line,
   would lose the rows. The rule is exact: line 1 must be the header's beginning, the same
   cells without the whitespace around them, and fewer of them. `idaho\tvalue`, which the
@@ -367,8 +384,12 @@ The file formats are unchanged.
   than the header (writes never cut), and a header given with `verifyHeader=False`. A strict
   `TSVZed` takes a line 1 that extends its header (the same leading cells, then named ones)
   for another program's widening, at open and whenever it follows the file, and its column
-  count becomes the wider header's; it used to raise "Header mismatch" and stop following.
-  Any other line 1 that is not its header is refused as before. A program still on the old
+  count becomes the wider header's; it used to raise "Header mismatch" and stop following. It
+  reads the rows of such a file loose, padded, and the file stays as it is (a strict read
+  dropped every row narrower than the new count, and a rewrite then deleted them), and its
+  `set`s that are narrower than the file are padded and written, where a strict store that
+  never met a widening still refuses them. Any other line 1 that is not its header is
+  refused as before. A program still on the old
   header then sees "Header mismatch" in its turn, and a strict reader given it raises; it
   does not narrow line 1. A one-column file
   with rows that hold no value is not widened, with a warning, and stays as it is: a lone
@@ -444,10 +465,12 @@ writes.
   defaults, and a strict reader's check moves with them. The store itself leaves memory's
   rows as they are and does not change the file at the commit. In a one-column file the
   lone keys are deletions at two columns: a store opened with such defaults, or given them
-  by `setDefaults()` and then `reload()`, does not hold them, where a plain open does, and
-  any rewrite of that store takes all but the first lone key out of the file, with no output
-  (`defaults=['#_defaults_#', 'P']` on `a\nb\nc\t1\n`: `hardMapToFile()` leaves
-  `a\nc\t1\n#_defaults_#\tP\n`). 5.4 did worse: its `TSVZed` read such a file as `{}` with
+  by `setDefaults()` and then `reload()`, does not hold them, where a plain open does. 5.5
+  took all but the first lone key out of the file at any rewrite of that store, with no
+  output (`defaults=['#_defaults_#', 'P']` on `a\nb\nc\t1\n`: `hardMapToFile()` left
+  `a\nc\t1\n#_defaults_#\tP\n`); from 5.6 the file stays one column and keeps every key
+  (`a\nb\nc\t1\n#_defaults_#\tP\n`: a rewrite compacts a file at its own width, its first keyed
+  line's, never at the store's). 5.4 did worse: its `TSVZed` read such a file as `{}` with
   no defaults at all, and its rewrite took out the first lone key too.
   The last `setDefaults()` wins, and is what a whole reload starts from. A rewrite changes
   nothing this store's reader reads, except what memory changed; pass the same defaults to
@@ -561,7 +584,12 @@ writes.
   - repeated `move_to_end` of a row read before the defaults grows the file
     ([entry](docs/limitations.md#repeated-move_to_end-of-a-row-read-before-the-defaults-grows-the-file));
   - a wider row that a move writes again is lost to 3.39 to 5.4 strict readers
-    ([entry](docs/limitations.md#a-wider-row-that-a-move-writes-again-is-lost-to-old-strict-readers)).
+    ([entry](docs/limitations.md#a-wider-row-that-a-move-writes-again-is-lost-to-old-strict-readers));
+  - a one-column delete rewrites the whole file
+    ([entry](docs/limitations.md#a-one-column-delete-rewrites-the-whole-file));
+  - a file of lone keys does not widen to a wider header or defaults: every key stays, and a
+    store given such defaults reads none of them
+    ([entry](docs/limitations.md#a-file-of-lone-keys-does-not-widen)).
 - **A late `setDefaults()` on a file whose first keyed line has one cell grows it at each
   rewrite** (a bare `#_defaults_#` or a lone key, and a row with an empty cell the defaults
   fill): 28 bytes per `hardMapToFile()` with one default. Reads do not change

@@ -222,3 +222,32 @@ entries go last, in the same commit as the change:
 - Lesson: when a check stops a good case that looks like the bad one, compare exactly (prefix cells, then named ones)
   instead of forbidding both. A flag that turns a check off must not turn off the guard against deleting what the program
   never held.
+
+## 2026-11-06 TSVZ 5.6: a file is compacted at its own width, never the store's
+- Changed: a `TSVZed` rewrite of a file of one column (its first keyed line has one cell) compacts it at column count 1, also
+  when the store's defaults have two cells or more. `a\nb\nc\n` under `defaults=['#_defaults_#', 'P']` becomes
+  `a\nb\nc\n#_defaults_#\tP\n`, not `a\n#_defaults_#\tP\n`. `TSVZedLite`'s delete at one column asks the file with its own
+  width too (no defaults), so `setDefaults()` after the load does not make the delete append a lone key that is a row.
+- Why we had to change: the compaction took the store's width from the defaults and carried out the lone keys as deletions
+  there, with no output; a plain open read three keys before and one after, on every rewrite route. 5.5's README and
+  limitations entry described the loss as accepted behaviour; the user chose to fix it in 5.6.
+- Original design was wrong because: one number, the store's width, answered two questions: how the store reads the file and
+  what the file's lines mean. Only the first can differ between readers; the second is the file's, and the compaction acts on
+  it for every reader.
+- Lesson: before a writer drops a line, ask which reader's meaning makes it droppable. If that reader is the store and not
+  the file, the line stays. Not done: widening such a file to the defaults or to a wider header, because a value-less row at
+  two columns is a deletion (limitations.md, "A file of lone keys does not widen").
+
+## 2026-11-06 TSVZ 5.6: a rule that tells two lines apart is one function, exact
+- Changed: a strict `TSVZed` that follows a line 1 widened by another program (the same cells as its header, then named
+  ones) tells it from other lines with the rule the rewrite uses to write one (`_sameCells`: equal once the whitespace around
+  each cell is taken off), not the containment of the header check; it reads the rows of such a file loose, padded, the file
+  untouched, and pads a narrower `set` instead of refusing it. A strict store that never met a widening still refuses it.
+- Why we had to change: the containment rule let `id\tvalue\tw` pass for a widening of `id\tv`; and the strict read of a
+  widened file dropped every row narrower than the new count, so memory held `{}` and a rewrite appended a deletion line for
+  each row of the file.
+- Original design was wrong because: the same question (is this line 1 my header, widened?) was answered by two rules, the
+  looser where the file was read and the exact where it was written. And a strict check built to drop a narrower line was
+  applied to a file whose rows are narrower on purpose.
+- Lesson: one question, one function. When a check lets a file through to the part that acts on it, the part that acts must
+  not be able to disagree with it.

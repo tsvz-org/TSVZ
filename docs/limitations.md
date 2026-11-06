@@ -202,7 +202,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   drops every row of more than one cell, and a loose one shows them whole. Read with the defaults the file's
   program uses (or its header) it reads right. Scrubs and rewrites keep such a file as it is. (A late `setDefaults()` on
   such a file makes a rewrite grow it: see the entry after the move-growth one, "A late setDefaults() on a file whose
-  first keyed line has one cell grows it at each rewrite".)
+  first keyed line has one cell grows it at each rewrite".) A delete of the file's first key (`K\n#_defaults_#\t\n`,
+  or `K\n<wider row>\n#_defaults_#\n`) takes that row, or the bare line with it, out of the read: the bare line was the
+  row `#_defaults_#` at one column and is a reset at the width the file reads at after the delete. No key's row changes.
 - Why: the column count comes from the first keyed line in every version from 3.39, and old and new readers must
   agree on it; skipping a bare defaults line there would make 5.5 readers see other rows than older readers of the
   same bytes.
@@ -330,40 +332,51 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   column count a reader takes) leaves memory's rows as they are, and the file unchanged at the commit. A rewrite
   then keeps those rows and adds the defaults line. At two columns a lone key is a deletion, so a store opened with
   such defaults, or given them by `setDefaults()` and then `reload()`, does not hold a one-column file's lone keys
-  (`a\nb\n` reads `{}`; a plain open reads the rows). A rewrite of that store takes all but the first lone key out
-  of the file, with no output: `mapToFile()`, `hardMapToFile()`, `rewrite(force=True)`, `rewrite_on_load` and
-  `rewrite_on_exit` always; `rewrite_interval` once the store is dirty. A commit does not. With
-  `defaults=['#_defaults_#', 'P']`, `a\nb\n` becomes `a\n#_defaults_#\tP\n` and `a\nb\nc\t1\n` becomes
-  `a\nc\t1\n#_defaults_#\tP\n`. 5.4 did worse on every route tried: its `TSVZed` read such a file as `{}` with no
-  defaults at all, and its rewrite took out the first lone key too.
+  (`a\nb\n` reads `{}`; a plain open reads the rows). A rewrite of that store (`mapToFile()`, `hardMapToFile()`,
+  `rewrite(force=True)`, `rewrite_on_load`, `rewrite_on_exit`, `rewrite_interval` once the store is dirty) keeps every
+  key of the file and adds the defaults line: with `defaults=['#_defaults_#', 'P']`, `a\nb\n` becomes
+  `a\nb\n#_defaults_#\tP\n` and `a\nb\nc\t1\n` becomes `a\nb\nc\t1\n#_defaults_#\tP\n`; a plain open reads the same keys
+  before and after, and the rewrite says nothing. (5.5, and 5.6 until its second fix round, took all but the first lone
+  key out of the file with no output: a file is now compacted at its own width, its first keyed line's, never at the
+  store's.) `TSVZedLite`'s delete asks the file with its own width too, so `setDefaults()` after the load does not turn
+  its lone keys into rows the delete leaves. 5.4 read such a file as `{}` with no defaults at all, and its rewrite took
+  out the first lone key too.
 - Why: the user chose to allow a `setDefaults()` that changes the column count.
-- Revisit when: 5.6, which keeps the rows (2026-11-06, the user chose "Fix in 5.6 (Recommended)").
+- Revisit when: someone needs the store to hold the lone keys under such defaults (see "A file of lone keys does not
+  widen").
 - Approved: 2026-11-05, the user chose "Allow it, document it (Recommended)" when asked whether `setDefaults()` may
-  change the column count.
+  change the column count; 2026-11-06, "Fix in 5.6 (Recommended)" on the rows a rewrite took out.
 
 
-### A one-column delete on TSVZedLite looks at the file every time
+### A TSVZedLite delete looks at the file's first lines every time
 - Kind: deferred
-- What the operator sees: with the default read gate (`W=-1`) each `delete`, `pop` and `popitem` on a file of one column
-  reads the file under the rewrite lock to learn the width, then rewrites it. On a 200k-row file a delete costs 34 us
-  against 6.3 us on a `.tsv`, and 2.8 ms against 12 us on a `.tsv.gz`.
+- What the operator sees: with the default read gate (`W=-1`, or a file known to be of one column) each `delete`, `pop`
+  and `popitem` takes the file's rewrite lock to read its first lines, which say the width; at two columns or more the
+  delete is then the appended line. Measured on a `.tsv` of 200k rows: 29 us (5.5: 6.3 us, 5.6 before its second fix round:
+  17.7 ms, the whole file read under the exclusive lock); of 2M rows: 31 us (before: 171 ms). On a `.tsv.gz` the first
+  member is read whole, so the cost follows its size: 2.5 ms for 200k rows in one member, 30 ms for 2M (before: 42 ms and
+  411 ms; 5.5: 12 us). In a file of one column the delete is a whole rewrite (see "A one-column delete rewrites the whole
+  file").
 - Why: the width is a fact of the file and another writer can change it, so the delete asks the file; a cached width
-  would be a second answer to the same question.
-- Revisit when: a store deletes in a hot loop on a large one-column file.
+  would be a second answer to the same question. A member of a compressed file cannot be read in part by this reader.
+- Revisit when: a store deletes in a hot loop on a big compressed file, or on a plain file where 30 us is too much.
 
 ### mapToFile() at 20 Hz beside an appender loses rows
 - Kind: deferred
-- What the operator sees: a `TSVZed` calling `mapToFile()` 20 times a second while another process appends to the file
-  without taking the lock loses some of the appended rows (733 of 4068 in the test), the same as 5.5.
-- Why: a rewrite replaces the file's contents from memory; a row appended between the rewrite's snapshot and its write is not in
-  the snapshot. Not verified: whether appenders that take the kernel lock are safe.
-- Revisit when: a program mixes forced rewrites at a high rate with lock-free appenders.
+- What the operator sees: a `TSVZed` calling `mapToFile()` 20 times a second while another process appends to the file with
+  `appendTabularFile` (which takes the lock) loses some of the appended rows (733 of 4068 in the review's test), the same as
+  5.5.
+- Why: the cause found is that `mapToFile()` runs with `sync=False`: it does not read what was appended since its last
+  look, and writes deletion lines for the rows it has not read yet. Not fixed here: a forced rewrite that reads first is a
+  change to every route that calls it.
+- Revisit when: a program mixes forced rewrites at a high rate with appenders.
 
 ### No deterministic test of the read gate
 - Kind: deferred
 - What the operator sees: nothing; the gate that keeps a reader out while a rewrite is mid-way (byte 2 of the lock layout)
   is covered by stress runs and the conformance cases, not by a test that forces the interleaving.
-- Why: forcing it needs a hook inside the rewrite, which is a part only the test would use.
+- Why: nobody has written it yet. It needs no hook: a child process can hold byte 2 of the lock layout, and the test checks
+  that a read blocks until the child lets go.
 - Revisit when: the lock layout changes or a stress run fails in the gate.
 
 ### legacyfuzz does not know the widening exception
@@ -372,3 +385,31 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   because it still holds the 5.5 rule that a rewrite of a healthy file only drops lines.
 - Why: the fuzzer is a development tool; the exception is documented in the README and tested directly.
 - Revisit when: the fuzzer is next used for a release.
+
+### A writer with no lock loses rows to a rewrite
+- Kind: known limitation
+- What the operator sees: `rewrite(force=True)` at 10 Hz on 10k rows beside a shell `>>` lost 229 of 1174 appended rows,
+  and a hot loop 4495 of 13313. 5.5 lost 0 on a clean store and 181 of 1175 on a dirty one. Writers that lock lost 0.
+- Why: a rewrite replaces the file, so it cannot see an append that takes no lock.
+- Revisit when: someone needs it.
+- Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
+
+### A one-column delete rewrites the whole file
+- Kind: known limitation
+- What the operator sees: `tsvz delete` and `TSVZedLite`'s delete on a one-column file cost one full rewrite each, because such
+  a file cannot hold a deletion line (a lone key is a row there); two-column files still append.
+- Why: correctness; a batch delete is a new API nobody needs yet.
+- Revisit when: someone deletes in bulk from a big one-column file.
+- Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
+
+### A file of lone keys does not widen
+- Kind: known limitation
+- What the operator sees: with a wider header or defaults on a one-column file of lone keys, a rewrite leaves it one
+  column and keeps every key. With defaults of two cells or more, a store reads none of the lone keys (they are deletions
+  at its width) and the rewrite adds the defaults line. With a wider header, line 1 is not widened (a warning says the file
+  holds rows with no value), and the store reads the lone keys as rows and prints "Header mismatch" at each open. No row is
+  lost. The file widens once every row holds a value.
+- Why: a value-less row at two columns is a deletion, so marking one needs a format change that every reader, the spec and
+  tsvz-rs would have to learn.
+- Revisit when: the format next changes.
+- Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
