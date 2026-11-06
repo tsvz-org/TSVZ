@@ -525,7 +525,7 @@ def test_socket_plan_is_deterministic_and_tracks_the_final_state(tmp_path):
 # --- running a benchmark -----------------------------------------------------------------------
 
 FAKE = r'''
-import os, subprocess, sys, time
+import subprocess, sys, time
 mode, reference, args = sys.argv[1], sys.argv[2], sys.argv[3:]
 ops = ('read', 'len', 'get', 'set', 'delete', 'scrub', 'clear', 'verify', 'serve', 'stop')
 op = next((a for a in args if a in ops), None)
@@ -536,8 +536,6 @@ if mode == 'sleep' and op == 'len':
 if mode == 'noserve' and op == 'serve':
 	sys.exit(1)
 if mode == 'hangset' and op == 'set' and args[-1] != '-':
-	with open(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'hung.log'), 'a') as log:
-		log.write('set\n')
 	time.sleep(60)
 if mode == 'noverify' and op == 'verify':
 	sys.exit(0)
@@ -642,14 +640,17 @@ def test_a_timed_out_call_ends_its_calls_workload(tmp_path, monkeypatch):
 	real_probe, real_handler = tb.probe, tb.Handler
 	monkeypatch.setattr(tb, 'probe', lambda impl, directory, timeout: real_probe(impl, directory, 60.0))
 	monkeypatch.setattr(tb, 'Handler', lambda impl, store, directory, wait=None: real_handler(impl, store, directory, 60.0))
+	real_child, sets = tb.run_child, []
+	def counted(argv, *args, **kwargs):
+		if 'set' in argv and argv[-1] != '-':
+			sets.append(argv)
+		return real_child(argv, *args, **kwargs)
+	monkeypatch.setattr(tb, 'run_child', counted)
 	bench, _ = run_suite(tmp_path, [('hang', fake(tmp_path, 'hangset'))], '--only', 'perop', '--timeout', '2')
 	found = marks(bench, 'hang')
 	assert found[('perop', 'cli 100')][0] == tb.TIMEOUT
 	assert found[('perop', 'cli via handler 100')][0] == tb.TIMEOUT
-	# (at most one set per cell: the workload ended at the first. Under load a call can be killed before the fake
-	# logs it, so the count is not exactly 2; both cells' marks above show that both timed out.)
-	log = tmp_path / 'hung.log'
-	assert (log.read_text().count('set') if log.exists() else 0) <= 2
+	assert len(sets) == 2, sets  # one per cell: the harness made no call after the first timed out
 
 
 def test_a_refusal_that_writes_a_part_is_wrong(tmp_path):
