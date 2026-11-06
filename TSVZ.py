@@ -433,6 +433,8 @@ class _RewriteRows(object):
 	in place after the snapshot is written as it was then.
 	"""
 
+	widened = False  # the lines were widened to the store's header (_legacyWidened): memory reads the file again after
+
 	def __init__(self, first, values, delimiter, encoding, errors, header, tail=()):
 		self.first = first
 		self.tail = tail  # lines written after every row
@@ -3019,6 +3021,31 @@ def _legacyDropKeys(fileName, keys, header, verifyHeader, defaults, encoding, de
 						  expect=stamp) is not None:
 			return True
 	raise OSError('{}: the delete is not written: the file kept changing'.format(fileName))
+
+
+def _legacyWidened(raw, header, defaults, encoding, delimiter):
+	"""The legacy lines ``raw`` (bytes, without their newline) with line 1 widened to ``header``, when line 1 is that
+	header's beginning: the same cells, each without the whitespace around it, and fewer of them (empty cells at its end
+	not counted). This exact rule, not the containment of _lineContainHeader: a line 1 that only resembles the header may
+	be a row, and is left alone. None when it does not apply; False when it would lose rows: a row with no value (one
+	column) reads as a deletion at two columns or more, and no line can hold it there.
+
+	The lines a reader takes that are narrower than ``header`` are padded with it, each as a loose read already pads it: a
+	strict reader, which drops a narrower line, then takes them as it did at the old column count. Nothing else changes."""
+	enc = encoding or 'utf8'
+	cells = _trimmedCells(cell.strip() for cell in raw[0].decode(enc, errors='replace').rstrip('\r\n').lstrip('\ufeff').split(delimiter)) if raw else []
+	if not cells or len(cells) >= len(header) or cells != [cell.strip() for cell in header[:len(cells)]]:
+		return None
+	before = _legacyLinesWidth(raw, header, True, defaults, encoding, delimiter)
+	pad = delimiter.encode(enc)
+	out = [_encodeRow(_sanitize(list(header),delimiter=delimiter),delimiter,encoding,'strict',what='header')]
+	for line in raw[1:]:
+		text = line.decode(enc, errors='replace')
+		kind, _, count, _ = _legacyLineKind(text, before, False, delimiter)
+		if kind == 'row' and before == 1 and _legacyLineKind(text, 2, False, delimiter)[0] == 'delete':
+			return False
+		out.append(line.rstrip(b'\r') + pad * (len(header) - count) if kind in ('row', 'defaults') and count < len(header) else line)
+	return out
 
 
 class _RawTap(object):
@@ -6464,7 +6491,8 @@ memoryOnly:{self.memoryOnly}
 
 	def _snapshotForRewrite(self, f):
 		"""``(None, lines, queued)``, what a rewrite writes, and the queued rows, taken from the queue (_writeFile puts them
-		back if it stops). A healthy file (Q-D3): its lines (_fileLines) with the queued rows after them and the lines
+		back if it stops). A healthy file (Q-D3): its lines (_fileLines) with the queued rows after them, line 1 widened to
+		the store's header when it is that header's beginning (_legacyWidened) and the lines
 		of drop items' keys left out (_legacyDropLines), compacted as a scrub compacts them (_legacyCompact). A file to
 		be made again: only what keeps its reading (_remadeLines); memory holds what was queued. Then, either way, what
 		memory holds that those lines do not say (_RewriteRows, a flat snapshot checked before anything is written: a
@@ -6491,6 +6519,14 @@ memoryOnly:{self.memoryOnly}
 			header = list(self.header) if self.header and any(self.header) else []
 			consumed = bool(header) and self.verifyHeader
 			defaults = list(self._givenDefaults)
+			widened = None
+			if consumed and not remade:
+				widened = _legacyWidened(raw, header, defaults, encoding, delimiter)
+				if widened:
+					raw = widened
+				elif widened is False:
+					_warnOnce(self, 'not-widened', self._fileName, 'line 1 is not widened to the header given: the file holds rows '
+							  'with no value, which read as deletions at two columns or more', self.teeLogger)
 			line0 = raw[0] if raw else None
 			matched = consumed and line0 is not None and _headerMatches(header, line0.decode(enc, errors='replace').rstrip('\r\n'), delimiter)
 			width = _legacyWidthOf(line0, header, consumed, defaults, encoding, delimiter)
@@ -6569,6 +6605,7 @@ memoryOnly:{self.memoryOnly}
 			# effect, as between a reset and the defaults, would drop it; a lone key stays one, for a reader at one column)
 			values = [_fitRow(row, diffWidth) if len(row) < diffWidth and any(row[1:]) else row for row in values]
 			rows = _RewriteRows(kept, values, delimiter, encoding, errors, self.header, tail=tail)
+			rows.widened = bool(widened)
 			del values
 			rows.check()
 		except BaseException:
@@ -6658,6 +6695,8 @@ memoryOnly:{self.memoryOnly}
 				end = f.tell()  # its own bytes end here: a writer that takes no lock may append after them
 				self._damaged = self._remake = False
 				self.dirty = self.deSynced = False
+				if getattr(lines, 'widened', False):
+					self._readWidened(f)
 			except BaseException:
 				if started:
 					self.dirty = self.deSynced = True  # made again from memory by the next rewrite
@@ -6677,6 +6716,16 @@ memoryOnly:{self.memoryOnly}
 					_unlockFile(f)
 					_closeUnflushed(f)  # a buffer a failed write left is dropped, not written after the unlock
 		return True
+
+	def _readWidened(self, f):
+		"""Memory becomes what the open legacy file ``f``, just rewritten, reads now that line 1 is widened: its rows gain
+		the new cells and the store the new column count. A '#' key, which no file holds, stays."""
+		with self._memLock:
+			held = [(key, row) for key, row in OrderedDict.items(self) if key.startswith('#')]
+		self._readFrom(f, True)
+		with self._memLock:
+			for key, row in held:
+				OrderedDict.__setitem__(self, key, row)
 
 	def _syncFile(self):
 		"""Take in another process's change to the legacy file (_syncFrom), reading it as reload() does: under the READ

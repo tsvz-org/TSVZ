@@ -170,7 +170,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   commands with `--x-header H` take that row for the header: `tsvz keys --x-header 'id\tv'` shows nothing, though the
   row stays in the file and reads without `--x-header` show it. Scrubs (`tsvz scrub`, `scrubTabularFile`, a handler)
   and any other `TSVZed` rewrite of a healthy file never change line 1 (a scrub adds a header you pass with
-  `verifyHeader=False`, which is not a row).
+  `verifyHeader=False`, which is not a row; a `TSVZed` rewrite widens a line 1 that is the start of its header).
 - Why: a write from memory, or a delete taking line 1 out, does not know the header the CLI is given later.
 - Revisit when: an operator meets it after one of those writes.
 - Approved: 2026-11-03, the user chose "Known limitation (Recommended)". Narrowed in 5.5 (the scrub and a TSVZed
@@ -291,18 +291,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: the first keyed line sets the column count, and a lone key at two columns is a deletion in every version.
 - Revisit when: someone hits it.
 - Approved: 2026-11-05, the user chose "Known limitation (Recommended)".
-
-### A header wider than the file's line 1 is not written into line 1
-- Kind: deferred to 5.6
-- What the operator sees: a program gives a header wider than the file's line 1 (it added a column: line 1
-  `id\tv`, header `id\tv\tw`). 5.5 keeps the file's width and prints "Header mismatch" at every open. Rows already in
-  the file, and rows whose last cell is empty, raise IndexError when the program reads the new column. Even
-  `hardMapToFile()` leaves line 1 as it is, so the way out today is editing line 1 by hand. 5.4 widened line 1 at a
-  rewrite. No data is lost.
-- Why: 5.5 no longer writes its header over a line 1 that is not that header (5.4 did, and a reader given no header
-  lost the row line 1 was).
-- Revisit when: 5.6, which lets a rewrite widen line 1 to the header the program gives.
-- Approved: 2026-11-05, the user chose "README now, fix in 5.6 (Recommended)".
 
 ### move_to_end follows the file first, so it waits for the lock and slows beside a busy writer
 - Kind: known limitation

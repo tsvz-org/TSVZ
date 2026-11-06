@@ -344,6 +344,24 @@ The file formats are unchanged.
   (it was a delete of a key it did not hold), and a row read at its offset has its cell
   (`t['a']` read as `[]`).
 
+- **A rewrite widens line 1 to the header the program gives.** A program that adds a column
+  (line 1 `id\tv`, `header='id\tv\tw'`) no longer has to edit line 1 by hand: a `TSVZed`
+  rewrite of any kind (`mapToFile()`, `hardMapToFile()`, `rewrite(force=True)`, the automatic
+  ones) writes the header as line 1, pads every narrower row and `#_defaults_#` line to it,
+  and the store's rows and column count follow at once, so `t['a'][2]` holds `''` and the
+  "Header mismatch" at each open ends. The padding is the one thing besides dropping lines
+  that a rewrite does to a line: without it a strict reader, which drops a narrower line,
+  would lose the rows. The rule is exact: line 1 must be the header's beginning, the same
+  cells without the whitespace around them, and fewer of them. `idaho\tvalue`, which the
+  read's looser check takes for `id\tv`, stays, as does a line 1 that is a row, or one wider
+  than the header (writes never cut), and a header given with `verifyHeader=False`. A strict
+  `TSVZed` refuses a header line 1 does not match at open, as before: open the store loose
+  once to widen it. A program still on the old header then sees "Header mismatch" in its
+  turn, and a strict reader given it raises; it does not narrow line 1. A one-column file
+  with rows that hold no value is not widened, with a warning, and stays as it is: a lone
+  key is a deletion at two columns or more, so widening would delete it. A scrub
+  still never changes line 1.
+
 ## Upgrading to 5.5 from 5.4
 
 The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family file 5.5
@@ -535,12 +553,12 @@ writes.
   rewrite** (a bare `#_defaults_#` or a lone key, and a row with an empty cell the defaults
   fill): 28 bytes per `hardMapToFile()` with one default. Reads do not change
   ([entry](docs/limitations.md#a-late-setdefaults-on-a-file-whose-first-keyed-line-has-one-cell-grows-it-at-each-rewrite)).
-- **A header wider than the file's line 1 is not written into line 1** (planned for 5.6;
-  5.4 widened it at a rewrite). A program that adds a column to its header finds that 5.5
-  keeps the file's width: "Header mismatch" prints at every open, and rows already in the
-  file (and rows whose last cell is empty) raise IndexError on the new column. Nothing is
-  lost. Until 5.6, edit line 1 of the file by hand to add the column
-  ([entry](docs/limitations.md#a-header-wider-than-the-files-line-1-is-not-written-into-line-1)).
+- **A header wider than the file's line 1 is not written into line 1** (5.4 widened it at a
+  rewrite, and from 5.6 a rewrite does again, see
+  [Upgrading to 5.6](#upgrading-to-56-from-55)). A program that adds a column to its header
+  finds that 5.5 keeps the file's width: "Header mismatch" prints at every open, and rows
+  already in the file (and rows whose last cell is empty) raise IndexError on the new
+  column. Nothing is lost.
 - **`move_to_end` follows the file first**, so it waits while another process holds the
   file's lock and slows beside a busy writer (100,000 rows and a writer at 20 Hz: 28
   moves/s, 5.4: 1.2 million), and it raises `KeyError` for a key another process has
@@ -887,7 +905,7 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
 | L16 | A scrub writes only if the file is still what its read saw: it reads again up to three times, then writes nothing, with a warning (`tsvz scrub` exits 1, C6); 3.39 wrote over rows appended after its read. |
 | L17 | `scrubTabularFile(lastLineOnly=True)` returns the last row and writes nothing; 3.39 wrote that row back as deletion lines, and the store was gone. |
 | L18 | A scrub keeps every `#_defaults_#` line as the file has it, where it was, so every row reads as it did; 3.39 dropped them, so rows appended later got no defaults. |
-| L19 | A scrub never changes line 1, except that a header you pass with `verifyHeader=False` is added; a `TSVZed` rewrite of a healthy file never changes it, unless a delete in a one-column file takes line 1 out; 3.39 put an empty line in front of a header line, and a reader given the header then read the header as a row. |
+| L19 | A scrub never changes line 1, except that a header you pass with `verifyHeader=False` is added; a `TSVZed` rewrite of a healthy file never changes it, unless a delete in a one-column file takes line 1 out or (5.6) line 1 is the start of a wider header the program gives; 3.39 put an empty line in front of a header line, and a reader given the header then read the header as a row. |
 | L20 | A row wider than the column count is read whole (only its empty cells past the count go); 3.39 cut it. |
 | L21 | `TSVZed` reads a one-column file's lone keys as rows, as `readTabularFile` does (3.39 showed none); a delete there takes the key's lines out at the next commit, not as a line; from 5.6 so do `tsvz delete`, `pop`, `popitem`, a handler and `TSVZedLite`, at once. |
 | L22 | Writes never cut a row: a wider row is written whole; 3.39 cut it to the column count. A strict read takes a wider row whole and drops only a narrower one; a strict store refuses only a narrower row. |

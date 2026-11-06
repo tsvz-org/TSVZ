@@ -14524,3 +14524,149 @@ def test_tsvzedlite_switchFile_takes_the_new_files_column_count(tmp_path):
 	del t['a']
 	t.close()
 	assert _bytes(one) == b'b\n'
+
+
+# --------------------------------------------------------------------------
+# 5.6: a rewrite widens line 1 to the header the program gives
+# --------------------------------------------------------------------------
+WIDE = 'id\tv\tw'
+
+
+def _widened(p, header=WIDE, how='hardMapToFile', **kwargs):
+	"""The store of ``p`` opened with ``header`` and rewritten, still open."""
+	t = TSVZ.TSVZed(p, header=header, verbose=False, append_check_delay=60, **kwargs)
+	if how == 'rewrite':
+		assert t.rewrite(force=True) is True
+	else:
+		getattr(t, how)()
+	return t
+
+
+@pytest.mark.parametrize('how', ['hardMapToFile', 'mapToFile', 'rewrite'])
+def test_a_rewrite_widens_line_1_to_the_header_the_program_gives(tmp_path, capsys, how):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'id\tv\na\t1\nb\t2\n')
+	t = _widened(p, how=how)
+	assert t['a'][2] == '' and t.correctColumnNum == 3  # (no IndexError on the new column, no reopen needed)
+	t.close()
+	assert _bytes(p) == b'id\tv\tw\na\t1\t\nb\t2\t\n'
+	capsys.readouterr()
+	t = TSVZ.TSVZed(p, header=WIDE, verbose=False)
+	assert dict(t) == {'a': ['a', '1', ''], 'b': ['b', '2', '']}
+	t.close()
+	assert 'Header mismatch' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('strict', [False, True], ids=['loose', 'strict'])
+@pytest.mark.parametrize('header', [WIDE, ''], ids=['header', 'no header'])
+def test_every_reader_keeps_the_rows_after_line_1_is_widened(tmp_path, strict, header):
+	# Line 1 alone made a strict reader drop every row narrower than the new count, so the rows are padded with it.
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'id\tv\na\t1\n#_defaults_#\tP\nb\t\nc\t3\n')
+	want = {'a': ['a', '1', ''], 'c': ['c', '3', '']}
+	_widened(p).close()
+	rows = dict(TSVZ.readTabularFile(p, header=header, strict=strict))
+	rows.pop('id', None)
+	assert rows == want
+
+
+def test_widening_keeps_wider_rows_deletions_comments_and_defaults_as_they_read(tmp_path):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'id\tv\na\t1\t2\t3\n# note\nb\t\nc\t3\n#_defaults_#\tP\td\ne\t\t4\n')
+	t = _widened(p)
+	memory = dict(t)
+	t.close()
+	assert memory == {'a': ['a', '1', '2', '3'], 'c': ['c', '3', ''], 'e': ['e', 'P', '4']}
+	assert dict(TSVZ.readTabularFile(p, header=WIDE)) == memory
+
+
+@pytest.mark.parametrize('suffix, d, line', [('.csv', b',', b'id,v\na,1\n'), ('.psv', b'|', b'id|v\na|1\n'),
+											 ('.nsv', b'\0', b'id\0v\na\x001\n')])
+def test_widening_in_the_other_delimiters(tmp_path, suffix, d, line):
+	p = str(tmp_path / ('h' + suffix))
+	_touch(p, line)
+	_widened(p, header=d.decode().join(['id', 'v', 'w'])).close()
+	assert _bytes(p) == d.join([b'id', b'v', b'w']) + b'\n' + d.join([b'a', b'1', b'']) + b'\n'
+
+
+def test_widening_a_compressed_file(tmp_path):
+	p = str(tmp_path / 'h.tsv.gz')
+	_touch(p, gzip.compress(b'id\tv\na\t1\n'))
+	t = _widened(p)
+	assert t['a'] == ['a', '1', '']
+	t.close()
+	assert gzip.decompress(_bytes(p)) == b'id\tv\tw\na\t1\t\n'
+
+
+def test_widening_a_file_with_crlf_lines_and_a_byte_order_mark(tmp_path):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'\xef\xbb\xbfid\tv\r\na\t1\r\n')
+	_widened(p).close()
+	assert TSVZ.readTabularFile(p, header=WIDE) == {'a': ['a', '1', '']}
+	assert _bytes(p).splitlines()[0] == b'id\tv\tw'
+
+
+def test_widening_writes_what_memory_changed_and_what_is_queued(tmp_path):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'id\tv\na\t1\nb\t2\n')
+	t = TSVZ.TSVZed(p, header=WIDE, verbose=False, append_check_delay=60)
+	t['a'][1] = 'X'
+	t['c'] = ['c', '1', '2']
+	t['#note'] = ['#note', 'memory only']
+	t.hardMapToFile()
+	assert t['c'] == ['c', '1', '2'] and t['b'] == ['b', '2', ''] and t['#note'] == ['#note', 'memory only']
+	t.close()
+	assert TSVZ.readTabularFile(p, header=WIDE) == {'a': ['a', 'X', ''], 'b': ['b', '2', ''], 'c': ['c', '1', '2']}
+
+
+@pytest.mark.parametrize('text, header', [
+	(b'a\t1\nb\t2\n', WIDE),  # (a row: 5.4 wrote over it, and a reader given no header lost it)
+	(b'idaho\tvalue\na\t1\n', WIDE),  # (the old containment rule takes this for `id\tv`: a loose match is no header)
+	(b'id\tx\na\t1\n', WIDE),
+	(b'id\tv\tw\ta\nb\t1\n', WIDE),  # (a wider line 1: writes never cut)
+	(b'id\tv\tw\na\t1\t2\n', WIDE),
+	(b'\na\t1\n', WIDE),  # (the empty line that stands for a header: not the start of this one)
+])
+def test_a_rewrite_leaves_a_line_1_that_is_not_the_start_of_the_header(tmp_path, text, header):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, text)
+	_widened(p, header=header).close()
+	assert _bytes(p).split(b'\n')[0] == text.split(b'\n')[0]
+
+
+def test_a_header_not_verified_is_not_taken_for_line_1(tmp_path):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'id\tv\na\t1\n')
+	_widened(p, verifyHeader=False).close()
+	assert _bytes(p).split(b'\n')[0] == b'id\tv'
+
+
+def test_line_1_widens_once_and_a_narrower_program_leaves_it(tmp_path):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'id\tv\na\t1\n')
+	_widened(p).close()
+	first = _bytes(p)
+	_widened(p).close()
+	assert _bytes(p) == first
+	_widened(p, header='id\tv').close()  # (a program still on the old header: never cut)
+	assert _bytes(p).split(b'\n')[0] == b'id\tv\tw'
+
+
+def test_a_one_column_file_with_lone_rows_is_not_widened_and_says_why(tmp_path, capsys):
+	# A row with no value reads as a deletion at two columns or more: widening would delete every lone key.
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'id\na\nb\n')
+	t = _widened(p, header='id\tv')
+	assert dict(t) == {'a': ['a'], 'b': ['b']}
+	t.close()
+	assert _bytes(p) == b'id\na\nb\n'
+	assert 'not widened' in capsys.readouterr().err
+
+
+def test_a_one_column_header_widens_when_every_row_holds_a_value(tmp_path):
+	p = str(tmp_path / 'h.tsv')
+	_touch(p, b'id\na\t1\nb\t2\n')
+	t = _widened(p, header='id\tv')
+	assert dict(t) == {'a': ['a', '1'], 'b': ['b', '2']}
+	t.close()
+	assert _bytes(p) == b'id\tv\na\t1\nb\t2\n'

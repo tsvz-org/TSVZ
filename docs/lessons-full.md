@@ -179,3 +179,17 @@ entries go last, in the same commit as the change:
 - Lesson: when one rule depends on a fact of the file, every writer asks the file, through one function. Fixing the one
   writer that a test found leaves the others saying the opposite. Ask the first lines, so the common case stays one append.
 
+## 2026-11-06 TSVZ 5.6: a rewrite widens line 1 to the header the program gives
+- Changed: a `TSVZed` rewrite of a healthy file whose line 1 is the beginning of the store's header writes the header as
+  line 1 and pads the narrower rows and `#_defaults_#` lines to it; memory then reads the file again. 5.5 kept line 1
+  always, so its rule that a rewrite of a healthy file only drops lines has this one named exception. Not for a one-column
+  file holding rows with no value, which stays as it is with a warning.
+- Why we had to change: a program that added a column got "Header mismatch" at every open and an IndexError on the new
+  column, and had to edit line 1 by hand; 5.4 had widened it at a rewrite.
+- Original design was wrong because: 5.4 wrote its header over whatever line 1 was, which lost a row, and 5.5 answered that
+  by never touching line 1. Neither asked what line 1 was. The header the program gives is a fact about the program,
+  and line 1 can be told apart from a row only by an exact comparison.
+- Lesson: when a rule was added to stop one bad case, check what good case it stopped too, and separate them by an exact
+  test rather than by forbidding the operation. A fact that changes how every row reads moves all at once: line 1 alone
+  would have made strict readers drop the rows, and from one column it would have turned every lone key into a deletion.
+
