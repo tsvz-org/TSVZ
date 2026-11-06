@@ -14779,13 +14779,13 @@ def test_a_clean_store_with_monitoring_off_keeps_a_row_another_process_appended(
 
 def test_a_store_that_changed_something_with_monitoring_off_still_overwrites(tmp_path, capsys):
 	p = str(tmp_path / 'm.tsv')
-	_touch(p, b'id\tv\na\t1\n')
+	_touch(p, b'id\tv\na\t1\nx\t9\n')
 	t = TSVZ.TSVZed(p, header='id\tv', monitor_external_changes=False, verbose=False, append_check_delay=60)
-	t['b'] = ['b', '2']
+	del t['x']  # (a delete leaves the store dirty until a rewrite, however soon the writer appends its line)
 	_append_external(p, b'c\t3\n')
 	assert t.rewrite(force=True)
 	t.close()
-	assert list(TSVZ.readTabularFile(p, header='id\tv')) == ['a', 'b']
+	assert list(TSVZ.readTabularFile(p, header='id\tv')) == ['a']
 	assert 'Overwriting external changes' in capsys.readouterr().out
 
 
