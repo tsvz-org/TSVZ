@@ -2986,7 +2986,7 @@ def _legacyHoldsHeader(line0, header, consumed, encoding, delimiter):
 				and _headerMatches(header, line0.decode(encoding or 'utf8', errors='replace').rstrip('\r\n'), delimiter))
 
 
-def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding, copied=None):
+def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding):
 	"""The legacy lines ``raw`` (bytes, without their newline) without the lines of each key of ``dropAt`` before the
 	index it gives (a row queued after a delete stays), and the key whose line moved up (or None), as a pair; line 1 is
 	left alone when a reader takes it for its header (``skipFirst``).
@@ -2999,12 +2999,7 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	with values moves up only when it is narrower than the first line left, as it reads where it was (_legacyMoved). The
 	file then reads at the count of its first line: the defaults lines narrower than it are padded (a strict reader would
 	drop them), and the bare ones after it go (a row that reset nothing at one column, a reset at this one), so every
-	reader sees the rows as before.
-
-	``copied``, a list a delete gives: when a defaults line lies between the place and a row with a value, the row also stays where it
-	was, and its key is added to the list. A reader whose column count is not the moved row's (a plain reader of a file
-	whose line 1 is wider) still reads the row after that line, filled from it; the copy in front sets the count of the
-	reader it moves up for. The file then holds the key twice, which reads as the last line (a store reading it is dirty)."""
+	reader sees the rows as before."""
 	enc = encoding or 'utf8'
 
 	def kindOf(line):
@@ -3045,12 +3040,7 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		name = kindOf(out[best])[1].rstrip()
 		line = _legacyMoved(out, place, best, delimiter, encoding)
 		rest = [other for other in out[place:best] if (kindOf(other)[1] or '').rstrip() != name]
-		# (a delete, with a defaults line in between: a row with a value stays where it was too, so a reader whose count is not the moved
-		# row's still reads it after that line, filled from it; the copy in front sets the count of the reader it moves up for)
-		keep = copied is not None and narrowest > 1 and any(kindOf(other)[0] == 'defaults' for other in out[place:best])
-		out = out[:place] + [line] + rest + out[best + (0 if keep else 1):]
-		if keep:
-			copied.append(name)
+		out = out[:place] + [line] + rest + out[best + 1:]
 	first = kindOf(out[place])[2]
 	if first > 1:
 		# (the file now reads at the count of its first line, which was 1: a defaults line narrower than it would be dropped
@@ -3147,18 +3137,13 @@ def _legacyWidthNow(fileName, header, verifyHeader, encoding, delimiter):
 		return None
 
 
-def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter, xHeader=False):
+def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter):
 	"""Delete ``keys`` from the legacy file where no line can: a file of one column, where a lone key is a row (and of
 	no column count yet, where it would make one). True when that is done: their lines are out of the file
 	(_legacyDropLines, which keeps the one column), or there were none. False when the file is of two columns or more
 	(_legacyFileWidth), or could not be read (a deletion line says it there; damage is reported): nothing is written.
 	``header`` is formatted and ``delimiter`` resolved. Only those lines go: this compacts nothing, and copies the others
 	as bytes.
-
-	``xHeader``: the caller is a --x-header one: line 1, when it is not ``header`` (_isHeaderLine), is a row to it, and a
-	reader given ``header`` skips it all the same. A key on line 1 goes for the caller and that reader's lines stay where it
-	reads them (_legacyLinesWithoutLineOne). Decided here, on the line 1 read under the rewrite lock the write is made
-	under, not on one read before it.
 
 	Read through the file's REWRITE lock and written under it, as ``TSVZed`` writes, so another process's write
 	(an append beside it) cannot fall between the read and the write: no retry, and none is lost. OSError when the
@@ -3177,57 +3162,22 @@ def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter, x
 						seen.append(line)
 						yield line
 				width = _legacyFileWidth(tap(), header, consumed, encoding, delimiter)
-				lineOneIsRow = bool(xHeader and any(header) and seen
-									and not _isHeaderLine(header, seen[0].decode(encoding or 'utf8', errors='replace'), delimiter))
-				raw = seen + list(lines) if width == 1 or lineOneIsRow and width == -1 else None
+				raw = seen + list(lines) if width == 1 else None
 		except Exception as e:
 			_warn('TSVZ warning: {}: the file cannot be read ({}): the delete is written as a deletion line, which deletes '
 				  'nothing if the file is of one column'.format(fileName, e))
 			done.append(False)
 			return None
 		done.append(width <= 1)
-		if not raw:
+		if width != 1:
 			return None
-		fromLines = lineOneIsRow or not _legacyHoldsHeader(raw[0], header, consumed, encoding, delimiter)
-		drops = dict.fromkeys((key.rstrip() for key in keys), len(raw))
-		kept = None
-		if lineOneIsRow:
-			kept = _legacyLinesWithoutLineOne(raw, drops, delimiter, encoding)
-		if kept is None:
-			kept = _legacyDropLines(raw, drops, consumed, fromLines, delimiter, encoding, [])[0]
+		fromLines = not _legacyHoldsHeader(raw[0], header, consumed, encoding, delimiter)
+		kept = _legacyDropLines(raw, dict.fromkeys((key.rstrip() for key in keys), len(raw)), consumed, fromLines, delimiter, encoding)[0]
 		return None if kept == raw else b''.join(line + b'\n' for line in kept)
 	if not os.path.isfile(fileName):
 		return False
 	_specRewriteInPlace(fileName, None, build=build)
 	return done[0]
-
-
-def _legacyLinesWithoutLineOne(raw, drops, delimiter, encoding):
-	"""The legacy lines ``raw`` of a delete of the keys of ``drops`` (_legacyDropLines) when line 1 is a row to the caller
-	and skipped by a reader given a header: None when line 1 holds none of those keys. So that both see only those keys go:
-
-	Line 1 of two cells or more stays, emptied: a deletion as wide as it was, so a reader that takes the column count from
-	it reads as before. A line 1 of one cell goes, as a row of a one-column file does; a bare comment then keeps its place
-	when the line that comes up to line 1 is one the other reader reads (at its column count, the next keyed line's)."""
-	enc = encoding or 'utf8'
-
-	def kindOf(line):
-		return _legacyLineKind(line.decode(enc, errors='replace'), 1, False, delimiter)
-	kind, key, cells, _ = kindOf(raw[0])
-	if kind != 'row' or key.rstrip() not in drops:
-		return None
-	if cells > 1:
-		kept = _legacyDropLines(raw, drops, True, True, delimiter, encoding, [])[0]
-		d = delimiter.encode(enc)
-		return [raw[0].rstrip(b'\r').split(d)[0] + d * (cells - 1)] + kept[1:]
-	copied = []
-	kept = _legacyDropLines(raw, drops, False, True, delimiter, encoding, copied)[0]
-	if kept and not copied:  # (a copy in front of a row that stays: that reader still reads the row where it was)
-		kind, _, cells, _ = kindOf(kept[0])
-		theirs = next((n for _, _, n, _ in map(kindOf, raw[1:])), -1)  # (a comment, if line 2, would be kept[0])
-		if kind != 'skip' and (cells > 1 or theirs == 1):  # (else a lone key: a deletion to them)
-			kept.insert(0, b'#')
-	return kept
 
 
 def _legacyWidened(raw, header, encoding, delimiter, errors):
@@ -8959,20 +8909,16 @@ class _ServeStore(object):
 	def _dropKeys(self, rows, log):
 		"""The deletions ``rows`` that are still to be written as lines (caller holds the lock). In a loose file of one
 		column, where a lone key is a row, the keys' lines are taken out of the file instead (_legacyDropKeys), once
-		everything queued is in it. A reset of the defaults is a line at every width.
-
-		The file's width is asked with the header given, as the library's readers take it, even when line 1 is not it and
-		is a row to this command (_legacyHeader): a line is a deletion or a row by that one answer, so a reader given that
-		header reads what this command deleted the same way."""
+		everything queued is in it. A reset of the defaults is a line at every width."""
 		if self.spec:
 			return rows
 		keys = [cells[0] for cells, marker in rows if cells[0] != DEFAULTS_INDICATOR_KEY]
-		self._legacyHeaderNow(log)  # (says a mismatch, and a strict store raises; whether line 1 is a row: _legacyDropKeys)
-		width = _legacyWidthNow(self.path, self.given, True, 'utf8', self.delimiter)
+		header = self._legacyHeaderNow(log)
+		width = _legacyWidthNow(self.path, header, True, 'utf8', self.delimiter)
 		if not keys or width is None or width > 1:
 			return rows  # (a look at the first lines: what is queued cannot change them, so no wait for it)
 		self.writer.barrier()
-		if not _legacyDropKeys(self.path, keys, self.given, True, 'utf8', self.delimiter, True):
+		if not _legacyDropKeys(self.path, keys, header, True, 'utf8', self.delimiter):
 			return rows
 		self.parts = None  # read again at the next request
 		return [row for row in rows if row[0][0] == DEFAULTS_INDICATOR_KEY]

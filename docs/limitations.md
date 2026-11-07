@@ -191,23 +191,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   file, leaves a plain reader without a default-filled cell. Every reader given the scrub's own arguments, of
   any version from 3.39, sees what it saw before. In fuzzing, about 1% of random files and argument sets, where 5.4
   changed far more of these readers' views.
-
-  A delete is the exception to that promise, even for a reader that holds the same header as the command. Under
-  `--x-header H` (`tsvz delete`, `pop`, `popitem`, a handler given H) with line 1 not H, line 1 is a row to the command
-  and a reader given H skips it, and a delete can change how a later lone key reads to that reader: `x\na\t\nb\n`, delete
-  `a`, and a reader given H goes from no keys to `{b}`; it can also gain a default-filled cell (`id\na\t\n#_defaults_#\t\tQ\nb\t1\n`,
-  H `id\tv`, delete `a`: `b` goes from `[b, 1]` to `[b, 1, Q]`). On a 3.39 reader the same cause can lose a cell: `id\na\t\nb\nb\t1\n`
-  under H `id\tv`, `b` goes from `[b, 1]` to `[b]`. 5.6 does this in nearly all the same cases.
 - Why: what is dead depends on the reader; keeping every line any reader could need would keep most of the lines a
-  compaction exists to drop. For the delete: padding the next lone key (`b<TAB>`) is untried, and would make tsvz-rs read `b`
-  as a row.
+  compaction exists to drop.
 - Revisit when: an operator reads one file with several header or defaults settings and loses rows after a scrub
-  or a rewrite. Scrub, and open `TSVZed`s, with the arguments the file's readers use. For the delete: someone hits it, or
-  when loose files go.
+  or a rewrite. Scrub, and open `TSVZed`s, with the arguments the file's readers use.
 - Approved: 2026-11-04, the user chose "Known limitation (Recommended)", and "One entry for both (Recommended)"
   for covering `TSVZed` rewrites of a healthy file in the same entry; 2026-11-06, "Keep it (Recommended)" for narrowing it in
   5.6 (a file of one column); 2026-11-06, "Known limitation (Recommended)" for each of the three cell cases above.
-  2026-11-07, the user chose "Known limitation (Recommended)" for the delete case.
 
 ### A stdout nobody reads can abort or hold the exit
 - Kind: known limitation
@@ -222,17 +212,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone hits it.
 - Approved: 2026-11-07, the user chose "Known limitation (Recommended)", first for the abort and again for the corrected
   wording that includes the wait.
-
-### tsvz-rs lists a key deleted from an emptied line 1
-- Kind: known limitation
-- What the operator sees: a delete of a key on line 1, under a header that line 1 isn't (`--x-header H`), leaves line 1
-  emptied (`a<TAB>`) when it has two cells or more, so that readers that take their column count from it read as before.
-  TSVZ reads that as a deletion; tsvz-rs lists `a` with an empty value, because spec §7.6 makes only a line with no delimiter a
-  tombstone. After 5.6's output it listed nothing.
-- Why: removing line 1 changes what those readers take as the column count, and spec §5.2 and tsvz-rs's silent-choices.md
-  cover loose files.
-- Revisit when: the spec's deletion rule changes, or someone reads such files with tsvz-rs.
-- Approved: 2026-11-07, the user chose "Known limitation (Recommended)".
 
 ### A caller's checkExternalChanges() can miss an append that lands as the writer thread looks
 - Kind: deferred (5.08)
@@ -255,7 +234,62 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   delete's lines go only after. When the writer thread's tick commits the delete first (a race), the rewrite sees a file with
   no such lines and widens. Forcing the rewrite to meet the queue (the tick committing nothing) gives `id\n` in 40 of 40
   runs; committing first gives `id\tv\n` in 60 of 60. A fix would drop the queued delete's lines before the widening is decided.
+- Repro (in a container): the file `id\n# n\na\n`; `t = TSVZed(p, header='id\tv', strict=False, append_check_delay=60)`;
+  `del t['a']`; `t.hardMapToFile()` or `t.rewrite(force=True)`; `t.close()`. Over 60 runs the file is `id\tv\n` 44 to 54
+  times and `id\n` the rest, at 5.6 and 5.07 alike; 5.5 writes `id\n` every time. It is this race: in a trace of each run,
+  `id\tv\n` is the writer thread's first ticks committing the delete (a rewrite that drops `a`, leaving `id\n`) before the
+  explicit rewrite, which then widens; `id\n` is the delete still queued when the explicit rewrite decides. A 0.3 s pause
+  after the open (the first ticks done before the delete) gives `id\n` 30 of 30, and a second `hardMapToFile()` then
+  `id\tv\n` 30 of 30; `commitAppendToFile()` before the rewrite gives `id\tv\n` 30 of 30, and alone `id\n` 30 of 30. A plain
+  reader, or one given `id`, reads `id` as `[id]` or `[id, v]` by timing.
 - Revisit when: 5.08.
+
+### The delete keeps a reader's column count by moving a row
+- Kind: deferred (5.08)
+- What the operator sees: in a loose file of one column, where a delete takes the key's lines out (`tsvz delete`, a handler,
+  `TSVZedLite`, a `TSVZed` delete with its commit or rewrite), the line that set a reader's column count can go, and 5.6's
+  delete keeps the count by moving another row up into its place, padding the defaults lines it passes and dropping a bare
+  reset after it. A moved row is in the wrong place for one of two kinds of reader: those that count from line 1 and those
+  given a header that line 1 isn't, which count from the first keyed line after it. So:
+  - the command and the library: a row moved above a defaults line, or a reset dropped, changes a cell.
+    `a\n#_defaults_#\t\tQ\nb\t1\n`, `tsvz delete F a`, gives `b\t1\n#_defaults_#\t\tQ\n`: a `TSVZedLite` reads `b` as
+    `[b, 1, Q]` where it read `[b, 1]`; after `a\n#_defaults_#\tP\n#_defaults_#\nb\t\t1\n` a `TSVZed` reads `b` as
+    `[b, P, 1]` where it read `[b, '', 1]`;
+  - a 3.39 loose reader: the count changes from one, so a row it cut to its key comes back whole (`a\nb\t\t1\n`, delete
+    `a`: `[b]` becomes `[b, '', 1]`);
+  - a reader given a header that line 1 isn't: the key stays (`tsvz --x-header id delete F a` on `id\tv\tw\na\nb\t1\t2\nb\t1\n`
+    appends `a`, a row at that reader's one column), a key appears, a row goes, and cells change (the two entries below);
+  - tsvz-rs: `a\nb\t\n`, delete `a`, becomes `b\n`, a deletion to it.
+  The bytes of every other row stay in the file.
+- Why: a one-column file can mark a deletion only by taking the key's lines out, and when one of them set a reader's column
+  count, something has to keep that count. Moving a row, the rule since 5.6, is right for one kind of reader and wrong for the
+  other; 5.07's round of fixes to it lost rows 5.6 kept, so 5.07 ships 5.6's delete unchanged.
+- Plan, the stand-in rule: a delete that must take a key's lines out takes out only those lines, and where one of them set a
+  reader's column count (the first keyed line, from line 1 or from line 2 when line 1 is the caller's header, and under
+  `--x-header H` with line 1 not H also the first keyed line after line 1) it leaves in its place, when the line that would
+  come there has another cell count, the key `c` of a later row that stays with as many empty cells as the line had: a key
+  whose line holds no value first, else one whose line holds a value and that no row with a value before the place names,
+  but never after a line 1 of one cell; with no such row the line just goes, and on line 1 under `--x-header` a bare `#`
+  keeps the place when the next line has the same count. No line moves, so no cell and no reader's count changes: the
+  stand-in reads as the deletion of a key with no row yet at two columns or more, as a row the key's own later line replaces
+  at one, and a reader that skips line 1 skips it.
+- Revisit when: 5.08.
+
+### A delete of line 1 under a header that line 1 isn't can hide the next line from readTabularFile
+- Kind: deferred (5.08)
+- What the operator sees: `tsvz delete --x-header id F a` on `a\nb\t1\n` leaves `b\t1\n`. `readTabularFile` given `id` goes from
+  `{b}` to `{}` and prints "Header mismatch"; a plain reader keeps b, and the bytes are intact.
+- Why: the command treats line 1 as a row when it is not the header given, and the library treats it as the header line. One
+  header text has two rules.
+- Revisit when: 5.08, with "The delete keeps a reader's column count by moving a row".
+
+### A delete under a header narrower than line 1 can create a key
+- Kind: deferred (5.08)
+- What the operator sees: `tsvz delete --x-header id F zz` on `id\tv\n# n\n` writes `zz`. A reader given `id` then shows the key
+  `zz`, which nobody set; a plain reader does not. The same at fa176f8; the review found 5.5 did more.
+- Why: line 1 is not the header given, so the command takes the file as having none, reads two columns from line 1 and writes
+  the delete as a line. A reader given `id` skips line 1 and takes its count from that line, one, where a lone key is a row.
+- Revisit when: 5.08, with "The delete keeps a reader's column count by moving a row".
 
 ### A file whose first keyed line is a bare #_defaults_# reads as one column without defaults
 - Kind: known limitation
@@ -487,9 +521,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `defaults=['#_defaults_#', 'P']`), a deleted row that held a value stays as `c<TAB>` after a rewrite
   (`a\nb\nc\t\n#_defaults_#\tP\n`): the store shows it gone, a plain reader shows c with an empty value. So with a wider
   header: `id\na\t1\nb\n`, `header='id\tv'`, `del t['a']` leaves `id\na\t1\nb\na\t\n`. `tsvz delete`, a handler and a
-  `TSVZedLite` ask the file, so they take the key's lines out whatever was read first (what stays: under a header that line 1
-  isn't, a key on line 1 of two cells or more leaves line 1 emptied, `a<TAB>`, so that a reader that takes its column count
-  from it reads as before). Two exceptions for a
+  `TSVZedLite` ask the file, so they take the key's lines out and leave nothing, whatever was read first. Two exceptions for a
   `TSVZedLite`: a program that gave `correctColumnNum` of two or more is not asked about, so the delete is the appended line; and
   under a header that line 1 isn't, a copy of the key on line 1 stays, in the header's place.
 - Why: a file that stays one column has no way to mark that deletion, so it needs a format change.

@@ -14399,7 +14399,7 @@ def test_a_line_1_that_only_contains_the_header_is_a_row_to_a_delete(tmp_path):
 	_touch(p, b'idx\nb\n')
 	assert _run('keys', p, '--x-header', 'id')[1] == 'idx\nb\n'
 	assert _run('delete', p, 'idx', '--x-header', 'id')[0] == 0
-	assert _bytes(p) == b'#\nb\n'
+	assert _bytes(p) == b'b\n'
 	assert _run('keys', p, '--x-header', 'id')[1] == 'b\n'
 
 
@@ -14880,46 +14880,23 @@ def test_a_delete_in_a_one_column_file_changes_no_other_row(tmp_path, door, name
 
 def test_a_delete_in_a_one_column_file_moves_a_row_up_only_when_it_is_narrower(tmp_path):
 	# The layout: no move when the first line left is no wider than any row; a row that moves carries its cells, and the
-	# defaults lines narrower than it are padded (a strict reader would drop them). A row with a value that moves over a
-	# defaults line also stays where it was: a reader whose count is not its own still reads it filled from that line.
+	# defaults lines narrower than it are padded (a strict reader would drop them).
 	for data, key, want in [
 			(b'a\n#_defaults_#\tP\nb\t\t1\n', 'a', b'#_defaults_#\tP\nb\t\t1\n'),
-			(b'a\n#_defaults_#\tP\tQ\tR\nb\t\t1\n', 'a', b'b\tP\t1\n#_defaults_#\tP\tQ\tR\nb\t\t1\n'),
-			(b'a\nc\t1\t2\t3\n#_defaults_#\tP\nb\t\t1\n', 'a', b'b\tP\t1\nc\t1\t2\t3\n#_defaults_#\tP\t\nb\t\t1\n'),
-			(b'a\n#_defaults_#\tP\nb\nc\t\t1\n', 'a', b'b\n#_defaults_#\tP\nc\t\t1\n'),  # (a lone key has no cell to fill)
-			(b'a\n#_defaults_#\tD\tE\tE\ne\tP\tx\t\t \n', 'a', b'e\tP\tx\n#_defaults_#\tD\tE\tE\ne\tP\tx\t\t \n'),
+			(b'a\n#_defaults_#\tP\tQ\tR\nb\t\t1\n', 'a', b'b\tP\t1\n#_defaults_#\tP\tQ\tR\n'),
+			(b'a\nc\t1\t2\t3\n#_defaults_#\tP\nb\t\t1\n', 'a', b'b\tP\t1\nc\t1\t2\t3\n#_defaults_#\tP\t\n'),
+			(b'a\n#_defaults_#\tP\nb\nc\t\t1\n', 'a', b'b\n#_defaults_#\tP\nc\t\t1\n'),
+			(b'a\n#_defaults_#\tD\tE\tE\ne\tP\tx\t\t \n', 'a', b'e\tP\tx\n#_defaults_#\tD\tE\tE\n'),
 			(b'a\nb\t1\t2\n#_defaults_#\tP\nc\t\t3\n', 'a', b'b\t1\t2\n#_defaults_#\tP\t\nc\t\t3\n'),
 			(b'a\n#_defaults_#\tP\n#_defaults_#\nb\t\t1\n', 'a', b'#_defaults_#\tP\nb\t\t1\n')]:
 		p = str(tmp_path / 'o.tsv')
 		_touch(p, data)
-		before = [_norm(TSVZ.readTabularFile(p, strict=strict)) for strict in (False, True)]
 		assert _run('delete', p, key)[0] == 0
 		assert _bytes(p) == want
-		for strict, was in zip((False, True), before):
-			was.pop(key)
-			assert _norm(TSVZ.readTabularFile(p, strict=strict)) == was
 
 
-@pytest.mark.parametrize('data, want, plain, given, got', [
-	# line 1 wider than the header: the plain reader's count is line 1's, the reader given `id` takes its own from `b`
-	(b'id\tv\tw\na\n#_defaults_#\t\tQ\nb\t1\n', b'id\tv\tw\nb\t1\n#_defaults_#\t\tQ\nb\t1\n',
-	 {'id': ['id', 'v', 'w'], 'b': ['b', '1', 'Q']}, {'b': ['b', '1']}, 'b\t1\tQ\n'),
-	# the key is line 1: the reader given `id` skips it and reads at the defaults line's count, the plain one at b's
-	(b'a\n#_defaults_#\t\tQ\nb\t1\n', b'b\t1\n#_defaults_#\t\tQ\nb\t1\n', {'b': ['b', '1']}, {'b': ['b', '1', 'Q']}, 'b\t1\n'),
-])
-def test_a_delete_over_a_defaults_line_keeps_the_default_filled_cell_of_every_reader(tmp_path, data, want, plain, given, got):
-	# The moved row also stays where it was, so no reader loses the cell the defaults line filled (it was `b 1 ` to `tsvz get`).
-	p = str(tmp_path / 'o.tsv')
-	_touch(p, data)
-	assert _run('delete', p, 'a', '--x-header', 'id')[0] == 0
-	assert _bytes(p) == want
-	assert _norm(TSVZ.readTabularFile(p, strict=False, verbose=False)) == _norm(plain)
-	assert _norm(TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)) == _norm(given)
-	assert _run('get', p, 'b', '--x-header', 'id')[:2] == (0, got)
-
-
-def test_a_store_that_reads_the_key_a_delete_wrote_twice_is_dirty_but_writes_nothing_of_its_own(tmp_path):
-	# The copy in front of a row that stays makes a store dirty (a key the file holds twice); with the defaults
+def test_a_store_that_reads_a_key_the_file_holds_twice_is_dirty_but_writes_nothing_of_its_own(tmp_path):
+	# A key the file holds twice (here `b`, its row and a later line) makes a store dirty; with the defaults
 	# (rewrite_interval=0, rewrite_on_exit=False) nothing rewrites on its own: not at a tick, not at the exit.
 	p = str(tmp_path / 'o.tsv')
 	data = b'id\tv\tw\nb\t1\n#_defaults_#\t\tQ\nb\t1\n'
@@ -16189,87 +16166,6 @@ def test_a_row_appended_to_a_store_with_a_header_and_no_row_is_followed(tmp_path
 	t.close()
 
 
-@pytest.mark.parametrize('data', [b'id\tv\n# n\n', b'id\tv\n', b'id\tv\n\n'])
-def test_a_delete_under_a_header_narrower_than_line_1_creates_no_key(tmp_path, data):
-	p = str(tmp_path / 's.tsv')
-	_touch(p, data)
-	seen = TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)
-	assert _run('delete', p, 'zz', '--x-header', 'id')[0] in (0, 3)
-	assert _bytes(p) == data
-	assert TSVZ.readTabularFile(p, header='id', strict=False, verbose=False) == seen
-
-
-def test_the_row_on_line_1_goes_when_nothing_keyed_follows(tmp_path):
-	p = str(tmp_path / 's.tsv')
-	_touch(p, b'id\tv\n# n\n')
-	assert _run('delete', p, 'id', '--x-header', 'id')[0] == 0
-	assert _bytes(p) == b'id\t\n# n\n'  # (emptied in its place: it stays as wide)
-	assert _run('keys', p, '--x-header', 'id')[1] == ''
-	assert TSVZ.readTabularFile(p, strict=False, verbose=False) == {}
-
-
-@pytest.mark.parametrize('data, key, want', [
-	(b'a\nb\t1\n', 'a', b'#\nb\t1\n'),
-	(b'a\nb\nc\n', 'a', b'#\nb\nc\n'),
-	(b'a\t\nb\t1\nc\t2\n', 'a', b'a\t\nb\t1\nc\t2\na\n'),  # (two columns: a line says it)
-	(b'a\n# n\nb\t1\n', 'a', b'# n\nb\t1\n'),  # (a comment is in the place already)
-	(b'a\nb\t1\nc\n', 'a', b'c\nb\t1\n'),  # (a lone key moved up: a deletion to that reader, and it keeps the file one column)
-	(b'a\nb\t1\t2\nc\t3\n', 'a', b'#\nc\t3\nb\t1\t2\n'),
-	(b'a\na\nb\t\n', 'a', b'#\nb\n'),  # (a lone key moved up, and that reader reads at one column: it is a row of its)
-	(b'a\t1\nb\n', 'a', b'a\t\nb\n'),  # (two cells, and to that reader one column: line 1 stays, emptied)
-	(b'a\t1\na\nb\n', 'a', b'a\t\nb\n'),
-	(b'a\nb\t1\n', 'b', b'a\n'),
-	(b'x\na\nb\t\n', 'a', b'x\nb\n'),  # (line 1 is not the key: that reader's first keyed line went, as under any header)
-	(b'a\n', 'a', b''),
-	(b'a\na\t1\nb\n', 'a', b'b\n'),  # (no `#`: it would make the reader given the header gain `b`; 5.6 wrote b)
-	(b'a \nb\t1\n', 'a', b'#\nb\t1\n'),  # (the key on line 1 is `a` to every reader: a space after it is no other key)
-	(b'a\t1\t2\nb\n', 'a', b'a\t\t\nb\n'),  # (line 1 of three cells stays three wide: a reader that takes its count from it)
-	(b'a\t1\na\nb\t1\t2\nc\n', 'a', b'a\t\nc\nb\t1\t2\n'),  # (line 1 emptied, and the lone key moves up: else `c` is a deletion)
-])
-def test_a_delete_of_line_1_under_a_header_it_is_not_reads_the_same_to_the_command_and_the_library(tmp_path, data, key, want):
-	# The command takes line 1 for a row, a reader given the header for the header's place: both see only `key` go.
-	p = str(tmp_path / 's.tsv')
-	_touch(p, data)
-
-	def views():
-		return (set(TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)),
-				set(TSVZ.readTabularFile(p, strict=False, verbose=False)),
-				set(_run('keys', p, '--x-header', 'id')[1].split()))
-	before = views()
-	assert _run('delete', p, key, '--x-header', 'id')[0] == 0
-	assert _bytes(p) == want
-	after = views()
-	assert after[1] == before[1] - {key} and after[2] == before[2] - {key}
-	assert after[0] == before[0] - {key}
-
-
-def test_a_key_on_line_1_that_ends_in_whitespace_goes_for_the_key_without_it(tmp_path):
-	# `<sep>` is a tab inside a cell: the key is `a` and a tab, which a store finds by `a` (the key without its trailing space).
-	p = str(tmp_path / 's.tsv')
-	_touch(p, b'a<sep>\t1\nb\n')
-	assert list(TSVZ.readTabularFile(p, strict=False, verbose=False)) == ['a\t']
-	assert _run('delete', p, 'a', '--x-header', 'id')[0] == 0
-	assert _bytes(p) == b'a<sep>\t\nb\n'
-	assert list(TSVZ.readTabularFile(p, strict=False, verbose=False)) == []
-
-
-@pytest.mark.parametrize('data, key, xHeader, want', [
-	(b'a\na\nb\n', 'a', True, b'#\nb\n'),  # (line 1 is not the header: a row to the command)
-	(b'a\na\nb\n', 'a', False, b'a\nb\n'),  # (a caller that holds no --x-header: line 1 is skipped for the header given)
-	(b'id\na\nb\n', 'a', True, b'id\nb\n'),  # (line 1 is the header)
-	(b' id \na\nb\n', 'a', True, b' id \nb\n'),  # (the cells equal once the whitespace around them is taken off)
-	(b'id\nb\n', 'id', True, b'id\nb\n'),  # (the header is no row, whatever the caller was told when it read)
-	(b'\na\nb\n', 'a', True, b'\nb\n'),  # (a line 1 with nothing on it is no row)
-])
-def test_whether_line_1_is_a_row_to_a_delete_is_decided_on_the_file_it_writes(tmp_path, data, key, xHeader, want):
-	# The command read line 1 under the read lock before; another process may have changed it by the time the write holds
-	# the rewrite lock. Decided there, on the line the write is made from.
-	p = str(tmp_path / 's.tsv')
-	_touch(p, data)
-	assert TSVZ._legacyDropKeys(p, [key], ['id'], True, 'utf8', '\t', xHeader) is True
-	assert _bytes(p) == want
-
-
 def test_a_delete_at_two_columns_under_a_header_line_1_is_not_is_a_line(tmp_path):
 	p = str(tmp_path / 's.tsv')
 	_touch(p, b'a\t1\nb\t2\n')
@@ -16277,16 +16173,6 @@ def test_a_delete_at_two_columns_under_a_header_line_1_is_not_is_a_line(tmp_path
 	assert _bytes(p) == b'a\t1\nb\t2\na\n'
 	assert _run('keys', p, '--x-header', 'id')[1].split() == ['b']
 	assert list(TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)) == ['b']
-
-
-def test_a_lone_key_a_reader_given_the_header_shows_goes_from_the_file(tmp_path):
-	# Line 1 wider than the header: to that reader the count is the next keyed line's, one, and a line could not delete `a`.
-	p = str(tmp_path / 's.tsv')
-	_touch(p, b'id\tv\na\n')
-	assert 'a' in TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)
-	assert _run('delete', p, 'a', '--x-header', 'id')[0] == 0
-	assert _bytes(p) == b'id\tv\n'
-	assert 'a' not in TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)
 
 
 def test_a_ctrl_c_that_python_3_6_turns_into_an_error_in_a_wait_stays_a_ctrl_c():

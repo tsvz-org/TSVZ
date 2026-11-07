@@ -142,9 +142,7 @@ named like an operation then needs a path prefix (`./read`).
     is then never a key, row or count, `scrub` and `clear` keep it, and
     `read --format table` shows it above the rows. When line 1 differs, the file has no
     header and line 1 is a row, with 3.39's "Header mismatch" warning (`--x-strict`: an
-    error, exit 1, nothing written). A delete there is written for a reader given H, which
-    skips line 1 whatever it holds, and keeps what that reader reads of the other keys in
-    nearly every file (see [Upgrading to 5.7](#upgrading-to-57-from-56) for the exceptions). A missing or empty file gets H first. Without
+    error, exit 1, nothing written). A missing or empty file gets H first. Without
     `--x-header`, line 1 is a row, as in 3.39. (The library's own header check, a
     `header=` given to `readTabularFile`, `appendTabularFile`, `clearTabularFile`,
     `scrubTabularFile` or `TSVZed`, is 3.39's, looser one: each cell of H within the
@@ -342,28 +340,13 @@ The file formats are unchanged.
   from the file (no keyed line yet, or a file emptied at one column); with a count or a row,
   only what follows is read, as before.
 
-- **`tsvz delete`, `pop` and `popitem` with `--x-header H`, on a file whose line 1 is not
-  `H`, ask the file's width with `H`, as a reader given `H` takes the file.** Line 1 stays a
-  row to the command, and a deletion now leaves the other keys reading as they did to a
-  reader given `H` (another reader of the same file, given no `H`, usually the same too; not
-  always, see the end of this item):
-  - a key nobody set is no longer made: `tsvz delete --x-header id F zz` on `id\tv\n# n\n`
-    leaves the file as it is (it wrote `zz`, a row to a reader given `id`);
-  - a lone key that reader shows goes from the file: `a` of `id\tv\na\n` (a line `a` there
-    was a second copy of it to that reader);
-  - a delete of a key on line 1 keeps what a reader given `id`, which skips line 1, reads. A
-    line 1 of one cell goes, and a bare `#` comment takes its place when a line that reader reads
-    would otherwise come up to it: `tsvz delete --x-header id F a` on `a\nb\t1\n` leaves
-    `#\nb\t1\n`. A scrub keeps the comment, as it keeps every line 1. A line 1 of two cells or
-    more stays as wide, emptied, when no line can delete it: `a\t1\nb\n` becomes `a\t\nb\n`.
-  - What it cannot always keep: a delete can change how a later lone key reads to a reader
-    given the same `H` (`x\na\t\nb\n`, delete `a`: it goes from no keys to `b`), and that
-    reader can gain a default-filled cell (`id\na\t\n#_defaults_#\t\tQ\nb\t1\n`, `H` = `id\tv`,
-    delete `a`: `b` goes from `[b, 1]` to `[b, 1, Q]`). The emptied line 1 (`a\t`) is a
-    deletion to `tsvz`; tsvz-rs lists `a` with an empty value, as its spec makes only a line
-    with no delimiter a deletion. A row that moves up over a defaults line stays where it was
-    too (`b\t1\n#_defaults_#\t\tQ\nb\t1\n`), so a file can hold a key twice. See
-    [docs/limitations.md](docs/limitations.md).
+- **Deletes write what 5.6 writes.** `tsvz delete`, `pop` and `popitem` (with or without
+  `--x-header`, `--x-strict` or `--x-defaults`), a `tsvz serve` handler, a `TSVZedLite` delete
+  and a `TSVZed` delete with its commit or rewrite leave the same bytes as in 5.6, so what 5.6
+  gets wrong in a loose one-column file stays for this version: a row moved up to keep a
+  reader's column count can change a cell or a key for some readers. A rule that moves no
+  line is planned for 5.08. See [docs/limitations.md](docs/limitations.md), "The delete keeps
+  a reader's column count by moving a row".
 
 ## Upgrading to 5.6 from 5.5
 
