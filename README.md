@@ -346,8 +346,11 @@ The file formats are unchanged.
   from the file (no keyed line yet, or a file emptied at one column); with a count or a row,
   only what follows is read, as before. A store's own whole write that leaves it with no row
   (`clear()`, or a rewrite of a store whose rows were all deleted) is followed the same way,
-  and the store then takes the column count a reopen would from the file it wrote (time
-  only: a few reads of the file, and a row set after the clear is shaped at the new count).
+  and the store then takes the column count and the rows a reopen would from the file it
+  wrote, so a row set after the clear is shaped at that count. This costs a few reads of the
+  file. One visible change: under `verifyHeader=False`, the header line a clear writes is then
+  held as a row, as a newly opened store holds it, so `len(t)` is 1 after `clear()` where 5.6
+  gave 0.
 
 - **"Header mismatch" is said once for a line 1, across all of a store's reads.** A `TSVZed`
   whose line 1 is not its header used to say it at every whole read of the file (46 times for
@@ -356,9 +359,10 @@ The file formats are unchanged.
 
 - **Deletes write what 5.6 writes.** `tsvz delete`, `pop` and `popitem` (with or without
   `--x-header`, `--x-strict` or `--x-defaults`), a `tsvz serve` handler, a `TSVZedLite` delete
-  and a `TSVZed` delete with its commit or rewrite leave the same bytes as in 5.6 (but for a
-  `TSVZed` on a file whose line 1 starts with a byte order mark or ends in empty cells, which
-  now writes what 5.6 writes for the same file without them: see the item above), so what 5.6 gets wrong in a loose one-column file
+  and a `TSVZed` delete with its commit or rewrite leave the same bytes as in 5.6, but for a
+  `TSVZed` on a file whose line 1 starts with a byte order mark (it now writes what 5.6 writes
+  for the same file without the mark) or ends in empty cells (it now writes its deletion lines
+  and padded rows as wide as line 1 counts its cells: see the item above). So what 5.6 gets wrong in a loose one-column file
   stays for this version: a row moved up to keep a reader's column count can change a cell or
   a key for some readers. A rule that moves no line is planned for 5.8. See [docs/limitations.md](docs/limitations.md), "The delete keeps
   a reader's column count by moving a row".

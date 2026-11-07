@@ -217,7 +217,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: deferred (5.08)
 - What the operator sees: a `TSVZed` whose `checkExternalChanges()` is called just as another process appends to the file can
   miss that append until the next check: the append shows only after the next change or call. No row is lost. 8 of 7680 runs
-  of the follow sweep at 5.07, 6 of 7680 at 5.6.
+  of the follow sweep at 5.07, 6 of 7680 at 5.6. A store that has just cleared its own file meets it at the same rate: since
+  5.07 it follows only what is appended after the clear, as a newly opened store does.
 - Why: the writer thread's tick reads the old size while the other process's `write(2)` has set the modification time but not
   yet extended the file, notes the file as seen and clears `deSynced`. The caller's `checkExternalChanges()` returns early on
   `if self.deSynced: return self`, so it misses the append. The proposed fix is to drop that early return (reasoned, not
@@ -243,6 +244,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `id\tv\n` 30 of 30; `commitAppendToFile()` before the rewrite gives `id\tv\n` 30 of 30, and alone `id\n` 30 of 30. A plain
   reader, or one given `id`, reads `id` as `[id]` or `[id, v]` by timing.
 - Revisit when: 5.08.
+
+### Other writers pad an appended row narrower than a line 1 with empty cells at its end
+- Kind: deferred (5.08)
+- What the operator sees: on a file whose line 1 ends in empty cells (`id\tv\tw\t`, a spreadsheet export with an unnamed last
+  column), `TSVZedLite`, `tsvz --x-header 'id\tv' set` and `appendTabularFile(header='id\tv')` append `c\t4\t5`, three cells,
+  and a strict reader given no header, which counts line 1's four cells, drops `c`. A `TSVZed` pads to line 1's own count
+  since 5.07. The same happens in 5.6.
+- Why: each writer works out the width it pads an appended row to by its own rule; 5.07 fixed only `TSVZed`'s.
+- Revisit when: 5.08, with one rule for that width shared by every writer.
 
 ### The delete keeps a reader's column count by moving a row
 - Kind: deferred (5.08)
