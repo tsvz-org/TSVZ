@@ -356,8 +356,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A TSVZedLite delete looks at the file's first lines every time
 - Kind: deferred
-- What the operator sees: with the default read gate (`W=-1`, or a file known to be of one column) each `delete`, `pop`
-  and `popitem` takes the file's rewrite lock to read its first lines, which say the width; at two columns or more the
+- What the operator sees: unless the program gave a column count of two or more, each `delete`, `pop`
+  and `popitem`, whatever was read first, takes the file's rewrite lock to read its first lines, which say the width; at two columns or more the
   delete is then the appended line. Measured on a `.tsv` of 200k rows: 29 us (5.5: 6.3 us, 5.6 before its second fix round:
   17.7 ms, the whole file read under the exclusive lock); of 2M rows: 31 us (before: 171 ms). On a `.tsv.gz` the first
   member is read whole, so the cost follows its size: 2.5 ms for 200k rows in one member, 30 ms for 2M (before: 42 ms and
@@ -429,7 +429,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `defaults=['#_defaults_#', 'P']`), a deleted row that held a value stays as `c<TAB>` after a rewrite
   (`a\nb\nc\t\n#_defaults_#\tP\n`): the store shows it gone, a plain reader shows c with an empty value. So with a wider
   header: `id\na\t1\nb\n`, `header='id\tv'`, `del t['a']` leaves `id\na\t1\nb\na\t\n`. `tsvz delete`, a handler and a
-  `TSVZedLite` ask the file, so they take the key's lines out and leave nothing, whatever was read first.
+  `TSVZedLite` ask the file, so they take the key's lines out and leave nothing, whatever was read first. Two exceptions for a
+  `TSVZedLite`: a program that gave `correctColumnNum` of two or more is not asked about, so the delete is the appended line; and
+  under a header that line 1 isn't, a copy of the key on line 1 stays, in the header's place.
 - Why: a file that stays one column has no way to mark that deletion, so it needs a format change.
 - Revisit when: the next format change.
 - Approved: 2026-11-06, the user chose "Known limitation (Recommended)", and "Widen the entry (Recommended)" for the wider
