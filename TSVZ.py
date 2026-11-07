@@ -379,7 +379,9 @@ _DAEMON_PRINT_WAIT = 5.0
 
 
 def _say(write, message):
-	"""Run ``write()``, the print of ``message``: every print of this module passes here. The interpreter's end freezes a
+	"""Run ``write()``, the print of ``message``: the prints of a store's thread pass here (``eprint``, ``_warn``, the
+	store's own). Not ``format_bytes`` and ``get_resource_usage``, which no store thread calls, nor the ``logger.teelog`` calls
+	of ``tsvz serve``'s handler, which has its own threads. The interpreter's end freezes a
 	daemon thread (a store's writer) where it stands, and one frozen inside a print keeps the stream's lock, so the last
 	flush dies with ``Fatal Python error: _enter_buffered_busy``. Once the exit has passed _closeStreamsToDaemons a daemon
 	thread never enters a stream: ``message`` goes to file descriptor 2 by a system call, which holds no lock."""
@@ -2307,13 +2309,15 @@ def _legacyRead(fileName, teeLogger, header, createIfNotExist, lastLineOnly, ver
 
 
 def _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, strict, delimiter, correctColumnNum,
-					  encoding, reporter, lastLineOnly=False, widening=False):
+					  encoding, reporter, lastLineOnly=False, widening=False, said=None):
 	"""Read and check the header line of the open legacy ``file`` when ``header`` is to be verified (readTabularFile).
 
 	Returns ``(correctColumnNum, lineNo)``, the column count and the lines read, or None when a compressed stream
 	is damaged inside the header line (noted on ``reporter``: nothing more is read, L5). ``widening``, a store's own
 	read: a line 1 that extends ``header`` (the same leading cells, then others that are named) is a program's widening
-	of it, not a mismatch: it is the header, and the column count is its own.
+	of it, not a mismatch: it is the header, and the column count is its own. ``said``, a store's own reads: a list of one
+	item, the line 1 whose mismatch was last said; a loose read says it once for the line, as 3.39 does (a strict one
+	raises every time).
 	"""
 	if not (any(header) and verifyHeader):
 		return correctColumnNum, 0
@@ -2334,7 +2338,13 @@ def _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, 
 		return (wider if correctColumnNum == -1 else correctColumnNum), 1
 	# A file that holds nothing (no byte, or only empty compressed streams) is an empty store with this header, as
 	# an append to it takes it (it writes the header first): not a header mismatch.
-	if (not raw or _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter)) and correctColumnNum == -1:
+	if said is not None and not strict and raw and said[0] == line:
+		matches = _headerMatches(header, line, delimiter)  # (said already for this line)
+	else:
+		matches = not raw or _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter)
+		if said is not None and not matches:
+			said[0] = line
+	if matches and correctColumnNum == -1:
 		correctColumnNum = len(header)
 		if verbose:
 			__teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
@@ -3127,7 +3137,7 @@ def _legacyWidthNow(fileName, header, verifyHeader, encoding, delimiter):
 		return None
 
 
-def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter, lineOneIsRow=False):
+def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter, xHeader=False):
 	"""Delete ``keys`` from the legacy file where no line can: a file of one column, where a lone key is a row (and of
 	no column count yet, where it would make one). True when that is done: their lines are out of the file
 	(_legacyDropLines, which keeps the one column), or there were none. False when the file is of two columns or more
@@ -3135,9 +3145,10 @@ def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter, l
 	``header`` is formatted and ``delimiter`` resolved. Only those lines go: this compacts nothing, and copies the others
 	as bytes.
 
-	``lineOneIsRow``: the caller (--x-header) holds line 1, which is not ``header``, for a row, and a reader given
-	``header`` skips it all the same. A key on line 1 goes for the caller and that reader's lines stay where it reads
-	them (_legacyLinesWithoutLineOne).
+	``xHeader``: the caller is a --x-header one: line 1, when it is not ``header`` (_isHeaderLine), is a row to it, and a
+	reader given ``header`` skips it all the same. A key on line 1 goes for the caller and that reader's lines stay where it
+	reads them (_legacyLinesWithoutLineOne). Decided here, on the line 1 read under the rewrite lock the write is made
+	under, not on one read before it.
 
 	Read through the file's REWRITE lock and written under it, as ``TSVZed`` writes, so another process's write
 	(an append beside it) cannot fall between the read and the write: no retry, and none is lost. OSError when the
@@ -3156,6 +3167,8 @@ def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter, l
 						seen.append(line)
 						yield line
 				width = _legacyFileWidth(tap(), header, consumed, encoding, delimiter)
+				lineOneIsRow = bool(xHeader and any(header) and seen
+									and not _isHeaderLine(header, seen[0].decode(encoding or 'utf8', errors='replace'), delimiter))
 				raw = seen + list(lines) if width == 1 or lineOneIsRow and width == -1 else None
 		except Exception as e:
 			_warn('TSVZ warning: {}: the file cannot be read ({}): the delete is written as a deletion line, which deletes '
@@ -3197,11 +3210,11 @@ def _legacyLinesWithoutLineOne(raw, drops, delimiter, encoding):
 		kept = _legacyDropLines(raw, drops, True, True, delimiter, encoding)[0]
 		d = delimiter.encode(enc)
 		return [raw[0].rstrip(b'\r').split(d)[0] + d * (cells - 1)] + kept[1:]
-	kept, moved = _legacyDropLines(raw, drops, False, True, delimiter, encoding)
+	kept = _legacyDropLines(raw, drops, False, True, delimiter, encoding)[0]
 	if kept:
 		kind, _, cells, _ = kindOf(kept[0])
-		theirs = next((n for k, _, n, _ in map(kindOf, raw[1:]) if k != 'skip'), -1)
-		if kind != 'skip' and (moved is None or cells > 1 or theirs == 1):  # (else a lone key: a deletion to them)
+		theirs = next((n for _, _, n, _ in map(kindOf, raw[1:])), -1)  # (a comment, if line 2, would be kept[0])
+		if kind != 'skip' and (cells > 1 or theirs == 1):  # (else a lone key: a deletion to them)
 			kept.insert(0, b'#')
 	return kept
 
@@ -5279,13 +5292,16 @@ def getListView(tsvzDic,header = [],delimiter = ...):
 			return [header] + values
 
 def _waited(event, timeout):
-	"""``event.wait(timeout)``, where a Ctrl-C is a KeyboardInterrupt on every Python. On 3.6 one that lands as the wait takes
-	its lock back leaves that lock let go of, and Event.wait() then ends with RuntimeError "release unlocked lock": an error
-	would stop the exit's wait for a queued row, where a Ctrl-C keeps it (_stopLiveStores)."""
+	"""``event.wait(timeout)``, where a Ctrl-C is a KeyboardInterrupt on every Python. On 3.6 a Ctrl-C that lands as the wait
+	takes its lock back can end it with RuntimeError "release unlocked lock", raised while the interrupt is handled (so its
+	``__context__`` is the KeyboardInterrupt): that is the Ctrl-C, and an error would stop the exit's wait for a queued row,
+	where a Ctrl-C keeps it (_stopLiveStores). Any other RuntimeError is not a Ctrl-C and goes up as it is."""
 	try:
 		return event.wait(timeout)
-	except RuntimeError:
-		raise KeyboardInterrupt
+	except RuntimeError as e:
+		if isinstance(e.__context__, KeyboardInterrupt):
+			raise KeyboardInterrupt
+		raise
 
 
 #: Every TSVZed and TSVZedLite not yet stopped, by id(): _stopLiveStores stops them at exit. Weak: a store
@@ -5636,6 +5652,7 @@ class TSVZed(OrderedDict):
 		else:
 			self.delimiter = get_delimiter(delimiter,file_name=fileName)
 		self.encoding = encoding
+		self._mismatchSaid = [None]  # the line 1 whose header mismatch the whole reads last said (_legacyReadHeader)
 		self.setDefaults(defaults)
 		self._constructorDefaults = list(self.defaults)
 		self.header = _formatHeader(header,verbose = verbose,teeLogger = self.teeLogger,delimiter=self.delimiter)
@@ -6525,6 +6542,7 @@ memoryOnly:{self.memoryOnly}
 	# another process's appends (the merge rule, _syncFrom); _known is then what the file held when it stopped.
 	_damaged = False
 	_readWhole = False  # setDefaults() gave memory defaults the file may not hold: its next change is read whole
+	_widthOpen = False  # the last whole read took no column count from the file: its first keyed line will set it
 	# A read under the file lock met damage another writer left (a compressed file: every read of it stops there, L5).
 	# Rows appended after it would be lost to the next read, so the next commit makes the file again from memory.
 	_remake = False
@@ -6982,10 +7000,12 @@ memoryOnly:{self.memoryOnly}
 		header = None  # True: a row was queued while what follows was read
 		# A last line with no newline is read again: what is appended may complete it (a compressed file's appends
 		# are members of their own). Not while rows are queued (unless the file is damaged): what follows would go after
-		# them in memory, where the file will hold them after it. Nor when a store holds no row (a file emptied, or with no
-		# keyed line yet): its first keyed line may set the column count, which a whole read takes.
+		# them in memory, where the file will hold them after it. Nor when a store holds no row and the last whole read took
+		# no column count from the file (a file with no keyed line yet): its first keyed line sets it, which a whole read takes.
+		# (A store emptied at one column is read whole too: a lone key there is a row until a line says otherwise.)
 		if (found is not None and (found[2] or self._damaged or _isCompressedFile(self._fileName))
-				and (self._damaged or (not self.appendQueue and not self._readWhole and self))):
+				and (self._damaged or (not self.appendQueue and not self._readWhole
+									   and (self or (self.correctColumnNum != 1 and not self._widthOpen))))):
 			rest, known, _ = found
 			header, torn = self._applyAppended(f, rest, self._known[1])
 			if header is None:
@@ -7084,7 +7104,7 @@ memoryOnly:{self.memoryOnly}
 					try:
 						start = _legacyReadHeader(stream, self._fileName, self.header, self.verifyHeader, self.verbose,
 												  self.teeLogger, self.strict, self.delimiter, -1, self.encoding, reporter,
-												  widening=True)
+												  widening=True, said=self._mismatchSaid)
 						if start is not None:
 							# (the rows of a file another program widened are read loose, padded, the file untouched: a strict
 							# reader would drop every row narrower than the new count, and a rewrite then delete them)
@@ -7120,6 +7140,7 @@ memoryOnly:{self.memoryOnly}
 			if loaded.dirty:
 				self.dirty = True  # a key the file holds twice
 			self._followedWidening = widened
+			self._widthOpen = width <= 0
 			if width > 0:
 				self.correctColumnNum = width  # the column count the read took (the header's, when line 1 holds it)
 			elif self.header and any(self.header) and self.verifyHeader:
@@ -8932,12 +8953,12 @@ class _ServeStore(object):
 		if self.spec:
 			return rows
 		keys = [cells[0] for cells, marker in rows if cells[0] != DEFAULTS_INDICATOR_KEY]
-		lineOneIsRow = any(self.given) and not any(self._legacyHeaderNow(log))
+		self._legacyHeaderNow(log)  # (says a mismatch, and a strict store raises; whether line 1 is a row: _legacyDropKeys)
 		width = _legacyWidthNow(self.path, self.given, True, 'utf8', self.delimiter)
 		if not keys or width is None or width > 1:
 			return rows  # (a look at the first lines: what is queued cannot change them, so no wait for it)
 		self.writer.barrier()
-		if not _legacyDropKeys(self.path, keys, self.given, True, 'utf8', self.delimiter, lineOneIsRow):
+		if not _legacyDropKeys(self.path, keys, self.given, True, 'utf8', self.delimiter, True):
 			return rows
 		self.parts = None  # read again at the next request
 		return [row for row in rows if row[0][0] == DEFAULTS_INDICATOR_KEY]

@@ -142,9 +142,9 @@ named like an operation then needs a path prefix (`./read`).
     is then never a key, row or count, `scrub` and `clear` keep it, and
     `read --format table` shows it above the rows. When line 1 differs, the file has no
     header and line 1 is a row, with 3.39's "Header mismatch" warning (`--x-strict`: an
-    error, exit 1, nothing written). A delete there writes what reads the same to a reader
-    given H, which skips line 1 whatever it holds (see
-    [Upgrading to 5.7](#upgrading-to-57-from-56)). A missing or empty file gets H first. Without
+    error, exit 1, nothing written). A delete there is written for a reader given H, which
+    skips line 1 whatever it holds, and keeps what that reader reads of the other keys in
+    nearly every file (see [Upgrading to 5.7](#upgrading-to-57-from-56) for the exceptions). A missing or empty file gets H first. Without
     `--x-header`, line 1 is a row, as in 3.39. (The library's own header check, a
     `header=` given to `readTabularFile`, `appendTabularFile`, `clearTabularFile`,
     `scrubTabularFile` or `TSVZed`, is 3.39's, looser one: each cell of H within the
@@ -308,12 +308,15 @@ damaged file, as asked, and warns.
 
 The file formats are unchanged.
 
-- **A program no longer dies at exit beside a store's writer thread.** A `TSVZed`'s writer
-  thread, a daemon, could be inside a print as the interpreter ended, and the program then
-  ended with `Fatal Python error: _enter_buffered_busy` and exit status 134 (no row was lost).
-  Now the exit waits for a print under way, up to 5 s, and from then to the interpreter's end
-  that thread writes what it has to say straight to file descriptor 2: not to `sys.stdout`,
-  `sys.stderr` or a `teeLogger`.
+- **A program no longer dies at exit beside a store's writer thread, unless nobody reads its
+  stdout.** A `TSVZed`'s writer thread, a daemon, could be inside a print as the interpreter
+  ended, and the program then ended with `Fatal Python error: _enter_buffered_busy` and exit
+  status 134 (no row was lost). Now the exit waits for a print under way, up to 5 s, and from
+  then to the interpreter's end that thread writes what it has to say straight to file
+  descriptor 2: not to `sys.stdout`, `sys.stderr` or a `teeLogger`. That helps a reader that
+  is slow but still reading. A verbose store whose stdout nobody reads (a full pipe, a
+  stopped reader) still ends with that error, now after about 7 s (2 s at 5.6); no row is
+  lost. See [docs/limitations.md](docs/limitations.md).
 
 - **On Python 3.6 a Ctrl-C at exit no longer drops a queued row.** One that landed as the exit's
   wait took its lock back came out as "Failed to stop append thread ... release unlocked lock",
@@ -332,12 +335,16 @@ The file formats are unchanged.
 
 - **A store that holds no row reads what another process appends as a reopen does.** The
   count comes from the first keyed line: `id\n` under `header='id\tv'`, then another
-  process's `a\n`, shows `a` (it read as a deletion, and memory stayed empty). It costs a
-  whole read of the file for each change while the store holds no row.
+  process's `a\n`, shows `a` (it read as a deletion, and memory stayed empty). Each change is
+  read whole only while the store holds no row and the last whole read took no column count
+  from the file (no keyed line yet, or a file emptied at one column); with a count or a row,
+  only what follows is read, as before.
 
 - **`tsvz delete`, `pop` and `popitem` with `--x-header H`, on a file whose line 1 is not
   `H`, ask the file's width with `H`, as a reader given `H` takes the file.** Line 1 stays a
-  row to the command, and a deletion now reads the same to every reader:
+  row to the command, and a deletion now leaves the other keys reading as they did to a
+  reader given `H` (another reader of the same file, given no `H`, usually the same too; not
+  always, see the end of this item):
   - a key nobody set is no longer made: `tsvz delete --x-header id F zz` on `id\tv\n# n\n`
     leaves the file as it is (it wrote `zz`, a row to a reader given `id`);
   - a lone key that reader shows goes from the file: `a` of `id\tv\na\n` (a line `a` there
@@ -347,6 +354,13 @@ The file formats are unchanged.
     would otherwise come up to it: `tsvz delete --x-header id F a` on `a\nb\t1\n` leaves
     `#\nb\t1\n`. A scrub keeps the comment, as it keeps every line 1. A line 1 of two cells or
     more stays as wide, emptied, when no line can delete it: `a\t1\nb\n` becomes `a\t\nb\n`.
+  - What it cannot always keep: a delete can change how a later lone key reads to a reader
+    given the same `H` (`x\na\t\nb\n`, delete `a`: it goes from no keys to `b`), and a
+    default-filled cell of a plain reader can turn empty (`id\tv\tw\na\n#_defaults_#\t\tQ\nb\t1\n`,
+    delete `a`: `b` reads `[b, 1, Q]` to a reader given nothing, then `[b, 1, '']`). The emptied
+    line 1 (`a\t`) is a deletion to `tsvz`; tsvz-rs lists `a` with an empty value, as its spec
+    makes only a line with no delimiter a deletion. See
+    [docs/limitations.md](docs/limitations.md).
 
 ## Upgrading to 5.6 from 5.5
 

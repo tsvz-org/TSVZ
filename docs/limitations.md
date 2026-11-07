@@ -191,13 +191,57 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   file, leaves a plain reader without a default-filled cell. Every reader given the scrub's own arguments, of
   any version from 3.39, sees what it saw before. In fuzzing, about 1% of random files and argument sets, where 5.4
   changed far more of these readers' views.
+
+  A delete is the exception to that promise, even for a reader that holds the same header as the command. Under
+  `--x-header H` (`tsvz delete`, `pop`, `popitem`, a handler given H) with line 1 not H, line 1 is a row to the command
+  and a reader given H skips it, and a delete can change how a later lone key reads to that reader: `x\na\t\nb\n`, delete
+  `a`, and a reader given H goes from no keys to `{b}`. On a 3.39 reader the same cause can lose a cell: `id\na\t\nb\nb\t1\n`
+  under H `id\tv`, `b` goes from `[b, 1]` to `[b]`. 5.6 does this in nearly all the same cases.
 - Why: what is dead depends on the reader; keeping every line any reader could need would keep most of the lines a
-  compaction exists to drop.
+  compaction exists to drop. For the delete: padding the next lone key (`b<TAB>`) is untried, and would make tsvz-rs read `b`
+  as a row.
 - Revisit when: an operator reads one file with several header or defaults settings and loses rows after a scrub
-  or a rewrite. Scrub, and open `TSVZed`s, with the arguments the file's readers use.
+  or a rewrite. Scrub, and open `TSVZed`s, with the arguments the file's readers use. For the delete: someone hits it, or
+  when loose files go.
 - Approved: 2026-11-04, the user chose "Known limitation (Recommended)", and "One entry for both (Recommended)"
   for covering `TSVZed` rewrites of a healthy file in the same entry; 2026-11-06, "Keep it (Recommended)" for narrowing it in
   5.6 (a file of one column); 2026-11-06, "Known limitation (Recommended)" for each of the three cell cases above.
+  2026-11-07, the user chose "Known limitation (Recommended)" for the delete case.
+
+### A stdout nobody reads still aborts at exit
+- Kind: known limitation
+- What the operator sees: a verbose `TSVZed` (one that prints) whose program's stdout nobody reads (a full pipe, a stopped
+  reader) ends with `Fatal Python error: _enter_buffered_busy` and exit status -6 (134 in a shell), after about 7 s (2 s at 5.6).
+  No row is lost. The exit's wait (up to 5 s for a print under way, then the thread writes to file descriptor 2) helps only a
+  reader that is slow but still moving.
+- Why: the writer thread is frozen by the interpreter's end inside a print that holds the stream's lock, and nothing safe can
+  free a stream lock held by a frozen thread.
+- Revisit when: someone hits it.
+- Approved: 2026-11-07, the user chose "Known limitation (Recommended)".
+
+### tsvz-rs lists a key deleted from an emptied line 1
+- Kind: known limitation
+- What the operator sees: a delete of a key on line 1, under a header that line 1 isn't (`--x-header H`), leaves line 1
+  emptied (`a<TAB>`) when it has two cells or more, so that readers that take their column count from it read as before.
+  TSVZ reads that as a deletion; tsvz-rs lists `a` with an empty value, because spec §7.6 makes only a line with no delimiter a
+  tombstone. After 5.6's output it listed nothing.
+- Why: removing line 1 changes what those readers take as the column count, and spec §5.2 and tsvz-rs's silent-choices.md
+  cover loose files.
+- Revisit when: the spec's deletion rule changes, or someone reads such files with tsvz-rs.
+- Approved: 2026-11-07, the user chose "Known limitation (Recommended)".
+
+### A delete over a #_defaults_# line can empty a plain reader's default-filled cell
+- Kind: deferred (5.08)
+- What the operator sees: `tsvz delete --x-header id F a` on `id<TAB>v<TAB>w`, `a`, `#_defaults_#<TAB><TAB>Q`, `b<TAB>1`
+  writes `id<TAB>v<TAB>w`, `b<TAB>1`, `#_defaults_#<TAB><TAB>Q`: a reader given `id` still reads `b` as `[b, 1]`, but a plain
+  reader (its column count from line 1) goes from `[b, 1, Q]` to `[b, 1, ]`, where it was clean at 5.6. The delete sweep has
+  25 such cases (15 where a reader loses a cell, 10 where one gains one; 6 of the losses are a plain reader's).
+- Why: the delete moves the narrowest row up in front of the defaults line, so the reader given `id` (whose column count is
+  its first keyed line's) keeps its count and its lone keys. The plain reader fills `b`'s third cell from the defaults only
+  when the defaults line comes first. No file does both: a first line of two cells keeps one reader's count, and a first line
+  that is the defaults line (three cells) makes a strict reader of the first drop `b` and turns its lone keys into
+  deletions.
+- Revisit when: 5.08. It takes a choice of which reader keeps its cells, or a defaults line that does not set the count.
 
 ### A file whose first keyed line is a bare #_defaults_# reads as one column without defaults
 - Kind: known limitation
@@ -429,7 +473,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `defaults=['#_defaults_#', 'P']`), a deleted row that held a value stays as `c<TAB>` after a rewrite
   (`a\nb\nc\t\n#_defaults_#\tP\n`): the store shows it gone, a plain reader shows c with an empty value. So with a wider
   header: `id\na\t1\nb\n`, `header='id\tv'`, `del t['a']` leaves `id\na\t1\nb\na\t\n`. `tsvz delete`, a handler and a
-  `TSVZedLite` ask the file, so they take the key's lines out and leave nothing, whatever was read first. Two exceptions for a
+  `TSVZedLite` ask the file, so they take the key's lines out whatever was read first (what stays: under a header that line 1
+  isn't, a key on line 1 of two cells or more leaves line 1 emptied, `a<TAB>`, so that a reader that takes its column count
+  from it reads as before). Two exceptions for a
   `TSVZedLite`: a program that gave `correctColumnNum` of two or more is not asked about, so the delete is the appended line; and
   under a header that line 1 isn't, a copy of the key on line 1 stays, in the header's place.
 - Why: a file that stays one column has no way to mark that deletion, so it needs a format change.

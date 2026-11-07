@@ -14349,6 +14349,65 @@ def test_correctColumnNum_1_on_an_empty_file_is_no_column_count(tmp_path):
 	t.close()
 
 
+def test_a_header_mismatch_is_said_once_for_a_line_1_however_many_changes_follow(tmp_path, capfd):
+	# A store that holds no row reads the whole file at each change while no keyed line gave it a column count; line 1 is
+	# not its header, and 3.39 says that once for the line (5.07 said it at every change: 46 times for 45 appends).
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, b'id\n')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	for _ in range(5):
+		with open(p, 'ab') as f:
+			f.write(b'# n\n')
+		_follow(t)
+	assert dict(t) == {}
+	with open(p, 'ab') as f:
+		f.write(b'a\t1\n')
+	_follow(t)
+	assert dict(t) == {'a': ['a', '1']}
+	t.close()
+	assert capfd.readouterr().out.count('Header mismatch') == 1
+
+
+def test_a_strict_store_raises_at_a_header_mismatch_each_time_not_once(tmp_path):
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, b'id\n')
+	for _ in range(2):
+		with pytest.raises(ValueError, match='Header mismatch'):
+			TSVZ.TSVZed(p, header='id\tv', strict=True, verbose=False, append_check_delay=60)
+
+
+def test_a_store_that_holds_no_row_but_has_a_column_count_reads_only_what_follows(tmp_path, monkeypatch):
+	# 5.07 read the whole file at each change of a store with no row (2M lines: 5 s a change, 0.01 s at 5.6).
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, b'id\tv\n')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	assert t.correctColumnNum == 2 and dict(t) == {}
+	whole = []
+	real = t._readFrom
+	monkeypatch.setattr(t, '_readFrom', lambda f, locked: whole.append(1) or real(f, locked))
+	for i in range(3):
+		with open(p, 'ab') as f:
+			f.write(b'k%d\t1\n' % i)
+		_follow(t)
+	assert sorted(t) == ['k0', 'k1', 'k2'] and not whole
+	t.close()
+
+
+@pytest.mark.parametrize('first', [b'', b'# n\n', b'id\n'])
+def test_a_store_with_no_column_count_yet_takes_it_from_the_first_keyed_line_another_process_appends(tmp_path, first):
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, first)
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	for add in (b'# m\n', b'a\n', b'b\t1\n'):
+		with open(p, 'ab') as f:
+			f.write(add)
+		_follow(t)
+	t.close()
+	r = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	assert dict(t) == dict(r) and 'a' in r
+	r.close()
+
+
 # --------------------------------------------------------------------------
 # 5.6: tsvz and TSVZedLite delete in a one-column file
 # --------------------------------------------------------------------------
@@ -15858,6 +15917,128 @@ def test_the_exit_waits_for_a_print_under_way_and_no_longer_than_its_bound(monke
 	assert not TSVZ._daemonsPrinting
 
 
+def test_the_main_thread_prints_through_the_streams_past_the_exit_too(capsys, monkeypatch):
+	# Only a daemon thread goes round them: a program's own thread at exit (an atexit hook, a handler) still has its streams.
+	monkeypatch.setattr(TSVZ, '_daemonsOut', True)
+	TSVZ.eprint('main thread')
+	assert capsys.readouterr().err == 'main thread\n'
+
+
+def test_the_door_is_shut_while_the_exit_waits_for_a_print_under_way(capfd, monkeypatch):
+	# A print that starts during the wait must not enter a stream, or it is the one the interpreter's end freezes.
+	monkeypatch.setattr(TSVZ, '_daemonsOut', False)
+	monkeypatch.setattr(TSVZ, '_DAEMON_PRINT_WAIT', 30)
+	monkeypatch.setattr(TSVZ, '_daemonsPrinting', set())
+	release, inside = threading.Event(), threading.Event()
+
+	def stuck():
+		inside.set()
+		release.wait(30)
+	first = threading.Thread(target=lambda: TSVZ._say(stuck, 'x'), daemon=True)
+	first.start()
+	assert inside.wait(30)
+	closer = threading.Thread(target=TSVZ._closeStreamsToDaemons, daemon=True)
+	closer.start()
+	try:
+		deadline = time.monotonic() + 10
+		while not TSVZ._daemonsOut and time.monotonic() < deadline:
+			time.sleep(0.001)
+		assert TSVZ._daemonsOut and closer.is_alive()  # (shut at once; the wait is still going)
+		_in_a_daemon_thread(lambda: TSVZ._say(lambda: pytest.fail('a stream was entered'), 'late'))
+	finally:
+		release.set()
+		first.join(30)
+		closer.join(30)
+	assert capfd.readouterr().err == 'late\n' and not closer.is_alive()
+
+
+def test_the_exit_does_not_wait_for_a_thread_that_is_not_there_to_end_its_print(monkeypatch):
+	# A fork leaves the parent's threads in the child as objects that are not alive: nothing would ever end their print.
+	gone = threading.Thread(target=lambda: None, daemon=True)
+	monkeypatch.setattr(TSVZ, '_daemonsPrinting', {gone})
+	monkeypatch.setattr(TSVZ, '_daemonsOut', False)
+	monkeypatch.setattr(TSVZ, '_DAEMON_PRINT_WAIT', 30)
+	begun = time.monotonic()
+	TSVZ._closeStreamsToDaemons()
+	assert time.monotonic() - begun < 10 and TSVZ._daemonsOut
+
+
+class _InterruptedStore(object):
+	_fileName = 'x.tsv'
+	_letGo = False
+
+	def _atExit(self):
+		raise KeyboardInterrupt
+
+	def _finish(self):
+		raise KeyboardInterrupt
+
+
+def test_a_ctrl_c_that_abandons_a_write_at_exit_still_shuts_the_door(capsys, monkeypatch):
+	store = _InterruptedStore()
+	monkeypatch.setattr(TSVZ, '_LIVE_STORES', {1: store})
+	monkeypatch.setattr(TSVZ, '_daemonsOut', False)
+	monkeypatch.setattr(TSVZ, '_daemonsPrinting', set())
+	with pytest.raises(KeyboardInterrupt):
+		TSVZ._stopLiveStores()
+	assert TSVZ._daemonsOut and store._letGo
+
+
+def test_a_daemon_thread_whose_descriptor_2_cannot_be_written_says_nothing_and_fails_nothing(monkeypatch):
+	real = os.write
+
+	def write(fd, data):
+		if fd == 2:
+			raise OSError(errno.EBADF, 'closed')
+		return real(fd, data)
+	monkeypatch.setattr(TSVZ, '_daemonsOut', True)
+	monkeypatch.setattr(TSVZ.os, 'write', write)
+	failed = []
+
+	def say():
+		try:
+			TSVZ._say(lambda: None, 'x')
+		except BaseException as e:
+			failed.append(e)
+	_in_a_daemon_thread(say)
+	assert failed == []
+
+
+def test_a_time_anomaly_is_news_only_to_a_verbose_store(tmp_path, capsys):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'id\tv\na\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	seen = {}
+	for verbose in (False, True):
+		t.verbose = verbose
+		t.externalFileUpdateTime = time.time_ns() + 10 ** 12  # (a file time earlier than the one noted)
+		capsys.readouterr()
+		t.checkExternalChanges()
+		seen[verbose] = capsys.readouterr().out
+	t.verbose = False
+	t.close()
+	assert seen[False] == '' and 'Time anomalies detected in ' in seen[True]
+
+
+@pytest.mark.parametrize('verbose', [False, True])
+def test_a_change_seen_in_a_tsvz_store_is_news_only_to_a_verbose_one(tmp_path, capsys, verbose):
+	p = str(tmp_path / 's.tsvz')
+	other = TSVZ.TSVZed(p, verbose=False, append_check_delay=60)
+	other['a'] = ['a', '1']
+	other.close()
+	t = TSVZ.TSVZed(p, verbose=False, append_check_delay=60)
+	t.verbose = verbose
+	capsys.readouterr()
+	b = TSVZ.TSVZed(p, verbose=False, append_check_delay=60)
+	b['b'] = ['b', '2']
+	b.close()
+	t.checkExternalChanges()
+	out = capsys.readouterr().out
+	t.verbose = False
+	t.close()
+	assert ('External changes detected in ' in out) == verbose and (verbose or out == '')
+
+
 @pytest.mark.parametrize('data', [b'\xef\xbb\xbfid\tv\tw\na\t1\t2\nb\t3\n', b'id\tv\tw\t\na\t1\t2\nb\t3\n',
 								  b'\xef\xbb\xbfid\tv\tw\t \t\r\na\t1\t2\nb\t3\n'], ids=['bom', 'trailing-cell', 'both'])
 def test_a_strict_store_follows_a_widening_as_the_rewrite_tells_one(tmp_path, data):
@@ -15943,6 +16124,10 @@ def test_the_row_on_line_1_goes_when_nothing_keyed_follows(tmp_path):
 	(b'a\nb\t1\n', 'b', b'a\n'),
 	(b'x\na\nb\t\n', 'a', b'x\nb\n'),  # (line 1 is not the key: that reader's first keyed line went, as under any header)
 	(b'a\n', 'a', b''),
+	(b'a\na\t1\nb\n', 'a', b'b\n'),  # (no `#`: it would make the reader given the header gain `b`; 5.6 wrote b)
+	(b'a \nb\t1\n', 'a', b'#\nb\t1\n'),  # (the key on line 1 is `a` to every reader: a space after it is no other key)
+	(b'a\t1\t2\nb\n', 'a', b'a\t\t\nb\n'),  # (line 1 of three cells stays three wide: a reader that takes its count from it)
+	(b'a\t1\na\nb\t1\t2\nc\n', 'a', b'a\t\nc\nb\t1\t2\n'),  # (line 1 emptied, and the lone key moves up: else `c` is a deletion)
 ])
 def test_a_delete_of_line_1_under_a_header_it_is_not_reads_the_same_to_the_command_and_the_library(tmp_path, data, key, want):
 	# The command takes line 1 for a row, a reader given the header for the header's place: both see only `key` go.
@@ -15959,6 +16144,32 @@ def test_a_delete_of_line_1_under_a_header_it_is_not_reads_the_same_to_the_comma
 	after = views()
 	assert after[1] == before[1] - {key} and after[2] == before[2] - {key}
 	assert after[0] == before[0] - {key}
+
+
+def test_a_key_on_line_1_that_ends_in_whitespace_goes_for_the_key_without_it(tmp_path):
+	# `<sep>` is a tab inside a cell: the key is `a` and a tab, which a store finds by `a` (the key without its trailing space).
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'a<sep>\t1\nb\n')
+	assert list(TSVZ.readTabularFile(p, strict=False, verbose=False)) == ['a\t']
+	assert _run('delete', p, 'a', '--x-header', 'id')[0] == 0
+	assert _bytes(p) == b'a<sep>\t\nb\n'
+	assert list(TSVZ.readTabularFile(p, strict=False, verbose=False)) == []
+
+
+@pytest.mark.parametrize('data, xHeader, want', [
+	(b'a\na\nb\n', True, b'#\nb\n'),  # (line 1 is not the header: a row to the command)
+	(b'a\na\nb\n', False, b'a\nb\n'),  # (a caller that holds no --x-header: line 1 is skipped for the header given)
+	(b'id\na\nb\n', True, b'id\nb\n'),  # (line 1 is the header)
+	(b' id \na\nb\n', True, b' id \nb\n'),  # (the cells equal once the whitespace around them is taken off)
+	(b'\na\nb\n', True, b'\nb\n'),  # (a line 1 with nothing on it is no row)
+])
+def test_whether_line_1_is_a_row_to_a_delete_is_decided_on_the_file_it_writes(tmp_path, data, xHeader, want):
+	# The command read line 1 under the read lock before; another process may have changed it by the time the write holds
+	# the rewrite lock. Decided there, on the line the write is made from.
+	p = str(tmp_path / 's.tsv')
+	_touch(p, data)
+	assert TSVZ._legacyDropKeys(p, ['a'], ['id'], True, 'utf8', '\t', xHeader) is True
+	assert _bytes(p) == want
 
 
 def test_a_delete_at_two_columns_under_a_header_line_1_is_not_is_a_line(tmp_path):
@@ -15983,9 +16194,51 @@ def test_a_lone_key_a_reader_given_the_header_shows_goes_from_the_file(tmp_path)
 def test_a_ctrl_c_that_python_3_6_turns_into_an_error_in_a_wait_stays_a_ctrl_c():
 	class Broken(object):
 		def wait(self, timeout):
-			raise RuntimeError('release unlocked lock')
+			try:
+				raise KeyboardInterrupt  # (the interrupt, and the lock error raised as it is handled: chained to it)
+			except KeyboardInterrupt:
+				raise RuntimeError('release unlocked lock')
 	with pytest.raises(KeyboardInterrupt):
 		TSVZ._waited(Broken(), 0.1)
 	done = threading.Event()
 	done.set()
 	assert TSVZ._waited(done, 0.1) is True
+
+
+def _a_wait_that_is_interrupted(monkeypatch):
+	waits = []
+
+	def interrupted(event, timeout):
+		waits.append(event)
+		raise KeyboardInterrupt
+	monkeypatch.setattr(TSVZ, '_waited', interrupted)
+	return waits
+
+
+def test_a_call_waiting_for_the_writer_thread_waits_through_waited(tmp_path, monkeypatch):
+	# Both waits are in steps that _waited keeps a Ctrl-C in, on every Python: a plain Event.wait() is not that on 3.6.
+	t = TSVZ.TSVZed(str(tmp_path / 's.tsv'), verbose=False, append_check_delay=60)
+	waits = _a_wait_that_is_interrupted(monkeypatch)
+	with pytest.raises(KeyboardInterrupt):
+		t.checkExternalChanges()
+	assert len(waits) == 1
+	monkeypatch.undo()
+	t.close()
+
+
+def test_the_exit_waits_for_the_writer_thread_through_waited(tmp_path, monkeypatch):
+	t = TSVZ.TSVZed(str(tmp_path / 's.tsv'), verbose=False, append_check_delay=60)
+	waits = _a_wait_that_is_interrupted(monkeypatch)
+	with pytest.raises(KeyboardInterrupt):
+		t._finish()
+	assert len(waits) == 1 and waits[0] is t._workerDone
+	monkeypatch.undo()
+	t.close()
+
+
+def test_a_runtime_error_in_a_wait_that_is_no_ctrl_c_goes_up_as_it_is():
+	class Broken(object):
+		def wait(self, timeout):
+			raise RuntimeError('cannot join thread before it is started')
+	with pytest.raises(RuntimeError, match='cannot join'):
+		TSVZ._waited(Broken(), 0.1)
