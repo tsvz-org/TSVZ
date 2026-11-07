@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.7**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.8**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -302,6 +302,41 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
+## Upgrading to 5.8 from 5.7
+
+The file formats are unchanged.
+
+- **A delete leaves the other rows as every reader read them: no line moves.** In a loose
+  file of one column a delete takes the key's lines out (`tsvz delete`, `pop` and `popitem`,
+  a `tsvz serve` handler, a `TSVZedLite` delete, a `TSVZed` delete with its commit or
+  rewrite). When one of those lines set a reader's column count (the first keyed line, and
+  under `--x-header H` with line 1 not H also the first keyed line after line 1, which a
+  reader given H counts from) and the next line has another cell count, 5.6 and 5.7 moved a
+  row up into its place, and a cell or a key changed for some readers. Now the key of a later
+  row, with as many empty cells as the line had, takes the place (a stand-in), and every
+  other line stays where it was: `a\n#_defaults_#\t\tQ\nb\t1\n`, delete `a`, becomes
+  `b\n#_defaults_#\t\tQ\nb\t1\n` (5.7: `b\t1\n#_defaults_#\t\tQ\n`, where a `TSVZedLite` then read
+  `b` as `[b, 1, Q]`). A stand-in reads as nothing to every reader: at two columns or more it is
+  the deletion of a key not yet read, at one a row the key's own later line replaces. Under
+  `--x-header id`, `a\nb\t1\n` becomes `b\nb\t1\n` (a reader given `id` read `b` before and
+  still does), `id\tv\n# n\n` with `zz` deleted is left as it is (5.7 wrote `zz`, a row to
+  that reader), and when the next line has the same cell count a bare `#` keeps line 1's place
+  (`a\nb\n` becomes `#\nb\n`).
+
+  What shows: a file can hold a key twice after a delete (the stand-in and the key's own
+  line), so a store that reads it is dirty; readers that keep the file's order list that
+  key earlier; a `TSVZed`'s memory keeps its order (5.7 moved the row to the front), and a
+  one-column store keeps one column (5.7 took the count of the row it moved up). Under
+  `--x-header H` with line 1 not H, the command now rewrites the file where 5.7 appended a
+  line, when a reader given H reads at one column. One shape is left, after a line 1 of one
+  cell, where a reader given H can see a cell change: see
+  [docs/limitations.md](docs/limitations.md), "Readers given other arguments".
+
+- **A store emptied after a rewrite follows another process's append at the count its file
+  says.** After a rewrite, a store whose rows were then all deleted read the next append at
+  its header's count where a reopen takes the file's (`# n\n` under `header='id\tv'`, a
+  row `a\t\t1`: an appended `b\t2` read as `[b, 2]` at two columns, where a reopen reads three).
+
 ## Upgrading to 5.7 from 5.6
 
 The file formats are unchanged.
@@ -364,8 +399,7 @@ The file formats are unchanged.
   for the same file without the mark) or ends in empty cells (it now writes its deletion lines
   and padded rows as wide as line 1 counts its cells: see the item above). So what 5.6 gets wrong in a loose one-column file
   stays for this version: a row moved up to keep a reader's column count can change a cell or
-  a key for some readers. A rule that moves no line is planned for 5.8. See [docs/limitations.md](docs/limitations.md), "The delete keeps
-  a reader's column count by moving a row".
+  a key for some readers. 5.8 moves no line: see [Upgrading to 5.8](#upgrading-to-58-from-57).
 
 ## Upgrading to 5.6 from 5.5
 

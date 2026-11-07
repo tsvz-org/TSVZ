@@ -43,7 +43,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.07'
+version = '5.08'
 __version__ = version
 author = 'pan@zopyr.us'
 COMMIT_DATE = '2026-11-06'
@@ -2988,89 +2988,57 @@ def _legacyHoldsHeader(line0, header, consumed, encoding, delimiter):
 				and _headerMatches(header, line0.decode(encoding or 'utf8', errors='replace').rstrip('\r\n'), delimiter))
 
 
-def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding):
+def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding, both=False):
 	"""The legacy lines ``raw`` (bytes, without their newline) without the lines of each key of ``dropAt`` before the
-	index it gives (a row queued after a delete stays), and the key whose line moved up (or None), as a pair; line 1 is
-	left alone when a reader takes it for its header (``skipFirst``).
+	index it gives (a row queued after a delete stays); line 1 is left alone when a reader takes it for its header
+	(``skipFirst``). No line moves and no cell changes.
 
-	When the column count comes from the first keyed line (``widthFromLines``), that line was one cell wide and it
-	went, the first of the narrowest lines left takes its place, with the key's earlier lines (superseded for every
-	reader) left out: a wider line first would make every other lone key a deletion, and a strict reader drop what is
-	narrower. A row counts the cells a read at column count 1 keeps (its empty cells at the end do not count), so a line
-	with no value is one cell (a row at column count 1, a deletion at any other) and moves up as the key alone. A row
-	with values moves up only when it is narrower than the first line left, as it reads where it was (_legacyMoved). The
-	file then reads at the count of its first line: the defaults lines narrower than it are padded (a strict reader would
-	drop them), and the bare ones after it go (a row that reset nothing at one column, a reset at this one), so every
-	reader sees the rows as before."""
-	enc = encoding or 'utf8'
+	A reader takes its column count from its first keyed line: the file's first (when the count comes from the lines,
+	``widthFromLines``), and with ``both`` also the first after line 1, which a reader that takes line 1 for a header the
+	caller holds for a row counts from (--x-header H, line 1 not H). When such a line goes and the line that would come
+	in its place has another cell count, a stand-in takes its place: the key of a later row that stays, and as many
+	empty cells as the line had, so no reader's count changes. With the same count nothing is needed, but on line 1 with
+	``both`` a bare ``#`` keeps the place a header reader skips.
 
-	def kindOf(line):
-		return _legacyLineKind(line.decode(enc, errors='replace'), 1, False, delimiter)
-	out = []
-	firstKeyedSeen = firstKeyedWent = False
-	for i, line in enumerate(raw):
-		if not (i == 0 and skipFirst):
-			kind, key, n, _ = kindOf(line)
-			if kind == 'row' and i < dropAt.get(key.rstrip(), 0):
-				firstKeyedWent = firstKeyedWent or (not firstKeyedSeen and n == 1)
-				firstKeyedSeen = True
-				continue
-			firstKeyedSeen = firstKeyedSeen or kind != 'skip'
-		out.append(line)
-	if not (widthFromLines and firstKeyedWent):
-		return out, None
-	place = next((i for i in range(1 if skipFirst else 0, len(out)) if kindOf(out[i])[0] != 'skip'), None)
-	if place is None:
-		return out, None
-	d = delimiter.encode(enc)
-
-	def width(line):  # (the cells a read at column count 1 keeps of a row: its empty cells at the end go)
-		cells = _unsanitize(_legacyLineBody(line.decode(enc, errors='replace')).split(delimiter), delimiter)
-		while len(cells) > 1 and not cells[-1]:
-			cells.pop()
-		return len(cells)
-	best = narrowest = None
-	for j in range(place, len(out)):
-		if kindOf(out[j])[0] == 'row':
-			n = width(out[j])
-			if narrowest is None or n < narrowest:
-				best, narrowest = j, n
-				if n == 1:
-					break
-	name = None
-	if best is not None and kindOf(out[place])[2] > narrowest:  # (a first line no wider than any row needs no row up in front of it)
-		name = kindOf(out[best])[1].rstrip()
-		line = _legacyMoved(out, place, best, delimiter, encoding)
-		rest = [other for other in out[place:best] if (kindOf(other)[1] or '').rstrip() != name]
-		out = out[:place] + [line] + rest + out[best + 1:]
-	first = kindOf(out[place])[2]
-	if first > 1:
-		# (the file now reads at the count of its first line, which was 1: a defaults line narrower than it would be dropped
-		# by a strict read, so it is padded; a bare one, a row that reset nothing at one column, would reset the defaults
-		# at this one and change what the rows after it read, so it goes: the file reads the same without it)
-		out = [other + d * (first - kindOf(other)[2]) if kindOf(other)[0] == 'defaults' and kindOf(other)[2] < first else other
-			   for at, other in enumerate(out) if at <= place or kindOf(other)[0] != 'reset']
-	return out, name
-
-
-def _legacyMoved(lines, place, best, delimiter, encoding):
-	"""The legacy line ``lines[best]`` (bytes, without its newline) as it goes in front of ``lines[place:best]``, reading
-	as it did where it was to a read at column count 1 (what the file was): its empty cells at the end are left off (that
-	read keeps none, and a wider count would fill them from the defaults), and where a defaults line comes in between,
-	the empty cells that read filled are filled in. A row with no value is its key alone."""
+	The key is one whose later line holds no value: every reader applies that line (a row at one column, a deletion at
+	more), so the key reads after it as it did. Else, unless a line 1 of one cell comes before the place (its readers
+	would read the stand-in as a row, and 3.39's strict read, which drops a wider line at one column, would gain it), a
+	key that no row with a value before the place names: at two columns or more the stand-in deletes a key not yet read,
+	at one it is a row the key's later line replaces. No such row: the line just goes."""
 	enc = encoding or 'utf8'
 	d = delimiter.encode(enc)
-	cells = lines[best].strip(b'\x00').rstrip(b'\r').split(d)
-	if any(_legacyLineKind(line.decode(enc, errors='replace'), 1, False, delimiter)[0] == 'defaults' for line in lines[place:best]):
-		held, defaults, row = {}, [], []
-		for line in lines[place:best + 1]:
-			row = _processLine(line.decode(enc, errors='replace'), held, 1, False, delimiter, defaults)[1]
-		for i in range(1, min(len(cells), len(row))):
-			if row[i] and not cells[i].decode(enc, errors='replace').rstrip():  # (a cell of whitespace is empty to the reader)
-				cells[i] = _encodeRow(_sanitize([row[i]], delimiter=delimiter), delimiter, encoding, 'replace')
-	while len(cells) > 1 and not cells[-1].decode(enc, errors='replace').rstrip():
-		cells.pop()
-	return d.join(cells)
+	texts = [line.decode(enc, errors='replace') for line in raw]
+	kinds = [_legacyLineKind(text, 1, False, delimiter) for text in texts]
+
+	def goes(i):
+		kind, key = kinds[i][:2]
+		return not (i == 0 and skipFirst) and kind == 'row' and i < dropAt.get(key.rstrip(), 0)
+
+	def valued(i):  # (a row that holds a value: a row, not a deletion, at two columns)
+		return _legacyLineKind(texts[i], 2, False, delimiter)[0] == 'row'
+
+	def keyed(start):
+		return next((i for i in range(start, len(raw)) if kinds[i][0] != 'skip'), None)
+	places = [keyed(1 if skipFirst else 0)] if widthFromLines else []
+	if both and places == [0]:
+		places.append(keyed(1))
+	stand = {}
+	for i in sorted((i for i in places if i is not None and goes(i)), reverse=True):  # (a later stand-in can come in an earlier's place)
+		nxt = next((j for j in range(i + 1, len(raw)) if j in stand or (kinds[j][0] != 'skip' and not goes(j))), None)
+		same = nxt is not None and (stand[nxt].count(d) + 1 if nxt in stand else kinds[nxt][2]) == kinds[i][2]
+		if same and both and i == 0:
+			stand[i] = b'#'  # (the count stays: only line 1's place, which a reader given the header skips, is kept)
+			continue
+		if nxt is None or same:
+			continue
+		later = [j for j in range(i + 1, len(raw)) if kinds[j][0] == 'row' and not goes(j)]
+		pick = [j for j in later if not valued(j)]
+		if not pick and not (i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):
+			named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
+			pick = [j for j in later if kinds[j][1].rstrip() not in named]
+		if pick:
+			stand[i] = raw[pick[0]].strip(b'\x00').rstrip(b'\r').split(d)[0] + d * (kinds[i][2] - 1)
+	return [stand.get(i, line) for i, line in enumerate(raw) if i in stand or not goes(i)]
 
 
 def _legacyFileWidth(lines, header, consumed, encoding, delimiter):
@@ -3139,13 +3107,18 @@ def _legacyWidthNow(fileName, header, verifyHeader, encoding, delimiter):
 		return None
 
 
-def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter):
+def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter, xHeader=False):
 	"""Delete ``keys`` from the legacy file where no line can: a file of one column, where a lone key is a row (and of
 	no column count yet, where it would make one). True when that is done: their lines are out of the file
 	(_legacyDropLines, which keeps the one column), or there were none. False when the file is of two columns or more
 	(_legacyFileWidth), or could not be read (a deletion line says it there; damage is reported): nothing is written.
 	``header`` is formatted and ``delimiter`` resolved. Only those lines go: this compacts nothing, and copies the others
 	as bytes.
+
+	``xHeader``: the caller is a --x-header one: line 1, when it is not ``header`` (_isHeaderLine), is a row to it, and a
+	reader given ``header`` skips it all the same and counts from the first keyed line after it. Both readers' count is
+	kept (_legacyDropLines, ``both``). Decided here, on the line 1 read under the rewrite lock the write is made under,
+	not on one read before it.
 
 	Read through the file's REWRITE lock and written under it, as ``TSVZed`` writes, so another process's write
 	(an append beside it) cannot fall between the read and the write: no retry, and none is lost. OSError when the
@@ -3164,17 +3137,20 @@ def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter):
 						seen.append(line)
 						yield line
 				width = _legacyFileWidth(tap(), header, consumed, encoding, delimiter)
-				raw = seen + list(lines) if width == 1 else None
+				lineOneIsRow = bool(xHeader and any(header) and seen
+									and not _isHeaderLine(header, seen[0].decode(encoding or 'utf8', errors='replace'), delimiter))
+				raw = seen + list(lines) if width == 1 or lineOneIsRow and width == -1 else None
 		except Exception as e:
 			_warn('TSVZ warning: {}: the file cannot be read ({}): the delete is written as a deletion line, which deletes '
 				  'nothing if the file is of one column'.format(fileName, e))
 			done.append(False)
 			return None
 		done.append(width <= 1)
-		if width != 1:
+		if not raw:
 			return None
-		fromLines = not _legacyHoldsHeader(raw[0], header, consumed, encoding, delimiter)
-		kept = _legacyDropLines(raw, dict.fromkeys((key.rstrip() for key in keys), len(raw)), consumed, fromLines, delimiter, encoding)[0]
+		fromLines = lineOneIsRow or not _legacyHoldsHeader(raw[0], header, consumed, encoding, delimiter)
+		kept = _legacyDropLines(raw, dict.fromkeys((key.rstrip() for key in keys), len(raw)), consumed and not lineOneIsRow,
+								fromLines, delimiter, encoding, lineOneIsRow)
 		return None if kept == raw else b''.join(line + b'\n' for line in kept)
 	if not os.path.isfile(fileName):
 		return False
@@ -6735,14 +6711,7 @@ memoryOnly:{self.memoryOnly}
 			del line0
 			for _ in range(2):  # (twice when the lines say keys are live that are gone from memory, in a one-column file)
 				if dropAt:
-					raw, moved = _legacyDropLines(raw, dropAt, consumed, not matched, delimiter, encoding)
-					if moved is not None:
-						with self._memLock:  # (its line moved up, the key alone if it held no value: memory stays the file)
-							row = dict.get(self, moved)  # (a caller may have deleted it meanwhile)
-							if row is not None:
-								if not any(row[1:]):
-									OrderedDict.__setitem__(self, moved, [moved])
-								OrderedDict.move_to_end(self, moved, last=False)
+					raw = _legacyDropLines(raw, dropAt, consumed, not matched, delimiter, encoding)
 				kept = _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched)
 				del raw
 				flags, diffWidth = self._readLines(kept, consumed, start, strict)
@@ -6899,9 +6868,6 @@ memoryOnly:{self.memoryOnly}
 				end = f.tell()  # its own bytes end here: a writer that takes no lock may append after them
 				self._damaged = self._remake = False
 				self.dirty = self.deSynced = False
-				# (a store left with no row may hold a file with no keyed line, whatever column count it had: its next keyed
-				# line sets the count, which a whole read takes, _syncFrom)
-				self._widthOpen = not self
 				if getattr(lines, 'widened', False) or not self:
 					self._readWidened(f)  # (no row left: the column count is what the file now says, as a reopen takes it)
 			except BaseException:
@@ -8914,16 +8880,21 @@ class _ServeStore(object):
 	def _dropKeys(self, rows, log):
 		"""The deletions ``rows`` that are still to be written as lines (caller holds the lock). In a loose file of one
 		column, where a lone key is a row, the keys' lines are taken out of the file instead (_legacyDropKeys), once
-		everything queued is in it. A reset of the defaults is a line at every width."""
+		everything queued is in it. A reset of the defaults is a line at every width.
+
+		The file's width is asked with the header given, as the library's readers take it, even when line 1 is not it and
+		is a row to this command (_legacyHeader): a line is a deletion or a row by that one answer, so a reader given that
+		header reads what this command deleted the same way, and the command's own count is kept too (_legacyDropKeys,
+		``xHeader``)."""
 		if self.spec:
 			return rows
 		keys = [cells[0] for cells, marker in rows if cells[0] != DEFAULTS_INDICATOR_KEY]
-		header = self._legacyHeaderNow(log)
-		width = _legacyWidthNow(self.path, header, True, 'utf8', self.delimiter)
+		self._legacyHeaderNow(log)  # (says a mismatch, and a strict store raises; whether line 1 is a row: _legacyDropKeys)
+		width = _legacyWidthNow(self.path, self.given, True, 'utf8', self.delimiter)
 		if not keys or width is None or width > 1:
 			return rows  # (a look at the first lines: what is queued cannot change them, so no wait for it)
 		self.writer.barrier()
-		if not _legacyDropKeys(self.path, keys, header, True, 'utf8', self.delimiter):
+		if not _legacyDropKeys(self.path, keys, self.given, True, 'utf8', self.delimiter, True):
 			return rows
 		self.parts = None  # read again at the next request
 		return [row for row in rows if row[0][0] == DEFAULTS_INDICATOR_KEY]
