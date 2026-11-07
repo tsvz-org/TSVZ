@@ -415,11 +415,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   at its width) and the rewrite adds the defaults line. With a wider header, line 1 is not widened (a warning says the file
   holds rows with no value), and the store prints "Header mismatch" at each open; it reads the lone keys as rows unless its
   defaults or the first row after line 1 give it a wider count (`id\na\t1\nb\n`), when it reads them as deletions and the
-  file keeps them all the same. No row is lost. The file widens once every row holds a value.
+  file keeps them all the same. No row is lost. The file widens once every row holds a value. After a `TSVZedLite` delete of the
+  first row, under a header that line 1 isn't, the count falls to one and those lone keys read as rows to that same store:
+  `id\na\t1\nb\n` under `header='id\tv'` shows a, and after `del t['a']` shows b, which every other reader already saw.
 - Why: a value-less row at two columns is a deletion, so marking one needs a format change that every reader, the spec and
   tsvz-rs would have to learn.
 - Revisit when: the format next changes.
-- Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
+- Approved: 2026-11-06, the user chose "Known limitation (Recommended)". The Lite delete case: the same answer, the same day.
 
 ### A row deleted from a one-column file under wider defaults or a wider header stays as its key
 - Kind: known limitation
@@ -467,6 +469,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   that line and shows `a`. The line stays in the file, so no row is lost. The same at fa176f8.
 - Why: what is appended is read at the count memory holds, and a whole read takes the count from the first keyed line. The
   store already reads whole for a one-column store emptied by another process; this needs the same for a file with no keyed line.
+- Revisit when: the next version.
+
+### A delete of line 1 under a header that line 1 isn't can hide the next line from readTabularFile
+- Kind: deferred
+- What the operator sees: `tsvz delete --x-header id F a` on `a\nb\t1\n` leaves `b\t1\n`. `readTabularFile` given `id` goes from
+  `{b}` to `{}` and prints "Header mismatch"; a plain reader keeps b, and the bytes are intact.
+- Why: the command treats line 1 as a row when it is not the header given, and the library treats it as the header line. One
+  header text has two rules.
 - Revisit when: the next version.
 
 ### A delete under a header narrower than line 1 can create a key
