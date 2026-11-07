@@ -1788,12 +1788,13 @@ def test_spec_scrub_backs_up_again_when_the_part_changed(tmp_path, monkeypatch):
 	_touch(p, gzip.compress(b'a\t1\n') + GZ_CORRUPT + gzip.compress(b'b\t2\n'))
 	real = TSVZ._specRewriteInPlace
 	calls = []
+	member = gzip.compress(b'c\t3\n')  # (once: the header holds the time, so two calls a second apart differ)
 
 	def changed_once(path, content, expect=None, memberSize=None):
 		if not calls:
 			calls.append(1)
 			with open(path, 'ab') as f:
-				f.write(gzip.compress(b'Q\tq\n')[:-6] + gzip.compress(b'c\t3\n'))
+				f.write(gzip.compress(b'Q\tq\n')[:-6] + member)
 			return None
 		return real(path, content, expect=expect, memberSize=memberSize)
 	monkeypatch.setattr(TSVZ, '_specRewriteInPlace', changed_once)
@@ -1801,7 +1802,7 @@ def test_spec_scrub_backs_up_again_when_the_part_changed(tmp_path, monkeypatch):
 	backups = sorted(n for n in os.listdir(str(tmp_path)) if n.startswith('m.tsvz.gz.damaged-'))
 	assert len(backups) == 2
 	with open(str(tmp_path / backups[-1]), 'rb') as f:
-		assert gzip.compress(b'c\t3\n') in f.read()
+		assert member in f.read()
 
 
 def test_cli_stop_policy_fails_the_read_but_lets_scrub_rewrite(tmp_path):
