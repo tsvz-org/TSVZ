@@ -27,6 +27,13 @@ SPEC = os.path.join(HERE, 'tsvz-spec-v1.md')
 BASELINE = os.path.join(HERE, 'conformance', 'reference-baseline.json')
 
 
+@pytest.fixture(autouse=True)
+def handler_limit(monkeypatch):
+	"""A limit, not a wait, as run_main's --timeout: a handler starts when the machine gets to it, and only a test about the
+	limit gives its own (wait=1)."""
+	monkeypatch.setattr(tc, 'HANDLER_WAIT', 300.0)
+
+
 def wait_gone(pid):
 	"""Return once `pid` no longer exists: a killed process is reaped when the machine gets to it, not at a set time."""
 	deadline = time.time() + 60
@@ -441,7 +448,7 @@ def test_client_reads_diagnostics_status_and_bulk_requests():
 	thread = threading.Thread(target=serve)
 	thread.daemon = True
 	thread.start()
-	client = tc.Client(path, 5)
+	client = tc.Client(path, 300)
 	try:
 		first = client.request(['get', 'k'])
 		assert first.status == 3 and first.message == 'gone\naway' and first.output == b'k\tv\n'
@@ -469,7 +476,7 @@ def test_a_status_line_with_non_ascii_digits_is_malformed():
 	thread = threading.Thread(target=serve)
 	thread.daemon = True
 	thread.start()
-	client = tc.Client(path, 5)
+	client = tc.Client(path, 300)
 	try:
 		with pytest.raises(ConnectionError, match='not #N'):
 			client.request(['len'])
@@ -675,6 +682,25 @@ while True:
 	conn, _ = server.accept()
 	threading.Thread(target=handle, args=(conn,), daemon=True).start()
 '''
+
+
+def test_a_handler_gets_the_limit_of_a_step_to_start(tmp_path, monkeypatch):
+	# --timeout is the limit for one step, and starting the handler is one: 10 s failed cases on a loaded host at --timeout 300.
+	waits = []
+
+	class Refused(tc.Handler):
+		def start(self):
+			waits.append(self.wait)
+			raise tc.HandlerError('stop here')
+	monkeypatch.setattr(tc, 'Handler', Refused)
+	monkeypatch.setattr(tc, 'HANDLER_WAIT', 10.0)
+	case = tc.validate_case({'id': '21.6.1-x', 'spec': ['21.6.1'], 'level': 'MUST', 'note': 'n', 'files': {'s.tsvz': 'k\tv\n'},
+		'steps': [{'request': ['get', 'k'], 'stdout': {'rows': [['k', 'v']]}}]}, 'handler', 'x')
+	for limit, want in ((300.0, 300.0), (1.0, 10.0)):
+		(tmp_path / str(limit)).mkdir()
+		ctx = tc.Context(tc.Impl('unused'), str(tmp_path / str(limit)), limit, frozenset(['handler']))
+		assert tc.run_case(case, 'socket', ctx).result == tc.FAIL
+		assert waits.pop() == want
 
 
 def test_socket_steps_obey_the_timeout(tmp_path):

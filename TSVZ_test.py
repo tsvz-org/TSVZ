@@ -7044,7 +7044,7 @@ def test_tsvzed_legacy_rows_survive_rewrites_and_reloads_for_another_process_str
 			written += 1
 	finally:
 		_touch(stop)
-		count = int(other.communicate(timeout=30)[0])
+		count = int(other.communicate(timeout=300)[0])  # (a limit: it ends at its next look at `stop`)
 	time.sleep(0.1)
 	t.close()
 	back = TSVZ.readTabularFile(p, header='key\tv')
@@ -15924,8 +15924,9 @@ def test_the_row_on_line_1_goes_when_nothing_keyed_follows(tmp_path):
 	p = str(tmp_path / 's.tsv')
 	_touch(p, b'id\tv\n# n\n')
 	assert _run('delete', p, 'id', '--x-header', 'id')[0] == 0
-	assert _bytes(p) == b'# n\n'
+	assert _bytes(p) == b'id\t\n# n\n'  # (emptied in its place: it stays as wide)
 	assert _run('keys', p, '--x-header', 'id')[1] == ''
+	assert TSVZ.readTabularFile(p, strict=False, verbose=False) == {}
 
 
 @pytest.mark.parametrize('data, key, want', [
@@ -15935,7 +15936,11 @@ def test_the_row_on_line_1_goes_when_nothing_keyed_follows(tmp_path):
 	(b'a\n# n\nb\t1\n', 'a', b'# n\nb\t1\n'),  # (a comment is in the place already)
 	(b'a\nb\t1\nc\n', 'a', b'c\nb\t1\n'),  # (a lone key moved up: a deletion to that reader, and it keeps the file one column)
 	(b'a\nb\t1\t2\nc\t3\n', 'a', b'#\nc\t3\nb\t1\t2\n'),
+	(b'a\na\nb\t\n', 'a', b'#\nb\n'),  # (a lone key moved up, and that reader reads at one column: it is a row of its)
+	(b'a\t1\nb\n', 'a', b'a\t\nb\n'),  # (two cells, and to that reader one column: line 1 stays, emptied)
+	(b'a\t1\na\nb\n', 'a', b'a\t\nb\n'),
 	(b'a\nb\t1\n', 'b', b'a\n'),
+	(b'x\na\nb\t\n', 'a', b'x\nb\n'),  # (line 1 is not the key: that reader's first keyed line went, as under any header)
 	(b'a\n', 'a', b''),
 ])
 def test_a_delete_of_line_1_under_a_header_it_is_not_reads_the_same_to_the_command_and_the_library(tmp_path, data, key, want):

@@ -3136,8 +3136,8 @@ def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter, l
 	as bytes.
 
 	``lineOneIsRow``: the caller (--x-header) holds line 1, which is not ``header``, for a row, and a reader given
-	``header`` takes it for the header's place all the same. So its key goes too, and a bare comment keeps the place when
-	the line that takes it is one that reader reads: no line of a row of that reader's moves into line 1.
+	``header`` skips it all the same. A key on line 1 goes for the caller and that reader's lines stay where it reads
+	them (_legacyLinesWithoutLineOne).
 
 	Read through the file's REWRITE lock and written under it, as ``TSVZed`` writes, so another process's write
 	(an append beside it) cannot fall between the read and the write: no retry, and none is lost. OSError when the
@@ -3166,17 +3166,44 @@ def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter, l
 		if not raw:
 			return None
 		fromLines = lineOneIsRow or not _legacyHoldsHeader(raw[0], header, consumed, encoding, delimiter)
-		kept, moved = _legacyDropLines(raw, dict.fromkeys((key.rstrip() for key in keys), len(raw)), consumed and not lineOneIsRow,
-									   fromLines, delimiter, encoding)
-		if lineOneIsRow and kept and kept[0] != raw[0]:
-			kind, _, cells, _ = _legacyLineKind(kept[0].decode(encoding or 'utf8', errors='replace'), 1, False, delimiter)
-			if kind != 'skip' and (moved is None or cells > 1):  # (a lone key moved up is no row of that reader's: its count is wider)
-				kept.insert(0, b'#')
+		drops = dict.fromkeys((key.rstrip() for key in keys), len(raw))
+		kept = None
+		if lineOneIsRow:
+			kept = _legacyLinesWithoutLineOne(raw, drops, delimiter, encoding)
+		if kept is None:
+			kept = _legacyDropLines(raw, drops, consumed, fromLines, delimiter, encoding)[0]
 		return None if kept == raw else b''.join(line + b'\n' for line in kept)
 	if not os.path.isfile(fileName):
 		return False
 	_specRewriteInPlace(fileName, None, build=build)
 	return done[0]
+
+
+def _legacyLinesWithoutLineOne(raw, drops, delimiter, encoding):
+	"""The legacy lines ``raw`` of a delete of the keys of ``drops`` (_legacyDropLines) when line 1 is a row to the caller
+	and skipped by a reader given a header: None when line 1 holds none of those keys. So that both see only those keys go:
+
+	Line 1 of two cells or more stays, emptied: a deletion as wide as it was, so a reader that takes the column count from
+	it reads as before. A line 1 of one cell goes, as a row of a one-column file does; a bare comment then keeps its place
+	when the line that comes up to line 1 is one the other reader reads (at its column count, the next keyed line's)."""
+	enc = encoding or 'utf8'
+
+	def kindOf(line):
+		return _legacyLineKind(line.decode(enc, errors='replace'), 1, False, delimiter)
+	kind, key, cells, _ = kindOf(raw[0])
+	if kind != 'row' or key.rstrip() not in drops:
+		return None
+	if cells > 1:
+		kept = _legacyDropLines(raw, drops, True, True, delimiter, encoding)[0]
+		d = delimiter.encode(enc)
+		return [raw[0].rstrip(b'\r').split(d)[0] + d * (cells - 1)] + kept[1:]
+	kept, moved = _legacyDropLines(raw, drops, False, True, delimiter, encoding)
+	if kept:
+		kind, _, cells, _ = kindOf(kept[0])
+		theirs = next((n for k, _, n, _ in map(kindOf, raw[1:]) if k != 'skip'), -1)
+		if kind != 'skip' and (moved is None or cells > 1 or theirs == 1):  # (else a lone key: a deletion to them)
+			kept.insert(0, b'#')
+	return kept
 
 
 def _legacyWidened(raw, header, encoding, delimiter, errors):

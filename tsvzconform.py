@@ -1326,11 +1326,11 @@ def _exited(proc):
 class Handler(object):
 	"""The implementation's own `serve STORE` (§21.13), started and stopped by the runner (design section 2.7)."""
 
-	def __init__(self, impl, store, out_dir, wait=HANDLER_WAIT):
+	def __init__(self, impl, store, out_dir, wait=None):
 		self.impl = impl
 		self.store = store
 		self.out_dir = out_dir
-		self.wait = wait
+		self.wait = HANDLER_WAIT if wait is None else wait
 		self.proc = None
 		self.path = None
 		self.exit = None
@@ -1541,7 +1541,7 @@ class CaseRun(object):
 		try:
 			if self.mode != 'files':
 				try:
-					self.handler = Handler(self.ctx.impl, self.store, self.dir).start()
+					self.handler = Handler(self.ctx.impl, self.store, self.dir, max(HANDLER_WAIT, self.ctx.timeout)).start()
 				except HandlerError as e:
 					raise Failed('serve   the handler did not start: %s' % e)
 			for step in steps:
@@ -1676,7 +1676,7 @@ class CheckContext(object):
 		return run_command(argv, self.impl.cwd, self.timeout, stdin, self.dir, 'run%d' % self.count)
 
 	def handler(self, store):
-		return Handler(self.impl, store, self.dir).start()
+		return Handler(self.impl, store, self.dir, max(HANDLER_WAIT, self.timeout)).start()
 
 
 def run_name(case, mode):

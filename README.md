@@ -142,7 +142,9 @@ named like an operation then needs a path prefix (`./read`).
     is then never a key, row or count, `scrub` and `clear` keep it, and
     `read --format table` shows it above the rows. When line 1 differs, the file has no
     header and line 1 is a row, with 3.39's "Header mismatch" warning (`--x-strict`: an
-    error, exit 1, nothing written). A missing or empty file gets H first. Without
+    error, exit 1, nothing written). A delete there writes what reads the same to a reader
+    given H, which skips line 1 whatever it holds (see
+    [Upgrading to 5.7](#upgrading-to-57-from-56)). A missing or empty file gets H first. Without
     `--x-header`, line 1 is a row, as in 3.39. (The library's own header check, a
     `header=` given to `readTabularFile`, `appendTabularFile`, `clearTabularFile`,
     `scrubTabularFile` or `TSVZed`, is 3.39's, looser one: each cell of H within the
@@ -336,10 +338,11 @@ The file formats are unchanged.
     leaves the file as it is (it wrote `zz`, a row to a reader given `id`);
   - a lone key that reader shows goes from the file: `a` of `id\tv\na\n` (a line `a` there
     was a second copy of it to that reader);
-  - a delete of line 1 in a one-column file leaves a bare `#` comment in its place when the next line
-    would otherwise become line 1: `tsvz delete --x-header id F a` on `a\nb\t1\n` leaves
-    `#\nb\t1\n`, so a reader given `id`, which skips line 1, still shows `b`. A scrub keeps
-    the comment, as it keeps every line 1.
+  - a delete of a key on line 1 keeps what a reader given `id`, which skips line 1, reads. A
+    line 1 of one cell goes, and a bare `#` comment takes its place when a line that reader reads
+    would otherwise come up to it: `tsvz delete --x-header id F a` on `a\nb\t1\n` leaves
+    `#\nb\t1\n`. A scrub keeps the comment, as it keeps every line 1. A line 1 of two cells or
+    more stays as wide, emptied, when no line can delete it: `a\t1\nb\n` becomes `a\t\nb\n`.
 
 ## Upgrading to 5.6 from 5.5
 
