@@ -342,10 +342,11 @@ The file formats are unchanged.
 
 - **Deletes write what 5.6 writes.** `tsvz delete`, `pop` and `popitem` (with or without
   `--x-header`, `--x-strict` or `--x-defaults`), a `tsvz serve` handler, a `TSVZedLite` delete
-  and a `TSVZed` delete with its commit or rewrite leave the same bytes as in 5.6, so what 5.6
-  gets wrong in a loose one-column file stays for this version: a row moved up to keep a
-  reader's column count can change a cell or a key for some readers. A rule that moves no
-  line is planned for 5.08. See [docs/limitations.md](docs/limitations.md), "The delete keeps
+  and a `TSVZed` delete with its commit or rewrite leave the same bytes as in 5.6 (but for a
+  `TSVZed` on a file whose line 1 starts with a byte order mark or ends in empty cells, which
+  now writes what 5.6 writes for the same file without them: see the item above), so what 5.6 gets wrong in a loose one-column file
+  stays for this version: a row moved up to keep a reader's column count can change a cell or
+  a key for some readers. A rule that moves no line is planned for 5.8. See [docs/limitations.md](docs/limitations.md), "The delete keeps
   a reader's column count by moving a row".
 
 ## Upgrading to 5.6 from 5.5

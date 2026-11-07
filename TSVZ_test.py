@@ -16175,6 +16175,26 @@ def test_a_delete_at_two_columns_under_a_header_line_1_is_not_is_a_line(tmp_path
 	assert list(TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)) == ['b']
 
 
+def test_a_delete_under_the_header_line_1_holds_moves_no_row_into_its_place(tmp_path):
+	# 5.6's bytes: line 1 is the header, so the first keyed line is line 2's place and the lone key `b<TAB>` stays as it is.
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'id\na\nb\t\n')
+	assert _run('delete', p, 'a', '--x-header', 'id')[0] == 0
+	assert _bytes(p) == b'id\nb\t\n'
+
+
+def test_a_loose_lite_delete_leaves_line_1_in_the_header_place(tmp_path):
+	# 5.6's bytes: a TSVZedLite given a header takes line 1 for its place even when line 1 is not that header.
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'a\na\t\t1\n')
+	t = TSVZ.TSVZedLite(p, header='id', strict=False, verbose=False)
+	try:
+		del t['a']
+	finally:
+		t.close()
+	assert _bytes(p) == b'a\n'
+
+
 def test_a_ctrl_c_that_python_3_6_turns_into_an_error_in_a_wait_stays_a_ctrl_c():
 	class Broken(object):
 		def wait(self, timeout):
