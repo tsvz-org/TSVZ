@@ -374,7 +374,7 @@ The file formats are unchanged.
   deletions, and the file does not widen to the defaults or to a wider header until every row
   holds a value ([entry](docs/limitations.md#a-file-of-lone-keys-does-not-widen)). A row with a
   value that such a store deletes stays in the file as its key and an empty cell
-  ([entry](docs/limitations.md#a-row-deleted-from-a-one-column-file-under-wider-defaults-stays-as-its-key)).
+  ([entry](docs/limitations.md#a-row-deleted-from-a-one-column-file-under-wider-defaults-or-a-wider-header-stays-as-its-key)).
 - **`TSVZedLite` knows a one-column file from its load.** So a one-cell row is a row there
   (it was a delete of a key it did not hold), and a row read at its offset has its cell
   (`t['a']` read as `[]`).
@@ -407,8 +407,9 @@ The file formats are unchanged.
   does not narrow line 1. A one-column file
   with a row that holds no value is not widened, with a warning, and keeps every row: a lone
   key is a deletion at two columns or more, so widening would delete it. A key's earlier line
-  with no value does not count when a later line gives the key one. A scrub
-  still never changes line 1.
+  with no value does not count when a later line gives the key one; that key then moves after the
+  rows between its two lines, no value lost (`id\nd\na\t1\nd\tx\n` under `header='id\tv'` becomes
+  `id\tv\na\t1\nd\tx\n`). A scrub still never changes line 1.
 
 ## Upgrading to 5.5 from 5.4
 

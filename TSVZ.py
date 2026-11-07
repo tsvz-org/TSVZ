@@ -3130,7 +3130,8 @@ def _legacyWidened(raw, header, encoding, delimiter, errors):
 	header's width, and no line can hold it there. An earlier line of a key that a later one gives a value loses nothing.
 
 	The lines a reader takes that are narrower than ``header`` are padded with it, each as a loose read already pads it: a
-	strict reader, which drops a narrower line, then takes them as it did at the old column count. Nothing else changes."""
+	strict reader, which drops a narrower line, then takes them all, those it dropped at the old column count too. Nothing
+	else changes."""
 	enc = encoding or 'utf8'
 	cells = _trimmedCells(cell.strip() for cell in raw[0].decode(enc, errors='replace').rstrip('\r\n').lstrip('\ufeff').split(delimiter)) if raw else []
 	if not cells or len(cells) >= len(header) or not _sameCells(cells, header[:len(cells)]):
@@ -7995,8 +7996,9 @@ class TSVZedLite(MutableMapping):
 			if self.verbose:
 				eprint(f"Key {key} deleted in memory")
 			return
-		if self.correctColumnNum <= 1 and _legacyDropKeys(self._fileName, [key], self.header, self.verifyHeader,
-														  self.encoding, self.delimiter):
+		# (asked of the file unless the program gave a count of two or more: correctColumnNum is only what the last read took)
+		if self._givenColumns <= 1 and _legacyDropKeys(self._fileName, [key], self.header, self.verifyHeader,
+													   self.encoding, self.delimiter):
 			# A lone key is a row in a one-column file: its lines went instead, and every offset after them moved.
 			held = [(k, v) for k, v in self.indexes.items() if k.startswith('#') and k != DEFAULTS_INDICATOR_KEY]  # (the rows memory alone holds)
 			self.reload()

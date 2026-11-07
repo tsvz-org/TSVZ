@@ -421,15 +421,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: the format next changes.
 - Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
 
-### A row deleted from a one-column file under wider defaults stays as its key
+### A row deleted from a one-column file under wider defaults or a wider header stays as its key
 - Kind: known limitation
 - What the operator sees: on a one-column file opened by a `TSVZed` with wider defaults (`a\nb\nc\t1\n`,
   `defaults=['#_defaults_#', 'P']`), a deleted row that held a value stays as `c<TAB>` after a rewrite
-  (`a\nb\nc\t\n#_defaults_#\tP\n`): the store shows it gone, a plain reader shows c with an empty value. `tsvz delete`, a
-  handler and a `TSVZedLite` ask the file, so they take the key's lines out and leave nothing.
+  (`a\nb\nc\t\n#_defaults_#\tP\n`): the store shows it gone, a plain reader shows c with an empty value. So with a wider
+  header: `id\na\t1\nb\n`, `header='id\tv'`, `del t['a']` leaves `id\na\t1\nb\na\t\n`. `tsvz delete`, a handler and a
+  `TSVZedLite` ask the file, so they take the key's lines out and leave nothing, whatever was read first.
 - Why: a file that stays one column has no way to mark that deletion, so it needs a format change.
 - Revisit when: the next format change.
-- Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
+- Approved: 2026-11-06, the user chose "Known limitation (Recommended)", and "Widen the entry (Recommended)" for the wider
+  header.
 
 ### pip 9 cannot upgrade from or uninstall 5.5 and earlier
 - Kind: known limitation
@@ -445,7 +447,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `Fatal Python error: _enter_buffered_busy: could not acquire lock for <_io.BufferedWriter name='<stdout>'> at interpreter
   shutdown`: the writer thread is printing to stdout while the interpreter finalizes. The rows are written: no data was lost
   in any run. In the review's runs 9 of 2,400 and 1 of 2,700 under load, then 5 of 2,400 on each of 3.14 and 3.6; `TSVZ_lock_test.py::test_an_exit_handler_that_runs_after_tsvz_still_writes[close]`
-  fails on it now and then. It is older than 5.6.
+  fails on it now and then. It is older than 5.6. It also hits a plain program with a neighbour appending every 2 ms, with no
+  exit handler of its own: 19 of 600 runs on 3.14, 29 of 600 on 3.6.
 - Why: the fix belongs in the writer thread's print (`__teePrintOrNot` reached from `_checkExternalChanges`), which must not
   touch a buffered stream while the interpreter is finalizing; this version does not change that path.
 - Revisit when: the next version: fix it at the writer thread's print.
@@ -456,3 +459,21 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: pip writes a plain `#!<python>` line into a script file and a `/bin/sh` wrapper only for an entry point. A launcher that delegates to the lowercase twin overwrites it on a case-insensitive disk under uv. One that execs `mcmd` or `mssh` works, but prints that name for `-V`, breaks `python3 $(which multiCMD)`, and TSVZ has no such sibling.
 - Revisit when: someone hits it.
 - Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
+
+### Memory can be short of a key another process appends to a file with no keyed line yet
+- Kind: deferred
+- What the operator sees: `id\n` opened with `header='id\tv'` has no keyed line, so the store's count is the header's, two.
+  Another process appends `a\n`: the store reads it as a deletion and memory stays `{}`, where a reopen takes one column from
+  that line and shows `a`. The line stays in the file, so no row is lost. The same at fa176f8.
+- Why: what is appended is read at the count memory holds, and a whole read takes the count from the first keyed line. The
+  store already reads whole for a one-column store emptied by another process; this needs the same for a file with no keyed line.
+- Revisit when: the next version.
+
+### A delete under a header narrower than line 1 can create a key
+- Kind: deferred
+- What the operator sees: `tsvz delete --x-header id F zz` on `id\tv\n# n\n` writes `zz`. A reader given `id` then shows the key
+  `zz`, which nobody set; a plain reader does not. The same at fa176f8; the review found 5.5 did more.
+- Why: line 1 is not the header given, so the command takes the file as having none, reads two columns from line 1 and writes
+  the delete as a line. A reader given `id` skips line 1 and takes its count from that line, one, where a lone key is a row.
+- Revisit when: the next version.
+

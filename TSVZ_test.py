@@ -15679,6 +15679,81 @@ def test_a_lite_delete_under_wider_defaults_asks_the_file(tmp_path):
 	assert _bytes(p) == b'a\nb\n'
 
 
+def _lite_reads(t, key, route):
+	"""Touch ``key`` of the TSVZedLite ``t`` by ``route``, the way a program does before it deletes."""
+	if route == 'contains':
+		assert key in t
+	elif route == 'get':
+		t[key]
+	elif route == 'iter':
+		list(t)
+	elif route == 'items':
+		list(t.items())
+
+
+@pytest.mark.parametrize('route', ['direct', 'contains', 'get', 'iter', 'items'])
+@pytest.mark.parametrize('data,kwargs,key,want', [(b'a\nb\nc\t1\n', dict(defaults=['#_defaults_#', 'P']), 'c', b'a\nb\n'),
+												  (b'id\na\t1\nb\n', dict(header='id\tv'), 'a', b'id\nb\n')],
+						 ids=['wider defaults', 'wider header'])
+def test_a_lite_delete_asks_the_file_whatever_was_read_first(tmp_path, data, kwargs, key, want, route):
+	# A read set the column count to the store's, and the delete took that for the file's: it appended a line that a plain
+	# reader shows as the key, where the same delete with no read took the key's lines out.
+	p = str(tmp_path / 's.tsv')
+	_touch(p, data)
+	t = TSVZ.TSVZedLite(p, strict=False, **kwargs)
+	_lite_reads(t, key, route)
+	del t[key]
+	t.close()
+	assert _bytes(p) == want
+
+
+def test_a_lite_pop_asks_the_file_too(tmp_path):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'a\nb\nc\t1\n')
+	t = TSVZ.TSVZedLite(p, defaults=['#_defaults_#', 'P'], strict=False)
+	assert t.pop('c')[:2] == ['c', '1']
+	t.close()
+	assert _bytes(p) == b'a\nb\n'
+
+
+def test_a_lite_delete_given_a_count_of_two_does_not_look_at_the_file(tmp_path, monkeypatch):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'a\t1\nb\t2\n')
+	t = TSVZ.TSVZedLite(p, correctColumnNum=2, strict=False)
+	monkeypatch.setattr(TSVZ, '_legacyDropKeys', lambda *args: pytest.fail('the delete asked the file'))
+	del t['a']
+	t.close()
+	assert b'a\t1\nb\t2\n' == _bytes(p)[:len(b'a\t1\nb\t2\n')] and list(TSVZ.readTabularFile(p, verbose=False)) == ['b']
+
+
+def test_a_rewrite_pads_the_defaults_line_to_a_line_1_wider_than_the_header(tmp_path):
+	# The rewrite's look at its lines starts from the count the store's read took, line 1's: from the first keyed line, here
+	# one cell, it padded nothing, and a strict reader at three columns would drop the defaults line.
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'id\tv\tw\na\n')
+	_rewritten(p, 'hardMapToFile', header='id', defaults=['#_defaults_#', 'P'])
+	assert _bytes(p).endswith(b'\n#_defaults_#\tP\t\n')
+
+
+def test_a_row_deleted_from_a_one_column_file_under_a_wider_header_stays_as_its_key(tmp_path):
+	# The second shape of the same known limitation: the store reads at two columns, the file stays one.
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'id\na\t1\nb\n')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	del t['a']
+	t.hardMapToFile()
+	t.close()
+	assert 'a' not in TSVZ.readTabularFile(p, header='id\tv', strict=False, verbose=False)
+	assert TSVZ.readTabularFile(p, verbose=False, strict=False)['a'] == ['a', '']
+
+
+def test_a_key_with_a_superseded_line_moves_after_the_rows_between_them_at_a_widening(tmp_path):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'id\nd\na\t1\nd\tx\n')
+	_rewritten(p, 'hardMapToFile', header='id\tv')
+	assert _bytes(p) == b'id\tv\na\t1\nd\tx\n'
+
+
 def test_no_two_commands_differ_only_in_case():
 	pytest.importorskip('setuptools', reason='needs setuptools to run setup.py')
 	# pip 9 (stock on EL7 and EL8) reads entry_points.txt with a parser that folds case, so two commands that differ only
