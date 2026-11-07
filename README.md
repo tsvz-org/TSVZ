@@ -315,6 +315,10 @@ The file formats are unchanged.
   that thread writes what it has to say straight to file descriptor 2: not to `sys.stdout`,
   `sys.stderr` or a `teeLogger`.
 
+- **On Python 3.6 a Ctrl-C at exit no longer drops a queued row.** One that landed as the exit's
+  wait took its lock back came out as "Failed to stop append thread ... release unlocked lock",
+  and the program ended without the row, or hung; it now reads as any Ctrl-C at exit does.
+
 - **"External changes detected" and "Time anomalies detected" print only with
   `verbose=True`.** They printed to stdout at every change another process made, whatever
   `verbose` said. A program that read them needs `verbose=True`. Warnings and errors print

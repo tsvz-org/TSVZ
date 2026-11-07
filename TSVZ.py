@@ -5278,6 +5278,16 @@ def getListView(tsvzDic,header = [],delimiter = ...):
 		else:
 			return [header] + values
 
+def _waited(event, timeout):
+	"""``event.wait(timeout)``, where a Ctrl-C is a KeyboardInterrupt on every Python. On 3.6 one that lands as the wait takes
+	its lock back leaves that lock let go of, and Event.wait() then ends with RuntimeError "release unlocked lock": an error
+	would stop the exit's wait for a queued row, where a Ctrl-C keeps it (_stopLiveStores)."""
+	try:
+		return event.wait(timeout)
+	except RuntimeError:
+		raise KeyboardInterrupt
+
+
 #: Every TSVZed and TSVZedLite not yet stopped, by id(): _stopLiveStores stops them at exit. Weak: a store
 #: stopped (its writer thread ended) and dropped is freed.
 _LIVE_STORES = weakref.WeakValueDictionary()
@@ -7227,7 +7237,7 @@ memoryOnly:{self.memoryOnly}
 		job = [fn, args, threading.Event(), None, None]
 		self._requests.append(job)
 		self._wake.set()
-		while not job[2].wait(0.1):  # in steps: a Ctrl-C stops the wait on every platform
+		while not _waited(job[2], 0.1):  # in steps: a Ctrl-C stops the wait on every platform
 			if not self._workerRuns():  # it stopped before it took the job
 				try:
 					self._requests.remove(job)
@@ -7508,7 +7518,7 @@ memoryOnly:{self.memoryOnly}
 		self._wake.set()
 		if self.appendThread is not threading.current_thread():
 			while self._workerRuns():
-				self._workerDone.wait(0.1)  # in steps: a Ctrl-C stops the wait on every platform (not join(): _workerRuns)
+				_waited(self._workerDone, 0.1)  # in steps: a Ctrl-C stops the wait on every platform (not join(): _workerRuns)
 		_LIVE_STORES.pop(id(self), None)
 
 	def _atExit(self):

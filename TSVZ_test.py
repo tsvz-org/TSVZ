@@ -15978,3 +15978,14 @@ def test_a_lone_key_a_reader_given_the_header_shows_goes_from_the_file(tmp_path)
 	assert _run('delete', p, 'a', '--x-header', 'id')[0] == 0
 	assert _bytes(p) == b'id\tv\n'
 	assert 'a' not in TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)
+
+
+def test_a_ctrl_c_that_python_3_6_turns_into_an_error_in_a_wait_stays_a_ctrl_c():
+	class Broken(object):
+		def wait(self, timeout):
+			raise RuntimeError('release unlocked lock')
+	with pytest.raises(KeyboardInterrupt):
+		TSVZ._waited(Broken(), 0.1)
+	done = threading.Event()
+	done.set()
+	assert TSVZ._waited(done, 0.1) is True
