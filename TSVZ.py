@@ -2316,8 +2316,8 @@ def _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, 
 	is damaged inside the header line (noted on ``reporter``: nothing more is read, L5). ``widening``, a store's own
 	read: a line 1 that extends ``header`` (the same leading cells, then others that are named) is a program's widening
 	of it, not a mismatch: it is the header, and the column count is its own. ``said``, a store's own reads: a list of one
-	item, the line 1 whose mismatch was last said; a loose read says it once for the line, as 3.39 does (a strict one
-	raises every time).
+	item, the line 1 whose mismatch was last said; a read says it once for the line, as 3.39 does (a strict one raises
+	before it is set).
 	"""
 	if not (any(header) and verifyHeader):
 		return correctColumnNum, 0
@@ -2338,7 +2338,7 @@ def _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, 
 		return (wider if correctColumnNum == -1 else correctColumnNum), 1
 	# A file that holds nothing (no byte, or only empty compressed streams) is an empty store with this header, as
 	# an append to it takes it (it writes the header first): not a header mismatch.
-	if said is not None and not strict and raw and said[0] == line:
+	if said is not None and raw and said[0] == line:
 		matches = _headerMatches(header, line, delimiter)  # (said already for this line)
 	else:
 		matches = not raw or _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter)
@@ -2986,7 +2986,7 @@ def _legacyHoldsHeader(line0, header, consumed, encoding, delimiter):
 				and _headerMatches(header, line0.decode(encoding or 'utf8', errors='replace').rstrip('\r\n'), delimiter))
 
 
-def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding):
+def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding, copied=None):
 	"""The legacy lines ``raw`` (bytes, without their newline) without the lines of each key of ``dropAt`` before the
 	index it gives (a row queued after a delete stays), and the key whose line moved up (or None), as a pair; line 1 is
 	left alone when a reader takes it for its header (``skipFirst``).
@@ -2999,7 +2999,12 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	with values moves up only when it is narrower than the first line left, as it reads where it was (_legacyMoved). The
 	file then reads at the count of its first line: the defaults lines narrower than it are padded (a strict reader would
 	drop them), and the bare ones after it go (a row that reset nothing at one column, a reset at this one), so every
-	reader sees the rows as before."""
+	reader sees the rows as before.
+
+	``copied``, a list a delete gives: when a defaults line lies between the place and a row with a value, the row also stays where it
+	was, and its key is added to the list. A reader whose column count is not the moved row's (a plain reader of a file
+	whose line 1 is wider) still reads the row after that line, filled from it; the copy in front sets the count of the
+	reader it moves up for. The file then holds the key twice, which reads as the last line (a store reading it is dirty)."""
 	enc = encoding or 'utf8'
 
 	def kindOf(line):
@@ -3040,7 +3045,12 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		name = kindOf(out[best])[1].rstrip()
 		line = _legacyMoved(out, place, best, delimiter, encoding)
 		rest = [other for other in out[place:best] if (kindOf(other)[1] or '').rstrip() != name]
-		out = out[:place] + [line] + rest + out[best + 1:]
+		# (a delete, with a defaults line in between: a row with a value stays where it was too, so a reader whose count is not the moved
+		# row's still reads it after that line, filled from it; the copy in front sets the count of the reader it moves up for)
+		keep = copied is not None and narrowest > 1 and any(kindOf(other)[0] == 'defaults' for other in out[place:best])
+		out = out[:place] + [line] + rest + out[best + (0 if keep else 1):]
+		if keep:
+			copied.append(name)
 	first = kindOf(out[place])[2]
 	if first > 1:
 		# (the file now reads at the count of its first line, which was 1: a defaults line narrower than it would be dropped
@@ -3184,7 +3194,7 @@ def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter, x
 		if lineOneIsRow:
 			kept = _legacyLinesWithoutLineOne(raw, drops, delimiter, encoding)
 		if kept is None:
-			kept = _legacyDropLines(raw, drops, consumed, fromLines, delimiter, encoding)[0]
+			kept = _legacyDropLines(raw, drops, consumed, fromLines, delimiter, encoding, [])[0]
 		return None if kept == raw else b''.join(line + b'\n' for line in kept)
 	if not os.path.isfile(fileName):
 		return False
@@ -3207,11 +3217,12 @@ def _legacyLinesWithoutLineOne(raw, drops, delimiter, encoding):
 	if kind != 'row' or key.rstrip() not in drops:
 		return None
 	if cells > 1:
-		kept = _legacyDropLines(raw, drops, True, True, delimiter, encoding)[0]
+		kept = _legacyDropLines(raw, drops, True, True, delimiter, encoding, [])[0]
 		d = delimiter.encode(enc)
 		return [raw[0].rstrip(b'\r').split(d)[0] + d * (cells - 1)] + kept[1:]
-	kept = _legacyDropLines(raw, drops, False, True, delimiter, encoding)[0]
-	if kept:
+	copied = []
+	kept = _legacyDropLines(raw, drops, False, True, delimiter, encoding, copied)[0]
+	if kept and not copied:  # (a copy in front of a row that stays: that reader still reads the row where it was)
 		kind, _, cells, _ = kindOf(kept[0])
 		theirs = next((n for _, _, n, _ in map(kindOf, raw[1:])), -1)  # (a comment, if line 2, would be kept[0])
 		if kind != 'skip' and (cells > 1 or theirs == 1):  # (else a lone key: a deletion to them)
@@ -6933,6 +6944,9 @@ memoryOnly:{self.memoryOnly}
 				end = f.tell()  # its own bytes end here: a writer that takes no lock may append after them
 				self._damaged = self._remake = False
 				self.dirty = self.deSynced = False
+				# (a store left with no row may hold a file with no keyed line, whatever column count it had: its next keyed
+				# line sets the count, which a whole read takes, _syncFrom)
+				self._widthOpen = not self
 				if getattr(lines, 'widened', False):
 					self._readWidened(f)
 			except BaseException:

@@ -195,7 +195,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   A delete is the exception to that promise, even for a reader that holds the same header as the command. Under
   `--x-header H` (`tsvz delete`, `pop`, `popitem`, a handler given H) with line 1 not H, line 1 is a row to the command
   and a reader given H skips it, and a delete can change how a later lone key reads to that reader: `x\na\t\nb\n`, delete
-  `a`, and a reader given H goes from no keys to `{b}`. On a 3.39 reader the same cause can lose a cell: `id\na\t\nb\nb\t1\n`
+  `a`, and a reader given H goes from no keys to `{b}`; it can also gain a default-filled cell (`id\na\t\n#_defaults_#\t\tQ\nb\t1\n`,
+  H `id\tv`, delete `a`: `b` goes from `[b, 1]` to `[b, 1, Q]`). On a 3.39 reader the same cause can lose a cell: `id\na\t\nb\nb\t1\n`
   under H `id\tv`, `b` goes from `[b, 1]` to `[b]`. 5.6 does this in nearly all the same cases.
 - Why: what is dead depends on the reader; keeping every line any reader could need would keep most of the lines a
   compaction exists to drop. For the delete: padding the next lone key (`b<TAB>`) is untried, and would make tsvz-rs read `b`
@@ -208,16 +209,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   5.6 (a file of one column); 2026-11-06, "Known limitation (Recommended)" for each of the three cell cases above.
   2026-11-07, the user chose "Known limitation (Recommended)" for the delete case.
 
-### A stdout nobody reads still aborts at exit
+### A stdout nobody reads can abort or hold the exit
 - Kind: known limitation
 - What the operator sees: a verbose `TSVZed` (one that prints) whose program's stdout nobody reads (a full pipe, a stopped
-  reader) ends with `Fatal Python error: _enter_buffered_busy` and exit status -6 (134 in a shell), after about 7 s (2 s at 5.6).
-  No row is lost. The exit's wait (up to 5 s for a print under way, then the thread writes to file descriptor 2) helps only a
-  reader that is slow but still moving.
-- Why: the writer thread is frozen by the interpreter's end inside a print that holds the stream's lock, and nothing safe can
-  free a stream lock held by a frozen thread.
+  reader) either ends with `Fatal Python error: _enter_buffered_busy` and exit status -6 (134 in a shell), after about 7 s
+  (2 s at 5.6), or, when the writer thread is inside a print just as the exit starts, the exit waits with no limit until
+  something reads stdout. A second Ctrl-C then abandons the write in progress, as "A second Ctrl-C at exit abandons a write in
+  progress" says. No row is lost. 5.6 does the same. The exit's wait (up to 5 s for a print under way, then the thread writes
+  to file descriptor 2) helps only a reader that is slow but still moving.
+- Why: nothing safe can free a stream lock held by a frozen thread, and bounding the wait would give up a write that may not
+  be on disk yet.
 - Revisit when: someone hits it.
-- Approved: 2026-11-07, the user chose "Known limitation (Recommended)".
+- Approved: 2026-11-07, the user chose "Known limitation (Recommended)", first for the abort and again for the corrected
+  wording that includes the wait.
 
 ### tsvz-rs lists a key deleted from an emptied line 1
 - Kind: known limitation
@@ -230,18 +234,28 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: the spec's deletion rule changes, or someone reads such files with tsvz-rs.
 - Approved: 2026-11-07, the user chose "Known limitation (Recommended)".
 
-### A delete over a #_defaults_# line can empty a plain reader's default-filled cell
+### A caller's checkExternalChanges() can miss an append that lands as the writer thread looks
 - Kind: deferred (5.08)
-- What the operator sees: `tsvz delete --x-header id F a` on `id<TAB>v<TAB>w`, `a`, `#_defaults_#<TAB><TAB>Q`, `b<TAB>1`
-  writes `id<TAB>v<TAB>w`, `b<TAB>1`, `#_defaults_#<TAB><TAB>Q`: a reader given `id` still reads `b` as `[b, 1]`, but a plain
-  reader (its column count from line 1) goes from `[b, 1, Q]` to `[b, 1, ]`, where it was clean at 5.6. The delete sweep has
-  25 such cases (15 where a reader loses a cell, 10 where one gains one; 6 of the losses are a plain reader's).
-- Why: the delete moves the narrowest row up in front of the defaults line, so the reader given `id` (whose column count is
-  its first keyed line's) keeps its count and its lone keys. The plain reader fills `b`'s third cell from the defaults only
-  when the defaults line comes first. No file does both: a first line of two cells keeps one reader's count, and a first line
-  that is the defaults line (three cells) makes a strict reader of the first drop `b` and turns its lone keys into
-  deletions.
-- Revisit when: 5.08. It takes a choice of which reader keeps its cells, or a defaults line that does not set the count.
+- What the operator sees: a `TSVZed` whose `checkExternalChanges()` is called just as another process appends to the file can
+  miss that append until the next check: the append shows only after the next change or call. No row is lost. 8 of 7680 runs
+  of the follow sweep at 5.07, 6 of 7680 at 5.6.
+- Why: the writer thread's tick reads the old size while the other process's `write(2)` has set the modification time but not
+  yet extended the file, notes the file as seen and clears `deSynced`. The caller's `checkExternalChanges()` returns early on
+  `if self.deSynced: return self`, so it misses the append. The proposed fix is to drop that early return (reasoned, not
+  tested). The sweep that finds it must run in a directory on a disk, not on tmpfs, where times are finer.
+- Revisit when: 5.08.
+
+### A rewrite of a one-column file with a queued delete can leave line 1 narrower than the header
+- Kind: deferred (5.08)
+- What the operator sees: `TSVZed(p, header='id\tv')` on `id`, `a`, `a`, `a` (one cell each), `del t['a']`, then
+  `hardMapToFile()` or `rewrite(force=True)` leaves `id\n` in 10 to 40% of runs instead of `id\tv\n`; a second rewrite widens
+  it. Also in 5.6 and 5.07 before this round. No row is lost.
+- Why: found, not fixed. The rewrite decides whether to widen line 1 (`_legacyWidened`) on the file's lines with the queued
+  delete's key still in them, where the lone `a` lines are rows of a one-column file and widening would lose them; the
+  delete's lines go only after. When the writer thread's tick commits the delete first (a race), the rewrite sees a file with
+  no such lines and widens. Forcing the rewrite to meet the queue (the tick committing nothing) gives `id\n` in 40 of 40
+  runs; committing first gives `id\tv\n` in 60 of 60. A fix would drop the queued delete's lines before the widening is decided.
+- Revisit when: 5.08.
 
 ### A file whose first keyed line is a bare #_defaults_# reads as one column without defaults
 - Kind: known limitation

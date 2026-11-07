@@ -315,8 +315,10 @@ The file formats are unchanged.
   then to the interpreter's end that thread writes what it has to say straight to file
   descriptor 2: not to `sys.stdout`, `sys.stderr` or a `teeLogger`. That helps a reader that
   is slow but still reading. A verbose store whose stdout nobody reads (a full pipe, a
-  stopped reader) still ends with that error, now after about 7 s (2 s at 5.6); no row is
-  lost. See [docs/limitations.md](docs/limitations.md).
+  stopped reader) either still ends with that error, now after about 7 s (2 s at 5.6), or,
+  when the writer thread is inside a print just as the exit starts, makes the exit wait with
+  no limit until something reads stdout (a second Ctrl-C abandons the write in progress, as
+  on any exit); 5.6 does the same. No row is lost. See [docs/limitations.md](docs/limitations.md).
 
 - **On Python 3.6 a Ctrl-C at exit no longer drops a queued row.** One that landed as the exit's
   wait took its lock back came out as "Failed to stop append thread ... release unlocked lock",
@@ -355,11 +357,12 @@ The file formats are unchanged.
     `#\nb\t1\n`. A scrub keeps the comment, as it keeps every line 1. A line 1 of two cells or
     more stays as wide, emptied, when no line can delete it: `a\t1\nb\n` becomes `a\t\nb\n`.
   - What it cannot always keep: a delete can change how a later lone key reads to a reader
-    given the same `H` (`x\na\t\nb\n`, delete `a`: it goes from no keys to `b`), and a
-    default-filled cell of a plain reader can turn empty (`id\tv\tw\na\n#_defaults_#\t\tQ\nb\t1\n`,
-    delete `a`: `b` reads `[b, 1, Q]` to a reader given nothing, then `[b, 1, '']`). The emptied
-    line 1 (`a\t`) is a deletion to `tsvz`; tsvz-rs lists `a` with an empty value, as its spec
-    makes only a line with no delimiter a deletion. See
+    given the same `H` (`x\na\t\nb\n`, delete `a`: it goes from no keys to `b`), and that
+    reader can gain a default-filled cell (`id\na\t\n#_defaults_#\t\tQ\nb\t1\n`, `H` = `id\tv`,
+    delete `a`: `b` goes from `[b, 1]` to `[b, 1, Q]`). The emptied line 1 (`a\t`) is a
+    deletion to `tsvz`; tsvz-rs lists `a` with an empty value, as its spec makes only a line
+    with no delimiter a deletion. A row that moves up over a defaults line stays where it was
+    too (`b\t1\n#_defaults_#\t\tQ\nb\t1\n`), so a file can hold a key twice. See
     [docs/limitations.md](docs/limitations.md).
 
 ## Upgrading to 5.6 from 5.5
