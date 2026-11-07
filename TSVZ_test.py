@@ -16156,19 +16156,20 @@ def test_a_key_on_line_1_that_ends_in_whitespace_goes_for_the_key_without_it(tmp
 	assert list(TSVZ.readTabularFile(p, strict=False, verbose=False)) == []
 
 
-@pytest.mark.parametrize('data, xHeader, want', [
-	(b'a\na\nb\n', True, b'#\nb\n'),  # (line 1 is not the header: a row to the command)
-	(b'a\na\nb\n', False, b'a\nb\n'),  # (a caller that holds no --x-header: line 1 is skipped for the header given)
-	(b'id\na\nb\n', True, b'id\nb\n'),  # (line 1 is the header)
-	(b' id \na\nb\n', True, b' id \nb\n'),  # (the cells equal once the whitespace around them is taken off)
-	(b'\na\nb\n', True, b'\nb\n'),  # (a line 1 with nothing on it is no row)
+@pytest.mark.parametrize('data, key, xHeader, want', [
+	(b'a\na\nb\n', 'a', True, b'#\nb\n'),  # (line 1 is not the header: a row to the command)
+	(b'a\na\nb\n', 'a', False, b'a\nb\n'),  # (a caller that holds no --x-header: line 1 is skipped for the header given)
+	(b'id\na\nb\n', 'a', True, b'id\nb\n'),  # (line 1 is the header)
+	(b' id \na\nb\n', 'a', True, b' id \nb\n'),  # (the cells equal once the whitespace around them is taken off)
+	(b'id\nb\n', 'id', True, b'id\nb\n'),  # (the header is no row, whatever the caller was told when it read)
+	(b'\na\nb\n', 'a', True, b'\nb\n'),  # (a line 1 with nothing on it is no row)
 ])
-def test_whether_line_1_is_a_row_to_a_delete_is_decided_on_the_file_it_writes(tmp_path, data, xHeader, want):
+def test_whether_line_1_is_a_row_to_a_delete_is_decided_on_the_file_it_writes(tmp_path, data, key, xHeader, want):
 	# The command read line 1 under the read lock before; another process may have changed it by the time the write holds
 	# the rewrite lock. Decided there, on the line the write is made from.
 	p = str(tmp_path / 's.tsv')
 	_touch(p, data)
-	assert TSVZ._legacyDropKeys(p, ['a'], ['id'], True, 'utf8', '\t', xHeader) is True
+	assert TSVZ._legacyDropKeys(p, [key], ['id'], True, 'utf8', '\t', xHeader) is True
 	assert _bytes(p) == want
 
 
