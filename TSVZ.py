@@ -400,12 +400,12 @@ def _say(write, message):
 		pass
 
 
-def _closeStreamsToDaemons():
-	"""Keep daemon threads out of the streams from here to the interpreter's end (_say), and wait for a print under way
-	(is_alive(): a thread a fork left behind in one is not there to end it)."""
+def _closeStreamsToDaemons(wait=None):
+	"""Keep daemon threads out of the streams from here to the interpreter's end (_say), and wait for a print under way,
+	``wait`` seconds (None: _DAEMON_PRINT_WAIT) at most (is_alive(): a thread a fork left behind in one is not there to end it)."""
 	global _daemonsOut
 	_daemonsOut = True
-	deadline = time.monotonic() + _DAEMON_PRINT_WAIT
+	deadline = time.monotonic() + (_DAEMON_PRINT_WAIT if wait is None else wait)
 	while any(thread.is_alive() for thread in list(_daemonsPrinting)) and time.monotonic() < deadline:
 		time.sleep(0.001)
 
@@ -2081,8 +2081,10 @@ def _legacyExtendsHeader(header, line, delimiter):
 	(_lineOneCells), then others that are named; else 0. A store reads such a file at that count, loose: what its whole
 	read does (_legacyReadHeader) and its rewrite's look at the same lines (_snapshotForRewrite) both ask here."""
 	cells = _lineOneCells(line, delimiter)
-	return len(cells) if (len(cells) > len(header) and _sameCells(header, cells[:len(header)])
-						  and all(cells[len(header):])) else 0
+	# (compared trimmed, but counted as the line is: a strict reader with no header counts its empty cells at the end too, and
+	# drops a row of fewer cells than that)
+	return len(line.rstrip('\r\n').split(delimiter)) if (len(cells) > len(header) and _sameCells(header, cells[:len(header)])
+														  and all(cells[len(header):])) else 0
 
 
 def _headerMatches(header, line, delimiter):
@@ -5273,7 +5275,7 @@ _LIVE_STORES = weakref.WeakValueDictionary()
 def _stopLiveStores():
 	"""At exit, stop every store still running (_atExit: a TSVZed's last rewrite and appends), letting a write in
 	progress finish: a first Ctrl-C meanwhile keeps waiting for it, and says so; a second abandons it."""
-	interrupted = False
+	interrupted = abandoned = False
 	try:
 		for store in reversed(list(_LIVE_STORES.values())):  # the last made first, as atexit runs its own
 			try:
@@ -5285,11 +5287,14 @@ def _stopLiveStores():
 				eprint(f"TSVZ: the write to {store._fileName} is being finished; Ctrl-C again to abandon it")
 				store._finish()
 	except BaseException:
+		abandoned = True
 		for store in list(_LIVE_STORES.values()):
 			store._letGo = True  # abandoned: no writer thread starts a write the interpreter's end would cut short
 		raise
 	finally:
-		_closeStreamsToDaemons()  # (after the stores: what a last write of theirs reports is still printed)
+		# (after the stores: what a last write of theirs reports is still printed; an abandon ends the program at once, so the
+		# door shuts without waiting for a print under way)
+		_closeStreamsToDaemons(0 if abandoned else None)
 
 
 atexit.register(_stopLiveStores)
@@ -6897,8 +6902,8 @@ memoryOnly:{self.memoryOnly}
 				# (a store left with no row may hold a file with no keyed line, whatever column count it had: its next keyed
 				# line sets the count, which a whole read takes, _syncFrom)
 				self._widthOpen = not self
-				if getattr(lines, 'widened', False):
-					self._readWidened(f)
+				if getattr(lines, 'widened', False) or not self:
+					self._readWidened(f)  # (no row left: the column count is what the file now says, as a reopen takes it)
 			except BaseException:
 				if started:
 					self.dirty = self.deSynced = True  # made again from memory by the next rewrite

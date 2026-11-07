@@ -321,6 +321,10 @@ The file formats are unchanged.
 - **On Python 3.6 a Ctrl-C at exit no longer drops a queued row.** One that landed as the exit's
   wait took its lock back came out as "Failed to stop append thread ... release unlocked lock",
   and the program ended without the row, or hung; it now reads as any Ctrl-C at exit does.
+  The same holds for a Ctrl-C during any other wait for a store's writer thread (a
+  `checkExternalChanges()`, `rewrite()`, `clear()` and the like): a `KeyboardInterrupt` where
+  3.6 raised `RuntimeError: release unlocked lock`. A `RuntimeError` of another kind is raised
+  as it is.
 
 - **"External changes detected" and "Time anomalies detected" print only with
   `verbose=True`.** They printed to stdout at every change another process made, whatever
@@ -330,15 +334,25 @@ The file formats are unchanged.
 - **A strict store follows a widened line 1 with a byte order mark or empty cells at its
   end.** `\ufeffid\tv\tw` and `id\tv\tw\t` under `header='id\tv'` raised "Header mismatch",
   though a rewrite widens such a line 1 the other way. One rule now answers both, and the
-  line stays as it is in the file. A loose store reads such a file padded, three columns wide,
-  where it took its count from the rows.
+  line stays as it is in the file. A loose store reads such a file padded, as wide as line 1
+  counts its cells, empty ones at its end too (`id\tv\tw\t` is four columns wide), where it took
+  its count from the rows; a row it adds is written that wide, so a strict reader given no header
+  keeps it.
 
 - **A store that holds no row reads what another process appends as a reopen does.** The
   count comes from the first keyed line: `id\n` under `header='id\tv'`, then another
   process's `a\n`, shows `a` (it read as a deletion, and memory stayed empty). Each change is
   read whole only while the store holds no row and the last whole read took no column count
   from the file (no keyed line yet, or a file emptied at one column); with a count or a row,
-  only what follows is read, as before.
+  only what follows is read, as before. A store's own whole write that leaves it with no row
+  (`clear()`, or a rewrite of a store whose rows were all deleted) is followed the same way,
+  and the store then takes the column count a reopen would from the file it wrote (time
+  only: a few reads of the file, and a row set after the clear is shaped at the new count).
+
+- **"Header mismatch" is said once for a line 1, across all of a store's reads.** A `TSVZed`
+  whose line 1 is not its header used to say it at every whole read of the file (46 times for
+  45 appends beside it); it now says it once for that line 1, an explicit `reload()` included,
+  and again if line 1 becomes another line. A strict store still raises at every read.
 
 - **Deletes write what 5.6 writes.** `tsvz delete`, `pop` and `popitem` (with or without
   `--x-header`, `--x-strict` or `--x-defaults`), a `tsvz serve` handler, a `TSVZedLite` delete

@@ -14428,6 +14428,25 @@ def test_a_store_that_holds_no_row_but_has_a_column_count_reads_only_what_follow
 	t.close()
 
 
+@pytest.mark.parametrize('text, row', [(b'id\n#_defaults_#\n', ['d']), (b'a\nb\t1\t2\n', ['d', '1'])])
+def test_a_store_that_cleared_its_file_shapes_the_next_rows_at_the_count_a_reopen_takes(tmp_path, text, row):
+	# The count at open (1, or 3) is not the cleared file's (`id\tv`: 2): a row set after the clear was shaped at the old
+	# count, written as a deletion or with an empty cell at its end, and a reopen read it otherwise.
+	p = str(tmp_path / 'c.tsv')
+	_touch(p, text)
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	t.clear()
+	t['d'] = ['d', '1', '2']
+	t.commitAppendToFile()
+	t['d'] = row
+	t.commitAppendToFile()
+	mem = dict(t)
+	t.close()
+	r = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	assert dict(r) == mem and ('d' in r) == (len(row) == 2), _bytes(p)  # (a one-cell row is a deletion at two columns)
+	r.close()
+
+
 @pytest.mark.parametrize('data, kw, how', [
 	(b'a\t1\n', {}, 'clear'), (b'x\na\t1\n', {'header': 'id'}, 'clear'), (b'x\ta\na\t1\n', {'header': 'id'}, 'clear'),
 	(b'a\t1\n', {}, 'delete-force'), (b'a\t1\n', {}, 'delete-hard'), (b'a\t1\n', {}, 'delete-map'),
@@ -16058,6 +16077,37 @@ def test_a_ctrl_c_that_abandons_a_write_at_exit_still_shuts_the_door(capsys, mon
 	assert TSVZ._daemonsOut and store._letGo
 
 
+@pytest.mark.parametrize('abandon', [True, False])
+def test_the_exit_that_abandons_a_write_does_not_wait_for_a_print_under_way(monkeypatch, abandon):
+	# "A second Ctrl-C ends the program at once": 7 s from it to the end at 5.07 (the stuck print's 5 s wait), 2 s at 5.06.
+	# Without an abandon the exit still waits for the print, up to its bound.
+	store = _InterruptedStore()
+	if not abandon:
+		store._atExit = lambda: None
+	monkeypatch.setattr(TSVZ, '_LIVE_STORES', {1: store})
+	monkeypatch.setattr(TSVZ, '_daemonsOut', False)
+	monkeypatch.setattr(TSVZ, '_daemonsPrinting', set())
+	monkeypatch.setattr(TSVZ, '_DAEMON_PRINT_WAIT', 0.5)
+	release, inside = threading.Event(), threading.Event()
+
+	def stuck():
+		inside.set()
+		release.wait(30)
+	thread = threading.Thread(target=lambda: TSVZ._say(stuck, 'x'), daemon=True)
+	thread.start()
+	assert inside.wait(30)
+	begun = time.monotonic()
+	try:
+		TSVZ._stopLiveStores()
+	except KeyboardInterrupt:
+		assert abandon
+	took = time.monotonic() - begun
+	release.set()
+	thread.join(30)
+	assert TSVZ._daemonsOut
+	assert (took < 0.4) if abandon else (took >= 0.5)
+
+
 def test_a_daemon_thread_whose_descriptor_2_cannot_be_written_says_nothing_and_fails_nothing(monkeypatch):
 	real = os.write
 
@@ -16113,14 +16163,17 @@ def test_a_change_seen_in_a_tsvz_store_is_news_only_to_a_verbose_one(tmp_path, c
 	assert ('External changes detected in ' in out) == verbose and (verbose or out == '')
 
 
-@pytest.mark.parametrize('data', [b'\xef\xbb\xbfid\tv\tw\na\t1\t2\nb\t3\n', b'id\tv\tw\t\na\t1\t2\nb\t3\n',
-								  b'\xef\xbb\xbfid\tv\tw\t \t\r\na\t1\t2\nb\t3\n'], ids=['bom', 'trailing-cell', 'both'])
-def test_a_strict_store_follows_a_widening_as_the_rewrite_tells_one(tmp_path, data):
-	# One answer: the exact rule that widens a line 1 with a byte order mark or an empty cell at its end follows one too.
+@pytest.mark.parametrize('data, count', [(b'\xef\xbb\xbfid\tv\tw\na\t1\t2\nb\t3\n', 3), (b'id\tv\tw\t\na\t1\t2\nb\t3\n', 4),
+										 (b'\xef\xbb\xbfid\tv\tw\t \t\r\na\t1\t2\nb\t3\n', 5)], ids=['bom', 'trailing-cell', 'both'])
+def test_a_strict_store_follows_a_widening_as_the_rewrite_tells_one(tmp_path, data, count):
+	# One answer: the exact rule that widens a line 1 with a byte order mark or an empty cell at its end follows one too. The
+	# count is the line's own, its empty cells at the end included: a strict reader with no header counts so, and drops a
+	# row of fewer cells.
 	p = str(tmp_path / 's.tsv')
 	_touch(p, data)
 	t = TSVZ.TSVZed(p, header='id\tv', strict=True, verbose=False, append_check_delay=60)
-	assert t.correctColumnNum == 3 and dict(t) == {'a': ['a', '1', '2'], 'b': ['b', '3', '']}
+	pad = [''] * (count - 3)
+	assert t.correctColumnNum == count and dict(t) == {'a': ['a', '1', '2'] + pad, 'b': ['b', '3', ''] + pad}
 	t['c'] = ['c', '4', '5']
 	t.hardMapToFile()
 	t.close()
@@ -16128,6 +16181,25 @@ def test_a_strict_store_follows_a_widening_as_the_rewrite_tells_one(tmp_path, da
 	again = TSVZ.TSVZed(p, header='id\tv', strict=True, verbose=False, append_check_delay=60)
 	assert list(again) == ['a', 'b', 'c']
 	again.close()
+
+
+@pytest.mark.parametrize('data, header, row', [(b'id\tv\t\na\t1\tx\n', 'id', ['c', '4']),
+											   (b'id\tv\tw\t\na\t1\t2\tz\n', 'id\tv', ['c', '4', '5'])])
+@pytest.mark.parametrize('how', ['append', 'rewrite'])
+def test_a_row_a_store_adds_under_a_line_1_with_empty_cells_at_its_end_is_kept_by_every_reader(tmp_path, data, header, row, how):
+	# The store counted 2 for `id\tv\t` and appended `c\t4`; a strict reader given no header counts 3 and dropped it.
+	p = str(tmp_path / 's.tsv')
+	_touch(p, data)
+	t = TSVZ.TSVZed(p, header=header, verbose=False, append_check_delay=60)
+	t['c'] = row
+	if how == 'rewrite':
+		t.hardMapToFile()
+	t.close()
+	for kw in ({}, {'strict': True}, {'header': header, 'strict': False}):  # (a strict read with a header line 1 is not: an error, as ever)
+		assert 'c' in TSVZ.readTabularFile(p, verbose=False, **kw), (kw, _bytes(p))
+	lite = TSVZ.TSVZedLite(p, verbose=False)
+	assert 'c' in lite
+	lite.close()
 
 
 @pytest.mark.parametrize('data', [b'id\tv\t\tw\na\t1\n', b'id\tx\tw\na\t1\n'], ids=['gap', 'other-cell'])
