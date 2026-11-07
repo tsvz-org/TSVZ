@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.6**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.7**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -301,6 +301,45 @@ with no header (or `verifyHeader=False`), anything written to a file the damage 
 empty; the keys it sets or deletes then take its values, and the keys it left out keep
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
+
+## Upgrading to 5.7 from 5.6
+
+The file formats are unchanged.
+
+- **A program no longer dies at exit beside a store's writer thread.** A `TSVZed`'s writer
+  thread, a daemon, could be inside a print as the interpreter ended, and the program then
+  ended with `Fatal Python error: _enter_buffered_busy` and exit status 134 (no row was lost).
+  Now the exit waits for a print under way, up to 5 s, and from then to the interpreter's end
+  that thread writes what it has to say straight to file descriptor 2: not to `sys.stdout`,
+  `sys.stderr` or a `teeLogger`.
+
+- **"External changes detected" and "Time anomalies detected" print only with
+  `verbose=True`.** They printed to stdout at every change another process made, whatever
+  `verbose` said. A program that read them needs `verbose=True`. Warnings and errors print
+  as before.
+
+- **A strict store follows a widened line 1 with a byte order mark or empty cells at its
+  end.** `\ufeffid\tv\tw` and `id\tv\tw\t` under `header='id\tv'` raised "Header mismatch",
+  though a rewrite widens such a line 1 the other way. One rule now answers both, and the
+  line stays as it is in the file. A loose store reads such a file padded, three columns wide,
+  where it took its count from the rows.
+
+- **A store that holds no row reads what another process appends as a reopen does.** The
+  count comes from the first keyed line: `id\n` under `header='id\tv'`, then another
+  process's `a\n`, shows `a` (it read as a deletion, and memory stayed empty). It costs a
+  whole read of the file for each change while the store holds no row.
+
+- **`tsvz delete`, `pop` and `popitem` with `--x-header H`, on a file whose line 1 is not
+  `H`, ask the file's width with `H`, as a reader given `H` takes the file.** Line 1 stays a
+  row to the command, and a deletion now reads the same to every reader:
+  - a key nobody set is no longer made: `tsvz delete --x-header id F zz` on `id\tv\n# n\n`
+    leaves the file as it is (it wrote `zz`, a row to a reader given `id`);
+  - a lone key that reader shows goes from the file: `a` of `id\tv\na\n` (a line `a` there
+    was a second copy of it to that reader);
+  - a delete of line 1 in a one-column file leaves a bare `#` comment in its place when the next line
+    would otherwise become line 1: `tsvz delete --x-header id F a` on `a\nb\t1\n` leaves
+    `#\nb\t1\n`, so a reader given `id`, which skips line 1, still shows `b`. A scrub keeps
+    the comment, as it keeps every line 1.
 
 ## Upgrading to 5.6 from 5.5
 

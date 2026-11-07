@@ -268,8 +268,8 @@ def test_basic_roundtrip():
 
 def test_version():
 	# (the scripts report the full form; pip and PyPI show it as 5.5)
-	assert TSVZ.version == '5.06'
-	assert TSVZ.__version__ == '5.06'
+	assert TSVZ.version == '5.07'
+	assert TSVZ.__version__ == '5.07'
 	assert not hasattr(TSVZ, 'WalStore')
 
 
@@ -15773,3 +15773,202 @@ def test_no_two_commands_differ_only_in_case():
 	assert 'scripts/TSVZ' in sources
 	with open(os.path.join(root, 'scripts', 'TSVZ'), encoding='utf-8') as f:
 		assert f.read().startswith('#!')
+
+
+# --------------------------------------------------------------------------
+# 5.7: no print from a daemon thread at the interpreter's end; one rule for line 1, one column count for a delete
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize('verbose, shown', [(False, ''), (True, 'External changes detected in ')])
+def test_a_change_seen_is_news_only_to_a_verbose_store(tmp_path, capsys, verbose, shown):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'id\tv\na\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	t.verbose = verbose
+	capsys.readouterr()
+	with open(p, 'ab') as f:
+		f.write(b'b\t2\n')
+	t.checkExternalChanges()
+	out = capsys.readouterr().out
+	t.verbose = False
+	t.close()
+	assert shown in out and (verbose or out == '')
+
+
+class _Recorder(object):
+	def __init__(self):
+		self.lines = []
+
+	def teelog(self, message, level='info', **kwargs):
+		self.lines.append(message)
+
+
+def _in_a_daemon_thread(fn):
+	thread = threading.Thread(target=fn, daemon=True)
+	thread.start()
+	thread.join(30)
+	assert not thread.is_alive()
+
+
+def test_past_the_exit_a_daemon_thread_stays_out_of_the_streams(capfd, monkeypatch):
+	# A thread frozen in a print keeps the stream's lock, and the interpreter's last flush dies on it. Only the system call.
+	class Stream(object):
+		def write(self, text):
+			pytest.fail('a stream was entered')
+
+		def flush(self):
+			pass
+	logger = _Recorder()
+	monkeypatch.setattr(TSVZ, '_daemonsOut', True)
+	real = sys.stdout, sys.stderr
+	sys.stdout = sys.stderr = Stream()
+	try:
+		_in_a_daemon_thread(lambda: TSVZ.eprint('one', 'two'))
+		_in_a_daemon_thread(lambda: TSVZ._warn('three', logger))
+		_in_a_daemon_thread(lambda: getattr(TSVZ, '__teePrintOrNot')('four', teeLogger=logger))
+	finally:
+		sys.stdout, sys.stderr = real
+	assert logger.lines == [] and capfd.readouterr().err == 'one two\nthree\nfour\n'
+	TSVZ.eprint('another thread prints as ever')
+	assert capfd.readouterr().err == 'another thread prints as ever\n'
+
+
+def test_before_the_exit_a_daemon_thread_prints_as_ever(capsys):
+	_in_a_daemon_thread(lambda: TSVZ.eprint('one'))
+	assert capsys.readouterr().err == 'one\n'
+
+
+def test_the_exit_waits_for_a_print_under_way_and_no_longer_than_its_bound(monkeypatch):
+	monkeypatch.setattr(TSVZ, '_daemonsOut', False)
+	monkeypatch.setattr(TSVZ, '_DAEMON_PRINT_WAIT', 0.05)
+	release = threading.Event()
+	inside = threading.Event()
+
+	def stuck():
+		inside.set()
+		release.wait(30)
+	thread = threading.Thread(target=lambda: TSVZ._say(stuck, 'x'), daemon=True)
+	thread.start()
+	assert inside.wait(30)
+	begun = time.monotonic()
+	TSVZ._closeStreamsToDaemons()
+	assert time.monotonic() - begun >= 0.05 and TSVZ._daemonsPrinting
+	release.set()
+	thread.join(30)
+	assert not TSVZ._daemonsPrinting
+
+
+@pytest.mark.parametrize('data', [b'\xef\xbb\xbfid\tv\tw\na\t1\t2\nb\t3\n', b'id\tv\tw\t\na\t1\t2\nb\t3\n',
+								  b'\xef\xbb\xbfid\tv\tw\t \t\r\na\t1\t2\nb\t3\n'], ids=['bom', 'trailing-cell', 'both'])
+def test_a_strict_store_follows_a_widening_as_the_rewrite_tells_one(tmp_path, data):
+	# One answer: the exact rule that widens a line 1 with a byte order mark or an empty cell at its end follows one too.
+	p = str(tmp_path / 's.tsv')
+	_touch(p, data)
+	t = TSVZ.TSVZed(p, header='id\tv', strict=True, verbose=False, append_check_delay=60)
+	assert t.correctColumnNum == 3 and dict(t) == {'a': ['a', '1', '2'], 'b': ['b', '3', '']}
+	t['c'] = ['c', '4', '5']
+	t.hardMapToFile()
+	t.close()
+	assert _bytes(p).startswith(data[:data.index(b'\n') + 1])
+	again = TSVZ.TSVZed(p, header='id\tv', strict=True, verbose=False, append_check_delay=60)
+	assert list(again) == ['a', 'b', 'c']
+	again.close()
+
+
+@pytest.mark.parametrize('data', [b'id\tv\t\tw\na\t1\n', b'id\tx\tw\na\t1\n'], ids=['gap', 'other-cell'])
+def test_a_strict_store_still_refuses_what_is_no_widening(tmp_path, data):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, data)
+	with pytest.raises(ValueError, match='Header mismatch'):
+		TSVZ.TSVZed(p, header='id\tv', strict=True, verbose=False, append_check_delay=60)
+
+
+@pytest.mark.parametrize('line1', [b'id\n', b''], ids=['start-of-header', 'nothing'])
+def test_a_lone_key_appended_to_a_file_with_no_keyed_line_reads_as_a_reopen_reads_it(tmp_path, line1):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, line1)
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	assert dict(t) == {}
+	with open(p, 'ab') as f:
+		f.write(b'a\n')
+	_follow(t)
+	reopened = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60, rewrite_on_load=False)
+	assert dict(t) == dict(reopened)
+	reopened.close()
+	t.close()
+	if line1:
+		assert 'a' in t
+
+
+def test_a_row_appended_to_a_store_with_a_header_and_no_row_is_followed(tmp_path):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'id\tv\n')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	with open(p, 'ab') as f:
+		f.write(b'a\t1\nb\n')  # (at the header's two columns the lone key is a deletion)
+	_follow(t)
+	assert dict(t) == {'a': ['a', '1']} and t.correctColumnNum == 2
+	t.close()
+
+
+@pytest.mark.parametrize('data', [b'id\tv\n# n\n', b'id\tv\n', b'id\tv\n\n'])
+def test_a_delete_under_a_header_narrower_than_line_1_creates_no_key(tmp_path, data):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, data)
+	seen = TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)
+	assert _run('delete', p, 'zz', '--x-header', 'id')[0] in (0, 3)
+	assert _bytes(p) == data
+	assert TSVZ.readTabularFile(p, header='id', strict=False, verbose=False) == seen
+
+
+def test_the_row_on_line_1_goes_when_nothing_keyed_follows(tmp_path):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'id\tv\n# n\n')
+	assert _run('delete', p, 'id', '--x-header', 'id')[0] == 0
+	assert _bytes(p) == b'# n\n'
+	assert _run('keys', p, '--x-header', 'id')[1] == ''
+
+
+@pytest.mark.parametrize('data, key, want', [
+	(b'a\nb\t1\n', 'a', b'#\nb\t1\n'),
+	(b'a\nb\nc\n', 'a', b'#\nb\nc\n'),
+	(b'a\t\nb\t1\nc\t2\n', 'a', b'a\t\nb\t1\nc\t2\na\n'),  # (two columns: a line says it)
+	(b'a\n# n\nb\t1\n', 'a', b'# n\nb\t1\n'),  # (a comment is in the place already)
+	(b'a\nb\t1\nc\n', 'a', b'c\nb\t1\n'),  # (a lone key moved up: a deletion to that reader, and it keeps the file one column)
+	(b'a\nb\t1\t2\nc\t3\n', 'a', b'#\nc\t3\nb\t1\t2\n'),
+	(b'a\nb\t1\n', 'b', b'a\n'),
+	(b'a\n', 'a', b''),
+])
+def test_a_delete_of_line_1_under_a_header_it_is_not_reads_the_same_to_the_command_and_the_library(tmp_path, data, key, want):
+	# The command takes line 1 for a row, a reader given the header for the header's place: both see only `key` go.
+	p = str(tmp_path / 's.tsv')
+	_touch(p, data)
+
+	def views():
+		return (set(TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)),
+				set(TSVZ.readTabularFile(p, strict=False, verbose=False)),
+				set(_run('keys', p, '--x-header', 'id')[1].split()))
+	before = views()
+	assert _run('delete', p, key, '--x-header', 'id')[0] == 0
+	assert _bytes(p) == want
+	after = views()
+	assert after[1] == before[1] - {key} and after[2] == before[2] - {key}
+	assert after[0] == before[0] - {key}
+
+
+def test_a_delete_at_two_columns_under_a_header_line_1_is_not_is_a_line(tmp_path):
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'a\t1\nb\t2\n')
+	assert _run('delete', p, 'a', '--x-header', 'id')[0] == 0
+	assert _bytes(p) == b'a\t1\nb\t2\na\n'
+	assert _run('keys', p, '--x-header', 'id')[1].split() == ['b']
+	assert list(TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)) == ['b']
+
+
+def test_a_lone_key_a_reader_given_the_header_shows_goes_from_the_file(tmp_path):
+	# Line 1 wider than the header: to that reader the count is the next keyed line's, one, and a line could not delete `a`.
+	p = str(tmp_path / 's.tsv')
+	_touch(p, b'id\tv\na\n')
+	assert 'a' in TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)
+	assert _run('delete', p, 'a', '--x-header', 'id')[0] == 0
+	assert _bytes(p) == b'id\tv\n'
+	assert 'a' not in TSVZ.readTabularFile(p, header='id', strict=False, verbose=False)

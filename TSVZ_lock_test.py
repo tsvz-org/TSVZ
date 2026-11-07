@@ -921,6 +921,85 @@ def test_an_exit_handler_that_runs_after_tsvz_still_writes(tmp_path, how):
 	assert TSVZ.readTabularFile(p, header='id\tv').get('x') == ['x', 'saved-at-exit']
 
 
+#: A verbose store whose stdout nobody reads: its writer thread is stopped inside a print when the program ends.
+PRINT_AT_EXIT = r"""
+import os, sys, time
+p, here = sys.argv[1], sys.argv[2]
+sys.path.insert(0, here)
+import TSVZ as T
+t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=True, append_check_delay=0.001)
+os.write(2, b'open\n')
+end = time.time() + 60
+while not os.path.exists(p + '.go') and time.time() < end:
+	time.sleep(0.01)
+os.write(2, b'exiting\n')
+"""
+
+
+@linux_only
+def test_a_writer_thread_inside_a_print_at_exit_does_not_abort_the_program(tmp_path):
+	import fcntl
+	import termios
+	import struct
+	p = _tsv(tmp_path, 20)
+	proc = subprocess.Popen([sys.executable, '-c', PRINT_AT_EXIT, p, HERE], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	try:
+		fcntl.fcntl(proc.stdout.fileno(), 1031, 4096)  # F_SETPIPE_SZ
+		assert proc.stderr.readline() == b'open\n'
+
+		def held():
+			return struct.unpack('i', fcntl.ioctl(proc.stdout.fileno(), termios.FIONREAD, b'\0' * 4))[0]
+		end, n = time.time() + 60, 0
+		while held() < 3500 and time.time() < end:  # (each change seen is a print: the pipe fills, and the next one stops in it)
+			n += 1
+			with open(p, 'ab') as f:
+				f.write(b'n%d\t%d\n' % (n, n))
+			time.sleep(0.002)
+		assert held() >= 3500
+		for _ in range(20):  # (the thread is past what the pipe still takes)
+			n += 1
+			with open(p, 'ab') as f:
+				f.write(b'n%d\t%d\n' % (n, n))
+			time.sleep(0.01)
+		open(p + '.go', 'w').close()
+		assert proc.stderr.readline() == b'exiting\n'
+		time.sleep(0.5)  # (the interpreter's end comes while the print still waits for the pipe)
+		out, err = proc.communicate(timeout=60)
+	finally:
+		if proc.poll() is None:
+			proc.kill()
+			proc.communicate()
+	assert proc.returncode == 0, err[-400:]
+	assert b'Fatal Python error' not in err
+
+
+@pytest.mark.parametrize('verbose', [False, True])
+def test_a_neighbour_at_exit_aborts_nothing(tmp_path, verbose):
+	# A program that ends beside an appender, 40 runs of the one the review's stress aborted 3% of.
+	script = "import sys\nsys.path.insert(0, sys.argv[2])\nimport TSVZ as T\nT.TSVZed(sys.argv[1], header='id\\tv', rewrite_on_load=False, verbose=%r)\n" % verbose
+	p = _tsv(tmp_path, 20)
+	stop = threading.Event()
+
+	def hammer():
+		n = 0
+		while not stop.is_set():
+			n += 1
+			with open(p, 'a') as f:
+				f.write('n%d\t%d\n' % (n, n))
+			time.sleep(0.002)
+	thread = threading.Thread(target=hammer)
+	thread.start()
+	try:
+		for _ in range(40):
+			run = subprocess.Popen([sys.executable, '-c', script, p, HERE], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+			out, err = run.communicate(timeout=120)
+			assert run.returncode == 0, err[-400:]
+			assert verbose or not out
+	finally:
+		stop.set()
+		thread.join()
+
+
 #: A store with a queued row whose commit waits for another process's lock at exit; a later exit handler (registered
 #: before TSVZ was imported) lets the other process go, after the second Ctrl-C abandoned the write.
 ABANDONED = r'''
