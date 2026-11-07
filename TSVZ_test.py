@@ -16011,7 +16011,7 @@ def test_a_time_anomaly_is_news_only_to_a_verbose_store(tmp_path, capsys):
 	seen = {}
 	for verbose in (False, True):
 		t.verbose = verbose
-		t.externalFileUpdateTime = time.time_ns() + 10 ** 12  # (a file time earlier than the one noted)
+		t.externalFileUpdateTime = int(time.time() * 1e9) + 10 ** 12  # (a file time earlier than the one noted)
 		capsys.readouterr()
 		t.checkExternalChanges()
 		seen[verbose] = capsys.readouterr().out
