@@ -402,7 +402,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     rewrite, each changing `b` for the command, every 5.5 and later reader given no header, a `TSVZed` and tsvz-rs.
   - **A line 1 that already names the key (shape 2).** `d\tX\na\nd\tY\tZ\n`, delete `a` under header `q`: every key
     that could stand in is already named by a valued row before the gap (line 1's own `d\tX`), so no stand-in goes
-    there, and 3.39's loose reader given `q`, which counts from the gap's place, goes from `[d]` to `[d, Y]`. 5.6 and 5.7
+    there, and 3.39's loose reader given `q`, which counts from the gap's place, goes from `[d]` to `[d, Y, Z]`. 5.6 and 5.7
     are no better. From 5.10 line 1's key stands in when the first keyed line after the gap is a row of it as wide as
     line 1 (`d\tX\na\nd\tY\n` becomes `d\tX\nd\nd\tY\n`); left are that line wider or narrower than line 1 (as
     here), another key's line or a defaults line first.

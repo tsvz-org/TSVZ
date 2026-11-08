@@ -317,17 +317,18 @@ The file formats are unchanged.
   columns from line 1 and drops `b\t1`, lost `b`. The same followed a delete whose stand-in set the store's count: on
   `a\t\t1\na\nb\t\t1\nb\t1\n`, a store given `id` that deletes `a` and rewrites, or `tsvz --x-header id delete` and then
   such a rewrite, lost `b` for those readers (5.07 to 5.9). Now every line any of those readers takes stays (the first
-  file is left as it is; the second, by the store, becomes `a\t\t1\nb\nb\t\t1\nb\t1\n`). A file with no header, or whose line 1 holds the
-  header, compacts as before. What shows: such files keep more lines after a rewrite, and their rewrite costs more (a
-  plan for each count: 3.9 s for 200,000 rows where 5.9 took 3.0 s; other files now rewrite in 2.4 to 2.5 s, as a line
-  with no escape is split without the regex).
+  file is left as it is; the second, by the store, becomes `a\t\t1\nb\nb\t\t1\nb\t1\n`). A file with no header, or
+  whose line 1 holds the header, is compacted for its one count, as before (but see the third item). What shows: such
+  files keep more lines after a rewrite, and their rewrite costs more (a plan for each count: 3.9 s for 200,000 rows
+  where 5.9 took 3.0 s; other files now rewrite in 2.4 to 2.5 s, as a line with no escape is split without the regex).
 
 - **A `TSVZed` delete's commit compacts again.** In a loose file of one column a delete is written by its commit, which
   rewrites the file. 5.9 took out only the deleted keys' lines there, so a store that updates rows and deletes kept every
   superseded line, and each delete rewrote all of them: 4,000 rounds of an update and a delete ended at 4,056 lines and
   took 118 s (quadratic; measured with 5.8 and 5.10 on the same busy machine). The commit now compacts, for every count
-  the file is read at (the item above): 56 lines and 38 s, against 5.8's 61 lines and 36 s, and 5.8's loss is not back (`id\tv\na\nb\t1\nb\t\t1\n` with `TSVZed(p, header='id\tv\tw')`, delete `a`, still
-  writes `id\tv\nb\nb\t1\nb\t\t1\n`, where 5.8 dropped the `b\t1` that 3.39's strict reader takes). What shows: comments,
+  the file is read at (the item above): 56 lines and 38 s, against 5.8's 61 lines and 36 s, and 5.8's loss is not back
+  (`id\tv\na\nb\t1\nb\t\t1\n` with `TSVZed(p, header='id\tv\tw')`, delete `a`, still writes `id\tv\nb\nb\t1\nb\t\t1\n`,
+  where 5.8 dropped the `b\t1` that 3.39's strict reader takes). What shows: comments,
   empty lines and superseded lines go at a delete's commit (`a\n# n\nb\t1\nb\n`, delete `a`, is `b\nb\n`, 5.8's bytes; 5.9
   wrote `b\n# n\nb\t1\nb\n`). `tsvz delete`, a handler and a `TSVZedLite` still take out only the key's lines. The
   advice to call `hardMapToFile()` now and then (5.9) is no longer needed.
