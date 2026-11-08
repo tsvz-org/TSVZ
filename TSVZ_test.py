@@ -16980,7 +16980,7 @@ def test_a_store_that_took_a_delete_out_of_a_one_column_file_holds_what_a_reopen
 	again.close()
 
 
-def _every_view(path, line1, header, defaults):
+def _every_view(path, line1, header, defaults, without=()):
 	"""What every reader of the file reads: this version's and 3.39's readTabularFile, strict and loose, given no header,
 	given line 1 and given the door's header, with no defaults and with the door's; and this version's TSVZed."""
 	out = []
@@ -16993,7 +16993,8 @@ def _every_view(path, line1, header, defaults):
 						kwargs['defaults'] = list(d)
 					try:
 						with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-							out.append((mod.__name__, strict, h, bool(d), list(mod.readTabularFile(path, **kwargs).items())))
+							out.append((mod.__name__, strict, h, bool(d),
+									[kv for kv in mod.readTabularFile(path, **kwargs).items() if kv[0] not in without]))
 					except Exception as e:
 						out.append((mod.__name__, strict, h, bool(d), type(e).__name__))
 	return sorted(out, key=repr)
@@ -17034,3 +17035,31 @@ def test_a_one_column_file_is_compacted_for_the_readers_given_defaults_too(tmp_p
 		finally:
 			t.close()
 	assert _every_view(p, line1, header, defaults) == before
+
+
+# 5.10 modelled a strict reader as the caller's defaults make it: with a value in them it takes every line. A strict reader
+# given none takes only the lines as wide as its count (3.39's) or at least as wide (5.5's), so the compaction moved
+# `b\t1` into `b\t`'s place (a delete's commit, a rewrite, a scrub) and that reader lost b. Each reader is now listed
+# again, given none, when the defaults have a value (F3b).
+@pytest.mark.parametrize('route', ['commit', 'rewrite', 'scrub'])
+@pytest.mark.parametrize('strict', [False, True])
+def test_a_compaction_under_defaults_with_a_value_keeps_the_rows_of_a_strict_reader_given_none(tmp_path, route, strict):
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, b'id\na\t\nb\t\nb\t1\n')
+	defaults = [D_, 'P']
+	before = _every_view(p, 'id', 'id', defaults, without=() if route == 'scrub' else ('a',))
+	if route == 'scrub':
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			TSVZ.scrubTabularFile(p, header='id', defaults=list(defaults), strict=strict)
+	else:
+		t = TSVZ.TSVZed(p, header='id', defaults=list(defaults), strict=strict, verbose=False, append_check_delay=60,
+						rewrite_on_load=False)
+		try:
+			del t['a']
+			if route == 'commit':
+				t.commitAppendToFile()
+			else:
+				t._call(t.hardMapToFile)
+		finally:
+			t.close()
+	assert _every_view(p, 'id', 'id', defaults) == before
