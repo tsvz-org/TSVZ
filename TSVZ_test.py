@@ -17002,7 +17002,7 @@ def _every_view(path, line1, header, defaults, without=()):
 
 
 # 5.07 to 5.10 compacted a file the plan reads as one column (a lone key is a row) for the readers at one column alone, and
-# dropped lines that a reader given defaults of two cells or more takes at their count (5.11's fix, F1): the row of `c`
+# dropped lines that a reader given defaults of two cells or more takes at their count (5.10's fix, F1): the row of `c`
 # here, whose first line (c, 1) is narrower than the defaults' three and whose second (c, 5, 6) is as wide as them.
 F1_CASES = [
 	# (text, header, defaults, strict, door)
@@ -17016,6 +17016,16 @@ F1_CASES = [
 	# a defaults line between the one-column rule's file and its rows: 5.09 kept c\t1 and c\t3, 5.10 only c\t3
 	(b'a\n#_defaults_#\nb\t1\nb\t5\t6\nb\t3\n', '', [D_, 'x', 'y'], False, 'scrub'),
 	(b'a\n#_defaults_#\nb\t1\nb\t5\t6\nb\t3\n', '', [D_, 'x', 'y'], True, 'scrub'),
+	# F9: no header, so the caller reads at the defaults' count (2 here), while a reader given none reads at the file's own
+	# (3): each such reader is planned at the count it reads at. 5.6 to 5.10 planned it at the caller's.
+	(b'c\t\t2\nc\t3\t2\nc\t1\n', '', [D_, 'P'], True, 'scrub'),
+	(b'c\t\t2\nc\t3\t2\nc\t1\n', '', [D_, 'P'], True, 'rewrite'),
+	(b'a\t1\t2\nk\t1\nk\t3\t4\t5\nk\t6\n', '', [D_, 'P'], False, 'scrub'),
+	(b'a\t1\t2\nk\t1\nk\t3\t4\t5\nk\t6\n', '', [D_, ''], False, 'scrub'),
+	(b'id\tv\tw\nb\t\t1\nb\t1\t2\nb\t1\n', '', [D_, 'P'], False, 'rewrite'),
+	(b'id\tv\tw\nb\t\t1\nb\t1\t2\nb\t1\n', '', [D_, 'P'], True, 'rewrite'),
+	(b'id\tv\tw\nc\t1\n#_defaults_#\t\tQ\nc\t1\n', '', [D_, 'P'], False, 'scrub'),
+	(b'id\tv\tw\nc\t1\n#_defaults_#\t\tQ\nc\t1\n', '', [D_, 'P'], False, 'rewrite'),
 ]
 
 
@@ -17081,3 +17091,15 @@ def test_a_strict_reader_given_no_defaults_is_planned_again_only_where_a_line_is
 	assert len(TSVZ._legacyCompactReaders(narrow_line1, 2, False, defaults, '\t', 'utf8', False)) == 2
 	assert len(TSVZ._legacyCompactReaders(narrow_line1, 2, True, defaults, '\t', 'utf8', False)) == 5  # (not the caller's: its twin is identical)
 	assert len(TSVZ._legacyCompactReaders(wide, 2, True, [D_, '', ''], '\t', 'utf8', True)) == 1
+
+
+def test_the_readers_of_a_compaction_are_each_planned_once_and_a_twin_at_the_count_it_reads_at():
+	"""F12: line 1 not being one cell, the no-header reader already reads at the defaults' count, so the one-column rule's
+	reader there is not listed again. F9: a reader given none reads at the file's own count, not the caller's."""
+	lines = _lines(b'x\t1\t2\na\nc\t1\nc\t5\t6\nc\t3\n')
+	for defaults in ([D_, 'P'], [D_, 'P', ''], [D_, '', '']):
+		readers = TSVZ._legacyCompactReaders(lines, 1, True, defaults, '\t', 'utf8', False)
+		assert len(readers) == len({(w, c, m, tuple(d)) for w, c, m, d in readers}), readers
+	lines = _lines(b'c\t\t2\nc\t3\t2\nc\t1\n')
+	readers = TSVZ._legacyCompactReaders(lines, 2, False, [D_, 'P'], '\t', 'utf8', False)
+	assert (3, False, False, ()) in readers and (2, False, False, [D_, 'P']) in readers

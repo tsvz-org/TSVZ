@@ -3028,30 +3028,40 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 	count from line 1 as well: given no header (line 1 a row to them, at its count, or the defaults' as the caller's
 	reader takes them) and given line 1 for their header (a store that follows a widening of its header among them).
 	The caller's reader then counts from the first keyed line after line 1 (or a program that does not follow a
-	widening, given the header line 1 widens), and its count is the one ``width`` gives. Each reader is given the caller's
-	defaults; when they have a value, a strict reader given none takes only the lines as wide as its count (3.39's) or at
-	least as wide (5.5's), where the caller's take every line: each of them is listed again, given none."""
+	widening, given the header line 1 widens), and its count is the one ``width`` gives. Each of these readers is given the
+	caller's defaults. A reader given none is another reader: it reads at the file's own count, not the defaults', and a
+	strict one takes only the lines as wide as its count (3.39's) or at least as wide (5.5's), where defaults with a value
+	take every line. So each is listed again, given none and at the count it then reads at, where that count or the
+	strictness differs."""
 	readers = [(width, consumed, matched, defaults)]
+	# (the count each reader is given no defaults reads at: the file's. A header the file holds gives it, else the first
+	# keyed line's, line 1 left out for a reader that takes it for its header)
+	own = [(width if matched else _legacyFileWidth(itertools.islice(raw, 1, None) if consumed else raw, (), False, encoding, delimiter),
+			consumed, matched)]
 	if consumed and not matched and raw:
 		kind, _, cells, _ = _legacyLineKind(raw[0].decode(encoding or 'utf8', errors='replace'), 1, False, delimiter)
 		if kind != 'skip':
 			readers.append((cells if cells == 1 or len(defaults) < 2 else len(defaults), False, False, defaults))
 			readers.append((cells, True, True, defaults))
+			own += [(cells, False, False), (cells, True, True)]
 	if width == 1 and len(defaults) > 1 and not matched:
 		# A file the plan reads as one column (the one-column rule) is read at the defaults' count by a reader given them
-		# (5.07 to 5.10 kept it for the one-column readers only, and a row such a reader takes was dropped).
+		# (5.6 to 5.10 kept it for the one-column readers only, and a row such a reader takes was dropped).
 		readers.append((len(defaults), consumed, matched, defaults))
-		if consumed and len(readers) > 2:
-			readers.append((len(defaults), False, False, defaults))
-	if len(defaults) > 1 and any(defaults[1:]):
-		# (The two differ only on a line with a value that is not exactly w cells wide: so a file with none needs no twin.)
+		if consumed and len(readers) > 2 and readers[1][0] != len(defaults):
+			readers.append((len(defaults), False, False, defaults))  # (not again when line 1's reader already reads there)
+	valued = len(defaults) > 1 and any(defaults[1:])
+	if valued or any(o[0] != r[0] for o, r in zip(own, readers)):
 		counts = {}  # line index (0, or 1 for every later line) -> the cell counts of its lines with a value
 		for i, line in enumerate(raw):
 			kind, _, cells, _ = _legacyLineKind(line.decode(encoding or 'utf8', errors='replace'), 2, False, delimiter)
 			if kind in ('row', 'defaults'):
 				counts.setdefault(i > 0, set()).add(cells)
-		readers += [(w, c, m, ()) for w, c, m, _ in readers
-					if not (w > 0 and counts.get(True, set()) <= {w} and (c or counts.get(False, set()) <= {w}))]
+		# (given no defaults the two differ only on a line with a value that is not exactly w cells wide: a file with none
+		# needs no twin where the counts agree; where they differ the twin is a reader of its own)
+		readers += [(w, c, m, ()) for (w, c, m), r in zip(own, readers)
+					if (valued or w != r[0])
+					and not (valued and w > 0 and counts.get(True, set()) <= {w} and (c or counts.get(False, set()) <= {w}))]
 	return readers
 
 
@@ -3077,10 +3087,13 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 
 	def plans(still=()):
 		out = []
+		prev = None
 		for n, (w, c, m, d) in enumerate(readers):
-			if n == 2 and out[1][6] and out[1][5] == w:
+			if c and m and n and prev is not None and prev[0] == (w, False, False, d) and prev[1][6]:
 				continue  # (the readers given line 1 for a header read as those given none but for line 1's key: it has no other line)
-			out.append(_legacyCompactPlan(raw, w, c, d, delimiter, encoding, m, still, True))
+			plan = _legacyCompactPlan(raw, w, c, d, delimiter, encoding, m, still, True)
+			prev = ((w, c, m, d), plan)
+			out.append(plan)
 		return out
 	every = plans()
 
