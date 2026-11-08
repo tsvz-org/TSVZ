@@ -315,23 +315,20 @@ The file formats are unchanged.
   shows: comments, empty lines and superseded lines stay until a rewrite you ask for (`hardMapToFile()`,
   `rewrite(force=True)`, the automatic ones) or a scrub compacts the file (`a\n# n\nb\t1\nb\n`, delete `a`, is now
   `b\n# n\nb\t1\nb\n`; 5.8 wrote `b\nb\n`), as in a file of two columns or more, where a delete is an appended line.
-
-- **A key that line 1 names can stand in for a deleted line.** `d\tX\na\nd\tY\n`, delete `a` under header `q`
-  (`tsvz --x-header q delete`, a handler, a `TSVZedLite` or `TSVZed` given `q`): a reader given `q` counts its column
-  count from `a`, and `d`, the only key that could stand in, is named by line 1, so 5.8 left no stand-in, and 3.39's
-  loose reader given `q` went from `[d]` to `[d, Y]`. 5.9 writes `d\tX\nd\nd\tY\n`: a reader given no header reads the
-  stand-in as `d`'s deletion and takes `d\tY` back, as wide as line 1, and a reader given `q` reads as before. When no
-  later line of the key is as wide as line 1 (`d\tY\tZ`), 3.39's strict reader would not take it back, and nothing
-  stands in, as in 5.8.
+  A program that keeps one store open on such a file and updates rows or deletes often should call `hardMapToFile()`
+  now and then: a one-column file whose lines get superseded keeps them until a rewrite, and each delete rewrites all of
+  it ([docs/limitations.md](docs/limitations.md), "A delete's commit compacts nothing").
 
 - **A delete under `--x-header` reads line 1 once.** `tsvz --x-header H delete` and `pop`, and a handler's `delete`,
   `pop` and `popitem`, read line 1 twice at two columns or more: now about 5 ms less per delete on a 200k-row `.tsv.gz`
   (15.0 ms to 9.4 to 10.2 ms) and 20 to 60 µs less on a `.tsv`.
 
 - Still as in 5.8: after a line 1 of one cell that is not the header given, a delete under that header can change a cell
-  for readers given it, and a rewrite that then widens line 1 makes the cell every reader's
-  ([docs/limitations.md](docs/limitations.md), "After a line 1 of one cell, a delete under a header can change a cell
-  for readers given it").
+  for readers given it, and a rewrite that then widens line 1 makes the cell every reader's; and when line 1 holds a
+  value for the only key that could stand in (`d\tX\na\nd\tY\n`, delete `a` under `q`), nothing stands in, and 3.39's
+  loose reader given `q` goes from `[d]` to `[d, Y]` (deferred to 5.10: a stand-in there needs the two-count compaction).
+  See [docs/limitations.md](docs/limitations.md), "After a line 1 of one cell, a delete under a header can change a
+  cell for readers given it".
 
 ## Upgrading to 5.8 from 5.7
 
@@ -368,7 +365,7 @@ The file formats are unchanged.
   header `q` (every key that could stand in is already named by a valued row before the gap, so only
   3.39's loose reader given `q` changes, from `[d]` to `[d, Y]`): see
   [docs/limitations.md](docs/limitations.md), "Readers given other arguments" and "After a line 1 of one cell, a delete
-  under a header can change a cell for readers given it" (5.9 fixes the second shape).
+  under a header can change a cell for readers given it" (deferred to 5.10).
   A 3.39 strict reader of a one-column file still sees a new row when the last lone key is
   deleted and only wider rows are left (`a\nb\t1\n`, delete `a`: it showed `a`, then shows
   `b`), as with 5.6; upgrading that reader cures it (docs/limitations.md).

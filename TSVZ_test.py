@@ -14657,18 +14657,82 @@ def test_a_delete_commit_compacts_nothing_so_every_door_writes_the_same(tmp_path
 
 
 @pytest.mark.parametrize('door', ['zed', 'cli', 'lite'])
-@pytest.mark.parametrize('text, written, differ', [
-	# Line 1 names d, the only key that could stand in. A reader given no header holds d from line 1, reads the stand-in as
-	# its deletion at two columns, and takes d\tY, as wide as line 1, back; 3.39's loose reader given q counts one column
-	# from the stand-in and cuts d\tY to d, as it did from a. 5.08 left no stand-in: that reader read d whole, [d, Y].
-	(b'd\tX\na\nd\tY\n', b'd\tX\nd\nd\tY\n', None),
-	# d's line is wider than line 1: 3.39's strict reader at two columns does not take it, and a stand-in would lose d for
-	# it; none goes there, and 3.39's loose reader given q reads d whole
-	(b'd\tX\na\nd\tY\tZ\n', b'd\tX\nd\tY\tZ\n', {'339-loose-H': 'cell'}),
+@pytest.mark.parametrize('text, written', [
+	# Line 1 names d, the only key that could stand in. 5.09's first build let d stand in when a later line of it was as wide
+	# as line 1 (`d\tX\nd\nd\tY\n`), which a rewrite then compacted at the store's one column: the as-wide line went as
+	# superseded and strict readers lost the key, and another key could come before d. Reverted in review: no stand-in
+	# (the line just goes, as in 5.8); 3.39's loose reader given q reads [d, Y] where it read [d] (docs/limitations.md,
+	# "After a line 1 of one cell, a delete under a header can change a cell for readers given it", deferred to 5.10).
+	(b'd\tX\na\nd\tY\n', b'd\tX\nd\tY\n'),
+	(b'd\tX\na\nd\tY\tZ\n', b'd\tX\nd\tY\tZ\n'),
 ])
-def test_a_key_line_1_names_stands_in_when_a_later_line_of_it_is_as_wide(tmp_path, door, text, written, differ):
+def test_a_key_line_1_names_gets_no_stand_in_for_a_deleted_line(tmp_path, door, text, written):
 	kwargs = {'strict': False} if door == 'lite' else {}
-	_delete_reads_as_before(str(tmp_path / 'f.tsv'), text, 'a', written, 'q', door, differ, **kwargs)
+	_delete_reads_as_before(str(tmp_path / 'f.tsv'), text, 'a', written, 'q', door, {'339-loose-H': 'cell'}, **kwargs)
+
+
+def _door_deletes_then_rewrites(p, door, H):
+	"""Delete a under H through ``door``, then a store given H rewrites the file: 'zedq' (the delete and the rewrite meet in the
+	writer thread), 'zedcq' (the delete is committed first) or 'cliw' (``tsvz --x-header H delete``, then a TSVZed given H
+	rewrites)."""
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		if door == 'cliw':
+			assert _run('--x-header', H, 'delete', p, 'a')[0] == 0
+		t = TSVZ.TSVZed(p, header=H, verbose=False, append_check_delay=60, rewrite_on_load=False)
+		if door != 'cliw':
+			del t['a']
+		if door == 'zedcq':
+			t.commitAppendToFile()
+		t.hardMapToFile()
+		t.close()
+
+
+@pytest.mark.parametrize('door', ['zedq', 'zedcq', 'cliw'])
+@pytest.mark.parametrize('H', ['q', 'id\tv'])
+@pytest.mark.parametrize('text', [b'b\t\t1\na\nb\t\t1\nb\t1\n', b'd\tX\tW\na\nd\t\tY\nd\tY\n'])
+def test_a_delete_under_a_header_then_a_rewrite_loses_no_row_to_a_strict_reader_given_no_header(tmp_path, door, H, text):
+	# Review round 1 of 5.9 (N1): line 1's own key standing in for the deleted line made the rewrite's compaction, at the one
+	# column the stand-in sets, drop the as-wide line as superseded: b was lost to 5.9's strict readTabularFile, a strict
+	# TSVZed and 3.39's strict reader (b\t\t1 / b\nb\t1 were all that was left). 5.8's bytes keep both lines.
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, text)
+	readers = [('new', functools.partial(TSVZ.readTabularFile, strict=True, verbose=False)),
+		('339', functools.partial(TSVZ_old.readTabularFile, strict=True, verbose=False))]
+	before = {name: set(read(p)) for name, read in readers}
+	_door_deletes_then_rewrites(p, door, H)
+	for name, read in readers:
+		assert set(read(p)) >= before[name] - {'a'}, (name, _bytes(p))
+	t = TSVZ.TSVZed(p, strict=True, verbose=False, append_check_delay=60, createIfNotExist=False, rewrite_on_load=False)
+	try:
+		assert set(t) >= set(before['new']) - {'a'}, _bytes(p)
+	finally:
+		t.close()
+	assert _bytes(p) == {b'b\t\t1\na\nb\t\t1\nb\t1\n': b'b\t\t1\nb\t\t1\nb\t1\n', b'd\tX\tW\na\nd\t\tY\nd\tY\n': b'd\tX\tW\nd\t\tY\nd\tY\n'}[text]
+
+
+@pytest.mark.parametrize('door', ['cli', 'lite', 'zed'])
+@pytest.mark.parametrize('H', ['q', 'id\tv'])
+def test_a_delete_under_a_header_keeps_the_key_order_every_strict_reader_given_no_header_lists(tmp_path, door, H):
+	# Review round 1 of 5.9 (N1): d's later line that the stand-in was taken from need not be the as-wide one (`d\tY` here,
+	# narrower than line 1), and strict readers take d again only at the as-wide line, after e: they listed e before d.
+	p = str(tmp_path / 'f.tsv')
+	text = b'd\tX\tW\na\nd\tY\ne\t1\t2\nd\t\tY\n'
+	_touch(p, text)
+	readers = [('new', functools.partial(TSVZ.readTabularFile, strict=True, verbose=False)),
+		('339', functools.partial(TSVZ_old.readTabularFile, strict=True, verbose=False))]
+	before = {name: list(read(p)) for name, read in readers}
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		if door == 'cli':
+			assert _run('--x-header', H, 'delete', p, 'a')[0] == 0
+		else:
+			t = TSVZ.TSVZedLite(p, header=H, verbose=False, strict=False) if door == 'lite' else TSVZ.TSVZed(
+				p, header=H, verbose=False, append_check_delay=60, rewrite_on_load=False)
+			del t['a']
+			if door == 'zed':
+				t.commitAppendToFile()
+			t.close()
+	for name, read in readers:
+		assert list(read(p)) == [k for k in before[name] if k != 'a'], (name, _bytes(p))
 
 
 

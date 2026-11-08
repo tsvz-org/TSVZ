@@ -398,17 +398,29 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     given H rewrites the file later: at depth 3 of the 5.09 sweep, 3 files and headers after `tsvz delete` then a
     rewrite, 2 after a `TSVZedLite` delete then a rewrite, and 1 (this one) after a `TSVZed` delete, its commit and a
     rewrite, each changing `b` for the command, every 5.5 and later reader given no header, a `TSVZed` and tsvz-rs.
+  - **A line 1 that already names the key (shape 2).** `d\tX\na\nd\tY\n`, delete `a` under header `q`: every key that
+    could stand in is already named by a valued row before the gap (line 1's own `d\tX`), so no stand-in goes there, and
+    3.39's loose reader given `q` goes from `[d]` to `[d, Y]`. 5.6 to 5.9 are the same.
   - No row is lost to any reader in these shapes but the old line-1 row that the widening by a rewrite asked for takes
     (README, "Upgrading to 5.8", item 3).
 - Why: no layout serves both readers. A reader given H counts from the line after line 1, so only a one-cell line keeps
   its count there, and any one-cell keyed line is a row to a reader at one column: 3.39's strict reader, which drops
   `b\t1` there, would show `b`. 5.08 kept that reader's view (Q3, approved for the command's door); the store's next
   widening then writes the store's view, which the delete changed, into the file.
-- Revisit when: the user answers the 5.09 design's question on these shapes (a stand-in from a row with a value at the
-  deleting store's own place, or in every door, or neither); the answer is built in 5.09 or 5.10.
+  Shape 2 has a stand-in that is not safe yet. 5.9's first build let line 1's own key stand in (`d\tX\nd\nd\tY\n`) when
+  a later line of it was as wide as line 1. Safe only while that as-wide line survives, and the store's rewrite compacts at
+  one count, the one the stand-in sets, where it drops the line as superseded: strict readers given no header then lost
+  the key (`b\t\t1\na\nb\t\t1\nb\t1\n` under `q`: `b\t\t1\nb\nb\t1\n`; 216 tier-1 reader-cases at depth 4 of the 5.09
+  review's sweep), and where the first later line of the key was not the as-wide one, strict readers listed another key
+  before it (`d\tX\tW\na\nd\tY\ne\t1\t2\nd\t\tY\n`). Reverted in review round 1; the stand-in needs a compaction that
+  keeps what two counts take (the next entry).
+- Revisit when: 5.10: the two-count compaction of the next entry, then shape 2's stand-in on it, with the user's answer
+  to the 5.09 design's question on the other shapes (a stand-in from a row with a value at the deleting store's own
+  place, or in every door, or neither).
 - Noted: 2026-11-07, a deferral under the user's standing rule that deferrals are noted, not asked. 2026-11-08: 5.09
-  fixes the other two shapes of the entry (a line 1 of two cells that already names the key, and 3.39's strict reader
-  in the `TSVZed` delete + commit door).
+  fixes one of the other two shapes of the entry (3.39's strict reader in the `TSVZed` delete + commit door). Shape 2
+  (a line 1 of two cells that already names the key) was fixed in 5.09's first build and put back as deferred to 5.10
+  with the two-count compaction (W1) in review round 1, after it lost rows for strict readers; same standing rule.
 
 ### A rewrite by a store whose line 1 widens its header can lose rows for strict readers given no header
 - Kind: deferred
@@ -423,8 +435,28 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   the header line 1 widens (1,500 reader-cases at depth 3) and for tsvz-rs (225); keeping what both counts need is a
   change to the compaction, not to the delete this version is about.
 - Revisit when: 5.10: compact at both counts when line 1 widens the store's header (keep every line either count's
-  readers take).
+  readers take). The same compaction lets shape 2's stand-in back (previous entry), and a delete's commit use it too
+  (next entries). It leads 5.10's list: this is a row loss for tier-1 strict readers, in 5.6 and later.
 - Noted: 2026-11-08, found in the 5.09 design sweep; a deferral under the user's standing rule.
+
+### A delete's commit compacts nothing, so a one-column file with superseded lines grows
+- Kind: deferred (5.10)
+- What the operator sees: a program that keeps one `TSVZed` open on a file of one column that holds valued rows, and
+  updates those rows and deletes keys often, ends with a file that keeps every superseded line until a rewrite, and each
+  delete's commit rewrites all of it. Measured over 4,000 rounds of 5 valued-row updates and a delete (50 lone keys, 5
+  valued rows): 5.8 ends at 61 lines in 11 s (linear), reopening in 1.0 ms; 5.9 at 4,056 lines in 82 s (quadratic),
+  reopening in 16.6 ms. Key-only work (an LRU with `move_to_end` and `popitem`, plain churn) does not grow, and memory
+  always equals a reopen. A file of two columns or more already keeps its superseded lines the same way, but there a delete
+  is an appended line, not a rewrite of the whole file. Workaround: call `hardMapToFile()` now and then (README,
+  "Upgrading to 5.9 from 5.8", item 1).
+- Why: 5.9's commit takes out only the deleted keys' lines and compacts nothing, so that no reader loses a row to a
+  compaction at the store's count (the 5.09 design's Call 3). That count is the one a reader given another count does not
+  share.
+- Plan: the two-count compaction planned for the previous entries (keep every line either count's readers take), applied
+  at the commit too.
+- Revisit when: 5.10.
+- Noted: 2026-11-08, found in the 5.09 review (round 1); a deferral under the user's standing rule that deferrals are
+  noted, not asked.
 
 ### A widening loses a key whose only line 3.39's strict reader takes holds no value
 - Kind: deferred

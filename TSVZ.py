@@ -3029,10 +3029,7 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	more), so the key reads after it as it did. Else, unless a line 1 of one cell comes before the place (its readers
 	would read the stand-in as a row, and 3.39's strict read, which drops a wider line at one column, would gain it), a
 	key that no row with a value before the place names: at two columns or more the stand-in deletes a key not yet read,
-	at one it is a row the key's later line replaces. A key such a row names (only line 1 comes before the place) stands
-	in too when a later line of it has as many cells as that row: every reader that read the row takes that line, which
-	gives the key back the value the stand-in deleted (`d\\tX\\na\\nd\\tY\\n`, a deleted under a header: `d\\tX\\nd\\nd\\tY\\n`).
-	No such row: the line just goes."""
+	at one it is a row the key's later line replaces. No such row: the line just goes."""
 	enc = encoding or 'utf8'
 	d = delimiter.encode(enc)
 	texts = [line.decode(enc, errors='replace') for line in raw]
@@ -3062,9 +3059,8 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		later = [j for j in range(i + 1, len(raw)) if kinds[j][0] == 'row' and not goes(j)]
 		pick = [j for j in later if not valued(j)]
 		if not pick and not (i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):
-			named = {kinds[j][1].rstrip(): kinds[j][2] for j in range(i) if valued(j)}  # (key -> its cells there: line 1's)
-			back = {kinds[j][1].rstrip() for j in later if named.get(kinds[j][1].rstrip()) == kinds[j][2]}
-			pick = [j for j in later if kinds[j][1].rstrip() not in named or kinds[j][1].rstrip() in back]
+			named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
+			pick = [j for j in later if kinds[j][1].rstrip() not in named]
 		if pick:
 			stand[i] = raw[pick[0]].strip(b'\x00').rstrip(b'\r').split(d)[0] + d * (kinds[i][2] - 1)
 	return [stand.get(i, line) for i, line in enumerate(raw) if i in stand or not goes(i)]
