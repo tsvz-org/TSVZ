@@ -503,6 +503,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-11-06, the user chose "Known limitation (Recommended)", and "Widen the entry (Recommended)" for the wider
   header.
 
+### 3.39's strict reader of a one-column file sees a new row when its last lone key is deleted
+- Kind: known limitation
+- What the operator sees: a one-column file whose only lone key is deleted and only wider rows are left: `a\nb\t1\n`,
+  `tsvz delete F a` (or a `TSVZedLite` or `TSVZed` delete). 3.39's strict `readTabularFile` reads at one column and drops
+  `b\t1` as wider, so it showed only `a`; after the delete it shows `b`. 5.5 and later readers show `b` as `[b, 1]` before
+  and after. 5.6 does exactly the same (its bytes `b\t1\n`, 5.8's `b\nb\t1\n`), in the same 5,235 cases of the depth-4
+  delete sweep.
+- Why: no layout serves both: 5.5's and later readers keep `[b, 1]` only if the file reads at one column or at two, and
+  either needs a keyed line that 3.39's strict read takes as a row of `b`. A bare `#_defaults_#` would keep one column, but
+  it is a row named `#_defaults_#` to every reader at one column.
+- Revisit when: nothing in the format can fix it; upgrading the reader from 3.39 cures it.
+- Approved: 2026-11-07, the user chose "Known limitation (Recommended)".
+
 ### pip 9 cannot upgrade from or uninstall 5.5 and earlier
 - Kind: known limitation
 - What the operator sees: With pip 9, the pip of EL7 and EL8 (`pip3 --version`), upgrading from 5.5 (5.05) or earlier and `pip3 uninstall TSVZ` of those releases stop with `configparser.DuplicateOptionError: ... option 'tsvz' in section 'console_scripts' already exists`, and nothing changes: the installed release keeps working. Run `pip3 install -U pip` once, then upgrade or uninstall. With `--user` the same happens, except that `pip3 install --user -U TSVZ` with no version does not stop: it installs the new release, which works, and leaves the old release's metadata behind. `pip3 list` then shows the old release after `pip3 uninstall TSVZ`, and the next uninstall stops with that error. To avoid this, run `pip3 install --user -U pip` once first. If it has already happened, run that, run `pip3 uninstall TSVZ` until it says TSVZ is not installed, and install again.

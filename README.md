@@ -331,6 +331,9 @@ The file formats are unchanged.
   line, when a reader given H reads at one column. One shape is left, after a line 1 of one
   cell, where a reader given H can see a cell change: see
   [docs/limitations.md](docs/limitations.md), "Readers given other arguments".
+  A 3.39 strict reader of a one-column file still sees a new row when the last lone key is
+  deleted and only wider rows are left (`a\nb\t1\n`, delete `a`: it showed `a`, then shows
+  `b`), as with 5.6; upgrading that reader cures it (docs/limitations.md).
 
 - **A store emptied after a rewrite follows another process's append at the count its file
   says.** After a rewrite, a store whose rows were then all deleted read the next append at
