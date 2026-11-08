@@ -14216,6 +14216,35 @@ def test_a_rewrite_whose_stand_in_key_a_caller_deletes_meanwhile_takes_its_lines
 	assert TSVZ_old.readTabularFile(p, strict=False, verbose=False) == {'b': ['b']}  # (3.39 loose cuts a row to its key at one column, as before)
 
 
+# --------------------------------------------------------------------------
+# 5.6: the readers take defaults as TSVZed does, and leave the caller's alone
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize('suffix', ['tsv', 'tsvz'])
+@pytest.mark.parametrize('strict', [False, True], ids=['loose', 'strict'])
+def test_readTabularFile_leaves_the_callers_defaults_list_alone(tmp_path, suffix, strict):
+	# The file's own defaults line went into the caller's list, so the same call then read `x` otherwise.
+	p = str(tmp_path / ('d.' + suffix))
+	_touch(p, b'x\t\t1\n#_defaults_#\tP\tQ\ny\t\t2\n')
+	given = ['#_defaults_#', 'A', 'B']
+	first = dict(TSVZ.readTabularFile(p, defaults=given, strict=strict))
+	assert given == ['#_defaults_#', 'A', 'B']
+	assert dict(TSVZ.readTabularFile(p, defaults=given, strict=strict)) == first
+
+
+@pytest.mark.parametrize('read', [TSVZ.readTabularFile, TSVZ.readTSV, TSVZ.scrubTabularFile])
+def test_a_reader_takes_text_defaults_as_TSVZed_does(tmp_path, read):
+	# Text was taken as a sequence of characters: ['x', '_', '1', 'e', 'f', ...].
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, b'x\t\t1\n')
+	t = TSVZ.TSVZed(p, defaults='#_defaults_#\tP\t', verbose=False)
+	row = t['x']
+	t.close()
+	assert row == ['x', 'P', '1']
+	for given in ('#_defaults_#\tP\t', 'P\t', ['#_defaults_#', 'P', ''], ('#_defaults_#', 'P', '')):
+		_touch(p, b'x\t\t1\n')
+		assert read(p, defaults=given, strict=False)['x'] == row, given
+
+
 def test_a_readers_sequence_keeps_its_first_cell_for_the_key_column(tmp_path):
 	# Every reader from 3.39: a first cell that is not #_defaults_# stands in the key's column, it is no default.
 	p = str(tmp_path / 'd.tsv')
@@ -16547,3 +16576,144 @@ def test_a_runtime_error_in_a_wait_that_is_no_ctrl_c_goes_up_as_it_is():
 			raise RuntimeError('cannot join thread before it is started')
 	with pytest.raises(RuntimeError, match='cannot join'):
 		TSVZ._waited(Broken(), 0.1)
+
+
+# --------------------------------------------------------------------------
+# 5.08 release review, round 1
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize('order', ['plain', 'commit first'])
+@pytest.mark.parametrize('route', ['hardMapToFile', 'rewrite', 'commit'])
+def test_a_rewrite_meeting_a_queued_one_column_delete_keeps_the_row_the_store_read(tmp_path, order, route):
+	# `b<TAB>` is a row with no value; widening line 1 to id,v,w with the queued delete's stand-in left out of the lines read as
+	# if b were a lone key that could go too, and the rewrite wrote `id,v,w` and `b<TAB>` alone: b lost to a reopen, and the
+	# bytes differed with the order. The widening is decided on the lines as the commit leaves them.
+	p = str(tmp_path / 'q.tsv')
+	_touch(p, b'id\tv\na\nb\t\n')
+	t = TSVZ.TSVZed(p, header='id\tv\tw', strict=False, verbose=False, append_check_delay=60)
+	time.sleep(0.2)  # (the writer thread's first ticks done: the delete stays queued unless committed first)
+	del t['a']
+	if order == 'commit first':
+		t.commitAppendToFile()
+	if route == 'hardMapToFile':
+		t.hardMapToFile()
+	elif route == 'rewrite':
+		t.rewrite(force=True)
+	else:
+		t.commitAppendToFile()
+	held = dict(t)
+	t.close()
+	assert _bytes(p) == b'id\tv\nb\nb\t\n'
+	again = TSVZ.TSVZed(p, header='id\tv\tw', strict=False, verbose=False, append_check_delay=60, rewrite_on_load=False)
+	assert dict(again) == held == {'b': ['b', '']}
+	again.close()
+
+
+@pytest.mark.parametrize('route, written', [('commit', b'id\tv\n'), ('hardMapToFile', b'id\tv\tw\n')])
+def test_a_deletes_own_commit_never_widens_line_1_but_a_rewrite_asked_for_does(tmp_path, route, written):
+	# Deleting the file's only keyed lines: the commit widened line 1 as a side effect (a reader given the header `id,v,w` then
+	# sees a different file than it did before the delete). A rewrite the program asks for widens.
+	p = str(tmp_path / 'c.tsv')
+	_touch(p, b'id\tv\na\na\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv\tw', strict=False, verbose=False, append_check_delay=60, rewrite_on_load=False)
+	del t['a']
+	if route == 'commit':
+		t.commitAppendToFile()
+	else:
+		t.hardMapToFile()
+	t.close()
+	assert _bytes(p) == written
+
+
+@pytest.mark.parametrize('writer', ['TSVZed', 'TSVZedLite', 'tsvz delete', 'handler', 'appendTabularFile'])
+@pytest.mark.parametrize('line1, padded', [('id\tv\tw\t', b'b\t\t\t'), ('id\tv\t\t', b'b\t\t'), ('id\tv\t', b'b\t\t'),
+										   ('id\tv\tw', b'b\t\t'), ('id\tv', b'b\t')])
+def test_a_deletion_line_is_not_padded_to_the_cells_line_1_counts(tmp_path, writer, line1, padded):
+	# Only a row that holds a value is as wide as line 1 counts its cells: a deletion line written that wide read as a row (or
+	# was kept as a key) to a reader that counts cells the spec's way. Every writer writes the deletion line 5.07 wrote.
+	p = str(tmp_path / 'd.tsv')
+	_touch(p, (line1 + '\na\t1\t2\nb\t3\t4\n').encode())
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		if writer == 'TSVZed':
+			t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60, rewrite_on_load=False)
+			del t['b']
+			t.commitAppendToFile()
+			t.close()
+			want = padded
+		elif writer == 'TSVZedLite':
+			t = TSVZ.TSVZedLite(p, header='id\tv', verbose=False, strict=False)
+			del t['b']
+			t.close()
+			want = b'b'
+		elif writer == 'tsvz delete':
+			assert _run('--x-header', 'id\tv', 'delete', p, 'b')[0] == 0
+			want = b'b\t' if line1 == 'id\tv' else b'b'
+		elif writer == 'handler':
+			s = TSVZ._ServeStore(p, header='id\tv')
+			TSVZ._serveRespond(s, 'delete\tb')
+			s.close()
+			want = b'b\t' if line1 == 'id\tv' else b'b'
+		else:
+			TSVZ.appendTabularFile(p, ['b'], header='id\tv', strict=False)
+			want = b'b\t' if line1 == 'id\tv' else b'b'
+	assert _bytes(p).split(b'\n')[3] == want
+	assert list(TSVZ.readTabularFile(p, strict=False, verbose=False)) == ['id', 'a']
+
+
+@pytest.mark.parametrize('how', ['cli', 'handler'])
+def test_a_set_under_x_header_reads_line_1_once(tmp_path, monkeypatch, how):
+	# Line 1 is read to say whether it is the header, and the payload's own header check took it again: on a compressed file
+	# each read decodes its first member (9.5 ms at 5.07, 18 ms at 5.08 for a 200k-row .tsv.gz).
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, b'x\ty\tz\na\t1\t2\n')
+	reads = []
+	original = TSVZ._legacyFirstLine
+	monkeypatch.setattr(TSVZ, '_legacyFirstLine', lambda *args: reads.append(1) or original(*args))
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		if how == 'cli':
+			assert _run('--x-header', 'id\tv', 'set', p, 'c', '3', '4')[0] == 0
+		else:
+			s = TSVZ._ServeStore(p, header='id\tv')
+			TSVZ._serveRespond(s, 'set\tc\t3\t4')
+			s.close()
+	assert len(reads) == 1
+	assert _bytes(p) == b'x\ty\tz\na\t1\t2\nc\t3\t4\n'
+
+
+def test_a_lite_load_does_not_read_line_1_a_second_time(tmp_path, monkeypatch):
+	p = str(tmp_path / 'l.tsv')
+	_touch(p, b'id\tv\tw\t\na\t1\t2\t\n')
+	reads = []
+	original = TSVZ._legacyFirstLine
+	monkeypatch.setattr(TSVZ, '_legacyFirstLine', lambda *args: reads.append(1) or original(*args))
+	t = TSVZ.TSVZedLite(p, header='id\tv', strict=False, verbose=False)
+	assert not reads and t._appendWidth == 4
+	t['c'] = ['c', '4']
+	t.close()
+	assert _bytes(p) == b'id\tv\tw\t\na\t1\t2\t\nc\t4\t\t\n'
+
+
+def test_a_lite_keeps_its_docstring():
+	assert TSVZ.TSVZedLite.__doc__ and TSVZ.TSVZedLite.__doc__.lstrip().startswith('A mutable mapping class')
+	assert TSVZ.TSVZedLite._appendWidth == 0
+
+
+@pytest.mark.parametrize('route', ['commit', 'hardMapToFile'])
+def test_a_store_that_took_a_delete_out_of_a_one_column_file_holds_what_a_reopen_reads(tmp_path, route):
+	# The deleted `a` set the file's count (one); without it the file reads at the defaults line's three, and a reopen reads
+	# b with Q. 5.07 moved b up into a's place and kept the count; the stand-in rule leaves the line, so memory follows the file
+	# as it does after a widening (the stand-in is none here: line 1 has one cell).
+	p = str(tmp_path / 'z.tsv')
+	_touch(p, b'x\na\n#_defaults_#\t\tQ\nb\t1\n')
+	t = TSVZ.TSVZed(p, header='id', strict=False, verbose=False, append_check_delay=60)
+	del t['a']
+	if route == 'commit':
+		t.commitAppendToFile()
+	else:
+		t.hardMapToFile()
+	held = dict(t)
+	count = t.correctColumnNum
+	t.close()
+	assert _bytes(p) == b'x\n#_defaults_#\t\tQ\nb\t1\n'
+	again = TSVZ.TSVZed(p, header='id', strict=False, verbose=False, append_check_delay=60, rewrite_on_load=False)
+	assert held == dict(again) == {'b': ['b', '1', 'Q']} and count == again.correctColumnNum
+	again.close()
