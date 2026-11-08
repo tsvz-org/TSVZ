@@ -2830,6 +2830,13 @@ def _legacyRawLine(line):
 	return line[:-1] if line.endswith(b'\n') else line.rstrip(b'\x00')
 
 
+def _legacyCells(line, delimiter):
+	"""The cells of the legacy line body ``line`` (_legacyLineBody) as _processLine reads them (_unsanitize), quicker when
+	it holds no escape: then each is the text between delimiters without the whitespace at its end."""
+	cells = line.split(delimiter)
+	return _unsanitize(cells, delimiter) if '<' in line else [cell.rstrip() for cell in cells]
+
+
 def _legacyLineKind(text, width, strictActive, delimiter):
 	"""What a read at column count ``width`` makes of the legacy line ``text``, as _processLine decides it, changing
 	nothing: ``(kind, key, ncells, strictTakes)``. ``kind`` is 'skip' (comment, empty, no key), 'row', 'delete',
@@ -2839,7 +2846,7 @@ def _legacyLineKind(text, width, strictActive, delimiter):
 	line = _legacyLineBody(text)
 	if not line or (line.startswith('#') and not line.startswith(DEFAULTS_INDICATOR_KEY)):
 		return 'skip', None, 0, False
-	cells = _unsanitize(line.split(delimiter), delimiter)
+	cells = _legacyCells(line, delimiter)
 	if not cells or not cells[0]:
 		return 'skip', None, 0, False
 	if len(cells) == 1 or not any(cells[1:]):
@@ -2852,8 +2859,8 @@ def _legacyLineKind(text, width, strictActive, delimiter):
 
 def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matched, still=(), lives=False):
 	"""What one reader's compaction of the legacy lines ``raw`` (bytes, without their newline) keeps:
-	``(kept, content, moved, lineLife, lifeEnd, width)``, ``width`` the column count it reads at. ``kept`` has a 1 for each
-	line kept, each a line of ``raw`` byte for
+	``(kept, content, moved, lineLife, lifeEnd, width, alone)``, ``width`` the column count it reads at, ``alone`` whether
+	line 1 is a row or a deletion to it and no other keyed line has line 1's key. ``kept`` has a 1 for each line kept, each a line of ``raw`` byte for
 	byte and in its place, but for those in ``content`` (index -> bytes): a key's last line moved up into its first line's
 	place (``moved``: first -> last) and a dead key's protected line emptied (built from its own bytes). ``still``: the
 	indexes where no line is moved in or emptied. With ``lives``, the key lives this reader reads: ``lineLife`` gives each
@@ -2874,6 +2881,8 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 	line0Keyed = bool(raw) and keyed(0)
 	after0 = next((i for i in range(1, len(raw)) if keyed(i)), None)
 	protectable = (0,) if after0 is None else (0, after0)
+	key0 = _legacyLineKind(raw[0].decode(enc, errors='replace'), 1, False, delimiter)[1] if raw else None
+	alone = not consumed  # (line 1 a row or a deletion to this reader, and no other keyed line of its key)
 	# Each live key's lines since its last deletion, one slot per key in flat arrays (small per key: memory peaks here
 	# during a TSVZed rewrite): its first and last line, the first and last a strict reader takes (-1: none), the cell
 	# counts of the first and last, and which strict readers take them (a mask: 1, 5.5's, which takes a wider line; 2,
@@ -2903,9 +2912,11 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 			kind, key, n, takes = _legacyLineKind(text, width, strictActive, delimiter)
 		if firstKeyed is None:
 			firstKeyed = i
+		if alone and (key == key0 if i else kind not in ('row', 'delete')):
+			alone = False
 		takesOld = kind in ('delete', 'reset') or n == width or strictActiveOld
 		if not takesOld and kind == 'row' and width == 1:  # (a line with no value is a row at width 1, whatever its cells)
-			takesOld = not any(_unsanitize(_legacyLineBody(text).split(delimiter), delimiter)[1:])
+			takesOld = not any(_legacyCells(_legacyLineBody(text), delimiter)[1:])
 		mask = (1 if takes else 0) | (2 if takesOld else 0)
 		if kind in ('defaults', 'reset'):
 			if boundaries and raw[i] == raw[boundaries[-1]] and i not in protectable:
@@ -2926,7 +2937,7 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 			if i in protectable:
 				pinfo[i] = (key, n)
 			full = bool(boundaries) and n == width and all(  # (only a defaults line before it can matter)
-				c.strip() for c in _unsanitize(_legacyLineBody(text).split(delimiter), delimiter)[1:])
+				c.strip() for c in _legacyCells(_legacyLineBody(text), delimiter)[1:])
 			slot = live.get(key)
 			if slot is None:
 				slot = live[key] = len(first)
@@ -3006,7 +3017,7 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 		key0 = _legacyLineKind(raw[0].decode(enc, errors='replace'), width, False, delimiter)[1]
 		if key0 is not None and key0 not in live and key0 in lastDelete:
 			kept[lastDelete[key0]] = 1
-	return kept, content, moved, lineLife, lifeEnd, width
+	return kept, content, moved, lineLife, lifeEnd, width, alone
 
 
 def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, matched):
@@ -3044,7 +3055,12 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 		return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]]
 
 	def plans(still=()):
-		return [_legacyCompactPlan(raw, w, c, defaults, delimiter, encoding, m, still, True) for w, c, m in readers]
+		out = []
+		for w, c, m in readers:
+			if len(out) == 2 and out[1][6] and out[1][5] == w:
+				break  # (the readers given line 1 for a header read as those given none but for line 1's key: it has no other line)
+			out.append(_legacyCompactPlan(raw, w, c, defaults, delimiter, encoding, m, still, True))
+		return out
 	every = plans()
 
 	def agrees(other, i, line, emptied):
@@ -3058,18 +3074,17 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 			 if not all(agrees(other, i, line, i not in plan[2]) for other in every)}
 	if still:
 		every = plans(still)
-	kept = bytearray(len(raw))
+	union = 0
 	for plan in every:
-		for i, k in enumerate(plan[0]):
-			if k:
-				kept[i] = 1
+		union |= int.from_bytes(plan[0], 'little')
+	kept = bytearray(union.to_bytes(len(raw), 'little'))
 	content = {}
 	for plan in every:
 		content.update(plan[1])  # (where two plans have a line, the same bytes now)
 	changed = True
 	while changed:
 		changed = False
-		for own, _, moved, lineLife, lifeEnd, _ in every:
+		for own, _, moved, lineLife, lifeEnd, _, _ in every:
 			# (the lines kept for the other readers alone: a byte 1 for each)
 			extra = (int.from_bytes(kept, 'little') & ~int.from_bytes(own, 'little')).to_bytes(len(raw), 'little')
 			top = {}  # life -> its last line kept for another reader
