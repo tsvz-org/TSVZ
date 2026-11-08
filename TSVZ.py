@@ -3049,22 +3049,24 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 
 
 def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched):
-	"""One pass of _legacyCompact over the legacy lines ``raw`` (bytes, without their newline): the lines kept, each a
-	line of ``raw`` byte for byte and in its place, but for a key's last line moved up into its first line's place
-	and a dead key's protected line emptied (built from its own bytes), for every reader of _legacyCompactReaders.
+	"""One pass of _legacyCompact over the legacy lines ``raw`` (bytes, without their newline): ``(lines, emptied)``, the
+	lines kept, each a line of ``raw`` byte for byte and in its place, but for a key's last line moved up into its first
+	line's place and a dead key's protected line emptied (built from its own bytes), for every reader of
+	_legacyCompactReaders; ``emptied`` whether a line was emptied (a pass that empties none leaves nothing new droppable).
 
 	With one reader, what its plan keeps (_legacyCompactPlan). With more, every line any of their plans keeps, and a
 	line moved or emptied only where every plan keeps that line with the same bytes, or (an emptied line, which is a
 	deletion as wide) a reader at two columns or more keeps no line of that key's life there; else no plan moves or
 	empties it, and each keeps those lines as they are. A line one plan keeps is then another's to read as well: where
-	it is a row of a key that reader reads as deleted after it, the deletion stays; where it falls between a key's first
-	line and the last line that reader moved into it, that last line stays too. Every reader then reads its own plan's
-	rows, in its order: a line kept for another reader falls inside a key's life whose first and last line the reader
-	takes are kept, or in a life whose end it reads."""
+	it is a row of a key that reader reads as deleted after it, the deletion stays. (No line stays for a reader that moved
+	a key's last line into its first line's place: a move survives only when every plan moves the same bytes there, and
+	a plan that collapses a life keeps no other line of it.) Every reader then reads its own plan's rows, in its order:
+	a line kept for another reader falls inside a key's life whose first and last line the reader takes are kept, or in a
+	life whose end it reads."""
 	readers = _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, matched)
 	if len(readers) == 1:
-		kept, content = _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matched)[:2]
-		return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]]
+		kept, content, moved = _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matched)[:3]
+		return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]], any(i not in moved for i in content)
 
 	def plans(still=()):
 		out = []
@@ -3096,25 +3098,19 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 	changed = True
 	while changed:
 		changed = False
-		for own, _, moved, lineLife, lifeEnd, _, _ in every:
+		for own, _, _, lineLife, lifeEnd, _, _ in every:
 			# (the lines kept for the other readers alone: a byte 1 for each)
 			extra = (int.from_bytes(kept, 'little') & ~int.from_bytes(own, 'little')).to_bytes(len(raw), 'little')
-			top = {}  # life -> its last line kept for another reader
 			i = extra.find(1)
 			while i >= 0:
 				life = lineLife[i]
 				if life >= 0:
-					top[life] = i
 					end = lifeEnd[life]
 					if end >= 0 and not kept[end]:
 						kept[end] = 1  # (a row kept for another reader: this one reads the key deleted after it)
 						changed = True
 				i = extra.find(1, i + 1)
-			for f, l in moved.items():
-				if not kept[l] and top.get(lineLife[f], f) > f:
-					kept[l] = 1  # (a line of the key kept between: this reader reads the last one after it)
-					changed = True
-	return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]]
+	return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]], any(i not in plan[2] for plan in every for i in plan[1])
 
 
 def _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched):
@@ -3122,14 +3118,16 @@ def _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched)
 	empty lines, superseded lines, dead keys' lines): what every reader given the caller's arguments takes from it,
 	of any version and either strictness, stays, and under a header line 1 does not hold what every reader that counts
 	from line 1 takes too (_legacyCompactReaders), because every line kept is kept as it is, in its place
-	(_legacyCompactOnce). Repeats until a pass changes nothing (emptying a line can make another one droppable), at most
-	4 passes: stopping early is less compact, never wrong."""
+	(_legacyCompactOnce). Repeats while a pass empties a line (that can make another one droppable; a pass that empties
+	none left nothing new droppable in 64,000 compactions tried), at most 4 passes: stopping early is less compact, never
+	wrong."""
 	defaults = list(defaults) if defaults and defaults is not ... else []
 	for _ in range(4):
-		out = _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched)
-		if out == raw:
-			break
+		out, emptied = _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched)
+		changed = out != raw
 		raw = out
+		if not (changed and emptied):
+			break
 	return raw
 
 

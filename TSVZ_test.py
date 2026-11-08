@@ -12700,7 +12700,7 @@ def _compact(raw, header='', defaults=None, delimiter='\t', passes=None):
 	if passes is None:
 		return TSVZ._legacyCompact(raw, width, consumed, dflt, delimiter, 'utf8', matched)
 	for _ in range(10):
-		out = TSVZ._legacyCompactOnce(raw, width, consumed, dflt, delimiter, 'utf8', matched)
+		out = TSVZ._legacyCompactOnce(raw, width, consumed, dflt, delimiter, 'utf8', matched)[0]
 		if out == raw:
 			return out
 		passes.append(1)
@@ -17012,6 +17012,9 @@ F1_CASES = [
 	(b'a\nb\t1\nc\t1\nc\t5\t6\nc\t3\n', '', [D_, '', ''], True, 'rewrite'),
 	(b'a\nb\t1\nc\t1\nc\t5\t6\nc\t3\n', '', [D_, '', ''], False, 'scrub'),
 	(b'x\na\nc\t1\nc\t5\t6\nc\t3\n', 'q', [D_, 'P'], False, 'scrub'),
+	# a defaults line between the one-column rule's file and its rows: 5.09 kept c\t1 and c\t3, 5.10 only c\t3
+	(b'a\n#_defaults_#\nb\t1\nb\t5\t6\nb\t3\n', '', [D_, 'x', 'y'], False, 'scrub'),
+	(b'a\n#_defaults_#\nb\t1\nb\t5\t6\nb\t3\n', '', [D_, 'x', 'y'], True, 'scrub'),
 ]
 
 
