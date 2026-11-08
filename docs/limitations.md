@@ -182,9 +182,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   rewrite of a healthy file (which compacts it the same way), decide which lines are dead with their own reader:
   its header, defaults and column count. A reader given other
   ones can see another file afterwards: one given a header that line 1 is not, which
-  takes its column count from a line the scrub may have dropped. A file of one column is the exception, from 5.6: line 1 or
-  the first keyed line after it being one cell, it is compacted as one whatever the scrub was given, so a reader that takes it
-  as one column keeps its lone keys. A widening or a rewrite can move a cell's value the same way, with no row lost: a store with
+  takes its column count from a line the scrub may have dropped. From 5.10, under a header that line 1 does not hold
+  (line 1 a row, or another program's widening of the header), the compaction also keeps what every reader given no
+  header, and every reader given line 1 for its header, takes: they count from line 1. A file of one column is the
+  exception, from 5.6: line 1 or the first keyed line after it being one cell, it is compacted as one whatever the scrub
+  was given, so a reader that takes it as one column keeps its lone keys. A widening or a rewrite can move a cell's value the same way, with no row lost: a store with
   defaults wider than its header writes them into a row (`id`, `a<TAB>1`, header `id<TAB>v`, three-cell defaults gives
   `a<TAB>1<TAB>Q`, so a reader given no defaults gains Q); a bare `#_defaults_#` in a one-column file becomes a reset once it
   widens, so a plain reader's default-filled cell turns empty; and a store with no header, whose defaults are narrower than the
@@ -209,7 +211,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   5.6 (a file of one column); 2026-11-06, "Known limitation (Recommended)" for each of the three cell cases above;
   2026-11-07, "Known limitation (Recommended)" for the delete case, then a wider set of shapes. Narrowed in 5.08 to the shape
   the stand-in rule leaves (no stand-in from a row with a value after a line 1 of one cell), which the 2026-11-07 approval
-  covers.
+  covers. Narrowed in 5.10 (under a header line 1 does not hold, also kept for the readers that count from line 1).
 
 ### A stdout nobody reads can abort or hold the exit
 - Kind: known limitation
@@ -422,46 +424,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   (a line 1 of two cells that already names the key) was fixed in 5.09's first build and put back as deferred to 5.10
   with the two-count compaction (W1) in review round 1, after it lost rows for strict readers; same standing rule.
 
-### A rewrite by a store whose line 1 widens its header can lose rows for strict readers given no header
-- Kind: deferred
-- What the operator sees: `TSVZed(p, header='id\tv')` (or `header='id'`) on `id\tv\tw\nb\t1\nb\t\t1\nb\t1\n`, a file whose
-  line 1 another program widened, then `hardMapToFile()` or `rewrite(force=True)`: the file becomes `id\tv\tw\nb\t1\n`,
-  and every strict reader given no header (`readTabularFile(p)` of 3.39 to 5.9, a strict `TSVZed` or a `TSVZedLite`),
-  which reads three columns from line 1 and drops `b\t1`, loses `b`: 12 reader-cases per strict reader class at depth 3
-  of the 5.09 sweep, with no delete in it. The store follows the widening and reads at three columns, but its rewrite
-  compacts at the count of the line after line 1 (two), which only a reader given `id\tv` (a mismatch to it) uses. 5.6
-  and 5.7 do the same.
-- Why: compacting at the store's three columns instead keeps those readers' rows but loses rows for the reader given
-  the header line 1 widens (1,500 reader-cases at depth 3) and for tsvz-rs (225); keeping what both counts need is a
-  change to the compaction, not to the delete this version is about.
-- Revisit when: 5.10: compact at both counts when line 1 widens the store's header (keep every line either count's
-  readers take). The same compaction lets shape 2's stand-in back (previous entry), and a delete's commit use it too
-  (next entries). It also cures a delete of a key whose stand-in comes from a key no earlier row names, followed by a
-  rewrite from a `TSVZed` given the header (`a\t\t1\na\nb\t\t1\nb\t1\n` under `id`: strict readers given no header
-  lose `b`; 72 tier-1 reader-cases in the store's own delete and rewrite, 396 after `tsvz delete` then such a rewrite,
-  at depth 4 of the 5.09 review; 5.07 and 5.08 lose them too). It leads 5.10's list: this is a row loss for tier-1
-  strict readers, in 5.6 and later.
-- Noted: 2026-11-08, found in the 5.09 design sweep; a deferral under the user's standing rule.
-
-### A delete's commit compacts nothing, so a one-column file with superseded lines grows
-- Kind: deferred (5.10)
-- What the operator sees: a program that keeps one `TSVZed` open on a file of one column that holds valued rows, and
-  updates those rows and deletes keys often, ends with a file that keeps every superseded line until a rewrite, and each
-  delete's commit rewrites all of it. Measured over 4,000 rounds of 5 valued-row updates and a delete (50 lone keys, 5
-  valued rows): 5.8 ends at 61 lines in 11 s (linear), reopening in 1.0 ms; 5.9 at 4,056 lines in 82 s (quadratic),
-  reopening in 16.6 ms. Key-only work (an LRU with `move_to_end` and `popitem`, plain churn) does not grow, and memory
-  always equals a reopen. A file of two columns or more already keeps its superseded lines the same way, but there a delete
-  is an appended line, not a rewrite of the whole file. Workaround: call `hardMapToFile()` now and then (README,
-  "Upgrading to 5.9 from 5.8", item 1).
-- Why: 5.9's commit takes out only the deleted keys' lines and compacts nothing, so that no reader loses a row to a
-  compaction at the store's count (the 5.09 design's Call 3). That count is the one a reader given another count does not
-  share.
-- Plan: the two-count compaction planned for the previous entries (keep every line either count's readers take), applied
-  at the commit too.
-- Revisit when: 5.10.
-- Noted: 2026-11-08, found in the 5.09 review (round 1); a deferral under the user's standing rule that deferrals are
-  noted, not asked.
-
 ### A widening loses a key whose only line 3.39's strict reader takes holds no value
 - Kind: deferred
 - What the operator sees: `TSVZed(p, header='id\tv')` on `id\nb\t\nb\t\t1\n`, then a rewrite you ask for: line 1
@@ -472,9 +434,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   the wider line and keep `b`. 5.6 to 5.8 do the same.
 - Why: the widening's rule (5.6) refuses a file with a key whose last line holds no value, and lets through a key that a
   later line gives a value; for 3.39's strict reader that later line is invisible when it is wider than the header.
-- Revisit when: 5.10, with the user's answer to the 5.09 design's question on it (refuse the widening there, with the
-  warning a lone key gives, or widen and lose the key for that reader).
-- Noted: 2026-11-08, found in the 5.09 design sweep; a deferral under the user's standing rule.
+- Revisit when: 5.11, with the user's answer to the 5.09 design's question on it (Q-C: refuse the widening there, with the
+  warning a lone key gives, or widen and lose the key for that reader). 5.10's compaction is not the cause: the widening is
+  decided before it, and once line 1 holds the header the file is compacted for one count. Left unwidened (Q-C's refusal),
+  the file is compacted for line 1's readers too (5.10), so the line 3.39's strict reader takes at line 1's one column stays.
+- Noted: 2026-11-08, found in the 5.09 design sweep; a deferral under the user's standing rule. 2026-11-08: not built in
+  5.10 (the user's answer is pending), deferred to 5.11 under the same rule.
 
 ### A TSVZedLite delete looks at the file's first lines every time
 - Kind: deferred

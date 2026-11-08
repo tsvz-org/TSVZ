@@ -289,3 +289,30 @@ entries go last, in the same commit as the change:
   nobody asked for one, and a compaction is right only for the reader whose count it is made at.
 - Lesson: when one operation is carried out by another's machinery, it takes only its own effect from it; each of the
   machinery's other effects is a request of its own. A door that does more than the others is the one to check first.
+
+## 2026-11-08 TSVZ 5.10: a compaction keeps what every count the file is read at takes
+- Changed: under a header that line 1 does not hold (line 1 a row to readers given no header, or another program's
+  widening of the header), a compaction of a loose file (a `TSVZed` rewrite, a scrub, and again a one-column delete's
+  commit) keeps every line that any of three readers takes: the caller's, which counts from the first keyed line after
+  line 1, and the readers given no header and given line 1 for a header, which count from line 1 (a store that follows a
+  widening is one of them). Each reader's plan is made as before (`_legacyCompactPlan`); a line kept for one reader is
+  kept as it is; a key's last line moves into its first line's place, or a dead key's line is emptied, only where every
+  plan agrees; and a line kept for another reader brings along the deletion or the last line its own plan needs around
+  it. A file with no header, or whose line 1 holds the header, compacts as in 5.9. A key's lines now also become one
+  line when each strict reader takes both or none of them (5.5 to 5.9: only when both strict readers took both). A
+  `TSVZed` delete's commit compacts again, as in 5.8, now for every count.
+- Why we had to change: three findings had one cause. W1: a store given `id\tv` on `id\tv\tw\nb\t1\nb\t\t1\nb\t1\n` (line 1
+  widened by another program) reads three columns, as every reader given no header does, but its rewrite compacted at the
+  count of the line after line 1 (two), where `b\t\t1` is superseded, and every strict reader given no header lost `b`
+  (5.6 to 5.9). R2: a delete under a header whose stand-in sets the store's count to one, then a rewrite, the same (72
+  tier-1 reader-cases in the store's doors, 396 after `tsvz delete`, at depth 4; 5.07 to 5.9). N2: 5.9 had cured the
+  commit's loss of the same kind (Call 3 of the 5.08 design) by taking the compaction out of the commit, and a one-column
+  file that a store updates and deletes in then kept every superseded line: 4,056 lines after 4,000 rounds, 80 s
+  (quadratic), against 61 lines and 15 s in 5.8.
+- Original design was wrong because: a compaction was made for one reader, the caller's, and `_legacyFileWidth` chose
+  which count that was, though a file under a header line 1 does not hold is read at two counts by the programs that
+  matter. 5.9's fix removed the step from the door where the loss showed instead of making the step right; the step was
+  also what kept the file small.
+- Lesson: when one file is read at more than one count (or by more than one rule), a maintenance step keeps what each of
+  those readers takes, and changes a line only where all of them agree. A step found right for only one reader is made
+  right for every reader, not taken out of the door where the loss showed: it may be what pays for something else.

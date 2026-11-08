@@ -43,7 +43,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.09'
+version = '5.10'
 __version__ = version
 author = 'pan@zopyr.us'
 COMMIT_DATE = '2026-11-08'
@@ -2850,18 +2850,22 @@ def _legacyLineKind(text, width, strictActive, delimiter):
 	return ('defaults' if cells[0] == DEFAULTS_INDICATOR_KEY else 'row'), cells[0], len(cells), takes
 
 
-def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched):
-	"""One pass of _legacyCompact over the legacy lines ``raw`` (bytes, without their newline): the lines kept, each a
-	line of ``raw`` byte for byte and in its place, but for a key's last line moved up into its first line's place
-	and a dead key's protected line emptied (built from its own bytes).
+def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matched, still=(), lives=False):
+	"""What one reader's compaction of the legacy lines ``raw`` (bytes, without their newline) keeps:
+	``(kept, content, moved, lineLife, lifeEnd, width)``, ``width`` the column count it reads at. ``kept`` has a 1 for each
+	line kept, each a line of ``raw`` byte for
+	byte and in its place, but for those in ``content`` (index -> bytes): a key's last line moved up into its first line's
+	place (``moved``: first -> last) and a dead key's protected line emptied (built from its own bytes). ``still``: the
+	indexes where no line is moved in or emptied. With ``lives``, the key lives this reader reads: ``lineLife`` gives each
+	row line its life's number (-1 for any other line), ``lifeEnd`` each life the deletion that ends it (-1: none).
 
-	``width`` is the column count of the caller's reader (-1: taken from the first keyed line), ``consumed`` whether
-	that reader takes line 1 for its header, ``matched`` whether line 1 holds that header, ``defaults`` the caller's.
+	``width`` is the column count of the reader (-1: taken from the first keyed line), ``consumed`` whether it takes line
+	1 for its header, ``matched`` whether line 1 holds that header, ``defaults`` the caller's.
 	Kept: line 1; every #_defaults_# line; for each live key since its last deletion, its first line (its place) and
 	its last (its value), and the first and last a strict reader takes, unless nothing between the first and the last
 	changes how a row reads, when the last line takes the first one's place; the first keyed line after line 1 when a
-	reader takes its column count from it (line 1 holds no key, or a header the caller's reader does not take): a dead
-	key's line there is kept emptied (a deletion as wide as it was), or with the deletion that ends it."""
+	reader takes its column count from it (line 1 holds no key, or a header the reader does not take): a dead key's line
+	there is kept emptied (a deletion as wide as it was), or with the deletion that ends it."""
 	enc = encoding or 'utf8'
 	strictActive = strictActiveOld = len(defaults) > 1 and any(defaults[1:])
 
@@ -2880,6 +2884,8 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 	firstN, lastN = array.array('l'), array.array('l')
 	firstTakes, lastTakes = bytearray(), bytearray()
 	lastFull = bytearray()  # whether the last line is exactly W wide with a value in every cell: no defaults reach it
+	lineLife = array.array('l', [-1]) * len(raw) if lives else None
+	lifeEnd = array.array('l') if lives else None  # (a slot is a life: a key starts a new one after each deletion)
 	pinfo = {}  # protectable index holding a row -> (key, ncells)
 	killer = {}  # protectable index whose key died -> the deletion that ended it
 	lastDelete = {}  # key -> its last deletion
@@ -2913,6 +2919,8 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 				for j in protectable:
 					if j in pinfo and pinfo[j][0] == key and j >= first[slot]:
 						killer[j] = i
+				if lives:
+					lifeEnd[slot] = i
 			lastDelete[key] = i
 		else:
 			if i in protectable:
@@ -2921,7 +2929,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 				c.strip() for c in _unsanitize(_legacyLineBody(text).split(delimiter), delimiter)[1:])
 			slot = live.get(key)
 			if slot is None:
-				live[key] = len(first)
+				slot = live[key] = len(first)
 				first.append(i)
 				last.append(i)
 				firstTaken.append(i if takes else -1)
@@ -2933,6 +2941,8 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 				firstTakes.append(mask)
 				lastTakes.append(mask)
 				lastFull.append(full)
+				if lives:
+					lifeEnd.append(-1)
 			else:
 				last[slot], lastN[slot], lastTakes[slot], lastFull[slot] = i, n, mask, full
 				if takes:
@@ -2943,23 +2953,30 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 					if firstTakenOld[slot] < 0:
 						firstTakenOld[slot] = i
 					lastTakenOld[slot] = i
+			if lives:
+				lineLife[i] = slot
 	kept = bytearray(len(raw))  # (one byte a line: whether it is kept)
 	for i in boundaries:
 		kept[i] = 1
 	if raw:
 		kept[0] = 1
 	content = {}
+	moved = {}
 	for slot in live.values():
 		f, l = first[slot], last[slot]
 		kept[f] = 1
 		if f == l:
 			continue
 		# The key becomes one line (its value at its place) when the same defaults reach both places (no defaults line
-		# between them), or none can reach its last line (exactly W wide, a value in every cell, for every reader).
+		# between them), or none can reach its last line (exactly W wide, a value in every cell, for every reader), and
+		# each strict reader takes both lines or none of the key's (5.10; 5.5 to 5.9: both, for both strict readers):
+		# it then reads the moved line as it read the last one, or not at all.
 		if ((lastFull[slot] or bisect.bisect_right(boundaries, f) == bisect.bisect_left(boundaries, l))
-				and firstTakes[slot] == lastTakes[slot] == 3
+				and firstTakes[slot] == lastTakes[slot] and f not in still
+				and (firstTakes[slot] & 1 or firstTaken[slot] < 0) and (firstTakes[slot] & 2 or firstTakenOld[slot] < 0)
 				and f != 0 and (f not in (firstKeyed, after0) or firstN[slot] == lastN[slot])):
 			content[f] = raw[l]
+			moved[f] = l
 			continue
 		kept[l] = 1
 		if firstTaken[slot] >= 0:
@@ -2976,7 +2993,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 	for j in protected:
 		kept[j] = 1
 		if j in killer:
-			if j != 0 and pinfo[j][1] > 1 and delimiter != '\x00':
+			if j != 0 and pinfo[j][1] > 1 and delimiter != '\x00' and j not in still:
 				# Emptied: a deletion as wide as the line was, so a reader takes the same column count from it and
 				# the key stays dead; the deletion that ended it is then not needed. (Not in .nsv: its readers strip
 				# trailing NULs, so an emptied line would read one cell wide.)
@@ -2989,13 +3006,95 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 		key0 = _legacyLineKind(raw[0].decode(enc, errors='replace'), width, False, delimiter)[1]
 		if key0 is not None and key0 not in live and key0 in lastDelete:
 			kept[lastDelete[key0]] = 1
+	return kept, content, moved, lineLife, lifeEnd, width
+
+
+def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, matched):
+	"""The readers a compaction of the legacy lines ``raw`` keeps what they take for, as ``(width, consumed, matched)``
+	(_legacyCompactPlan): the caller's, and, when it takes line 1 for a header line 1 does not hold, the readers that
+	count from line 1 as well: given no header (line 1 a row to them, at its count, or the defaults' as the caller's
+	reader takes them) and given line 1 for their header (a store that follows a widening of its header among them).
+	The caller's reader then counts from the first keyed line after line 1 (or a program that does not follow a
+	widening, given the header line 1 widens), and its count is the one ``width`` gives."""
+	readers = [(width, consumed, matched)]
+	if consumed and not matched and raw:
+		kind, _, cells, _ = _legacyLineKind(raw[0].decode(encoding or 'utf8', errors='replace'), 1, False, delimiter)
+		if kind != 'skip':
+			readers.append((cells if cells == 1 or len(defaults) < 2 else len(defaults), False, False))
+			readers.append((cells, True, True))
+	return readers
+
+
+def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched):
+	"""One pass of _legacyCompact over the legacy lines ``raw`` (bytes, without their newline): the lines kept, each a
+	line of ``raw`` byte for byte and in its place, but for a key's last line moved up into its first line's place
+	and a dead key's protected line emptied (built from its own bytes), for every reader of _legacyCompactReaders.
+
+	With one reader, what its plan keeps (_legacyCompactPlan). With more, every line any of their plans keeps, and a
+	line moved or emptied only where every plan keeps that line with the same bytes, or (an emptied line, which is a
+	deletion as wide) a reader at two columns or more keeps no line of that key's life there; else no plan moves or
+	empties it, and each keeps those lines as they are. A line one plan keeps is then another's to read as well: where
+	it is a row of a key that reader reads as deleted after it, the deletion stays; where it falls between a key's first
+	line and the last line that reader moved into it, that last line stays too. Every reader then reads its own plan's
+	rows, in its order: a line kept for another reader falls inside a key's life whose first and last line the reader
+	takes are kept, or in a life whose end it reads."""
+	readers = _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, matched)
+	if len(readers) == 1:
+		kept, content = _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matched)[:2]
+		return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]]
+
+	def plans(still=()):
+		return [_legacyCompactPlan(raw, w, c, defaults, delimiter, encoding, m, still, True) for w, c, m in readers]
+	every = plans()
+
+	def agrees(other, i, line, emptied):
+		# (the same bytes there; or an emptied line, which reads as a deletion as wide, where the other reader keeps no
+		# line of that key's life: it reads the key deleted after it all the same)
+		if other[0][i]:
+			return other[1].get(i) == line
+		life = other[3][i]
+		return emptied and other[5] > 1 and life >= 0 and other[4][life] >= 0
+	still = {i for plan in every for i, line in plan[1].items()
+			 if not all(agrees(other, i, line, i not in plan[2]) for other in every)}
+	if still:
+		every = plans(still)
+	kept = bytearray(len(raw))
+	for plan in every:
+		for i, k in enumerate(plan[0]):
+			if k:
+				kept[i] = 1
+	content = {}
+	for plan in every:
+		content.update(plan[1])  # (where two plans have a line, the same bytes now)
+	changed = True
+	while changed:
+		changed = False
+		for own, _, moved, lineLife, lifeEnd, _ in every:
+			# (the lines kept for the other readers alone: a byte 1 for each)
+			extra = (int.from_bytes(kept, 'little') & ~int.from_bytes(own, 'little')).to_bytes(len(raw), 'little')
+			top = {}  # life -> its last line kept for another reader
+			i = extra.find(1)
+			while i >= 0:
+				life = lineLife[i]
+				if life >= 0:
+					top[life] = i
+					end = lifeEnd[life]
+					if end >= 0 and not kept[end]:
+						kept[end] = 1  # (a row kept for another reader: this one reads the key deleted after it)
+						changed = True
+				i = extra.find(1, i + 1)
+			for f, l in moved.items():
+				if not kept[l] and top.get(lineLife[f], f) > f:
+					kept[l] = 1  # (a line of the key kept between: this reader reads the last one after it)
+					changed = True
 	return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]]
 
 
 def _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched):
 	"""The legacy file whose lines are ``raw`` (bytes, without their newline) compacted by dropping lines (comments,
 	empty lines, superseded lines, dead keys' lines): what every reader given the caller's arguments takes from it,
-	of any version and either strictness, stays, because every line kept is kept as it is, in its place
+	of any version and either strictness, stays, and under a header line 1 does not hold what every reader that counts
+	from line 1 takes too (_legacyCompactReaders), because every line kept is kept as it is, in its place
 	(_legacyCompactOnce). Repeats until a pass changes nothing (emptying a line can make another one droppable), at most
 	4 passes: stopping early is less compact, never wrong."""
 	defaults = list(defaults) if defaults and defaults is not ... else []
@@ -3089,6 +3188,15 @@ def _legacyFileWidth(lines, header, consumed, encoding, delimiter):
 	if opening == 1 or (opening != -1 and not consumed):
 		return opening
 	return next((cells for cells in map(cellsOf, lines) if cells != -1), -1)
+
+
+def _legacyReaderWidth(raw, header, consumed, matched, encoding, delimiter):
+	"""The column count the caller's reader takes from the legacy lines ``raw``, which _legacyCompact keeps what it reads
+	at: the file's (_legacyFileWidth), but under a header line 1 does not hold (``matched``) the first keyed line after
+	line 1's, which that reader counts from; the readers that count from line 1 are _legacyCompactReaders' others."""
+	if consumed and not matched:
+		return _legacyFileWidth(itertools.islice(raw, 1, None), (), False, encoding, delimiter)
+	return _legacyFileWidth(raw, header, consumed, encoding, delimiter)
 
 
 @contextlib.contextmanager
@@ -3301,7 +3409,7 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 		matched = consumed and line0 is not None and _headerMatches(formatted, line0, dlm)
 		if consumed and line0 is not None and not matched and not tries:
 			__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
-		if _legacyFileWidth(raw, formatted, consumed, encoding, dlm) == 1:
+		if _legacyReaderWidth(raw, formatted, consumed, matched, encoding, dlm) == 1:
 			width = 1  # (a file of one column is compacted as one, as a TSVZed rewrite does: its lone keys are rows)
 		lines = _legacyCompact(raw, width, consumed, givenDefaults, dlm, encoding, matched)
 		del raw
@@ -6690,7 +6798,7 @@ memoryOnly:{self.memoryOnly}
 		back if it stops). A healthy file (Q-D3): its lines (_fileLines) with the queued rows after them, line 1 widened to
 		the store's header when it is that header's beginning (_legacyWidened) and the lines
 		of drop items' keys left out (_legacyDropLines), compacted as a scrub compacts them (_legacyCompact), but for a
-		commit's (``commit``): it widens and compacts nothing. A file to
+		commit's (``commit``): it widens nothing. A file to
 		be made again: only what keeps its reading (_remadeLines); memory holds what was queued. Then, either way, what
 		memory holds that those lines do not say (_RewriteRows, a flat snapshot checked before anything is written: a
 		TSVZEncodeError changes nothing): rows that read otherwise (changed in place, put in memory straight, every row
@@ -6737,7 +6845,7 @@ memoryOnly:{self.memoryOnly}
 			# A file of one column is compacted as one, whatever the store's defaults say: its lone keys are rows, and at their
 			# width they are deletions the compaction would carry out (a\nb\nc under defaults of two cells lost b and c). At
 			# two columns or more the defaults set the width of the reader the compaction keeps what it reads for.
-			width = _legacyFileWidth(raw, header, consumed, encoding, delimiter)
+			width = _legacyReaderWidth(raw, header, consumed, matched, encoding, delimiter)
 			if width != 1 and not matched and len(defaults) > 1:
 				width = len(defaults)
 			# How the store's read takes these lines: the same width and strictness, or the rewrite takes rows the read kept
@@ -6749,10 +6857,11 @@ memoryOnly:{self.memoryOnly}
 			for _ in range(2):  # (twice when the lines say keys are live that are gone from memory, in a one-column file)
 				if dropAt:
 					raw = _legacyDropLines(raw, dropAt, consumed, not matched, delimiter, encoding)
-				# A commit's rewrite is a delete, not a compaction: only the deleted keys' lines go, as through every other
-				# door (_legacyDropKeys). A compaction at the store's count drops lines a reader at another count takes (a
-				# narrower line superseded at the store's one column is the only line 3.39's strict reader takes at two).
-				kept = raw if commit else _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched)
+				# A commit's rewrite compacts too, or a one-column file that a store updates and deletes in grows with every
+				# superseded line, and each delete rewrites all of it (5.9). The compaction keeps what every count the file is
+				# read at takes (_legacyCompactReaders): one made at the store's count alone dropped a narrower line superseded
+				# there, the only line 3.39's strict reader takes at line 1's two (5.8).
+				kept = _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched)
 				del raw
 				flags, diffWidth = self._readLines(kept, consumed, start, strict)
 				with self._memLock:
