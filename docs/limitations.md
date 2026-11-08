@@ -400,7 +400,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     rewrite, each changing `b` for the command, every 5.5 and later reader given no header, a `TSVZed` and tsvz-rs.
   - **A line 1 that already names the key (shape 2).** `d\tX\na\nd\tY\n`, delete `a` under header `q`: every key that
     could stand in is already named by a valued row before the gap (line 1's own `d\tX`), so no stand-in goes there, and
-    3.39's loose reader given `q` goes from `[d]` to `[d, Y]`. 5.6 to 5.9 are the same.
+    3.39's loose reader given `q` goes from `[d]` to `[d, Y]`. 5.6 and 5.7 are no better.
   - No row is lost to any reader in these shapes but the old line-1 row that the widening by a rewrite asked for takes
     (README, "Upgrading to 5.8", item 3).
 - Why: no layout serves both readers. A reader given H counts from the line after line 1, so only a one-cell line keeps
@@ -436,7 +436,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   change to the compaction, not to the delete this version is about.
 - Revisit when: 5.10: compact at both counts when line 1 widens the store's header (keep every line either count's
   readers take). The same compaction lets shape 2's stand-in back (previous entry), and a delete's commit use it too
-  (next entries). It leads 5.10's list: this is a row loss for tier-1 strict readers, in 5.6 and later.
+  (next entries). It also cures a delete of a key whose stand-in comes from a key no earlier row names, followed by a
+  rewrite from a `TSVZed` given the header (`a\t\t1\na\nb\t\t1\nb\t1\n` under `id`: strict readers given no header
+  lose `b`; 72 tier-1 reader-cases in the store's own delete and rewrite, 396 after `tsvz delete` then such a rewrite,
+  at depth 4 of the 5.09 review; 5.07 and 5.08 lose them too). It leads 5.10's list: this is a row loss for tier-1
+  strict readers, in 5.6 and later.
 - Noted: 2026-11-08, found in the 5.09 design sweep; a deferral under the user's standing rule.
 
 ### A delete's commit compacts nothing, so a one-column file with superseded lines grows
