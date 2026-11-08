@@ -3035,6 +3035,12 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 		if kind != 'skip':
 			readers.append((cells if cells == 1 or len(defaults) < 2 else len(defaults), False, False))
 			readers.append((cells, True, True))
+	if width == 1 and len(defaults) > 1 and not matched:
+		# A file the plan reads as one column (the one-column rule) is read at the defaults' count by a reader given them
+		# (5.07 to 5.10 kept it for the one-column readers only, and a row such a reader takes was dropped).
+		readers.append((len(defaults), consumed, matched))
+		if consumed and len(readers) > 2:
+			readers.append((len(defaults), False, False))
 	return readers
 
 
@@ -3058,9 +3064,9 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 
 	def plans(still=()):
 		out = []
-		for w, c, m in readers:
-			if len(out) == 2 and out[1][6] and out[1][5] == w:
-				break  # (the readers given line 1 for a header read as those given none but for line 1's key: it has no other line)
+		for n, (w, c, m) in enumerate(readers):
+			if n == 2 and out[1][6] and out[1][5] == w:
+				continue  # (the readers given line 1 for a header read as those given none but for line 1's key: it has no other line)
 			out.append(_legacyCompactPlan(raw, w, c, defaults, delimiter, encoding, m, still, True))
 		return out
 	every = plans()

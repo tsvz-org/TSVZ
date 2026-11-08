@@ -16978,3 +16978,59 @@ def test_a_store_that_took_a_delete_out_of_a_one_column_file_holds_what_a_reopen
 	again = TSVZ.TSVZed(p, header='id', strict=False, verbose=False, append_check_delay=60, rewrite_on_load=False)
 	assert held == dict(again) == {'b': ['b', '1', 'Q']} and count == again.correctColumnNum
 	again.close()
+
+
+def _every_view(path, line1, header, defaults):
+	"""What every reader of the file reads: this version's and 3.39's readTabularFile, strict and loose, given no header,
+	given line 1 and given the door's header, with no defaults and with the door's; and this version's TSVZed."""
+	out = []
+	for mod in (TSVZ, TSVZ_old):
+		for strict in (True, False):
+			for h in {'', line1, header}:
+				for d in (None, defaults):
+					kwargs = dict(header=h, strict=strict, verbose=False)
+					if d:
+						kwargs['defaults'] = list(d)
+					try:
+						with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+							out.append((mod.__name__, strict, h, bool(d), list(mod.readTabularFile(path, **kwargs).items())))
+					except Exception as e:
+						out.append((mod.__name__, strict, h, bool(d), type(e).__name__))
+	return sorted(out, key=repr)
+
+
+# 5.07 to 5.10 compacted a file the plan reads as one column (a lone key is a row) for the readers at one column alone, and
+# dropped lines that a reader given defaults of two cells or more takes at their count (5.11's fix, F1): the row of `c`
+# here, whose first line (c, 1) is narrower than the defaults' three and whose second (c, 5, 6) is as wide as them.
+F1_CASES = [
+	# (text, header, defaults, strict, door)
+	(b'a\nc\t1\nc\t5\t6\nc\t3\n', '', [D_, '', ''], False, 'scrub'),
+	(b'a\nc\t1\nc\t5\t6\nc\t3\n', '', [D_, '', ''], True, 'scrub'),
+	(b'c\na\nb\t1\nb\t5\t6\nb\t3\n', 'id\tv', [D_, '', ''], False, 'scrub'),
+	(b'c\na\nb\t1\nb\t5\t6\nb\t3\n', 'id\tv', [D_, '', ''], False, 'rewrite'),
+	(b'a\nb\t1\nc\t1\nc\t5\t6\nc\t3\n', '', [D_, '', ''], True, 'rewrite'),
+	(b'a\nb\t1\nc\t1\nc\t5\t6\nc\t3\n', '', [D_, '', ''], False, 'scrub'),
+	(b'x\na\nc\t1\nc\t5\t6\nc\t3\n', 'q', [D_, 'P'], False, 'scrub'),
+]
+
+
+@pytest.mark.parametrize('text, header, defaults, strict, door', F1_CASES)
+def test_a_one_column_file_is_compacted_for_the_readers_given_defaults_too(tmp_path, text, header, defaults, strict, door):
+	"""A scrub or a store's rewrite with defaults of two cells or more reads a file the one-column rule makes of one column
+	at their count as well, and every reader (given no header, line 1 or the door's, with or without those defaults) reads
+	the file as before. The rows are what is checked, not the written bytes."""
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, text)
+	line1 = text.split(b'\n')[0].decode()
+	before = _every_view(p, line1, header, defaults)
+	if door == 'scrub':
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			TSVZ.scrubTabularFile(p, header=header, defaults=list(defaults), strict=strict)
+	else:
+		t = TSVZ.TSVZed(p, header=header, defaults=list(defaults), strict=strict, verbose=False, append_check_delay=60,
+						rewrite_on_load=False)
+		try:
+			t._call(t.hardMapToFile)
+		finally:
+			t.close()
+	assert _every_view(p, line1, header, defaults) == before
