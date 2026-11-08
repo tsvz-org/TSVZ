@@ -385,8 +385,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees:
   - **A rewrite after a committed delete (N1).** `TSVZed(p, header='id\tv')` on `id\na\n#_defaults_#\t\tQ\nb\t1\n`. Delete
     `a`, let the commit run (`commitAppendToFile()` or the writer thread's), then call `hardMapToFile()` or
-    `rewrite(force=True)`. The file becomes `id\tv\n#_defaults_#\t\tQ\nb\t1\nb\t1\tQ\n`, and every reader reads `b` as
-    `[b, 1, Q]` where it read `[b, 1]` before (27 reader classes in the review's sweep, in that order only). If the
+    `rewrite(force=True)`. The file becomes `id\tv\n#_defaults_#\t\tQ\nb\t1\nb\t1\tQ\n`, and every 5.5 and later
+    reader, the command, a `TSVZed` and tsvz-rs read `b` as `[b, 1, Q]` where they read `[b, 1]` before (27 reader classes
+    in the review's sweep, in that order only); 3.39's readers keep `[b, 1]`. If the
     delete is still queued when the rewrite runs, everyone keeps `[b, 1]`, as 5.6 and 5.7 do in both orders.
   - **A line 1 of two cells that already names the key (shape 2).** `d\tX\na\nd\tY\n`, delete `a` under header `q`: every key
     that could stand in is already named by a valued row before the gap (line 1's own `d\tX`), so no stand-in goes there,
@@ -398,7 +399,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - **3.39's strict reader in the `TSVZed` delete + commit door (the design's Call 3).** The store's compaction drops a
     narrower line as superseded at its own count, and 3.39's strict reader then loses a row: 2 + 2 cases at depth 3 of
     the sweep (88 at depth 4). Example: `id\tv\na\nb\t1\nb\t\t1\n` with a store given `id\tv\tw`, delete `a`.
-  - No row is lost to any other reader in these shapes.
+  - Apart from the old line-1 row that the widening by a rewrite asked for takes (README, "Upgrading to 5.8", item 3), no
+    row is lost to any other reader in these shapes.
 - Why: the stand-in rule gives no stand-in where a stand-in would be a row to some reader, or where its key is already
   named; these shapes are what that leaves. In the first, the store reads the file again so that memory equals a reopen,
   and the rewrite then widens line 1 and appends memory's row.
