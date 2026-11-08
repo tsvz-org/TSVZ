@@ -43,10 +43,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.08'
+version = '5.09'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-11-06'
+COMMIT_DATE = '2026-11-08'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -3029,7 +3029,10 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	more), so the key reads after it as it did. Else, unless a line 1 of one cell comes before the place (its readers
 	would read the stand-in as a row, and 3.39's strict read, which drops a wider line at one column, would gain it), a
 	key that no row with a value before the place names: at two columns or more the stand-in deletes a key not yet read,
-	at one it is a row the key's later line replaces. No such row: the line just goes."""
+	at one it is a row the key's later line replaces. A key such a row names (only line 1 comes before the place) stands
+	in too when a later line of it has as many cells as that row: every reader that read the row takes that line, which
+	gives the key back the value the stand-in deleted (`d\\tX\\na\\nd\\tY\\n`, a deleted under a header: `d\\tX\\nd\\nd\\tY\\n`).
+	No such row: the line just goes."""
 	enc = encoding or 'utf8'
 	d = delimiter.encode(enc)
 	texts = [line.decode(enc, errors='replace') for line in raw]
@@ -3059,8 +3062,9 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		later = [j for j in range(i + 1, len(raw)) if kinds[j][0] == 'row' and not goes(j)]
 		pick = [j for j in later if not valued(j)]
 		if not pick and not (i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):
-			named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
-			pick = [j for j in later if kinds[j][1].rstrip() not in named]
+			named = {kinds[j][1].rstrip(): kinds[j][2] for j in range(i) if valued(j)}  # (key -> its cells there: line 1's)
+			back = {kinds[j][1].rstrip() for j in later if named.get(kinds[j][1].rstrip()) == kinds[j][2]}
+			pick = [j for j in later if kinds[j][1].rstrip() not in named or kinds[j][1].rstrip() in back]
 		if pick:
 			stand[i] = raw[pick[0]].strip(b'\x00').rstrip(b'\r').split(d)[0] + d * (kinds[i][2] - 1)
 	return [stand.get(i, line) for i, line in enumerate(raw) if i in stand or not goes(i)]
@@ -6689,7 +6693,8 @@ memoryOnly:{self.memoryOnly}
 		"""``(None, lines, queued)``, what a rewrite writes, and the queued rows, taken from the queue (_writeFile puts them
 		back if it stops). A healthy file (Q-D3): its lines (_fileLines) with the queued rows after them, line 1 widened to
 		the store's header when it is that header's beginning (_legacyWidened) and the lines
-		of drop items' keys left out (_legacyDropLines), compacted as a scrub compacts them (_legacyCompact). A file to
+		of drop items' keys left out (_legacyDropLines), compacted as a scrub compacts them (_legacyCompact), but for a
+		commit's (``commit``): it widens and compacts nothing. A file to
 		be made again: only what keeps its reading (_remadeLines); memory holds what was queued. Then, either way, what
 		memory holds that those lines do not say (_RewriteRows, a flat snapshot checked before anything is written: a
 		TSVZEncodeError changes nothing): rows that read otherwise (changed in place, put in memory straight, every row
@@ -6748,7 +6753,10 @@ memoryOnly:{self.memoryOnly}
 			for _ in range(2):  # (twice when the lines say keys are live that are gone from memory, in a one-column file)
 				if dropAt:
 					raw = _legacyDropLines(raw, dropAt, consumed, not matched, delimiter, encoding)
-				kept = _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched)
+				# A commit's rewrite is a delete, not a compaction: only the deleted keys' lines go, as through every other
+				# door (_legacyDropKeys). A compaction at the store's count drops lines a reader at another count takes (a
+				# narrower line superseded at the store's one column is the only line 3.39's strict reader takes at two).
+				kept = raw if commit else _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched)
 				del raw
 				flags, diffWidth = self._readLines(kept, consumed, start, strict)
 				with self._memLock:
@@ -8474,6 +8482,10 @@ def _serveCloseWriters():
 atexit.register(_serveCloseWriters)
 
 
+#: A line not read yet (_ServeStore._payload): None is a read that found no line 1.
+_UNREAD = object()
+
+
 class _ServeWriter(object):
 	"""The single appender of a store (spec §18.3): each batch of queued payloads is one write.
 
@@ -8924,13 +8936,15 @@ class _ServeStore(object):
 				reporter.flush()
 
 	# -- writes ---------------------------------------------------------------
-	def _payload(self, rows, log):
-		"""Bytes for ``rows`` (``[(cells, marker), ...]``), formatted as the direct writers format them."""
+	def _payload(self, rows, log, first=_UNREAD):
+		"""Bytes for ``rows`` (``[(cells, marker), ...]``), formatted as the direct writers format them. ``first``: the
+		file's line 1 as _lineOneNow read it just before (a delete's, _dropKeys), else it is read here."""
 		if self.spec:
 			if rows and any(self.header):
 				_specCheckHeader(self.path, self.header, self.delimiter, self.strict, self.verbose, log)
 			return _specFormatRecords(rows, self.delimiter).encode('utf-8')
-		first = self._lineOneNow()  # (read once: the payload's header check takes it from here)
+		if first is _UNREAD:
+			first = self._lineOneNow()  # (read once: the payload's header check takes it from here)
 		self._legacyHeader(first, log)
 		# Rows for a file that holds nothing yet are fitted to the header it is about to begin with.
 		assume = self.header if any(self.header) and _fileHoldsNothing(self.path) else None
@@ -8949,26 +8963,32 @@ class _ServeStore(object):
 		The file's width is asked with the header given, as the library's readers take it, even when line 1 is not it and
 		is a row to this command (_legacyHeader): a line is a deletion or a row by that one answer, so a reader given that
 		header reads what this command deleted the same way, and the command's own count is kept too (_legacyDropKeys,
-		``xHeader``)."""
+		``xHeader``).
+
+		Returns ``(rows, first)``: ``first`` is the line 1 read here for the header check, which the payload's check takes
+		too (_payload) when nothing was written since, or when no row is left to append; else _UNREAD (read again)."""
 		if self.spec:
-			return rows
+			return rows, _UNREAD
 		keys = [cells[0] for cells, marker in rows if cells[0] != DEFAULTS_INDICATOR_KEY]
-		self._legacyHeaderNow(log)  # (says a mismatch, and a strict store raises; whether line 1 is a row: _legacyDropKeys)
+		first = self._lineOneNow()
+		self._legacyHeader(first, log)  # (says a mismatch, and a strict store raises; whether line 1 is a row: _legacyDropKeys)
 		width = _legacyWidthNow(self.path, self.given, True, 'utf8', self.delimiter)
 		if not keys or width is None or width > 1:
-			return rows  # (a look at the first lines: what is queued cannot change them, so no wait for it)
+			return rows, first  # (a look at the first lines: what is queued cannot change them, so no wait for it)
 		self.writer.barrier()
 		if not _legacyDropKeys(self.path, keys, self.given, True, 'utf8', self.delimiter, True):
-			return rows
+			return rows, _UNREAD
 		self.parts = None  # read again at the next request
-		return [row for row in rows if row[0][0] == DEFAULTS_INDICATOR_KEY]
+		rows = [row for row in rows if row[0][0] == DEFAULTS_INDICATOR_KEY]
+		return rows, (_UNREAD if rows else first)  # (a reset still to append is checked against line 1 as written)
 
 	def _durable(self, sync):
 		return sync or (self.spec and self.state is not None and self.state.writeAck == 'disk')
 
-	def _submit(self, rows, sync, log):
-		"""Queue ``rows`` (caller holds the lock); return ``(seq, durable)`` or None when there is nothing to write."""
-		payload = self._payload(rows, log)
+	def _submit(self, rows, sync, log, first=_UNREAD):
+		"""Queue ``rows`` (caller holds the lock); return ``(seq, durable)`` or None when there is nothing to write.
+		``first``: see _payload."""
+		payload = self._payload(rows, log, first)
 		if not payload:
 			return None
 		durable = self._durable(sync)
@@ -9008,8 +9028,8 @@ class _ServeStore(object):
 				if self.unreadable:
 					return False
 				rows = _specDeleteRows(rows, self.delimiter, self.state.strip, self.data)
-			rows = self._dropKeys(rows, log)
-			queued = self._submit(rows, sync, log)
+			rows, first = self._dropKeys(rows, log)
+			queued = self._submit(rows, sync, log, first)
 		self._ack(queued, written)
 		self._wrote(rows, log)
 		return True
@@ -9025,7 +9045,8 @@ class _ServeStore(object):
 			if row is None:
 				return None
 			row = list(row)
-			queued = self._submit(self._dropKeys(self._tombstone(key), log), sync, log)
+			rows, first = self._dropKeys(self._tombstone(key), log)
+			queued = self._submit(rows, sync, log, first)
 		self._ack(queued, written=True)  # the row is only popped once its tombstone is written
 		return row
 
@@ -9042,7 +9063,8 @@ class _ServeStore(object):
 			else:  # a dict is reversible from Python 3.8
 				key = next(reversed(self.data)) if hasattr(self.data, '__reversed__') else list(self.data)[-1]
 			row = list(self.data[key])
-			queued = self._submit(self._dropKeys(self._tombstone(key), log), sync, log)
+			rows, first = self._dropKeys(self._tombstone(key), log)
+			queued = self._submit(rows, sync, log, first)
 		self._ack(queued, written=True)
 		return row
 

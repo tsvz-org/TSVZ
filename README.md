@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.8**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.9**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -302,6 +302,37 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
+## Upgrading to 5.9 from 5.8
+
+The file formats are unchanged.
+
+- **A `TSVZed` delete's commit takes out only the deleted keys' lines, as `tsvz delete` does.** In a loose file of one
+  column a `TSVZed` delete is written by its commit (`commitAppendToFile()`, or the writer thread's), which rewrites the
+  file. 5.8 also compacted the file there, at the store's own column count, and so dropped lines that a reader counting
+  from another line takes: `id\tv\na\nb\t1\nb\t\t1\n` with `TSVZed(p, header='id\tv\tw')`, delete `a`, became
+  `id\tv\nb\nb\t\t1\n`, and 3.39's strict reader given no header, which reads two columns from line 1 and takes only
+  `b\t1`, lost `b`. 5.9 writes `id\tv\nb\nb\t1\nb\t\t1\n`, the bytes `tsvz delete` and a `TSVZedLite` write. What
+  shows: comments, empty lines and superseded lines stay until a rewrite you ask for (`hardMapToFile()`,
+  `rewrite(force=True)`, the automatic ones) or a scrub compacts the file (`a\n# n\nb\t1\nb\n`, delete `a`, is now
+  `b\n# n\nb\t1\nb\n`; 5.8 wrote `b\nb\n`), as in a file of two columns or more, where a delete is an appended line.
+
+- **A key that line 1 names can stand in for a deleted line.** `d\tX\na\nd\tY\n`, delete `a` under header `q`
+  (`tsvz --x-header q delete`, a handler, a `TSVZedLite` or `TSVZed` given `q`): a reader given `q` counts its column
+  count from `a`, and `d`, the only key that could stand in, is named by line 1, so 5.8 left no stand-in, and 3.39's
+  loose reader given `q` went from `[d]` to `[d, Y]`. 5.9 writes `d\tX\nd\nd\tY\n`: a reader given no header reads the
+  stand-in as `d`'s deletion and takes `d\tY` back, as wide as line 1, and a reader given `q` reads as before. When no
+  later line of the key is as wide as line 1 (`d\tY\tZ`), 3.39's strict reader would not take it back, and nothing
+  stands in, as in 5.8.
+
+- **A delete under `--x-header` reads line 1 once.** `tsvz --x-header H delete` and `pop`, and a handler's `delete`,
+  `pop` and `popitem`, read line 1 twice at two columns or more: now about 5 ms less per delete on a 200k-row `.tsv.gz`
+  (15.0 ms to 9.4 to 10.2 ms) and 20 to 60 µs less on a `.tsv`.
+
+- Still as in 5.8: after a line 1 of one cell that is not the header given, a delete under that header can change a cell
+  for readers given it, and a rewrite that then widens line 1 makes the cell every reader's
+  ([docs/limitations.md](docs/limitations.md), "After a line 1 of one cell, a delete under a header can change a cell
+  for readers given it").
+
 ## Upgrading to 5.8 from 5.7
 
 The file formats are unchanged.
@@ -336,8 +367,8 @@ The file formats are unchanged.
   H can see a cell change: after a line 1 of one cell, and `d\tX\na\nd\tY\n` with `a` deleted under
   header `q` (every key that could stand in is already named by a valued row before the gap, so only
   3.39's loose reader given `q` changes, from `[d]` to `[d, Y]`): see
-  [docs/limitations.md](docs/limitations.md), "Readers given other arguments" and "The stand-in rule leaves shapes
-  where a delete can change a cell or lose a row to 3.39" (deferred to 5.09).
+  [docs/limitations.md](docs/limitations.md), "Readers given other arguments" and "After a line 1 of one cell, a delete
+  under a header can change a cell for readers given it" (5.9 fixes the second shape).
   A 3.39 strict reader of a one-column file still sees a new row when the last lone key is
   deleted and only wider rows are left (`a\nb\t1\n`, delete `a`: it showed `a`, then shows
   `b`), as with 5.6; upgrading that reader cures it (docs/limitations.md).
@@ -355,8 +386,8 @@ The file formats are unchanged.
   queued deletes leave them, stand-ins included (the same drop the commit makes), so line 1 widens to the
   header (`id\tv\n`, 60 of 60 runs in each order) when nothing that reads as a row with no value is left,
   and the file reads the same whichever came first, except
-  after the shape in [docs/limitations.md](docs/limitations.md), "The stand-in rule leaves shapes where a delete can
-  change a cell or lose a row to 3.39" (deferred to 5.09): `TSVZed(p, header='id\tv')` on `id\na\n#_defaults_#\t\tQ\nb\t1\n`, delete `a`, commit, then
+  after the shape in [docs/limitations.md](docs/limitations.md), "After a line 1 of one cell, a delete under a header
+  can change a cell for readers given it": `TSVZed(p, header='id\tv')` on `id\na\n#_defaults_#\t\tQ\nb\t1\n`, delete `a`, commit, then
   a rewrite writes `b\t1\tQ`, where with the delete still queued when the rewrite runs `b` reads `[b, 1]`. (The 31
   header-less cases where everything is deleted write `''` or `\n`, and every reader reads them the same.) Under `id\tv\tw`, `id\tv\na\nb\t\n` with `a` deleted
   was written `id\tv\tw\nb\t\n` when the delete was still queued, losing `b`; it is now `id\tv\nb\nb\t\n`

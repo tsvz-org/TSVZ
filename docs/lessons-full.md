@@ -275,3 +275,17 @@ entries go last, in the same commit as the change:
 - Why we had to change: 5.6 kept the count by moving the narrowest row up into the place. A moved row passes the key's earlier lines (dropped as superseded, which a strict reader that drops the later, narrower line still needed), the defaults lines and resets between (padded, dropped, or copied in 5.07's round), and lands on line 1, which a reader given a header skips. Each review round of 5.07 fixed the layout for one family of readers and found new shapes for the other; 5.07 shipped 5.6's delete. In the depth-4 sweep the stand-in leaves the command and 5.07's readers with no changed row (5.6: 320 cells), the 5.6, 5.5 and 3.39 readers with only the 5,235 gained rows that no layout avoids (5.6: 10,315), and readers given a header that line 1 isn't with 17,999 changed cells and nothing else (5.6: about 350,000 verdicts).
 - Original design was wrong because: it kept the fact (the count) by moving a neighbour into its place, and a neighbour carries everything that depends on where it stands. Two families of readers count from two different lines, so a moved row is always in the wrong place for one of them.
 - Lesson: when one fact that every reader takes from one place has to survive a removal, keep the place and change what it holds; moving a neighbour into it changes what every reader of the neighbour, and of the lines it passes, sees.
+
+## 2026-11-08 TSVZ 5.09: a delete's commit is a delete, not a compaction
+- Changed: a `TSVZed`'s commit of a one-column delete (`_snapshotForRewrite(commit=True)`) takes out only the deleted keys'
+  lines, with their stand-ins, and compacts nothing: the bytes `tsvz delete`, a handler and `TSVZedLite` write. Comments,
+  empty lines and superseded lines stay until a rewrite asked for or a scrub.
+- Why we had to change: the commit rewrote through the general rewrite and so also compacted, at the store's own column
+  count. In `id\tv\na\nb\t1\nb\t\t1\n`, a store given `id\tv\tw` reads one column from `a`; the compaction dropped `b\t1` as
+  superseded there, and 3.39's strict reader given no header, which reads two columns from line 1 and takes only `b\t1`, lost
+  `b` (2 + 2 cases at depth 3 of the delete sweep, 88 at depth 4). The other doors, which only drop lines, were right.
+- Original design was wrong because: a delete in a one-column file has to be a rewrite, and the rewrite it borrowed brought
+  its other job along. A compaction is a maintenance write the caller asks for (the 5.5 lesson); at a delete's commit
+  nobody asked for one, and a compaction is right only for the reader whose count it is made at.
+- Lesson: when one operation is carried out by another's machinery, it takes only its own effect from it; each of the
+  machinery's other effects is a request of its own. A door that does more than the others is the one to check first.

@@ -380,32 +380,65 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   change the column count; 2026-11-06, "Fix in 5.6 (Recommended)" on the rows a rewrite took out.
 
 
-### The stand-in rule leaves shapes where a delete can change a cell or lose a row to 3.39
+### After a line 1 of one cell, a delete under a header can change a cell for readers given it
 - Kind: deferred
 - What the operator sees:
-  - **A rewrite after a committed delete (N1).** `TSVZed(p, header='id\tv')` on `id\na\n#_defaults_#\t\tQ\nb\t1\n`. Delete
-    `a`, let the commit run (`commitAppendToFile()` or the writer thread's), then call `hardMapToFile()` or
-    `rewrite(force=True)`. The file becomes `id\tv\n#_defaults_#\t\tQ\nb\t1\nb\t1\tQ\n`, and every 5.5 and later
-    reader, the command, a `TSVZed` and tsvz-rs read `b` as `[b, 1, Q]` where they read `[b, 1]` before (27 reader classes
-    in the review's sweep, in that order only); 3.39's readers keep `[b, 1]`. If the
-    delete is still queued when the rewrite runs, everyone keeps `[b, 1]`, as 5.6 and 5.7 do in both orders.
-  - **A line 1 of two cells that already names the key (shape 2).** `d\tX\na\nd\tY\n`, delete `a` under header `q`: every key
-    that could stand in is already named by a valued row before the gap (line 1's own `d\tX`), so no stand-in goes there,
-    and 3.39's loose reader given `q` goes from `[d]` to `[d, Y]`. 5.6 and 5.7 are no better here.
-  - **The `TSVZed` and `TSVZedLite(strict=False)` doors given a header** also hit the shape "Readers given other arguments"
-    describes (a line 1 of one cell, not the header; Q3's shape), and readers given that header then see the cell. 5.7's
-    `TSVZed` and Lite moved `b` up, so only 3.39's loose reader given the header saw it there. A `TSVZed`'s memory now
-    equals a reopen after it.
-  - **3.39's strict reader in the `TSVZed` delete + commit door (the design's Call 3).** The store's compaction drops a
-    narrower line as superseded at its own count, and 3.39's strict reader then loses a row: 2 + 2 cases at depth 3 of
-    the sweep (88 at depth 4). Example: `id\tv\na\nb\t1\nb\t\t1\n` with a store given `id\tv\tw`, delete `a`.
-  - Apart from the old line-1 row that the widening by a rewrite asked for takes (README, "Upgrading to 5.8", item 3), no
-    row is lost to any other reader in these shapes.
-- Why: the stand-in rule gives no stand-in where a stand-in would be a row to some reader, or where its key is already
-  named; these shapes are what that leaves. In the first, the store reads the file again so that memory equals a reopen,
-  and the rewrite then widens line 1 and appends memory's row.
-- Revisit when: 5.09, as one design pass on the stand-in rule that covers all of them.
-- Noted: 2026-11-07, a deferral under the user's standing rule that deferrals are noted, not asked.
+  - **The `TSVZed` and `TSVZedLite(strict=False)` doors given a header** H, on a file whose line 1 is one cell and not H
+    (Q3's shape: `id\na\n#_defaults_#\t\tQ\nb\t1\n` under `id\tv`, delete `a`). The store counts from the line after
+    line 1, and only a row with a value could stand in for `a`, so nothing does (the rule that keeps 3.39's strict
+    reader given no header from gaining the key): the store, and every reader given H, read `b` as `[b, 1, Q]` after
+    the delete, where they read `[b, 1]`. In this door the reader given H is the deleting store itself. 5.7's `TSVZed`
+    and Lite moved `b` up, so only 3.39's loose reader given H saw it there. The command's door (`tsvz --x-header H
+    delete`, a handler) is the approved case in "Readers given other arguments".
+  - **A rewrite that then widens line 1 (N1).** On that file, after the commit (`commitAppendToFile()` or the writer
+    thread's), `hardMapToFile()` or `rewrite(force=True)` makes the file `id\tv\n#_defaults_#\t\tQ\nb\t1\nb\t1\tQ\n`,
+    and every 5.5 and later reader, the command, a `TSVZed` and tsvz-rs read `b` as `[b, 1, Q]` (27 reader classes in
+    the 5.08 review's sweep, in that order only); 3.39's readers keep `[b, 1]`. If the delete is still queued when the
+    rewrite runs, everyone keeps `[b, 1]`. The same follows the command's delete (or a `TSVZedLite`'s) when a `TSVZed`
+    given H rewrites the file later: at depth 3 of the 5.09 sweep, 3 files and headers after `tsvz delete` then a
+    rewrite, 2 after a `TSVZedLite` delete then a rewrite, and 1 (this one) after a `TSVZed` delete, its commit and a
+    rewrite, each changing `b` for the command, every 5.5 and later reader given no header, a `TSVZed` and tsvz-rs.
+  - No row is lost to any reader in these shapes but the old line-1 row that the widening by a rewrite asked for takes
+    (README, "Upgrading to 5.8", item 3).
+- Why: no layout serves both readers. A reader given H counts from the line after line 1, so only a one-cell line keeps
+  its count there, and any one-cell keyed line is a row to a reader at one column: 3.39's strict reader, which drops
+  `b\t1` there, would show `b`. 5.08 kept that reader's view (Q3, approved for the command's door); the store's next
+  widening then writes the store's view, which the delete changed, into the file.
+- Revisit when: the user answers the 5.09 design's question on these shapes (a stand-in from a row with a value at the
+  deleting store's own place, or in every door, or neither); the answer is built in 5.09 or 5.10.
+- Noted: 2026-11-07, a deferral under the user's standing rule that deferrals are noted, not asked. 2026-11-08: 5.09
+  fixes the other two shapes of the entry (a line 1 of two cells that already names the key, and 3.39's strict reader
+  in the `TSVZed` delete + commit door).
+
+### A rewrite by a store whose line 1 widens its header can lose rows for strict readers given no header
+- Kind: deferred
+- What the operator sees: `TSVZed(p, header='id\tv')` (or `header='id'`) on `id\tv\tw\nb\t1\nb\t\t1\nb\t1\n`, a file whose
+  line 1 another program widened, then `hardMapToFile()` or `rewrite(force=True)`: the file becomes `id\tv\tw\nb\t1\n`,
+  and every strict reader given no header (`readTabularFile(p)` of 3.39 to 5.9, a strict `TSVZed` or a `TSVZedLite`),
+  which reads three columns from line 1 and drops `b\t1`, loses `b`: 12 reader-cases per strict reader class at depth 3
+  of the 5.09 sweep, with no delete in it. The store follows the widening and reads at three columns, but its rewrite
+  compacts at the count of the line after line 1 (two), which only a reader given `id\tv` (a mismatch to it) uses. 5.6
+  and 5.7 do the same.
+- Why: compacting at the store's three columns instead keeps those readers' rows but loses rows for the reader given
+  the header line 1 widens (1,500 reader-cases at depth 3) and for tsvz-rs (225); keeping what both counts need is a
+  change to the compaction, not to the delete this version is about.
+- Revisit when: 5.10: compact at both counts when line 1 widens the store's header (keep every line either count's
+  readers take).
+- Noted: 2026-11-08, found in the 5.09 design sweep; a deferral under the user's standing rule.
+
+### A widening loses a key whose only line 3.39's strict reader takes holds no value
+- Kind: deferred
+- What the operator sees: `TSVZed(p, header='id\tv')` on `id\nb\t\nb\t\t1\n`, then a rewrite you ask for: line 1
+  widens (`id\tv\nb\t\t1\n`), and 3.39's strict reader given no header, which at one column took `b\t` as the row `b`
+  and dropped `b\t\t1`, now reads two columns, where `b\t` would be a deletion and `b\t\t1` is still too wide: `b` is
+  lost: 118 reader-cases at depth 3 of the 5.09 sweep for that reader given no header and 10 given line 1, from a rewrite
+  alone; after a queued delete took the last lone key out, the 12 the 5.08 review counted. 5.5 and later readers take
+  the wider line and keep `b`. 5.6 to 5.8 do the same.
+- Why: the widening's rule (5.6) refuses a file with a key whose last line holds no value, and lets through a key that a
+  later line gives a value; for 3.39's strict reader that later line is invisible when it is wider than the header.
+- Revisit when: 5.10, with the user's answer to the 5.09 design's question on it (refuse the widening there, with the
+  warning a lone key gives, or widen and lose the key for that reader).
+- Noted: 2026-11-08, found in the 5.09 design sweep; a deferral under the user's standing rule.
 
 ### A TSVZedLite delete looks at the file's first lines every time
 - Kind: deferred

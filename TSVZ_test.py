@@ -267,9 +267,9 @@ def test_basic_roundtrip():
 
 
 def test_version():
-	# (the scripts report the full form; pip and PyPI show it as 5.8)
-	assert TSVZ.version == '5.08'
-	assert TSVZ.__version__ == '5.08'
+	# (the scripts report the full form; pip and PyPI show it as 5.9)
+	assert TSVZ.version == '5.09'
+	assert TSVZ.__version__ == '5.09'
 	assert not hasattr(TSVZ, 'WalStore')
 
 
@@ -13368,10 +13368,10 @@ def _one_column_views(p, keys):
 	# at one column and no line moves
 	(b'a\nb\tX\nc\n', 'a', b'c\nb\tX\nc\n', ['b', 'c'], None),
 	(b'a\n#_defaults_#\tX\nb\n', 'a', b'b\n#_defaults_#\tX\nb\n', ['b'], None),
-	(b'a\nb\tX\nc\tY\nc\n', 'a', b'c\nb\tX\nc\n', ['b', 'c'], None),  # (c's earlier line goes in the compaction: superseded for every reader)
+	(b'a\nb\tX\nc\tY\nc\n', 'a', b'c\nb\tX\nc\tY\nc\n', ['b', 'c'], None),  # (the commit compacts nothing: c's earlier line stays)
 	(b'a\nb\t\nc\tX\n', 'a', b'b\nb\t\nc\tX\n', ['b', 'c'], None),  # (a key whose line holds no value first)
 	(b'a\nb\tX\n', 'a', b'b\nb\tX\n', ['b'], Q4),  # (no lone key left: b stands in, and its own line replaces it; Q4)
-	(b'\na\nb\tX\nc\n', 'a', b'\nc\nb\tX\n', ['b', 'c'], None),  # (the empty line 1 stays; c's own line is superseded)
+	(b'\na\nb\tX\nc\n', 'a', b'\nc\nb\tX\nc\n', ['b', 'c'], None),  # (the empty line 1 stays, and c's own line)
 	# not the first keyed line, or the next line has the same count: nothing stands in
 	(b'a\nb\tX\nc\n', 'c', b'a\nb\tX\n', ['a', 'b'], None),
 	(b'a\nb\nc\tX\n', 'a', b'b\nc\tX\n', ['b', 'c'], None),
@@ -14641,6 +14641,36 @@ def test_a_delete_leaves_the_other_rows_as_every_reader_read_them(tmp_path, text
 	_delete_reads_as_before(str(tmp_path / 'f.tsv'), text, key, written, H, door, differ, **kwargs)
 
 
+@pytest.mark.parametrize('door', ['zed', 'cli', 'lite'])
+@pytest.mark.parametrize('text, H, written', [
+	# The store, given a header line 1 begins, reads at one column from a; 3.39's strict reader given no header reads at two
+	# from line 1 and takes only b\t1. 5.08's commit compacted at the store's one column and dropped b\t1 as superseded: b was
+	# lost to that reader (Call 3 of the 5.08 design: 2 + 2 cases at depth 3 of the sweep, 88 at depth 4).
+	(b'id\tv\na\nb\t1\nb\t\t1\n', 'id\tv\tw', b'id\tv\nb\nb\t1\nb\t\t1\n'),
+	(b'id\tv\na\nb\t1\nb\t1\t2\n', 'id\tv\tw', b'id\tv\nb\nb\t1\nb\t1\t2\n'),
+	# a comment and a superseded line stay too, as `tsvz delete` leaves them
+	(b'a\n# n\nb\t1\nb\n', '', b'b\n# n\nb\t1\nb\n'),  # (5.08's commit: b\nb\n)
+])
+def test_a_delete_commit_compacts_nothing_so_every_door_writes_the_same(tmp_path, door, text, H, written):
+	kwargs = {'strict': False} if door == 'lite' and H else {}
+	_delete_reads_as_before(str(tmp_path / 'f.tsv'), text, 'a', written, H, door, None, **kwargs)
+
+
+@pytest.mark.parametrize('door', ['zed', 'cli', 'lite'])
+@pytest.mark.parametrize('text, written, differ', [
+	# Line 1 names d, the only key that could stand in. A reader given no header holds d from line 1, reads the stand-in as
+	# its deletion at two columns, and takes d\tY, as wide as line 1, back; 3.39's loose reader given q counts one column
+	# from the stand-in and cuts d\tY to d, as it did from a. 5.08 left no stand-in: that reader read d whole, [d, Y].
+	(b'd\tX\na\nd\tY\n', b'd\tX\nd\nd\tY\n', None),
+	# d's line is wider than line 1: 3.39's strict reader at two columns does not take it, and a stand-in would lose d for
+	# it; none goes there, and 3.39's loose reader given q reads d whole
+	(b'd\tX\na\nd\tY\tZ\n', b'd\tX\nd\tY\tZ\n', {'339-loose-H': 'cell'}),
+])
+def test_a_key_line_1_names_stands_in_when_a_later_line_of_it_is_as_wide(tmp_path, door, text, written, differ):
+	kwargs = {'strict': False} if door == 'lite' else {}
+	_delete_reads_as_before(str(tmp_path / 'f.tsv'), text, 'a', written, 'q', door, differ, **kwargs)
+
+
 
 @pytest.mark.parametrize('order', ['pause after open', 'commit first', 'plain'])
 @pytest.mark.parametrize('rewrite', ['hardMapToFile', 'rewrite', 'none'])
@@ -14652,9 +14682,10 @@ def test_a_rewrite_with_a_queued_one_column_delete_widens_line_1_whatever_commit
 	# 5.6 and 5.07 decided the widening on the lines with the queued delete's key still in them, where a lone `a` is a row
 	# of a one-column file that a widened line 1 would lose: id\n when the delete was still queued, id\tv\n when the writer
 	# thread's tick had committed it first. With a gone nothing is lost, so a rewrite asked for widens line 1 in every
-	# order; the delete's own commit widens nothing (as in every version), so its other readers read line 1 as before.
+	# order; the delete's own commit widens nothing (as in every version), so its other readers read line 1 as before, and
+	# compacts nothing (5.09): the comment stays, as a `tsvz delete` leaves it.
 	if rewrite == 'none':
-		written = {b'id\n# n\na\n': b'id\n', b'id\n# n\na\nb\t1\n': b'id\nb\t1\n'}[text]
+		written = {b'id\n# n\na\n': b'id\n# n\n', b'id\n# n\na\nb\t1\n': b'id\n# n\nb\t1\n'}[text]
 	p = str(tmp_path / 'q.tsv')
 	_touch(p, text)
 	before = TSVZ.readTabularFile(p, strict=True, verbose=False)
@@ -16677,6 +16708,32 @@ def test_a_set_under_x_header_reads_line_1_once(tmp_path, monkeypatch, how):
 			s.close()
 	assert len(reads) == 1
 	assert _bytes(p) == b'x\ty\tz\na\t1\t2\nc\t3\t4\n'
+
+
+@pytest.mark.parametrize('how', ['cli delete', 'cli pop', 'handler delete', 'handler pop'])
+@pytest.mark.parametrize('text, lines, written', [
+	# at two columns the delete is a line: line 1 is read once, for the delete's header check and the payload's (5.08 read it
+	# twice: about 5 ms more per delete on a 200k-row .tsv.gz)
+	(b'x\ty\tz\na\t1\t2\n', 1, b'x\ty\tz\na\t1\t2\na\n'),
+	# at one column the keys' lines are taken out, and the file is written: nothing is left to append, so no second read
+	(b'x\na\nb\n', 1, b'x\nb\n'),
+])
+def test_a_delete_under_x_header_reads_line_1_once(tmp_path, monkeypatch, how, text, lines, written):
+	p = str(tmp_path / 'r.tsv')
+	_touch(p, text)
+	reads = []
+	original = TSVZ._legacyFirstLine
+	monkeypatch.setattr(TSVZ, '_legacyFirstLine', lambda *args: reads.append(1) or original(*args))
+	door, verb = how.split()
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		if door == 'cli':
+			assert _run('--x-header', 'id\tv', verb, p, 'a')[0] == 0
+		else:
+			s = TSVZ._ServeStore(p, header='id\tv')
+			TSVZ._serveRespond(s, verb + '\ta')
+			s.close()
+	assert len(reads) == lines
+	assert _bytes(p) == written
 
 
 def test_a_lite_load_does_not_read_line_1_a_second_time(tmp_path, monkeypatch):
