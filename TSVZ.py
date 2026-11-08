@@ -3044,7 +3044,14 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 		if consumed and len(readers) > 2:
 			readers.append((len(defaults), False, False, defaults))
 	if len(defaults) > 1 and any(defaults[1:]):
-		readers += [(w, c, m, ()) for w, c, m, _ in readers]
+		# (The two differ only on a line with a value that is not exactly w cells wide: so a file with none needs no twin.)
+		counts = {}  # line index (0, or 1 for every later line) -> the cell counts of its lines with a value
+		for i, line in enumerate(raw):
+			kind, _, cells, _ = _legacyLineKind(line.decode(encoding or 'utf8', errors='replace'), 2, False, delimiter)
+			if kind in ('row', 'defaults'):
+				counts.setdefault(i > 0, set()).add(cells)
+		readers += [(w, c, m, ()) for w, c, m, _ in readers
+					if not (w > 0 and counts.get(True, set()) <= {w} and (c or counts.get(False, set()) <= {w}))]
 	return readers
 
 

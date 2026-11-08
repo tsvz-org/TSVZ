@@ -16304,7 +16304,8 @@ def test_a_row_deleted_from_a_one_column_file_under_wider_defaults_stays_as_its_
 	del t['c']
 	t.hardMapToFile()
 	t.close()
-	assert _bytes(p) == b'a\nb\nc\t\n#_defaults_#\tP\n'
+	# (5.10 review F3b: `c\t1` stays before it: a strict reader given no defaults takes `c\t` alone at one column, 5.5's both)
+	assert _bytes(p) == b'a\nb\nc\t1\nc\t\n#_defaults_#\tP\n'
 	t = TSVZ.TSVZed(p, defaults=['#_defaults_#', 'P'], verbose=False, append_check_delay=60)
 	assert 'c' not in t
 	t.close()
@@ -17066,3 +17067,17 @@ def test_a_compaction_under_defaults_with_a_value_keeps_the_rows_of_a_strict_rea
 		finally:
 			t.close()
 	assert _every_view(p, 'id', 'id', defaults) == before
+
+
+def test_a_strict_reader_given_no_defaults_is_planned_again_only_where_a_line_is_not_as_wide_as_the_count():
+	"""F3b's twin readers cost a plan each; they differ from the caller's only on a line with a value that is not exactly
+	as wide as the reader's count, so a file with none needs none (and gets the same bytes either way)."""
+	defaults = [D_, 'P']
+	wide = _lines(b'id\tv\na\t1\nb\t2\n#_defaults_#\tP\n')
+	assert len(TSVZ._legacyCompactReaders(wide, 2, True, defaults, '\t', 'utf8', True)) == 1
+	mixed = _lines(b'id\tv\na\t1\nb\t2\t3\n')
+	assert len(TSVZ._legacyCompactReaders(mixed, 2, True, defaults, '\t', 'utf8', True)) == 2
+	narrow_line1 = _lines(b'x\t1\t2\na\t1\n')
+	assert len(TSVZ._legacyCompactReaders(narrow_line1, 2, False, defaults, '\t', 'utf8', False)) == 2
+	assert len(TSVZ._legacyCompactReaders(narrow_line1, 2, True, defaults, '\t', 'utf8', False)) == 5  # (not the caller's: its twin is identical)
+	assert len(TSVZ._legacyCompactReaders(wide, 2, True, [D_, '', ''], '\t', 'utf8', True)) == 1
