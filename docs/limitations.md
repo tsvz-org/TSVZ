@@ -520,17 +520,30 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: known limitation
 - What the operator sees: on a one-column file opened by a `TSVZed` with wider defaults (`a\nb\nc\t1\n`,
   `defaults=['#_defaults_#', 'P']`), a deleted row that held a value stays as `c<TAB>` after a rewrite
-  (`a\nb\nc\t1\nc\t\n#_defaults_#\tP\n`; earlier versions wrote `c\t` in the place of `c\t1`; 5.10 keeps that line,
-  which a strict reader given no defaults reads differently): the store shows it gone, a plain reader shows c
-  with an empty value. So with a wider
+  (`a\nb\nc\t\n#_defaults_#\tP\n`): the store shows it gone, a plain reader shows c with an empty value. So with a wider
   header: `id\na\t1\nb\n`, `header='id\tv'`, `del t['a']` leaves `id\na\t1\nb\na\t\n`. `tsvz delete`, a handler and a
   `TSVZedLite` ask the file, so they take the key's lines out and leave nothing, whatever was read first. Two exceptions for a
   `TSVZedLite`: a program that gave `correctColumnNum` of two or more is not asked about, so the delete is the appended line; and
   under a header that line 1 isn't, a copy of the key on line 1 stays, in the header's place.
+  From 5.10 a rewrite also keeps the deleted value's line, before the key's `c<TAB>` (see "A deleted key's value line stays in a one-column file under wider defaults", deferred).
 - Why: a file that stays one column has no way to mark that deletion, so it needs a format change.
 - Revisit when: the next format change.
 - Approved: 2026-11-06, the user chose "Known limitation (Recommended)", and "Widen the entry (Recommended)" for the wider
   header.
+
+### A deleted key's value line stays in a one-column file under wider defaults
+- Kind: deferred
+- What the operator sees: in the file of the entry above (a one-column file, `a\nb\nc\t1\n`, opened by a `TSVZed` with wider
+  defaults such as `['#_defaults_#', 'P']`, or `id\na\nb\n` under header `id\tv`), a rewrite keeps the deleted key's value line as
+  well as the `c<TAB>` that marks it (`a\nb\nc\t1\nc\t\n#_defaults_#\tP\n`): one more line per deleted key, where 5.9 wrote
+  `a\nb\nc\t\n#_defaults_#\tP\n`. 1,000 rounds of a set and a delete of a new key end at 2,003 lines, against 5.9's 1,003. Every
+  reader's view is the same as with the one line.
+- Why: the compaction plans a strict reader given no defaults too (5.10, review round 1), and that reader takes `c\t` alone at
+  one column, where 5.5's takes both lines, so the two lines are not moved into one (the collapse needs every strict reader to
+  take both or neither).
+- Revisit when: 5.11. The plan is an order-aware collapse: allow the move when each strict reader that takes the first line also
+  takes the last, and no other key that reader takes lies between them.
+- Noted: 2026-11-08, found in the 5.10 re-review (F10); a deferral under the user's standing rule that deferrals are noted, not asked.
 
 ### 3.39's strict reader of a one-column file sees a new row when its last lone key is deleted
 - Kind: known limitation

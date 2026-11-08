@@ -340,20 +340,27 @@ The file formats are unchanged.
   wrote `b\n# n\nb\t1\nb\n`). `tsvz delete`, a handler and a `TSVZedLite` still take out only the key's lines. The
   advice to call `hardMapToFile()` now and then (5.9) is no longer needed.
 
-- **A file read as one column is compacted for the readers given defaults too, and a strict reader given none is a reader.**
-  5.7 to 5.9 compacted a file the one-column rule reads as one column (a lone key is a row) for the readers at one column
+- **A file read as one column is compacted for the readers given defaults too, and a reader given none is planned at the
+  count it then reads at.**
+  5.6 to 5.9 compacted a file the one-column rule reads as one column (a lone key is a row) for the readers at one column
   alone. A reader given defaults of two cells or more reads it at their count, and a scrub or a rewrite could drop the row
   it takes: `a\nc\t1\nc\t5\t6\nc\t3\n` with three-cell defaults wrote `a\nc\t3\n` (strict readers given those defaults lost
   `c`, which read `[c, 5, 6]`); under a header that line 1 is not (`c\na\nb\t1\nb\t5\t6\nb\t3\n`, header `id\tv`) the same
   followed a scrub or a store's rewrite; and a strict store's rewrite of `a\nb\t1\nc\t1\nc\t5\t6\nc\t3\n` appended
-  memory's row, so readers given no defaults saw `c` change from `[c, 3]` to `[c, 5, 6]`. Separately, 5.7 to 5.10 modelled a
-  strict reader as the store's defaults make it, which with a value in them takes every line; a strict reader given none
-  takes only the lines as wide as its count (3.39's) or at least as wide (5.5's), and `id\na\t\nb\t\nb\t1\n` with
-  `TSVZed(header='id', defaults=['#_defaults_#', 'P'])`, delete `a`, moved `b\t1` into `b\t`'s place at the commit
-  and at a rewrite (a rewrite in 5.7 to 5.10, the commit in 5.7, 5.8 and 5.10; 5.9's commit compacted nothing), and 3.39's strict reader given no defaults lost `b`.
-  Both are readers of the compaction now. What shows: such files keep a line or two more (`c\t1` stays before the `c\t`
-  that deleted it in `a\nb\nc\t1\n` with value defaults and the delete of `c`), and a rewrite plans each reader a
-  second time when the defaults have a value and a line is not as wide as the count (cost, see the first item).
+  memory's row, so readers given no defaults saw `c` change from `[c, 3]` to `[c, 5, 6]`. Separately, a compaction took
+  every reader to be given the store's or the scrub's defaults, at the count they give (the store's own, or line 1's). A
+  reader given none reads at the file's own count, and a strict one takes only the lines as wide as its count (3.39's) or
+  at least as wide (5.5's), where defaults with a value take every line. Two shapes lost rows or changed cells for it:
+  `id\na\t\nb\t\nb\t1\n` with `TSVZed(header='id', defaults=['#_defaults_#', 'P'])`, delete `a`, moved `b\t1` into `b\t`'s
+  place at the commit and at a rewrite (a rewrite in 5.4 to 5.10, the commit in 5.5 to 5.8 and 5.10; 5.9's commit
+  compacted nothing), and 3.39's strict reader given no defaults lost `b`; and, with no header, where the store's count
+  comes from its defaults, `id\tv\tw\nb\t\t1\nb\t1\t2\nb\t1\n` with defaults `['#_defaults_#', 'P']` and a rewrite
+  (`c\t\t2\nc\t3\t2\nc\t1\n` and `a\t1\t2\nk\t1\nk\t3\t4\t5\nk\t6\n` the same, scrubbed) changed `b` from `[b, 1, 2]`
+  to `[b, '', 1]` for every strict reader given no defaults (5.9 and 5.10; earlier versions were not tried). Both are readers of the compaction now, each
+  at the count it reads at. What shows: such files keep more lines after a rewrite, and a rewrite plans those readers
+  where the count or the strictness differs (cost, see the first item). A deleted key's value line stays in a one-column
+  file under wider defaults (`c\t1` before the `c\t` that marks `c` deleted in `a\nb\nc\t1\n` with value defaults): one
+  more line per deleted key ([docs/limitations.md](docs/limitations.md), deferred to 5.11).
 
 - **A key's lines as wide as each other become one line, whatever the count.** A compaction moves a key's last line into
   its first line's place when nothing between them changes how a row reads. 5.5 to 5.9 did so only when both kinds of

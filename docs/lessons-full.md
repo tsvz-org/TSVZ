@@ -295,12 +295,14 @@ entries go last, in the same commit as the change:
 ## 2026-11-08 TSVZ 5.10: a compaction keeps what every count the file is read at takes
 - Changed: under a header that line 1 does not hold (line 1 a row to readers given no header, or another program's
   widening of the header), a compaction of a loose file (a `TSVZed` rewrite, a scrub, and again a one-column delete's
-  commit) keeps every line that any of three readers takes: the caller's, which counts from the first keyed line after
+  commit) keeps every line that any of the readers takes: the caller's, which counts from the first keyed line after
   line 1, and the readers given no header and given line 1 for a header, which count from line 1 (a store that follows a
-  widening is one of them). Each reader's plan is made as before (`_legacyCompactPlan`); a line kept for one reader is
+  widening is one of them); and, from the review rounds, a file read as one column also for the readers given defaults
+  at their count (F1), and each of these readers again given no defaults, at the count it then reads at, where that
+  count or its strictness differs (F3b, F9). Each reader's plan is made as before (`_legacyCompactPlan`); a line kept for one reader is
   kept as it is; a key's last line moves into its first line's place, or a dead key's line is emptied, only where every
   plan agrees; and a line kept for another reader brings along the deletion or the last line its own plan needs around
-  it. A file with no header, or whose line 1 holds the header, compacts as in 5.9. A key's lines now also become one
+  it. A file with no header, or whose line 1 holds the header, compacts as in 5.9 but for the readers given none. A key's lines now also become one
   line when they are as wide as each other and each strict reader takes both or none of them (5.5 to 5.9: only when
   both strict readers took both). A `TSVZed` delete's commit compacts again, as in 5.8, now for every count.
 - Why we had to change: three findings had one cause. W1: a store given `id\tv` on `id\tv\tw\nb\t1\nb\t\t1\nb\t1\n` (line 1
@@ -322,11 +324,14 @@ entries go last, in the same commit as the change:
   The review of 5.10 found the same mistake twice more, on the reader's arguments rather than its columns. F1: a file the
   one-column rule makes of one column was compacted for the readers at one column alone, though a reader given defaults of
   two cells or more reads it at their count (`a\nc\t1\nc\t5\t6\nc\t3\n`, three-cell defaults: `c` lost for every strict
-  reader given them, 5.07 to 5.10). F3b: a strict reader given no defaults takes only the lines as wide as its count (3.39's)
+  reader given them, 5.6 to 5.10). F3b: a strict reader given no defaults takes only the lines as wide as its count (3.39's)
   or at least as wide (5.5's), where the store's defaults, with a value in them, make every line taken (`id\na\t\nb\t\nb\t1\n`,
   `TSVZed(header='id', defaults=[D, 'P'])`, delete `a`: `b\t1` moved up into `b\t`'s place, and 3.39's strict reader lost `b`,
-  in a rewrite in 5.07 to 5.10 and in a commit in 5.07, 5.08 and 5.10). Both are now readers of the compaction: the defaults' count, and each reader
-  again given none.
+  in a rewrite in 5.4 to 5.10 and in a commit in 5.5 to 5.8 and 5.10). F9 (round 2): the reader given none was planned at the
+  caller's count, which a store or scrub with no header takes from its defaults, where a reader given none reads at the
+  file's own (`id\tv\tw\nb\t\t1\nb\t1\t2\nb\t1\n`, defaults `[D, 'P']`, a rewrite: `b` from `[b, 1, 2]` to `[b, '', 1]` for 13
+  strict readers given none, 5.9 and 5.10). All three are readers of the compaction now: the defaults' count, and each
+  reader again given none, at the count it then reads at.
 - Lesson: when one file is read at more than one count (or by more than one rule), a maintenance step keeps what each of
   those readers takes, and changes a line only where all of them agree. A step found right for only one reader is made
   right for every reader, not taken out of the door where the loss showed: it may be what pays for something else. A
