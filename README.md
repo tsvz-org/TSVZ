@@ -321,10 +321,11 @@ The file formats are unchanged.
   file is left as it is; the second, by the store, becomes `a\t\t1\nb\nb\t\t1\nb\t1\n`). A file with no header, or
   whose line 1 holds the header, is compacted for its one count, as before (but see the fourth item). What shows: such
   files keep more lines after a rewrite, and a rewrite plans each count (a pass that empties no line is the last, and a
-  line with no escape is split without the regex). Rewriting 200,000 rows (median of 5, a busy machine): with no defaults
-  every shape takes 1.9 to 2.0 s, where 5.9 took 2.2 to 3.1 s; with defaults that have a value, a file whose line 1 holds
-  the header, or with no header, takes 2.3 to 2.7 s (5.9: 2.7 to 3.2 s), and a file under a header that line 1 does not
-  hold takes 5.5 to 6.3 s (5.9: 3.2 s), because each reader is then planned again given none (the third item).
+  line with no escape is split without the regex). Rewriting 200,000 rows (median of 5, interleaved
+  runs on a busy machine, so ratios and not seconds): with no defaults, a file compacted by one plan (line 1 holds the
+  header, or no header) takes about 0.6 of 5.9's time, and one compacted by several (a header that line 1 does not hold)
+  about 0.9; with defaults that have a value, one plan takes about 0.8 and a file under a header that line 1 does not
+  hold about 1.5, because each reader is then planned again given none (the third item).
 
 - **A `TSVZed` delete's commit compacts again.** In a loose file of one column a delete is written by its commit, which
   rewrites the file. 5.9 took out only the deleted keys' lines there, so a store that updates rows and deletes kept every
