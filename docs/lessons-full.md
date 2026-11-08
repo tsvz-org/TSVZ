@@ -289,6 +289,8 @@ entries go last, in the same commit as the change:
   nobody asked for one, and a compaction is right only for the reader whose count it is made at.
 - Lesson: when one operation is carried out by another's machinery, it takes only its own effect from it; each of the
   machinery's other effects is a request of its own. A door that does more than the others is the one to check first.
+- Reversed by 2026-11-08 TSVZ 5.10 (below): the commit compacts again, with a compaction right for every reader. The
+  lesson stands only in part: a compaction was made right for one reader, and taking it out of the commit made files grow.
 
 ## 2026-11-08 TSVZ 5.10: a compaction keeps what every count the file is read at takes
 - Changed: under a header that line 1 does not hold (line 1 a row to readers given no header, or another program's
@@ -317,6 +319,14 @@ entries go last, in the same commit as the change:
   reader at the plan's count took neither, and the fuzz found a reader at the defaults' count that took one of them
   (`\na\nc\tX\tX\tX\t2\nc\t1\n`, three-cell defaults: the plan read one column, the reader three, and lost `c`). The
   condition that holds at every count is that the two lines are as wide as each other.
+  The review of 5.10 found the same mistake twice more, on the reader's arguments rather than its columns. F1: a file the
+  one-column rule makes of one column was compacted for the readers at one column alone, though a reader given defaults of
+  two cells or more reads it at their count (`a\nc\t1\nc\t5\t6\nc\t3\n`, three-cell defaults: `c` lost for every strict
+  reader given them, 5.07 to 5.10). F3b: a strict reader given no defaults takes only the lines as wide as its count (3.39's)
+  or at least as wide (5.5's), where the store's defaults, with a value in them, make every line taken (`id\na\t\nb\t\nb\t1\n`,
+  `TSVZed(header='id', defaults=[D, 'P'])`, delete `a`: `b\t1` moved up into `b\t`'s place, and 3.39's strict reader lost `b`,
+  in a rewrite in 5.07 to 5.10 and in a commit in 5.07, 5.08 and 5.10). Both are now readers of the compaction: the defaults' count, and each reader
+  again given none.
 - Lesson: when one file is read at more than one count (or by more than one rule), a maintenance step keeps what each of
   those readers takes, and changes a line only where all of them agree. A step found right for only one reader is made
   right for every reader, not taken out of the door where the loss showed: it may be what pays for something else. A

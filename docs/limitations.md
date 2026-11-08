@@ -184,7 +184,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   ones can see another file afterwards: one given a header that line 1 is not, which
   takes its column count from a line the scrub may have dropped. From 5.10, under a header that line 1 does not hold
   (line 1 a row, or another program's widening of the header), the compaction also keeps what every reader given no
-  header, and every reader given line 1 for its header, takes: they count from line 1. A file of one column is the
+  header, and every reader given line 1 for its header, takes with the scrub's or the store's defaults (or with none): they
+  count from line 1. A `TSVZed` delete's commit compacts the same way from 5.10 (5.9's took out only the deleted keys'
+  lines), so a reader given other defaults than the store's can see another file after it too, as after a rewrite. A file of one column is the
   exception, from 5.6: line 1 or the first keyed line after it being one cell, it is compacted as one whatever the scrub
   was given, so a reader that takes it as one column keeps its lone keys. A widening or a rewrite can move a cell's value the same way, with no row lost: a store with
   defaults wider than its header writes them into a row (`id`, `a<TAB>1`, header `id<TAB>v`, three-cell defaults gives
@@ -518,7 +520,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: known limitation
 - What the operator sees: on a one-column file opened by a `TSVZed` with wider defaults (`a\nb\nc\t1\n`,
   `defaults=['#_defaults_#', 'P']`), a deleted row that held a value stays as `c<TAB>` after a rewrite
-  (`a\nb\nc\t\n#_defaults_#\tP\n`): the store shows it gone, a plain reader shows c with an empty value. So with a wider
+  (`a\nb\nc\t1\nc\t\n#_defaults_#\tP\n`; earlier versions wrote `c\t` in the place of `c\t1`; 5.10 keeps that line,
+  which a strict reader given no defaults reads differently): the store shows it gone, a plain reader shows c
+  with an empty value. So with a wider
   header: `id\na\t1\nb\n`, `header='id\tv'`, `del t['a']` leaves `id\na\t1\nb\na\t\n`. `tsvz delete`, a handler and a
   `TSVZedLite` ask the file, so they take the key's lines out and leave nothing, whatever was read first. Two exceptions for a
   `TSVZedLite`: a program that gave `correctColumnNum` of two or more is not asked about, so the delete is the appended line; and
