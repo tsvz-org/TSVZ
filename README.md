@@ -329,11 +329,15 @@ The file formats are unchanged.
   one-column store keeps one column (5.7 took the count of the row it moved up); where no
   stand-in can take the place of the line that set the count (after a line 1 of one cell, below), a `TSVZed`
   reads the file again once its delete is written, so its memory holds what a reopen reads
-  (`x\na\n#_defaults_#\t\tQ\nb\t1\n`, delete `a`: `b` is `[b, 1, Q]`, as the file now reads it). Under
+  (with a header given: `x\na\n#_defaults_#\t\tQ\nb\t1\n`, delete `a`: `b` is `[b, 1, Q]`, as the file now
+  reads it; with no header `b` stays `[b, 1]`). Under
   `--x-header H` with line 1 not H, the command now rewrites the file where 5.7 appended a
-  line, when a reader given H reads at one column. One shape is left, after a line 1 of one
-  cell, where a reader given H can see a cell change: see
-  [docs/limitations.md](docs/limitations.md), "Readers given other arguments".
+  line, when a reader given H reads at one column. Two shapes are left where a reader given
+  H can see a cell change: after a line 1 of one cell, and `d\tX\na\nd\tY\n` with `a` deleted under
+  header `q` (every key that could stand in is already named by a valued row before the gap, so only
+  3.39's loose reader given `q` changes, from `[d]` to `[d, Y]`): see
+  [docs/limitations.md](docs/limitations.md), "Readers given other arguments" and "The stand-in rule leaves shapes
+  where a delete can change a cell or lose a row to 3.39" (deferred to 5.09).
   A 3.39 strict reader of a one-column file still sees a new row when the last lone key is
   deleted and only wider rows are left (`a\nb\t1\n`, delete `a`: it showed `a`, then shows
   `b`), as with 5.6; upgrading that reader cures it (docs/limitations.md).
@@ -350,7 +354,11 @@ The file formats are unchanged.
   a row the widening would lose, still in the lines. A rewrite asked for now decides on the lines as the
   queued deletes leave them, stand-ins included (the same drop the commit makes), so line 1 widens to the
   header (`id\tv\n`, 60 of 60 runs in each order) when nothing that reads as a row with no value is left,
-  and the file is the same whichever came first. Under `id\tv\tw`, `id\tv\na\nb\t\n` with `a` deleted
+  and the file reads the same whichever came first, except
+  after the shape in [docs/limitations.md](docs/limitations.md), "The stand-in rule leaves shapes where a delete can
+  change a cell or lose a row to 3.39" (deferred to 5.09): `TSVZed(p, header='id\tv')` on `id\na\n#_defaults_#\t\tQ\nb\t1\n`, delete `a`, commit, then
+  a rewrite writes `b\t1\tQ`, where with the delete still queued when the rewrite runs `b` reads `[b, 1]`. (The 31
+  header-less cases where everything is deleted write `''` or `\n`, and every reader reads them the same.) Under `id\tv\tw`, `id\tv\na\nb\t\n` with `a` deleted
   was written `id\tv\tw\nb\t\n` when the delete was still queued, losing `b`; it is now `id\tv\nb\nb\t\n`
   in every order. A delete's own commit (`commitAppendToFile()`, or the writer thread's) never widens line 1
   (5.6 and 5.7 widened it in some files: `id\tv\na\na\t1\n` under `id\tv\tw`, delete `a`, became
