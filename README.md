@@ -340,6 +340,33 @@ The file formats are unchanged.
   its header's count where a reopen takes the file's (`# n\n` under `header='id\tv'`, a
   row `a\t\t1`: an appended `b\t2` read as `[b, 2]` at two columns, where a reopen reads three).
 
+- **A rewrite with a queued one-column delete widens line 1 whatever committed first.**
+  `TSVZed(p, header='id\tv')` on `id\n# n\na\n`, `del t['a']`, then `hardMapToFile()` or
+  `rewrite(force=True)` left `id\n` in some runs and `id\tv\n` in others, by whether the writer
+  thread's tick had committed the delete first: the widening was decided with `a`'s lone line,
+  a row the widening would lose, still in the lines. It is now decided on the lines as the
+  queued deletes leave them, so line 1 widens to the header (`id\tv\n`, 60 of 60 runs in each
+  order) when nothing that reads as a row with no value is left. A delete's own commit
+  (`commitAppendToFile()`, or the writer thread's) widens nothing, as in every version
+  (`id\n`), so the file's other readers read line 1 as before; the next rewrite asked for
+  widens it.
+
+- **`checkExternalChanges()` asks the file every time.** It returned at once while the store
+  had already noted a change, and the writer thread could be following the file just as
+  another process's append landed, then mark it seen on the bytes it read: the append
+  showed only after the next change (3 to 9 of 7680 runs of a follow sweep on a disk; 0 of
+  30,720 now). A call while a change is noted now costs what any call costs (about 30 us,
+  where it returned in 0.1 us).
+
+- **Every writer pads an appended row to the cells line 1 counts.** On a file whose line 1
+  holds the header given or widens it and ends in empty cells (`id\tv\tw\t`, a spreadsheet
+  export with an unnamed last column), `TSVZedLite`, `tsvz --x-header 'id\tv' set`, a handler
+  and `appendTabularFile(header='id\tv')` appended `c\t4\t5`, which a strict reader given no
+  header, counting line 1's four cells, dropped. Each writer, `TSVZed` included, now pads a
+  row, and a deletion line, as wide as line 1 is, empty cells at its end counted
+  (`c\t4\t5\t`), by one rule. `TSVZed` already did this for a widened line 1 in 5.7; it now
+  also does it for a line 1 that is the header with empty cells after it (`id\tv\t\t`).
+
 ## Upgrading to 5.7 from 5.6
 
 The file formats are unchanged.

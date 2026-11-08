@@ -208,7 +208,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   for covering `TSVZed` rewrites of a healthy file in the same entry; 2026-11-06, "Keep it (Recommended)" for narrowing it in
   5.6 (a file of one column); 2026-11-06, "Known limitation (Recommended)" for each of the three cell cases above;
   2026-11-07, "Known limitation (Recommended)" for the delete case, then a wider set of shapes. Narrowed in 5.08 to the shape
-  the stand-in rule leaves (no stand-in from a row with a value after a line 1 of one cell): to be confirmed with the user.
+  the stand-in rule leaves (no stand-in from a row with a value after a line 1 of one cell), which the 2026-11-07 approval
+  covers.
 
 ### A stdout nobody reads can abort or hold the exit
 - Kind: known limitation
@@ -223,47 +224,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone hits it.
 - Approved: 2026-11-07, the user chose "Known limitation (Recommended)", first for the abort and again for the corrected
   wording that includes the wait.
-
-### A caller's checkExternalChanges() can miss an append that lands as the writer thread looks
-- Kind: deferred (5.08)
-- What the operator sees: a `TSVZed` whose `checkExternalChanges()` is called just as another process appends to the file can
-  miss that append until the next check: the append shows only after the next change or call. No row is lost. 8 of 7680 runs
-  of the follow sweep at 5.07, 6 of 7680 at 5.6. A store that has just cleared its own file meets it at the same rate: since
-  5.07 it follows only what is appended after the clear, as a newly opened store does.
-- Why: the writer thread's tick reads the old size while the other process's `write(2)` has set the modification time but not
-  yet extended the file, notes the file as seen and clears `deSynced`. The caller's `checkExternalChanges()` returns early on
-  `if self.deSynced: return self`, so it misses the append. The proposed fix is to drop that early return (reasoned, not
-  tested). The sweep that finds it must run in a directory on a disk, not on tmpfs, where times are finer.
-- Revisit when: 5.08.
-
-### A rewrite of a one-column file with a queued delete can leave line 1 narrower than the header
-- Kind: deferred (5.08)
-- What the operator sees: `TSVZed(p, header='id\tv')` on `id`, `a`, `a`, `a` (one cell each), `del t['a']`, then
-  `hardMapToFile()` or `rewrite(force=True)` leaves `id\n` in 10 to 40% of runs instead of `id\tv\n`; a second rewrite widens
-  it. Also in 5.6 and 5.07 before this round. No row is lost.
-- Why: found, not fixed. The rewrite decides whether to widen line 1 (`_legacyWidened`) on the file's lines with the queued
-  delete's key still in them, where the lone `a` lines are rows of a one-column file and widening would lose them; the
-  delete's lines go only after. When the writer thread's tick commits the delete first (a race), the rewrite sees a file with
-  no such lines and widens. Forcing the rewrite to meet the queue (the tick committing nothing) gives `id\n` in 40 of 40
-  runs; committing first gives `id\tv\n` in 60 of 60. A fix would drop the queued delete's lines before the widening is decided.
-- Repro (in a container): the file `id\n# n\na\n`; `t = TSVZed(p, header='id\tv', strict=False, append_check_delay=60)`;
-  `del t['a']`; `t.hardMapToFile()` or `t.rewrite(force=True)`; `t.close()`. Over 60 runs the file is `id\tv\n` 44 to 54
-  times and `id\n` the rest, at 5.6 and 5.07 alike; 5.5 writes `id\n` every time. It is this race: in a trace of each run,
-  `id\tv\n` is the writer thread's first ticks committing the delete (a rewrite that drops `a`, leaving `id\n`) before the
-  explicit rewrite, which then widens; `id\n` is the delete still queued when the explicit rewrite decides. A 0.3 s pause
-  after the open (the first ticks done before the delete) gives `id\n` 30 of 30, and a second `hardMapToFile()` then
-  `id\tv\n` 30 of 30; `commitAppendToFile()` before the rewrite gives `id\tv\n` 30 of 30, and alone `id\n` 30 of 30. A plain
-  reader, or one given `id`, reads `id` as `[id]` or `[id, v]` by timing.
-- Revisit when: 5.08.
-
-### Other writers pad an appended row narrower than a line 1 with empty cells at its end
-- Kind: deferred (5.08)
-- What the operator sees: on a file whose line 1 ends in empty cells (`id\tv\tw\t`, a spreadsheet export with an unnamed last
-  column), `TSVZedLite`, `tsvz --x-header 'id\tv' set` and `appendTabularFile(header='id\tv')` append `c\t4\t5`, three cells,
-  and a strict reader given no header, which counts line 1's four cells, drops `c`. A `TSVZed` pads to line 1's own count
-  since 5.07. The same happens in 5.6.
-- Why: each writer works out the width it pads an appended row to by its own rule; 5.07 fixed only `TSVZed`'s.
-- Revisit when: 5.08, with one rule for that width shared by every writer.
 
 ### A file whose first keyed line is a bare #_defaults_# reads as one column without defaults
 - Kind: known limitation

@@ -13720,8 +13720,8 @@ def test_move_to_end_order_is_written_when_the_rewrite_takes_its_rows_again(tmp_
 	real = TSVZ.TSVZed._snapshotForRewrite
 	calls = []
 
-	def snapshot(self, f):
-		result = real(self, f)
+	def snapshot(self, f, *args):
+		result = real(self, f, *args)
 		if not calls:
 			calls.append(1)
 			with open(p, 'ab') as g:
@@ -14611,6 +14611,98 @@ def test_a_delete_leaves_the_other_rows_as_every_reader_read_them(tmp_path, text
 	kwargs = {'strict': False} if door == 'lite' and H else {}
 	_delete_reads_as_before(str(tmp_path / 'f.tsv'), text, key, written, H, door, differ, **kwargs)
 
+
+
+@pytest.mark.parametrize('order', ['pause after open', 'commit first', 'plain'])
+@pytest.mark.parametrize('rewrite', ['hardMapToFile', 'rewrite', 'none'])
+@pytest.mark.parametrize('text, written', [
+	(b'id\n# n\na\n', b'id\tv\n'),
+	(b'id\n# n\na\nb\t1\n', b'id\tv\nb\t1\n'),
+])
+def test_a_rewrite_with_a_queued_one_column_delete_widens_line_1_whatever_committed_first(tmp_path, order, rewrite, text, written):
+	# 5.6 and 5.07 decided the widening on the lines with the queued delete's key still in them, where a lone `a` is a row
+	# of a one-column file that a widened line 1 would lose: id\n when the delete was still queued, id\tv\n when the writer
+	# thread's tick had committed it first. With a gone nothing is lost, so a rewrite asked for widens line 1 in every
+	# order; the delete's own commit widens nothing (as in every version), so its other readers read line 1 as before.
+	if rewrite == 'none':
+		written = {b'id\n# n\na\n': b'id\n', b'id\n# n\na\nb\t1\n': b'id\nb\t1\n'}[text]
+	p = str(tmp_path / 'q.tsv')
+	_touch(p, text)
+	before = TSVZ.readTabularFile(p, strict=True, verbose=False)
+	t = TSVZ.TSVZed(p, header='id\tv', strict=False, verbose=False, append_check_delay=60)
+	if order == 'pause after open':
+		time.sleep(0.3)  # (the writer thread's first ticks done: the delete stays queued until the rewrite)
+	del t['a']
+	if order == 'commit first':
+		t.commitAppendToFile()
+	if rewrite == 'rewrite':
+		t.rewrite(force=True)
+	elif rewrite == 'hardMapToFile':
+		t.hardMapToFile()
+	else:
+		t.commitAppendToFile()
+	t.close()
+	assert _bytes(p) == written
+	after = TSVZ.readTabularFile(p, strict=True, verbose=False)  # (a strict reader given no header keeps every other row)
+	assert set(after) == set(before) - {'a'}
+
+
+def test_a_callers_check_looks_at_the_file_even_when_a_change_was_noted(tmp_path, monkeypatch):
+	# The follow sweep (ap1.py, 7680 runs on a disk directory) missed 3 to 9 appends at 5.07, 0 in 4 x 7680 now: the writer
+	# thread's tick can be following the file as another process's append lands, and clears deSynced on the bytes it saw.
+	# A caller's checkExternalChanges() that returned at once on deSynced missed the rest until the next change; it now
+	# asks the file each time, on the writer thread, after any tick under way. (The race itself is timing; this pins the call.)
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, b'x\nb\n')
+	t = TSVZ.TSVZed(p, verbose=False, append_check_delay=60, strict=False)
+	asked = []
+	real = t._checkExternalChanges
+	t._checkExternalChanges = lambda: (asked.append(1), real())[1]
+	try:
+		t.deSynced = True
+		t.checkExternalChanges()
+		assert asked  # (the call asked; a tick may ask too)
+	finally:
+		del t._checkExternalChanges
+		t.close()
+
+
+def _append_through(writer, p, row):
+	"""Append ``row`` under the header ``id<TAB>v`` through one of the writers."""
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		if writer == 'TSVZed':
+			t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60, rewrite_on_load=False)
+			t[row[0]] = row
+			t.commitAppendToFile()
+			t.close()
+		elif writer == 'TSVZedLite':
+			t = TSVZ.TSVZedLite(p, header='id\tv', verbose=False, strict=False)
+			t[row[0]] = row
+			t.close()
+		elif writer == 'tsvz set':
+			assert _run('--x-header', 'id\tv', 'set', p, *row)[0] == 0
+		else:
+			TSVZ.appendTabularFile(p, row, header='id\tv', strict=False)
+
+
+@pytest.mark.parametrize('writer', ['TSVZed', 'TSVZedLite', 'tsvz set', 'appendTabularFile'])
+@pytest.mark.parametrize('line1, width', [('id\tv\tw\t', 4), ('id\tv\t\t', 4), ('id\tv\t', 3), ('id\tv\tw', 3), ('id\tv', 2)])
+@pytest.mark.parametrize('row', [['c', '4', '5'], ['c', '4']])
+def test_every_writer_pads_an_appended_row_to_the_cells_line_1_counts(tmp_path, writer, line1, width, row):
+	# A line 1 that holds the header given, or widens it, with empty cells at its end (a spreadsheet's unnamed last column):
+	# a strict reader given no header counts them, and dropped a narrower row. One rule (_legacyAppendWidth) for every writer;
+	# 5.07 had it for TSVZed's widened line 1 only.
+	p = str(tmp_path / 'w.tsv')
+	_touch(p, (line1 + '\na\t1\t2\n').encode())
+	_append_through(writer, p, row)
+	assert _bytes(p).split(b'\n')[2] == '\t'.join(row + [''] * (width - len(row))).encode()
+	for mod in (TSVZ, TSVZ_old):
+		if mod is TSVZ_old and len(row) > width:
+			continue
+		got = mod.readTabularFile(p, strict=True, verbose=False)
+		assert [cell for cell in got['c'] if cell] == row, mod.__name__
+	got = TSVZ.readTabularFile(p, header='id\tv', strict=False, verbose=False)
+	assert [cell for cell in got['c'] if cell] == row
 
 
 def test_a_store_emptied_after_a_rewrite_follows_an_append_at_the_count_its_file_says(tmp_path):

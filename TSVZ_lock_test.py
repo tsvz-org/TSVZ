@@ -1356,10 +1356,10 @@ def test_a_compacting_rewrite_opens_nothing_by_name_and_takes_no_read_lock(tmp_p
 	inside, compacted = [], []
 	real = TSVZ.TSVZed._snapshotForRewrite
 
-	def compacting(self, f):
+	def compacting(self, f, *args):
 		inside.append(True)
 		try:
-			result = real(self, f)
+			result = real(self, f, *args)
 		finally:
 			inside.pop()
 		compacted.append(result is not None)

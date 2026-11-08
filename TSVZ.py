@@ -2076,15 +2076,26 @@ def _lineOneCells(line, delimiter):
 	return _trimmedCells(cell.strip() for cell in line.rstrip('\r\n').lstrip('\ufeff').split(delimiter))
 
 
+def _legacyAppendWidth(header, line, delimiter):
+	"""The column count every writer pads a row it appends under ``header`` to, for a legacy file whose line 1 is ``line``
+	(None: none yet): when line 1 holds the header or widens it (the same leading cells, _lineOneCells, then others that
+	are named), as many cells as line 1 has, its empty cells at the end too, and at least the header's: a strict reader
+	given no header counts them all and drops a narrower row. Else 0: the writer's own count stands. TSVZed, TSVZedLite,
+	the CLI and a handler, and appendTabularFile all ask here."""
+	if not header or not any(header) or line is None:
+		return 0
+	cells = _lineOneCells(line, delimiter)
+	if len(cells) < len(header) or not _sameCells(header, cells[:len(header)]) or not all(cells[len(header):]):
+		return 0
+	return max(len(header), len(line.rstrip('\r\n').split(delimiter)))
+
+
 def _legacyExtendsHeader(header, line, delimiter):
 	"""The cell count of ``line``, a legacy line 1, when it is ``header`` widened by a program: the same leading cells
 	(_lineOneCells), then others that are named; else 0. A store reads such a file at that count, loose: what its whole
-	read does (_legacyReadHeader) and its rewrite's look at the same lines (_snapshotForRewrite) both ask here."""
-	cells = _lineOneCells(line, delimiter)
-	# (compared trimmed, but counted as the line is: a strict reader with no header counts its empty cells at the end too, and
-	# drops a row of fewer cells than that)
-	return len(line.rstrip('\r\n').split(delimiter)) if (len(cells) > len(header) and _sameCells(header, cells[:len(header)])
-														  and all(cells[len(header):])) else 0
+	read does (_legacyReadHeader) and its rewrite's look at the same lines (_snapshotForRewrite) both ask here. The count
+	is the one every writer pads to (_legacyAppendWidth)."""
+	return _legacyAppendWidth(header, line, delimiter) if len(_lineOneCells(line, delimiter)) > len(header) else 0
 
 
 def _headerMatches(header, line, delimiter):
@@ -2311,7 +2322,7 @@ def _legacyRead(fileName, teeLogger, header, createIfNotExist, lastLineOnly, ver
 
 
 def _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, strict, delimiter, correctColumnNum,
-					  encoding, reporter, lastLineOnly=False, widening=False, said=None):
+					  encoding, reporter, lastLineOnly=False, widening=False, said=None, seen=None):
 	"""Read and check the header line of the open legacy ``file`` when ``header`` is to be verified (readTabularFile).
 
 	Returns ``(correctColumnNum, lineNo)``, the column count and the lines read, or None when a compressed stream
@@ -2335,6 +2346,8 @@ def _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, 
 	except UnicodeDecodeError:
 		line = raw.decode(encoding=encoding,errors='replace')
 		reporter.note('decode', 'line 1', 'invalid {} replaced with U+FFFD'.format(encoding))
+	if seen is not None:
+		seen[:] = [line if raw else None]
 	wider = _legacyExtendsHeader(header, line, delimiter) if widening and raw else 0
 	if wider:
 		return (wider if correctColumnNum == -1 else correctColumnNum), 1
@@ -2533,7 +2546,7 @@ def _legacyRows(linesToAppend, delimiter):
 
 
 def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding, strict, delimiter,
-						 errors='strict', rows=None, assume=None):
+						 errors='strict', rows=None, assume=None, given=None):
 	"""Format rows as 3.39's ``appendLinesTabularFile`` writes them; return ``(payload, count)``.
 
 	``header`` is a formatted header list and ``delimiter`` a resolved
@@ -2544,21 +2557,28 @@ def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeade
 	would be written. ``rows`` are the rows already made
 	by ``_legacyRows``. ``assume`` is the header list that the file's first line
 	is (or is to be) when the file is not to be read: the file is about to be
-	created, or emptied with that header left.
+	created, or emptied with that header left. ``given``: the header the caller was given, when ``header`` is another one
+	(the CLI's in effect, none when line 1 is a row to it): every row is padded to what line 1 says of it
+	(_legacyAppendWidth), as every writer pads.
 	"""
 	formatedLines = _legacyRows(linesToAppend, delimiter) if rows is None else rows
 	if not formatedLines:
 		return b'', 0
 	correctColumnNum = max([len(line) for line in formatedLines])
-	if any(header) and verifyHeader:
+	given = header if given is None else given
+	line = None
+	if (any(header) or any(given)) and verifyHeader:
 		if assume is not None:
 			line = delimiter.join(assume)
 		else:
 			line = _legacyFirstLine(fileName, encoding, teeLogger)
+	if any(header) and verifyHeader:
 		if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
 			correctColumnNum = len(header)
 			if verbose:
 				__teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
+	if line is not None and verifyHeader:
+		correctColumnNum = max(correctColumnNum, _legacyAppendWidth(given, line, delimiter))
 	# pad the lines to the correct number of columns; a wider one keeps its cells (writes never cut)
 	fitted = [_fitRow(line, correctColumnNum) for line in formatedLines]
 	payload = b'\n'.join([_encodeRow(line,delimiter,encoding,errors,header) for line in fitted]) + b'\n'
@@ -5965,6 +5985,8 @@ class TSVZed(OrderedDict):
 				value = _fitRow(value, columns)  # (padded; a wider row is written whole)
 		else:
 			columns = len(value)  # taken by __setitem__ once the row is known to be writable
+		if self._appendWidth > len(value) and any(value[1:]):
+			value = _fitRow(value, self._appendWidth)  # (as wide as line 1 counts its cells: _legacyAppendWidth)
 		if defaults and len(defaults) > 1:
 			for i in range(1,len(value)):
 				if not value[i] and i < len(defaults) and defaults[i]:
@@ -6060,7 +6082,7 @@ class TSVZed(OrderedDict):
 			self.appendQueue.append(_specTombstoneLines(key, self.delimiter, self._specState.strip))
 			return self
 		if self.correctColumnNum > 1:
-			emptyLine = [key]+['']*(self.correctColumnNum-1)
+			emptyLine = [key]+['']*(max(self.correctColumnNum, self._appendWidth)-1)  # (_legacyAppendWidth: as rows are)
 		else:
 			emptyLine = [key]
 		if self.verbose:
@@ -6485,6 +6507,7 @@ memoryOnly:{self.memoryOnly}
 	_damaged = False
 	_readWhole = False  # setDefaults() gave memory defaults the file may not hold: its next change is read whole
 	_widthOpen = False  # the last whole read took no column count from the file: its first keyed line will set it
+	_appendWidth = 0  # what a row it appends is padded to, from line 1 as the last whole read or write left it (_legacyAppendWidth)
 	# A read under the file lock met damage another writer left (a compressed file: every read of it stops there, L5).
 	# Rows appended after it would be lost to the next read, so the next commit makes the file again from memory.
 	_remake = False
@@ -6657,7 +6680,7 @@ memoryOnly:{self.memoryOnly}
 			lines.append(_encodeRow(_sanitize(row,delimiter=delimiter),delimiter,encoding,errors,self.header))
 		return lines
 
-	def _snapshotForRewrite(self, f):
+	def _snapshotForRewrite(self, f, commit=False):
 		"""``(None, lines, queued)``, what a rewrite writes, and the queued rows, taken from the queue (_writeFile puts them
 		back if it stops). A healthy file (Q-D3): its lines (_fileLines) with the queued rows after them, line 1 widened to
 		the store's header when it is that header's beginning (_legacyWidened) and the lines
@@ -6689,9 +6712,17 @@ memoryOnly:{self.memoryOnly}
 			defaults = list(self._givenDefaults)
 			widened = None
 			if consumed and not remade:
-				widened = _legacyWidened(raw, header, encoding, delimiter, errors)
+				# A rewrite asked for decides on the lines as they read once the queued deletes are made: a lone key they take
+				# out is no row the widening would lose, whether or not the writer thread committed its delete first. A
+				# commit's (``commit``: the rewrite a one-column delete makes) carries out the queue and widens nothing that
+				# was not widened before it: the delete changes nothing else for the file's other readers.
+				dropped = bool(dropAt) and not commit
+				widened = _legacyWidened(_legacyDropLines(raw, dropAt, consumed, False, delimiter, encoding) if dropped else raw,
+										 header, encoding, delimiter, errors)
 				if widened:
 					raw = widened
+					if dropped:
+						dropAt = {}  # (the deletes made: line 1 now holds the header, so no line sets a count)
 				elif widened is False:
 					_warnOnce(self, 'not-widened', self._fileName, 'line 1 is not widened to the header given: the file holds rows '
 							  'with no value, which read as deletions at two columns or more', self.teeLogger)
@@ -6804,16 +6835,16 @@ memoryOnly:{self.memoryOnly}
 		return (known is None or st.st_size != known[1] or _updateTimeNs(st) != self.externalFileUpdateTime
 				or (known[0][1] is not None and _fileIdentity(st) != known[0]))
 
-	def _writeFile(self, sync=True, snapshot=None):
+	def _writeFile(self, sync=True, snapshot=None, commit=False):
 		"""_writeFileStarted, unless the exit has let go of the store (False: nothing is written)."""
 		if not self._startWrite():
 			return False
 		try:
-			return self._writeFileStarted(sync, snapshot)
+			return self._writeFileStarted(sync, snapshot, commit)
 		finally:
 			self._endWrite()
 
-	def _writeFileStarted(self, sync=True, snapshot=None):
+	def _writeFileStarted(self, sync=True, snapshot=None, commit=False):
 		"""Write memory (or ``snapshot()``'s, a clear's) over the legacy file, whole (a compressed file as whole members;
 		written over the file, then cut to its end): True when all of it is on disk, False when the file could not be
 		opened or locked (reported); what stops it raises.
@@ -6847,7 +6878,7 @@ memoryOnly:{self.memoryOnly}
 						self._syncFrom(f, True)
 					elif sync is False and self._externalChange():
 						self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
-					header, lines, queued = snapshot() if snapshot else self._snapshotForRewrite(f)
+					header, lines, queued = snapshot() if snapshot else self._snapshotForRewrite(f, commit)
 					if not sync or self._damaged or attempt == 2 or not self._changedSince(f):
 						break
 					# A writer that takes no lock appended while the rows were taken: taken in too, and taken again.
@@ -6868,6 +6899,9 @@ memoryOnly:{self.memoryOnly}
 				end = f.tell()  # its own bytes end here: a writer that takes no lock may append after them
 				self._damaged = self._remake = False
 				self.dirty = self.deSynced = False
+				first = header if header is not None else (getattr(lines, 'first', None) or [None])[0]
+				self._appendWidth = _legacyAppendWidth(self.header, None if first is None else first.decode(
+					self.encoding or 'utf8', errors='replace'), self.delimiter) if self.verifyHeader else 0  # (the line 1 it wrote)
 				if getattr(lines, 'widened', False) or not self:
 					self._readWidened(f)  # (no row left: the column count is what the file now says, as a reopen takes it)
 			except BaseException:
@@ -7024,6 +7058,7 @@ memoryOnly:{self.memoryOnly}
 		known = _KNOWN_NOTHING
 		damaged = False
 		widened = False
+		lineOne = [None]  # (the line 1 the read met: what every row appended is padded to, _legacyAppendWidth)
 		if f is not None:
 			codec = _fileCodec(self._fileName)
 			reader = _HashingReader(f)
@@ -7039,7 +7074,7 @@ memoryOnly:{self.memoryOnly}
 					try:
 						start = _legacyReadHeader(stream, self._fileName, self.header, self.verifyHeader, self.verbose,
 												  self.teeLogger, self.strict, self.delimiter, -1, self.encoding, reporter,
-												  widening=True, said=self._mismatchSaid)
+												  widening=True, said=self._mismatchSaid, seen=lineOne)
 						if start is not None:
 							# (the rows of a file another program widened are read loose, padded, the file untouched: a strict
 							# reader would drop every row narrower than the new count, and a rewrite then delete them)
@@ -7075,6 +7110,7 @@ memoryOnly:{self.memoryOnly}
 			if loaded.dirty:
 				self.dirty = True  # a key the file holds twice
 			self._followedWidening = widened
+			self._appendWidth = _legacyAppendWidth(self.header, lineOne[0], self.delimiter) if self.verifyHeader else 0
 			self._widthOpen = width <= 0
 			if width > 0:
 				self.correctColumnNum = width  # the column count the read took (the header's, when line 1 holds it)
@@ -7123,10 +7159,11 @@ memoryOnly:{self.memoryOnly}
 		self._call(self._hardMapToFile, False, True)
 		return self
 
-	def _hardMapToFile(self, sync=False, explicit=False):
-		"""hardMapToFile(); ``sync``: see _writeFile, ``explicit``: see _refuse. True when the file is written."""
+	def _hardMapToFile(self, sync=False, explicit=False, commit=False):
+		"""hardMapToFile(); ``sync``: see _writeFile, ``explicit``: see _refuse, ``commit``: see _snapshotForRewrite. True
+		when the file is written."""
 		try:
-			return self._writeFile(sync=sync) and self._rewritten()
+			return self._writeFile(sync=sync, commit=commit) and self._rewritten()
 		except TSVZEncodeError as e:
 			self._refuse('hardMapToFile()', e, explicit)
 		except Exception as e:
@@ -7160,8 +7197,8 @@ memoryOnly:{self.memoryOnly}
 			return self._hardMapToFile(sync, explicit)
 
 	def checkExternalChanges(self):
-		if self.deSynced:
-			return self
+		# (no early return when deSynced: the writer thread's tick may be reading the file as another process's append lands,
+		# and clear it on the bytes it saw; a caller's check then looks at the file itself)
 		if not self.monitor_external_changes:
 			return self
 		if self._spec:
@@ -7335,7 +7372,7 @@ memoryOnly:{self.memoryOnly}
 			# makes it, not begun with these rows alone (the next read would then drop every other row from memory).
 			# Damaged where every read stops (_remake): made again too; a rewrite refused, these rows are appended.
 			# A drop item says what no line can: the rewrite takes its key's lines out (and writes the queue).
-			if self._hardMapToFile(sync=self.monitor_external_changes if dropping and not missing else True):
+			if self._hardMapToFile(sync=self.monitor_external_changes if dropping and not missing else True, commit=True):
 				self._worked('append')
 				return self
 			if missing:
@@ -7571,6 +7608,7 @@ memoryOnly:{self.memoryOnly}
 
 
 class TSVZedLite(MutableMapping):
+	_appendWidth = 0  # what a row it appends is padded to, from line 1 (_legacyAppendWidth)
 	"""
 	A mutable mapping class that provides a dictionary-like interface to a Tabular (TSV by default) file.
 	TSVZedLite stores key-value pairs where each row in the file represents an entry, with the first
@@ -7933,7 +7971,18 @@ class TSVZedLite(MutableMapping):
 			# (as an open of this file: a one-column file is known from here on, and emptied it stays one column; any
 			# other count is read from the rows, not kept from a one-column file this was before a delete or a reload)
 			self.correctColumnNum = 1 if width == 1 else -1
+		self._appendWidth = self._lineOneWidth()
 		return self
+
+	def _lineOneWidth(self):
+		"""_legacyAppendWidth of the file's line 1 as it is now: 0 without a header to verify, or a line 1 to read."""
+		if not (any(self.header) and self.verifyHeader):
+			return 0
+		try:
+			line = _legacyFirstLine(self._fileName, self.encoding or 'utf8', None) if os.path.isfile(self._fileName) else ''
+		except Exception:  # (damage there: the read reported it)
+			return 0
+		return _legacyAppendWidth(self.header, line or None, self.delimiter)
 
 	def positions(self):
 		return self.indexes.values()
@@ -7967,6 +8016,7 @@ class TSVZedLite(MutableMapping):
 						 encoding=self.encoding, delimiter=self.delimiter, errors=self.errors)
 		if self.fileObj is not None:
 			self.fileObj.seek(0, os.SEEK_END)  # (and drops what it had read ahead)
+		self._appendWidth = self._lineOneWidth()  # (the line 1 the clear kept)
 		return self
 
 	def switchFile(self,newFileName,createIfNotExist = ...,verifyHeader = ...):
@@ -8066,7 +8116,7 @@ class TSVZedLite(MutableMapping):
 			return
 		if self.verbose:
 			eprint(f"Writing tombstone line for {key}")
-		self.__writeValues([key])
+		self.__writeValues([key] + [''] * (self._appendWidth - 1))  # (as wide as rows are: _legacyAppendWidth)
 
 	def __readValuesAtPos(self,pos,key = ...):
 		if self._spec:
@@ -8152,6 +8202,8 @@ class TSVZedLite(MutableMapping):
 			newColumnNum = None
 		else:
 			newColumnNum = len(value)  # taken once the row is known to be writable
+		if self._appendWidth > len(value) and any(value[1:]):
+			value = _fitRow(value, self._appendWidth)  # (as wide as line 1 counts its cells: _legacyAppendWidth)
 		if self.defaults and len(self.defaults) > 1:
 			for i in range(1,len(value)):
 				if not value[i] and i < len(self.defaults) and self.defaults[i]:
@@ -8871,7 +8923,7 @@ class _ServeStore(object):
 		# Rows for a file that holds nothing yet are fitted to the header it is about to begin with.
 		assume = self.header if any(self.header) and _fileHoldsNothing(self.path) else None
 		return _legacyFormatPayload(self.path, [cells for cells, marker in rows], log, self.header, True, self.verbose,
-									'utf8', self.strict, self.delimiter, assume=assume)[0]
+									'utf8', self.strict, self.delimiter, assume=assume, given=self.given)[0]
 
 	def _tombstone(self, key):
 		"""Rows that delete ``key``: written with stripping off when it would strip ``key`` (spec §9.6)."""
