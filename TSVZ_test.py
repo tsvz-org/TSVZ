@@ -12769,9 +12769,13 @@ COMPACT_EXAMPLES = [
 	('\n#_defaults_#\na\t1\t2\n', '', None, False, '\t', '\n#_defaults_#\na\t1\t2\n'),    # E11
 	('id\tv\nb\t\t2\n', 'id\tv', None, True, '\t', 'id\tv\nb\t\t2\n'),                    # S1
 	('id\tv\tw\na\t1\nb\t1\t2\t3\n', 'id\tv\tw', None, False, '\t', 'id\tv\tw\na\t1\nb\t1\t2\t3\n'),  # G1t
-	# 5.10: each strict reader takes both of a's lines or neither (here neither, as they are narrower): one line
+	# 5.10: a's lines as wide as each other, and each strict reader takes both or neither (here neither: narrower): one line
 	('id\tv\tw\na\t1\na\t2\n', 'id\tv\tw', None, False, '\t', 'id\tv\tw\na\t2\n'),
 	('id\tv\tw\na\t1\na\t2\t3\na\t4\n', 'id\tv\tw', None, False, '\t', 'id\tv\tw\na\t1\na\t2\t3\na\t4\n'),
+	# ... only when the two lines are as wide as each other: a reader at the defaults' three columns takes c's first
+	# line alone (the plan reads at one column, where neither strict reader takes either line)
+	('\na\nc\tX\tX\tX\t2\nc\t1\n', '', [D_, '', ''], True, '\t', '\na\nc\tX\tX\tX\t2\nc\t1\n'),
+	('b\n#_defaults_#\na\tX\t\tX\na\t1\n', '', [D_, 'P', 'Q'], True, '\t', 'b\n#_defaults_#\na\tX\t\tX\na\t1\n'),
 ]
 
 
@@ -12810,6 +12814,44 @@ def test_legacy_compact_reaches_a_fixed_point_within_3_passes():
 		passes = []
 		_compact(_lines(text.encode('utf8')), header, defaults, delimiter, passes)
 		assert len(passes) <= 3
+
+
+def test_a_compaction_under_a_header_line_1_does_not_hold_keeps_every_count_its_readers_read(tmp_path):
+	"""5.10: under a header that line 1 is not (a row, or another program's widening of it), the readers given no header and
+	given line 1 count from line 1, and a reader given the header from the line after it; a compaction (here as a TSVZed
+	rewrite asks it) keeps every row each of them reads, in its order, for this version's and 3.39's readers, strict and
+	loose. 5.6 to 5.9 kept them for the reader given the header alone."""
+	import legacyfuzz
+	rng = random.Random(510)
+	before, after = str(tmp_path / 'before.tsv'), str(tmp_path / 'after.tsv')
+
+	def views(path, line1, header):
+		out = []
+		for mod in (TSVZ, TSVZ_old):
+			for strict in (True, False):
+				for h in ('', line1) + ((header,) if not strict else ()):
+					try:
+						with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+							out.append(list(mod.readTabularFile(path, header=h, strict=strict, verbose=False).items()))
+					except Exception as e:
+						out.append(type(e).__name__)
+		return out
+	compacted = 0
+	for _ in range(1500):
+		text = legacyfuzz.gen_text(rng)
+		first = rng.choice(['a\t1', 'a\t\t1', 'b', 'id\tv\tw', 'id\tv\tw\tx', 'id', 'c\t\t'])
+		raw = _lines((first + '\n' + text).encode('utf8'))
+		for header in ('id', 'id\tv', 'q'):
+			hdr = TSVZ._formatHeader(header, delimiter='\t')
+			if TSVZ._legacyHoldsHeader(raw[0], hdr, True, 'utf8', '\t'):
+				continue
+			width = TSVZ._legacyReaderWidth(raw, hdr, True, False, 'utf8', '\t')
+			out = TSVZ._legacyCompact(list(raw), width, True, [], '\t', 'utf8', False)
+			compacted += len(out) < len(raw)
+			_touch(before, b''.join(line + b'\n' for line in raw))
+			_touch(after, b''.join(line + b'\n' for line in out))
+			assert views(after, first, header) == views(before, first, header), (raw, header, out)
+	assert compacted > 1000
 
 
 def test_cli_read_table_shows_a_wide_legacy_row_whole(tmp_path):
@@ -14663,18 +14705,22 @@ def test_a_delete_commit_compacts_for_every_count_the_files_readers_read_at(tmp_
 
 
 @pytest.mark.parametrize('door', ['zed', 'cli', 'lite'])
-@pytest.mark.parametrize('text, written', [
-	# Line 1 names d, the only key that could stand in. 5.09's first build let d stand in when a later line of it was as wide
-	# as line 1 (`d\tX\nd\nd\tY\n`), which a rewrite then compacted at the store's one column: the as-wide line went as
-	# superseded and strict readers lost the key, and another key could come before d. Reverted in review: no stand-in
-	# (the line just goes, as in 5.8); 3.39's loose reader given q reads [d, Y] where it read [d] (docs/limitations.md,
-	# "After a line 1 of one cell, a delete under a header can change a cell for readers given it", deferred to 5.10).
-	(b'd\tX\na\nd\tY\n', b'd\tX\nd\tY\n'),
-	(b'd\tX\na\nd\tY\tZ\n', b'd\tX\nd\tY\tZ\n'),
+@pytest.mark.parametrize('text, written, differ', [
+	# Line 1 names d, the only key that could stand in. 5.8 and 5.9 let nothing stand in, and 3.39's loose reader given q,
+	# which counts from the place, went from [d] to [d, Y]. 5.9's first build let d stand in when any later line of it was as
+	# wide as line 1; a rewrite then compacted at the one column the stand-in sets and dropped that line (the loss below),
+	# and a line of another key between the stand-in and that line moved d after it for strict readers (the order test
+	# below). Now d stands in when its next line comes first after the place and is as wide as line 1: every reader of line
+	# 1 reads d deleted there and takes that line back before any other key, and a compaction keeps it for them (5.10).
+	(b'd\tX\na\nd\tY\n', b'd\tX\nd\nd\tY\n', None),
+	# (d's next line wider than line 1: 3.39's strict reader at two columns would not take it back; nothing stands in)
+	(b'd\tX\na\nd\tY\tZ\n', b'd\tX\nd\tY\tZ\n', {'339-loose-H': 'cell'}),
+	# (a defaults line first: nothing stands in, as before)
+	(b'd\tX\na\n#_defaults_#\tP\nd\tY\n', b'd\tX\n#_defaults_#\tP\nd\tY\n', {'339-loose-H': 'cell'}),
 ])
-def test_a_key_line_1_names_gets_no_stand_in_for_a_deleted_line(tmp_path, door, text, written):
+def test_line_1s_key_stands_in_when_its_next_line_is_as_wide_as_line_1(tmp_path, door, text, written, differ):
 	kwargs = {'strict': False} if door == 'lite' else {}
-	_delete_reads_as_before(str(tmp_path / 'f.tsv'), text, 'a', written, 'q', door, {'339-loose-H': 'cell'}, **kwargs)
+	_delete_reads_as_before(str(tmp_path / 'f.tsv'), text, 'a', written, 'q', door, differ, **kwargs)
 
 
 def _door_deletes_then_rewrites(p, door, H):
@@ -14713,7 +14759,9 @@ def test_a_delete_under_a_header_then_a_rewrite_loses_no_row_to_a_strict_reader_
 		assert set(t) >= set(before['new']) - {'a'}, _bytes(p)
 	finally:
 		t.close()
-	assert _bytes(p) == {b'b\t\t1\na\nb\t\t1\nb\t1\n': b'b\t\t1\nb\t\t1\nb\t1\n', b'd\tX\tW\na\nd\t\tY\nd\tY\n': b'd\tX\tW\nd\t\tY\nd\tY\n'}[text]
+	# (5.10: line 1's key stands in, its next line as wide as line 1, and the rewrite keeps that line for line 1's readers)
+	assert _bytes(p) == {b'b\t\t1\na\nb\t\t1\nb\t1\n': b'b\t\t1\nb\nb\t\t1\nb\t1\n',
+						 b'd\tX\tW\na\nd\t\tY\nd\tY\n': b'd\tX\tW\nd\nd\t\tY\nd\tY\n'}[text]
 
 
 def _rewrite_reads_as_before(p, text, H, written, door, differ=None):

@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.9**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.10**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -301,6 +301,63 @@ with no header (or `verifyHeader=False`), anything written to a file the damage 
 empty; the keys it sets or deletes then take its values, and the keys it left out keep
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
+
+## Upgrading to 5.10 from 5.9
+
+The file formats are unchanged.
+
+- **A compaction keeps what every reader of line 1 takes, also under a header line 1 does not hold.** A `TSVZed` given a
+  header compacts a loose file when it rewrites it (`hardMapToFile()`, `rewrite(force=True)`, the automatic ones), and so
+  does a scrub given one. When line 1 is not that header (a row to readers given no header, or another program's widening
+  of it), the file is read at two counts: the store's or the scrub's reader counts from the first keyed line after line 1,
+  readers given no header and readers given line 1 count from line 1 (and so does a store that follows the widening). 5.6
+  to 5.9 compacted at one of them, and strict readers at the other lost rows: `TSVZed(p, header='id\tv')` on
+  `id\tv\tw\nb\t1\nb\t\t1\nb\t1\n` (line 1 widened by another program), then a rewrite, wrote `id\tv\tw\nb\t1\n`, and every
+  strict reader given no header (`readTabularFile(p)`, a strict `TSVZed`, a `TSVZedLite`, 3.39's), which reads three
+  columns from line 1 and drops `b\t1`, lost `b`. The same followed a delete whose stand-in set the store's count: on
+  `a\t\t1\na\nb\t\t1\nb\t1\n`, a store given `id` that deletes `a` and rewrites, or `tsvz --x-header id delete` and then
+  such a rewrite, lost `b` for those readers (5.07 to 5.9). Now every line any of those readers takes stays (the first
+  file is left as it is; the second, by the store, becomes `a\t\t1\nb\nb\t\t1\nb\t1\n`). A file with no header, or whose line 1 holds the
+  header, compacts as before. What shows: such files keep more lines after a rewrite, and their rewrite costs more (a
+  plan for each count: 3.9 s for 200,000 rows where 5.9 took 3.0 s; other files now rewrite in 2.4 to 2.5 s, as a line
+  with no escape is split without the regex).
+
+- **A `TSVZed` delete's commit compacts again.** In a loose file of one column a delete is written by its commit, which
+  rewrites the file. 5.9 took out only the deleted keys' lines there, so a store that updates rows and deletes kept every
+  superseded line, and each delete rewrote all of them: 4,000 rounds of an update and a delete ended at 4,056 lines and
+  took 118 s (quadratic; measured with 5.8 and 5.10 on the same busy machine). The commit now compacts, for every count
+  the file is read at (the item above): 56 lines and 38 s, against 5.8's 61 lines and 36 s, and 5.8's loss is not back (`id\tv\na\nb\t1\nb\t\t1\n` with `TSVZed(p, header='id\tv\tw')`, delete `a`, still
+  writes `id\tv\nb\nb\t1\nb\t\t1\n`, where 5.8 dropped the `b\t1` that 3.39's strict reader takes). What shows: comments,
+  empty lines and superseded lines go at a delete's commit (`a\n# n\nb\t1\nb\n`, delete `a`, is `b\nb\n`, 5.8's bytes; 5.9
+  wrote `b\n# n\nb\t1\nb\n`). `tsvz delete`, a handler and a `TSVZedLite` still take out only the key's lines. The
+  advice to call `hardMapToFile()` now and then (5.9) is no longer needed.
+
+- **A key's lines as wide as each other become one line, whatever the count.** A compaction moves a key's last line into
+  its first line's place when nothing between them changes how a row reads. 5.5 to 5.9 did so only when both kinds of
+  strict reader (5.5's, which takes a line at least as wide as the count, and 3.39's, which takes only one exactly as
+  wide) took both lines; now also when the two lines have as many cells as each other and a strict reader that takes
+  neither takes no line of the key between them: every reader, at any count and with any defaults, then takes both lines
+  or neither. What shows: a file whose rows are narrower than its line 1 (`id\tv\tw\na\t1\na\t2\n` under `id\tv\tw`)
+  compacts to one line a key (`id\tv\tw\na\t2\n`); a key with a line between them that a strict reader takes, or with
+  lines of two widths, stays as it was (`id\tv\tw\na\t1\na\t2\t3\na\t4\n`). This is what keeps the first item's files
+  small.
+
+- **Line 1's own key stands in when its next line is as wide as line 1.** Under a header that line 1 is not (`tsvz
+  --x-header q delete`, a handler, a `TSVZedLite` or `TSVZed` given `q`), a delete of the first keyed line after line 1,
+  which a reader given that header counts from, puts a stand-in in its place when the next line has another cell count
+  (5.8): a key no earlier row with a value names. When line 1's row
+  names the only key that could stand in, 5.8 and 5.9 put none, and 3.39's loose reader given `q`, which counts from that
+  place, read a cell of it again: `d\tX\na\nd\tY\n`, delete `a`, was `d\tX\nd\tY\n`, and that reader went from `[d]` to
+  `[d, Y]`. Now line 1's key stands in when its next line comes first after the place and is as wide as line 1:
+  `d\tX\nd\nd\tY\n`. Every reader of line 1 reads `d` deleted at the stand-in and takes `d\tY` back before any other key,
+  and a rewrite keeps that line for them (the first item). When `d`'s next line is wider or narrower than line 1, or
+  another line comes first, nothing stands in, as before (`d\tX\na\nd\tY\tZ\n`).
+
+- Still as in 5.9, each waiting for a decision: after a line 1 of one cell that is not the header given, a delete under
+  that header can change a cell for readers given it, and so can the item above when line 1's key's next line is not as
+  wide as line 1; and a widening can
+  lose, for 3.39's strict reader, a key whose only line it takes holds no value. See
+  [docs/limitations.md](docs/limitations.md).
 
 ## Upgrading to 5.9 from 5.8
 

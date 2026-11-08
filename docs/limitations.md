@@ -400,29 +400,33 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     given H rewrites the file later: at depth 3 of the 5.09 sweep, 3 files and headers after `tsvz delete` then a
     rewrite, 2 after a `TSVZedLite` delete then a rewrite, and 1 (this one) after a `TSVZed` delete, its commit and a
     rewrite, each changing `b` for the command, every 5.5 and later reader given no header, a `TSVZed` and tsvz-rs.
-  - **A line 1 that already names the key (shape 2).** `d\tX\na\nd\tY\n`, delete `a` under header `q`: every key that
-    could stand in is already named by a valued row before the gap (line 1's own `d\tX`), so no stand-in goes there, and
-    3.39's loose reader given `q` goes from `[d]` to `[d, Y]`. 5.6 and 5.7 are no better.
+  - **A line 1 that already names the key (shape 2).** `d\tX\na\nd\tY\tZ\n`, delete `a` under header `q`: every key
+    that could stand in is already named by a valued row before the gap (line 1's own `d\tX`), so no stand-in goes
+    there, and 3.39's loose reader given `q`, which counts from the gap's place, goes from `[d]` to `[d, Y]`. 5.6 and 5.7
+    are no better. From 5.10 line 1's key stands in when the first keyed line after the gap is a row of it as wide as
+    line 1 (`d\tX\na\nd\tY\n` becomes `d\tX\nd\nd\tY\n`); left are that line wider or narrower than line 1 (as
+    here), another key's line or a defaults line first.
   - No row is lost to any reader in these shapes but the old line-1 row that the widening by a rewrite asked for takes
     (README, "Upgrading to 5.8", item 3).
 - Why: no layout serves both readers. A reader given H counts from the line after line 1, so only a one-cell line keeps
   its count there, and any one-cell keyed line is a row to a reader at one column: 3.39's strict reader, which drops
   `b\t1` there, would show `b`. 5.08 kept that reader's view (Q3, approved for the command's door); the store's next
   widening then writes the store's view, which the delete changed, into the file.
-  Shape 2 has a stand-in that is not safe yet. 5.9's first build let line 1's own key stand in (`d\tX\nd\nd\tY\n`) when
-  a later line of it was as wide as line 1. Safe only while that as-wide line survives, and the store's rewrite compacts at
-  one count, the one the stand-in sets, where it drops the line as superseded: strict readers given no header then lost
-  the key (`b\t\t1\na\nb\t\t1\nb\t1\n` under `q`: `b\t\t1\nb\nb\t1\n`; 216 tier-1 reader-cases at depth 4 of the 5.09
-  review's sweep), and where the first later line of the key was not the as-wide one, strict readers listed another key
-  before it (`d\tX\tW\na\nd\tY\ne\t1\t2\nd\t\tY\n`). Reverted in review round 1; the stand-in needs a compaction that
-  keeps what two counts take (the next entry).
-- Revisit when: 5.10: the two-count compaction of the next entry, then shape 2's stand-in on it, with the user's answer
-  to the 5.09 design's question on the other shapes (a stand-in from a row with a value at the deleting store's own
-  place, or in every door, or neither).
+  In shape 2 a stand-in of line 1's key is a row with a value to a reader at line 1's count, and safe only while a line
+  of the key as wide as line 1 comes right after it and survives. 5.9's first build let it stand in when any later line
+  was that wide, and the store's rewrite then compacted at the one count the stand-in sets, dropping that line as
+  superseded: strict readers given no header lost the key (`b\t\t1\na\nb\t\t1\nb\t1\n` under `q`), or listed another
+  key before it when the as-wide line was not the next one (`d\tX\tW\na\nd\tY\ne\t1\t2\nd\t\tY\n`). Reverted in 5.9's
+  review round 1; 5.10 builds it on the compaction that keeps what every count takes, for the next line only. A stand-in
+  from a row with a value that is not as wide gives some reader a cell it did not read, which is the user's question.
+- Revisit when: 5.11, with the user's answer to the 5.09 design's question on the other shapes (a stand-in from a row
+  with a value at the deleting store's own place, or in every door, or neither).
 - Noted: 2026-11-07, a deferral under the user's standing rule that deferrals are noted, not asked. 2026-11-08: 5.09
   fixes one of the other two shapes of the entry (3.39's strict reader in the `TSVZed` delete + commit door). Shape 2
   (a line 1 of two cells that already names the key) was fixed in 5.09's first build and put back as deferred to 5.10
   with the two-count compaction (W1) in review round 1, after it lost rows for strict readers; same standing rule.
+  2026-11-08: 5.10 fixes shape 2 when line 1's key's next line is as wide as line 1; the rest waits for the user's
+  answer, deferred to 5.11 under the same rule.
 
 ### A widening loses a key whose only line 3.39's strict reader takes holds no value
 - Kind: deferred

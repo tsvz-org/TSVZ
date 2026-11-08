@@ -299,8 +299,8 @@ entries go last, in the same commit as the change:
   kept as it is; a key's last line moves into its first line's place, or a dead key's line is emptied, only where every
   plan agrees; and a line kept for another reader brings along the deletion or the last line its own plan needs around
   it. A file with no header, or whose line 1 holds the header, compacts as in 5.9. A key's lines now also become one
-  line when each strict reader takes both or none of them (5.5 to 5.9: only when both strict readers took both). A
-  `TSVZed` delete's commit compacts again, as in 5.8, now for every count.
+  line when they are as wide as each other and each strict reader takes both or none of them (5.5 to 5.9: only when
+  both strict readers took both). A `TSVZed` delete's commit compacts again, as in 5.8, now for every count.
 - Why we had to change: three findings had one cause. W1: a store given `id\tv` on `id\tv\tw\nb\t1\nb\t\t1\nb\t1\n` (line 1
   widened by another program) reads three columns, as every reader given no header does, but its rewrite compacted at the
   count of the line after line 1 (two), where `b\t\t1` is superseded, and every strict reader given no header lost `b`
@@ -313,6 +313,11 @@ entries go last, in the same commit as the change:
   which count that was, though a file under a header line 1 does not hold is read at two counts by the programs that
   matter. 5.9's fix removed the step from the door where the loss showed instead of making the step right; the step was
   also what kept the file small.
+  The first build of 5.10 made the same mistake once more inside one plan: it let a key's lines collapse when a strict
+  reader at the plan's count took neither, and the fuzz found a reader at the defaults' count that took one of them
+  (`\na\nc\tX\tX\tX\t2\nc\t1\n`, three-cell defaults: the plan read one column, the reader three, and lost `c`). The
+  condition that holds at every count is that the two lines are as wide as each other.
 - Lesson: when one file is read at more than one count (or by more than one rule), a maintenance step keeps what each of
   those readers takes, and changes a line only where all of them agree. A step found right for only one reader is made
-  right for every reader, not taken out of the door where the loss showed: it may be what pays for something else.
+  right for every reader, not taken out of the door where the loss showed: it may be what pays for something else. A
+  condition checked at one count must be one that holds at every count a reader can take.

@@ -2980,11 +2980,13 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 			continue
 		# The key becomes one line (its value at its place) when the same defaults reach both places (no defaults line
 		# between them), or none can reach its last line (exactly W wide, a value in every cell, for every reader), and
-		# each strict reader takes both lines or none of the key's (5.10; 5.5 to 5.9: both, for both strict readers):
-		# it then reads the moved line as it read the last one, or not at all.
+		# both strict readers take both lines, or (5.10) the two lines are as wide as each other and each strict reader
+		# takes both or none of the key's: a reader at any count, given any defaults, then takes both or neither, and
+		# reads the moved line as it read the last one, or not at all.
 		if ((lastFull[slot] or bisect.bisect_right(boundaries, f) == bisect.bisect_left(boundaries, l))
 				and firstTakes[slot] == lastTakes[slot] and f not in still
-				and (firstTakes[slot] & 1 or firstTaken[slot] < 0) and (firstTakes[slot] & 2 or firstTakenOld[slot] < 0)
+				and (firstTakes[slot] == 3 or (firstN[slot] == lastN[slot] and (firstTakes[slot] & 1 or firstTaken[slot] < 0)
+					and (firstTakes[slot] & 2 or firstTakenOld[slot] < 0)))
 				and f != 0 and (f not in (firstKeyed, after0) or firstN[slot] == lastN[slot])):
 			content[f] = raw[l]
 			moved[f] = l
@@ -3143,7 +3145,10 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	more), so the key reads after it as it did. Else, unless a line 1 of one cell comes before the place (its readers
 	would read the stand-in as a row, and 3.39's strict read, which drops a wider line at one column, would gain it), a
 	key that no row with a value before the place names: at two columns or more the stand-in deletes a key not yet read,
-	at one it is a row the key's later line replaces. No such row: the line just goes."""
+	at one it is a row the key's later line replaces. Else line 1's own key, when the first keyed line after the place is
+	a row of it as wide as line 1 (5.10): every reader that read line 1's row reads the key deleted at the stand-in and
+	takes that line back before any other key, and a compaction keeps that line for line 1's readers (_legacyCompact).
+	No such row: the line just goes."""
 	enc = encoding or 'utf8'
 	d = delimiter.encode(enc)
 	texts = [line.decode(enc, errors='replace') for line in raw]
@@ -3175,6 +3180,9 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		if not pick and not (i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):
 			named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
 			pick = [j for j in later if kinds[j][1].rstrip() not in named]
+			if (not pick and nxt not in stand and kinds[nxt][0] == 'row' and kinds[nxt][1].rstrip() in named and valued(nxt)
+					and kinds[nxt][2] == kinds[0][2]):
+				pick = [nxt]  # (line 1's key: its next line comes first after the place, as wide as line 1)
 		if pick:
 			stand[i] = raw[pick[0]].strip(b'\x00').rstrip(b'\r').split(d)[0] + d * (kinds[i][2] - 1)
 	return [stand.get(i, line) for i, line in enumerate(raw) if i in stand or not goes(i)]
