@@ -2988,6 +2988,16 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 	content = {}
 	moved = {}
 
+	ahead = {}  # (per strict reader: (from, the first row line it takes at or after from, -1 for none))
+
+	def takesBefore(bit, start, end):
+		# (whether that reader takes a row line in [start, end). The slots come in file order, so the next one asks from
+		# further on and the answer is reused: each stretch is searched once, not once per key it lies before)
+		got = ahead.get(bit)
+		if got is None or got[0] > start or 0 <= got[1] < start:
+			got = ahead[bit] = (start, rowTaken[bit].find(1, start))
+		return 0 <= got[1] < end
+
 	def inOrder(slot, f):
 		# (5.11) Each strict reader that takes the key's first line takes its last, and one that does not, if it takes a line
 		# of the key, takes the last and no row of another key before its first: the moved line then reads to it as the
@@ -2998,7 +3008,7 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 				continue
 			if not lastTakes[slot] & bit:
 				return False
-			if not firstTakes[slot] & bit and rowTaken[bit].find(1, f + 1, rFirst) >= 0:
+			if not firstTakes[slot] & bit and takesBefore(bit, f + 1, rFirst):
 				return False
 		return True
 	for slot in live.values():
