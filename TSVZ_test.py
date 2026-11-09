@@ -17167,6 +17167,22 @@ def test_a_stores_delete_then_its_rewrite_writes_the_same_bytes_whichever_was_fi
 			assert mod.readTabularFile(p, header=header, strict=False, verbose=False)['b'] == ['b', '1']
 
 
+def test_a_lite_delete_then_a_stores_rewrite_keeps_the_rows_cells(tmp_path):
+	# The same after a TSVZedLite(strict=False) delete: 5.10 left no stand-in, and a TSVZed given the header then widened
+	# line 1 and wrote b\t1\tQ for every reader.
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, Q3_SHAPE)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		t = TSVZ.TSVZedLite(p, header='id\tv', strict=False, verbose=False)
+		del t['a']
+		t.close()
+		t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60, rewrite_on_load=False)
+		t.hardMapToFile()
+		t.close()
+	assert _bytes(p) == b'id\tv\n#_defaults_#\t\tQ\nb\t1\n'
+	assert TSVZ.readTabularFile(p, verbose=False)['b'] == ['b', '1']
+
+
 @pytest.mark.parametrize('route', ['hardMapToFile', 'rewrite'])
 def test_a_widening_is_refused_when_the_only_line_339s_strict_reader_takes_of_a_key_holds_no_value(tmp_path, route):
 	# Q-C (2026-11-08: "Refuse the widening"). At line 1's one column 3.39's strict reader takes b\t as the row b and drops
