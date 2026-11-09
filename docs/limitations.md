@@ -386,68 +386,39 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### After a line 1 of one cell, a delete under a header can change a cell for readers given it
 - Kind: deferred
-- What the operator sees:
-  - **The `TSVZed` and `TSVZedLite(strict=False)` doors given a header** H, on a file whose line 1 is one cell and not H
-    (Q3's shape: `id\na\n#_defaults_#\t\tQ\nb\t1\n` under `id\tv`, delete `a`). The store counts from the line after
-    line 1, and only a row with a value could stand in for `a`, so nothing does (the rule that keeps 3.39's strict
-    reader given no header from gaining the key): the store, and every reader given H, read `b` as `[b, 1, Q]` after
-    the delete, where they read `[b, 1]`. In this door the reader given H is the deleting store itself. 5.7's `TSVZed`
-    and Lite moved `b` up, so only 3.39's loose reader given H saw it there. The command's door (`tsvz --x-header H
-    delete`, a handler) is the approved case in "Readers given other arguments".
-  - **A rewrite that then widens line 1 (N1).** On that file, after the commit (`commitAppendToFile()` or the writer
-    thread's), `hardMapToFile()` or `rewrite(force=True)` makes the file `id\tv\n#_defaults_#\t\tQ\nb\t1\nb\t1\tQ\n`,
-    and every 5.5 and later reader, the command, a `TSVZed` and tsvz-rs read `b` as `[b, 1, Q]` (27 reader classes in
-    the 5.08 review's sweep, in that order only); 3.39's readers keep `[b, 1]`. If the delete is still queued when the
-    rewrite runs, everyone keeps `[b, 1]`. The same follows the command's delete (or a `TSVZedLite`'s) when a `TSVZed`
-    given H rewrites the file later: at depth 3 of the 5.09 sweep, 3 files and headers after `tsvz delete` then a
-    rewrite, 2 after a `TSVZedLite` delete then a rewrite, and 1 (this one) after a `TSVZed` delete, its commit and a
-    rewrite, each changing `b` for the command, every 5.5 and later reader given no header, a `TSVZed` and tsvz-rs.
-  - **A line 1 that already names the key (shape 2).** `d\tX\na\nd\tY\tZ\n`, delete `a` under header `q`: every key
-    that could stand in is already named by a valued row before the gap (line 1's own `d\tX`), so no stand-in goes
-    there, and 3.39's loose reader given `q`, which counts from the gap's place, goes from `[d]` to `[d, Y, Z]`. 5.6 and 5.7
-    are no better. From 5.10 line 1's key stands in when the first keyed line after the gap is a row of it as wide as
-    line 1 (`d\tX\na\nd\tY\n` becomes `d\tX\nd\nd\tY\n`); left are that line wider or narrower than line 1 (as
-    here), another key's line or a defaults line first.
+- What the operator sees: two shapes are left, one through the command's door and one with a line 1 of two cells; 5.11
+  fixed the store's own doors (Noted, below).
+  - **The command's delete, then a store's rewrite that widens line 1.** `tsvz --x-header 'id\tv' delete` (or a handler
+    given that header) on `id\na\n#_defaults_#\t\tQ\nb\t1\n`, delete `a`: the command reads line 1 as a row, so no row
+    with a value stands in after it (Q3, the approved case in "Readers given other arguments"), and the file is
+    `id\n#_defaults_#\t\tQ\nb\t1\n`. A `TSVZed` given `id\tv` reads `b` there as `[b, 1, Q]`, and its next rewrite
+    widens line 1 and writes that view for every reader: `id\tv\n#_defaults_#\t\tQ\nb\t1\nb\t1\tQ\n`, and every 5.5 and
+    later reader, the command, a `TSVZed` and tsvz-rs read `b` as `[b, 1, Q]`; 3.39's readers keep `[b, 1]` (3 file-header
+    cases at depth 3 of the 5.09 sweep).
+  - **A line 1 that already names the key (shape 2).** `d\tX\na\nd\tY\tZ\n`, delete `a` under header `q`, in every door:
+    every key that could stand in is already named by a valued row before the gap (line 1's own `d\tX`), so no stand-in
+    goes there, and 3.39's loose reader given `q`, which counts from the gap's place, goes from `[d]` to `[d, Y, Z]`. From
+    5.10 line 1's key stands in when the first keyed line after the gap is a row of it as wide as line 1
+    (`d\tX\na\nd\tY\n` becomes `d\tX\nd\nd\tY\n`); left are that line wider or narrower than line 1 (as here), another
+    key's line or a defaults line first.
   - No row is lost to any reader in these shapes but the old line-1 row that the widening by a rewrite asked for takes
     (README, "Upgrading to 5.8", item 3).
 - Why: no layout serves both readers. A reader given H counts from the line after line 1, so only a one-cell line keeps
   its count there, and any one-cell keyed line is a row to a reader at one column: 3.39's strict reader, which drops
-  `b\t1` there, would show `b`. 5.08 kept that reader's view (Q3, approved for the command's door); the store's next
-  widening then writes the store's view, which the delete changed, into the file.
-  In shape 2 a stand-in of line 1's key is a row with a value to a reader at line 1's count, and safe only while a line
-  of the key as wide as line 1 comes right after it and survives. 5.9's first build let it stand in when any later line
-  was that wide, and the store's rewrite then compacted at the one count the stand-in sets, dropping that line as
-  superseded: strict readers given no header lost the key (`b\t\t1\na\nb\t\t1\nb\t1\n` under `q`), or listed another
-  key before it when the as-wide line was not the next one (`d\tX\tW\na\nd\tY\ne\t1\t2\nd\t\tY\n`). Reverted in 5.9's
-  review round 1; 5.10 builds it on the compaction that keeps what every count takes, for the next line only. A stand-in
-  from a row with a value that is not as wide gives some reader a cell it did not read, which is the user's question.
-- Revisit when: 5.11, which builds the user's answer to the 5.09 design's question on the other shapes (a stand-in from
-  a row with a value at the deleting store's own place, or in every door, or neither): on 2026-11-08 they chose "A:
-  stand-in in the store's own delete".
+  `b\t1` there, would show `b`. Where the command deletes it reads line 1 as a row, so 5.08 kept 3.39's strict reader's
+  view (Q3, approved for the command's door); a store given H that rewrites later writes its own view, as a widening does.
+  In shape 2 a stand-in of line 1's key is a row with a value to a reader at line 1's count, and a stand-in from a row
+  with a value that is not as wide gives some reader a cell it did not read.
+- Revisit when: 5.12, with the user's answer on these two shapes (asked with 5.11: a known limitation, or a stand-in in
+  these doors too, at a cost to 3.39's strict reader).
 - Noted: 2026-11-07, a deferral under the user's standing rule that deferrals are noted, not asked. 2026-11-08: 5.09
-  fixes one of the other two shapes of the entry (3.39's strict reader in the `TSVZed` delete + commit door). Shape 2
-  (a line 1 of two cells that already names the key) was fixed in 5.09's first build and put back as deferred to 5.10
-  with the two-count compaction (W1) in review round 1, after it lost rows for strict readers; same standing rule.
-  2026-11-08: 5.10 fixes shape 2 when line 1's key's next line is as wide as line 1; the rest, deferred to 5.11 under
-  the same rule, follows the user's answer of the same day (above).
-
-### A widening loses a key whose only line 3.39's strict reader takes holds no value
-- Kind: deferred
-- What the operator sees: `TSVZed(p, header='id\tv')` on `id\nb\t\nb\t\t1\n`, then a rewrite you ask for: line 1
-  widens (`id\tv\nb\t\t1\n`), and 3.39's strict reader given no header, which at one column took `b\t` as the row `b`
-  and dropped `b\t\t1`, now reads two columns, where `b\t` would be a deletion and `b\t\t1` is still too wide: `b` is
-  lost: 118 reader-cases at depth 3 of the 5.09 sweep for that reader given no header and 10 given line 1, from a rewrite
-  alone; after a queued delete took the last lone key out, the 12 the 5.08 review counted. 5.5 and later readers take
-  the wider line and keep `b`. 5.6 to 5.8 do the same.
-- Why: the widening's rule (5.6) refuses a file with a key whose last line holds no value, and lets through a key that a
-  later line gives a value; for 3.39's strict reader that later line is invisible when it is wider than the header.
-- Revisit when: 5.11, which builds the user's answer to the 5.09 design's question on it (Q-C: refuse the widening there,
-  with the warning a lone key gives, or widen and lose the key for that reader): on 2026-11-08 they chose "Refuse the
-  widening". 5.10's compaction is not the cause: the widening is
-  decided before it, and once line 1 holds the header the file is compacted for one count. Left unwidened (Q-C's refusal),
-  the file is compacted for line 1's readers too (5.10), so the line 3.39's strict reader takes at line 1's one column stays.
-- Noted: 2026-11-08, found in the 5.09 design sweep; a deferral under the user's standing rule. 2026-11-08: not built in
-  5.10, deferred to 5.11 under the same rule, which builds the user's answer of the same day (above).
+  fixes one of the shapes (3.39's strict reader in the `TSVZed` delete + commit door); 5.10 fixes shape 2 when line 1's key's
+  next line is as wide as line 1. 2026-11-09: 5.11 builds the user's answer of 2026-11-08 to Q-A, "A: stand-in in the
+  store's own delete": in the `TSVZed` and `TSVZedLite(strict=False)` doors given H, a row with a value stands in after a
+  line 1 of one cell (`id\nb\n#_defaults_#\t\tQ\nb\t1\n`), the store and readers given H keep `[b, 1]`, the store's rewrite
+  writes the same bytes whether the delete was committed first or not (N1), and so does a `TSVZedLite` delete followed by a
+  store's rewrite; 3.39's strict reader given no header or line 1 gains `b` there (the kind approved as Q4). The rest is
+  deferred to 5.12 under the same rule.
 
 ### A TSVZedLite delete looks at the file's first lines every time
 - Kind: deferred
@@ -512,11 +483,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   defaults or the first row after line 1 give it a wider count (`id\na\t1\nb\n`), when it reads them as deletions and the
   file keeps them all the same. No row is lost. The file widens once every row holds a value. (From 5.08 a `TSVZedLite`
   delete of that first row keeps the store's count: a stand-in, `id\nb\t\nb\n`, so b stays a deletion to it.)
+  From 5.11 a key whose only line 3.39's strict reader takes holds no value also keeps line 1 one column, with the same
+  warning, when a later line gives it a value but is wider than the header (`id\nb\t\nb\t\t1\n` under `id\tv`): at the
+  header's two columns that reader would drop the wider line and take `b\t` as a deletion, and lose `b` (5.6 to 5.10 widened).
 - Why: a value-less row at two columns is a deletion, so marking one needs a format change that every reader, the spec and
   tsvz-rs would have to learn.
 - Revisit when: the format next changes.
 - Approved: 2026-11-06, the user chose "Known limitation (Recommended)". The Lite delete case: the same answer, the same day
-  (5.08 closes that case).
+  (5.08 closes that case). The widening refused for 3.39's strict reader: 2026-11-08, Q-C, the user chose "Refuse the
+  widening (Recommended)".
 
 ### A row deleted from a one-column file under wider defaults or a wider header stays as its key
 - Kind: known limitation
@@ -526,52 +501,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   header: `id\na\t1\nb\n`, `header='id\tv'`, `del t['a']` leaves `id\na\t1\nb\na\t\n`. `tsvz delete`, a handler and a
   `TSVZedLite` ask the file, so they take the key's lines out and leave nothing, whatever was read first. Two exceptions for a
   `TSVZedLite`: a program that gave `correctColumnNum` of two or more is not asked about, so the delete is the appended line; and
-  under a header that line 1 isn't, a copy of the key on line 1 stays, in the header's place.
+  under a header that line 1 isn't, a copy of the key on line 1 stays, in the header's place. From 5.11 the deleted key's own value line goes at a rewrite
+  (5.10 kept `c\t1` before the `c\t`: one more line per deleted key).
 - Why: a file that stays one column has no way to mark that deletion, so it needs a format change.
 - Revisit when: the next format change.
 - Approved: 2026-11-06, the user chose "Known limitation (Recommended)", and "Widen the entry (Recommended)" for the wider
   header.
-
-### A deleted key's value line stays in a one-column file under wider defaults
-- Kind: deferred
-- What the operator sees: in the file of the entry above (a one-column file, `a\nb\nc\t1\n`, opened by a `TSVZed` with wider
-  defaults such as `['#_defaults_#', 'P']`, or `id\na\nb\n` under header `id\tv`), a rewrite keeps the deleted key's value line as
-  well as the `c<TAB>` that marks it (`a\nb\nc\t1\nc\t\n#_defaults_#\tP\n`): one more line per deleted key, where 5.9 wrote
-  `a\nb\nc\t\n#_defaults_#\tP\n`. 1,000 rounds of a set and a delete of a new key end at 2,003 lines, against 5.9's 1,003. Every
-  reader's view is the same as with the one line.
-  The entry above, approved before 5.10, is unchanged; this one is the 5.10 addition to what its rewrite writes.
-- Why: the compaction plans a strict reader given no defaults too (5.10, review round 1), and that reader takes `c\t` alone at
-  one column, where 5.5's takes both lines, so the two lines are not moved into one (the collapse needs every strict reader to
-  take both or neither).
-- Revisit when: 5.11. The plan is an order-aware collapse: allow the move when each strict reader that takes the first line also
-  takes the last, and no other key that reader takes lies between them.
-- Noted: 2026-11-08, found in the 5.10 re-review (F10); a deferral under the user's standing rule that deferrals are noted, not asked.
-
-### The compaction plan reads a #_defaults_# line wider than a reader's count wrongly for 3.39's strict reader
-- Kind: deferred
-- What the operator sees: a scrub (or a rewrite) of a file with a `#_defaults_#` line wider than a reader's column count can
-  change a cell for 3.39's strict reader given the scrub's own header and defaults:
-  `id\tv\nb\t1\t\nb\tX\nb\t5\t\n#_defaults_#\t\tP\nb\t9\t\n` with `header='id\tv', defaults=['#_defaults_#', '', 'Q']` is written as
-  `id\tv\nb\t1\t\nb\tX\n#_defaults_#\t\tP\nb\t9\t\n`, and that reader sees `b` go from `[b, 5]` to `[b, X]` (5.09 wrote the file
-  without `b\tX` and `b` went to `[b, 1]`, so it is not new in 5.10; 5.09 was right only by coincidence). No key is lost.
-- Why: 3.39 cuts such a defaults line down to its count and fills it from the active defaults; when every value lies beyond
-  the count, the line makes it strict again. The plan keeps one `strictActiveOld` flag per reader and assumes the reader
-  stays lenient after the line.
-- Revisit when: 5.11. The plan: in `_legacyCompactPlan`, keep 3.39's active defaults per column, and apply a defaults line the
-  way 3.39 does.
-- Noted: 2026-11-09, found in the 5.10 re-review (round 3); a deferral under the user's standing rule that deferrals are noted, not asked.
-
-### An explicit correctColumnNum is replaced by the header's width in a scrub
-- Kind: deferred
-- What the operator sees: a scrub given `correctColumnNum` and a header of another width plans the header's width, not the
-  count (`_legacyReaderWidth(...) == 1` override, TSVZ.py near line 3463). `a\nb\nb\tP\t1\na\t1\tP\nb\t1\t2\t3\n` with
-  `header='a', defaults=['#_defaults_#', 'P'], correctColumnNum=2` is written as `a\nb\na\t1\tP\nb\t1\t2\t3\n`, and every reader
-  given header `a` and `correctColumnNum=2` sees the key order go from b, a to a, b; no cell changes. 5.09 writes the same
-  bytes, so it is not new in 5.10.
-- Why: the compaction plans the readers it knows (the header's width, the defaults' count, line 1, none); an explicit count
-  that differs from the header's width is a reader it does not plan.
-- Revisit when: 5.11. The plan: plan the explicit count as one more reader when it differs from the header's width.
-- Noted: 2026-11-09, found in the 5.10 re-review (round 3); a deferral under the user's standing rule that deferrals are noted, not asked.
 
 ### 3.39's strict reader of a one-column file sees a new row when its last lone key is deleted
 - Kind: known limitation
