@@ -17141,3 +17141,35 @@ def test_a_stores_delete_then_its_rewrite_writes_the_same_bytes_whichever_was_fi
 	for mod in (TSVZ, TSVZ_old):
 		for header in ('', 'id\tv'):
 			assert mod.readTabularFile(p, header=header, strict=False, verbose=False)['b'] == ['b', '1']
+
+
+@pytest.mark.parametrize('route', ['hardMapToFile', 'rewrite'])
+def test_a_widening_is_refused_when_the_only_line_339s_strict_reader_takes_of_a_key_holds_no_value(tmp_path, route):
+	# Q-C (2026-11-08: "Refuse the widening"). At line 1's one column 3.39's strict reader takes b\t as the row b and drops
+	# b\t\t1; at the header's two, b\t would be a deletion and b\t\t1 is still too wide: 5.6 to 5.10 widened, and b was lost.
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, b'id\nb\t\nb\t\t1\n')
+	before = TSVZ_old.readTabularFile(p, strict=True, verbose=False)
+	assert 'b' in before
+	err = io.StringIO()
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+		t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60, rewrite_on_load=False)
+		t.hardMapToFile() if route == 'hardMapToFile' else t.rewrite(force=True)
+		t.close()
+	assert _bytes(p).startswith(b'id\n') and 'not widened' in err.getvalue()
+	assert TSVZ_old.readTabularFile(p, strict=True, verbose=False) == before
+	assert TSVZ.readTabularFile(p, header='id\tv', strict=False, verbose=False)['b'] == ['b', '', '1']
+
+
+@pytest.mark.parametrize('text, written', [
+	(b'id\nb\t\nb\t1\n', b'id\tv\nb\t1\n'),  # (a later line as wide as the header gives b a value 3.39's strict reader takes)
+	(b'id\nb\t\nb\t\t1\nb\t2\n', b'id\tv\nb\t\t1\nb\t2\n'),
+])
+def test_a_widening_still_goes_when_a_later_line_no_wider_than_the_header_gives_the_key_a_value(tmp_path, text, written):
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, text)
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60, rewrite_on_load=False)
+	t.hardMapToFile()
+	t.close()
+	assert _bytes(p) == written
+	assert TSVZ_old.readTabularFile(p, strict=True, verbose=False)['b'] == ['b', '2' if b'b\t2' in text else '1']

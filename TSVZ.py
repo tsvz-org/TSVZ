@@ -3350,7 +3350,9 @@ def _legacyWidened(raw, header, encoding, delimiter, errors):
 	not counted). This exact rule, not the containment of _lineContainHeader: a line 1 that only resembles the header may
 	be a row, and is left alone. None when it does not apply; False when it would lose rows: in a file of one column
 	(_legacyFileWidth) a key whose last line holds no value is a row with no value, that line reads as a deletion at the
-	header's width, and no line can hold it there. An earlier line of a key that a later one gives a value loses nothing.
+	header's width, and no line can hold it there. An earlier line of a key that a later one gives a value loses nothing,
+	unless that later line is wider than the header (5.11): 3.39's strict reader, which took the line with no value as a
+	row at one column, drops a wider line at the header's count, and would lose the key (Q-C: the widening is refused).
 
 	The lines a reader takes that are narrower than ``header`` are padded with it, each as a loose read already pads it: a
 	strict reader, which drops a narrower line, then takes them all, those it dropped at the old column count too. Nothing
@@ -3366,8 +3368,8 @@ def _legacyWidened(raw, header, encoding, delimiter, errors):
 		kind, key, count, _ = _legacyLineKind(line.decode(enc, errors='replace'), len(header), False, delimiter)
 		if kind == 'delete':
 			valueless.add(key.rstrip())
-		elif kind == 'row':
-			valueless.discard(key.rstrip())
+		elif kind == 'row' and count <= len(header):
+			valueless.discard(key.rstrip())  # (a wider line clears nothing: 3.39's strict reader drops it at the header's count)
 		out.append(line.rstrip(b'\r') + pad * (len(header) - count) if kind in ('row', 'defaults') and count < len(header) else line)
 	return False if valueless and _legacyFileWidth(raw, header, True, encoding, delimiter) == 1 else out
 
