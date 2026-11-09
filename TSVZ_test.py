@@ -17328,6 +17328,20 @@ def test_a_correct_column_num_as_wide_as_the_scrubs_count_adds_no_reader():
 	assert (3, True, True, []) in TSVZ._legacyCompactReaders(lines, 2, True, [], '\t', 'utf8', True, (3, -1))
 
 
+@pytest.mark.parametrize('defaults', [[D_, 'P', 'Q'], [D_, 'P']])
+def test_a_scrub_given_a_count_keeps_what_a_reader_given_that_count_and_no_defaults_takes(tmp_path, defaults):
+	# A reader given correctColumnNum and no defaults reads at the count, not at the file's: it is the twin of the scrub's
+	# own reader, planned at the count also when the scrub reads at it (5.11 review). 3.39's strict reader at two takes
+	# c\t2 alone; the scrub's own reader (lenient under the defaults) and the twin at the file's three do not need it.
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, b'x\t1\t2\nc\t1\t\nc\t2\nc\t\t2\n' if len(defaults) == 2 else b'c\t1\t\nc\t2\nc\t\t2\n')
+	before = dict(TSVZ_old.readTabularFile(p, correctColumnNum=2, strict=True, verbose=False))
+	assert before['c'] == ['c', '2']
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		TSVZ.scrubTabularFile(p, defaults=list(defaults), correctColumnNum=2)
+	assert dict(TSVZ_old.readTabularFile(p, correctColumnNum=2, strict=True, verbose=False)) == before
+
+
 def test_the_compaction_keeps_every_readers_view_of_random_files_under_defaults(tmp_path):
 	"""5.11's collapse and defaults rules on random small files: a scrub given each of several defaults and headers leaves
 	every reader (this version's and 3.39's readTabularFile, strict and loose, given no header, line 1 or the scrub's,

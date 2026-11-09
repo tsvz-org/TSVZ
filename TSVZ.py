@@ -3076,8 +3076,9 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 	strict one takes only the lines as wide as its count (3.39's) or at least as wide (5.5's), where defaults with a value
 	take every line. So each is listed again, given none and at the count it then reads at, where that count or the
 	strictness differs. ``counts``: column counts readers are given explicitly (a scrub's ``correctColumnNum``), each
-	another reader, given the caller's header and defaults, and none, where it differs from ``width`` (5.11)."""
-	explicit = sorted({count for count in counts if count > 0 and count != width})
+	another reader given the caller's header and defaults where it differs from ``width`` (5.11), and, given none, at that
+	count whatever ``width`` is: a reader given none and a count reads at the count, not at the file's."""
+	given = sorted({count for count in counts if count > 0})
 	readers = [(width, consumed, matched, defaults)]
 	# (the count each reader is given no defaults reads at: the file's. A header the file holds gives it, else the first
 	# keyed line's, line 1 left out for a reader that takes it for its header)
@@ -3107,10 +3108,11 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 		readers += [(w, c, m, ()) for (w, c, m), r in zip(own, readers)
 					if (valued or w != r[0])
 					and not (valued and w > 0 and counts.get(True, set()) <= {w} and (c or counts.get(False, set()) <= {w}))]
-	for count in explicit:
-		readers.append((count, consumed, matched, defaults))
-		if valued:
-			readers.append((count, consumed, matched, ()))  # (a strict one given none: the explicit count, its own strictness)
+	for count in given:
+		if count != width:
+			readers.append((count, consumed, matched, defaults))
+		if valued and (count, consumed, matched, ()) not in readers:
+			readers.append((count, consumed, matched, ()))  # (a strict one given none: the count given, its own strictness)
 	return readers
 
 
