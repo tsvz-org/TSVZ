@@ -43,10 +43,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.07'
+version = '5.09'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-11-07'
+COMMIT_DATE = '2026-11-08'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -2076,15 +2076,26 @@ def _lineOneCells(line, delimiter):
 	return _trimmedCells(cell.strip() for cell in line.rstrip('\r\n').lstrip('\ufeff').split(delimiter))
 
 
+def _legacyAppendWidth(header, line, delimiter):
+	"""The column count every writer pads a row it appends under ``header`` to, for a legacy file whose line 1 is ``line``
+	(None: none yet): when line 1 holds the header or widens it (the same leading cells, _lineOneCells, then others that
+	are named), as many cells as line 1 has, its empty cells at the end too, and at least the header's: a strict reader
+	given no header counts them all and drops a narrower row. Else 0: the writer's own count stands. TSVZed, TSVZedLite,
+	the CLI and a handler, and appendTabularFile all ask here."""
+	if not header or not any(header) or line is None:
+		return 0
+	cells = _lineOneCells(line, delimiter)
+	if len(cells) < len(header) or not _sameCells(header, cells[:len(header)]) or not all(cells[len(header):]):
+		return 0
+	return max(len(header), len(line.rstrip('\r\n').split(delimiter)))
+
+
 def _legacyExtendsHeader(header, line, delimiter):
 	"""The cell count of ``line``, a legacy line 1, when it is ``header`` widened by a program: the same leading cells
 	(_lineOneCells), then others that are named; else 0. A store reads such a file at that count, loose: what its whole
-	read does (_legacyReadHeader) and its rewrite's look at the same lines (_snapshotForRewrite) both ask here."""
-	cells = _lineOneCells(line, delimiter)
-	# (compared trimmed, but counted as the line is: a strict reader with no header counts its empty cells at the end too, and
-	# drops a row of fewer cells than that)
-	return len(line.rstrip('\r\n').split(delimiter)) if (len(cells) > len(header) and _sameCells(header, cells[:len(header)])
-														  and all(cells[len(header):])) else 0
+	read does (_legacyReadHeader) and its rewrite's look at the same lines (_snapshotForRewrite) both ask here. The count
+	is the one every writer pads to (_legacyAppendWidth)."""
+	return _legacyAppendWidth(header, line, delimiter) if len(_lineOneCells(line, delimiter)) > len(header) else 0
 
 
 def _headerMatches(header, line, delimiter):
@@ -2278,11 +2289,12 @@ def readTabularFile(fileName,teeLogger = None,header = '',createIfNotExist = Fal
 
 
 def _legacyRead(fileName, teeLogger, header, createIfNotExist, lastLineOnly, verifyHeader, verbose, taskDic, encoding, strict,
-				delimiter, defaults, correctColumnNum, storeOffset, errors):
+				delimiter, defaults, correctColumnNum, storeOffset, errors, seen=None):
 	"""readTabularFile for a legacy file: ``(what it returns, the column count the read took)``, -1 for none.
 
 	``delimiter`` is resolved, and ``defaults`` a list (_readerDefaults) that the read works on, so it ends as the
-	defaults in effect at the end of the file: a caller who needs those (TSVZedLite) passes its own."""
+	defaults in effect at the end of the file: a caller who needs those (TSVZedLite) passes its own. ``seen``: a list
+	that ends as [the line 1 the read met] when a header is verified (see _legacyReadHeader)."""
 	if taskDic is None:
 		taskDic = {}
 	header = _formatHeader(header,verbose = verbose,teeLogger = teeLogger, delimiter = delimiter)
@@ -2297,7 +2309,7 @@ def _legacyRead(fileName, teeLogger, header, createIfNotExist, lastLineOnly, ver
 		# Under the READ lock: another process's rewrite is waited out (a nested read of the file takes no second lock).
 		with _readLock(fileName), openFileAsCompressed(fileName, mode ='rb',encoding=encoding,teeLogger=teeLogger) as file:
 			start = _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, strict, delimiter,
-									  correctColumnNum, encoding, reporter, lastLineOnly)
+									  correctColumnNum, encoding, reporter, lastLineOnly, seen=seen)
 			if start is None:
 				return taskDic, -1
 			correctColumnNum, lineNo = start
@@ -2311,7 +2323,7 @@ def _legacyRead(fileName, teeLogger, header, createIfNotExist, lastLineOnly, ver
 
 
 def _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, strict, delimiter, correctColumnNum,
-					  encoding, reporter, lastLineOnly=False, widening=False, said=None):
+					  encoding, reporter, lastLineOnly=False, widening=False, said=None, seen=None):
 	"""Read and check the header line of the open legacy ``file`` when ``header`` is to be verified (readTabularFile).
 
 	Returns ``(correctColumnNum, lineNo)``, the column count and the lines read, or None when a compressed stream
@@ -2335,6 +2347,8 @@ def _legacyReadHeader(file, fileName, header, verifyHeader, verbose, teeLogger, 
 	except UnicodeDecodeError:
 		line = raw.decode(encoding=encoding,errors='replace')
 		reporter.note('decode', 'line 1', 'invalid {} replaced with U+FFFD'.format(encoding))
+	if seen is not None:
+		seen[:] = [line if raw else None]
 	wider = _legacyExtendsHeader(header, line, delimiter) if widening and raw else 0
 	if wider:
 		return (wider if correctColumnNum == -1 else correctColumnNum), 1
@@ -2533,7 +2547,7 @@ def _legacyRows(linesToAppend, delimiter):
 
 
 def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeader, verbose, encoding, strict, delimiter,
-						 errors='strict', rows=None, assume=None):
+						 errors='strict', rows=None, assume=None, given=None, first=None):
 	"""Format rows as 3.39's ``appendLinesTabularFile`` writes them; return ``(payload, count)``.
 
 	``header`` is a formatted header list and ``delimiter`` a resolved
@@ -2544,23 +2558,34 @@ def _legacyFormatPayload(fileName, linesToAppend, teeLogger, header, verifyHeade
 	would be written. ``rows`` are the rows already made
 	by ``_legacyRows``. ``assume`` is the header list that the file's first line
 	is (or is to be) when the file is not to be read: the file is about to be
-	created, or emptied with that header left.
+	created, or emptied with that header left. ``given``: the header the caller was given, when ``header`` is another one
+	(the CLI's in effect, none when line 1 is a row to it): every row is padded to what line 1 says of it
+	(_legacyAppendWidth), as every writer pads. ``first``: the file's first line as text, when the caller has just read
+	it (``assume`` stands in for it otherwise): not read again.
 	"""
 	formatedLines = _legacyRows(linesToAppend, delimiter) if rows is None else rows
 	if not formatedLines:
 		return b'', 0
 	correctColumnNum = max([len(line) for line in formatedLines])
-	if any(header) and verifyHeader:
+	given = header if given is None else given
+	line = None
+	if (any(header) or any(given)) and verifyHeader:
 		if assume is not None:
 			line = delimiter.join(assume)
+		elif first is not None:
+			line = first
 		else:
 			line = _legacyFirstLine(fileName, encoding, teeLogger)
+	if any(header) and verifyHeader:
 		if _lineContainHeader(header,line,verbose = verbose,teeLogger = teeLogger,strict = strict,delimiter = delimiter):
 			correctColumnNum = len(header)
 			if verbose:
 				__teePrintOrNot(f"correctColumnNum: {correctColumnNum}",teeLogger=teeLogger)
-	# pad the lines to the correct number of columns; a wider one keeps its cells (writes never cut)
-	fitted = [_fitRow(line, correctColumnNum) for line in formatedLines]
+	wide = max(correctColumnNum, _legacyAppendWidth(given, line, delimiter)) if line is not None and verifyHeader else correctColumnNum
+	# pad the lines to the correct number of columns; a wider one keeps its cells (writes never cut). A row that holds a value
+	# is as wide as line 1 counts its cells (_legacyAppendWidth); a deletion line (no value) is not: it is as 5.07 wrote it,
+	# which a reader that counts cells the spec's way (tsvz-rs) reads as the deletion it is
+	fitted = [_fitRow(row, wide if any(row[1:]) else correctColumnNum) for row in formatedLines]
 	payload = b'\n'.join([_encodeRow(line,delimiter,encoding,errors,header) for line in fitted]) + b'\n'
 	return payload, len(fitted)
 
@@ -2988,89 +3013,57 @@ def _legacyHoldsHeader(line0, header, consumed, encoding, delimiter):
 				and _headerMatches(header, line0.decode(encoding or 'utf8', errors='replace').rstrip('\r\n'), delimiter))
 
 
-def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding):
+def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding, both=False):
 	"""The legacy lines ``raw`` (bytes, without their newline) without the lines of each key of ``dropAt`` before the
-	index it gives (a row queued after a delete stays), and the key whose line moved up (or None), as a pair; line 1 is
-	left alone when a reader takes it for its header (``skipFirst``).
+	index it gives (a row queued after a delete stays); line 1 is left alone when a reader takes it for its header
+	(``skipFirst``). No line moves and no cell changes.
 
-	When the column count comes from the first keyed line (``widthFromLines``), that line was one cell wide and it
-	went, the first of the narrowest lines left takes its place, with the key's earlier lines (superseded for every
-	reader) left out: a wider line first would make every other lone key a deletion, and a strict reader drop what is
-	narrower. A row counts the cells a read at column count 1 keeps (its empty cells at the end do not count), so a line
-	with no value is one cell (a row at column count 1, a deletion at any other) and moves up as the key alone. A row
-	with values moves up only when it is narrower than the first line left, as it reads where it was (_legacyMoved). The
-	file then reads at the count of its first line: the defaults lines narrower than it are padded (a strict reader would
-	drop them), and the bare ones after it go (a row that reset nothing at one column, a reset at this one), so every
-	reader sees the rows as before."""
-	enc = encoding or 'utf8'
+	A reader takes its column count from its first keyed line: the file's first (when the count comes from the lines,
+	``widthFromLines``), and with ``both`` also the first after line 1, which a reader that takes line 1 for a header the
+	caller holds for a row counts from (--x-header H, line 1 not H). When such a line goes and the line that would come
+	in its place has another cell count, a stand-in takes its place: the key of a later row that stays, and as many
+	empty cells as the line had, so no reader's count changes. With the same count nothing is needed, but on line 1 with
+	``both`` a bare ``#`` keeps the place a header reader skips.
 
-	def kindOf(line):
-		return _legacyLineKind(line.decode(enc, errors='replace'), 1, False, delimiter)
-	out = []
-	firstKeyedSeen = firstKeyedWent = False
-	for i, line in enumerate(raw):
-		if not (i == 0 and skipFirst):
-			kind, key, n, _ = kindOf(line)
-			if kind == 'row' and i < dropAt.get(key.rstrip(), 0):
-				firstKeyedWent = firstKeyedWent or (not firstKeyedSeen and n == 1)
-				firstKeyedSeen = True
-				continue
-			firstKeyedSeen = firstKeyedSeen or kind != 'skip'
-		out.append(line)
-	if not (widthFromLines and firstKeyedWent):
-		return out, None
-	place = next((i for i in range(1 if skipFirst else 0, len(out)) if kindOf(out[i])[0] != 'skip'), None)
-	if place is None:
-		return out, None
-	d = delimiter.encode(enc)
-
-	def width(line):  # (the cells a read at column count 1 keeps of a row: its empty cells at the end go)
-		cells = _unsanitize(_legacyLineBody(line.decode(enc, errors='replace')).split(delimiter), delimiter)
-		while len(cells) > 1 and not cells[-1]:
-			cells.pop()
-		return len(cells)
-	best = narrowest = None
-	for j in range(place, len(out)):
-		if kindOf(out[j])[0] == 'row':
-			n = width(out[j])
-			if narrowest is None or n < narrowest:
-				best, narrowest = j, n
-				if n == 1:
-					break
-	name = None
-	if best is not None and kindOf(out[place])[2] > narrowest:  # (a first line no wider than any row needs no row up in front of it)
-		name = kindOf(out[best])[1].rstrip()
-		line = _legacyMoved(out, place, best, delimiter, encoding)
-		rest = [other for other in out[place:best] if (kindOf(other)[1] or '').rstrip() != name]
-		out = out[:place] + [line] + rest + out[best + 1:]
-	first = kindOf(out[place])[2]
-	if first > 1:
-		# (the file now reads at the count of its first line, which was 1: a defaults line narrower than it would be dropped
-		# by a strict read, so it is padded; a bare one, a row that reset nothing at one column, would reset the defaults
-		# at this one and change what the rows after it read, so it goes: the file reads the same without it)
-		out = [other + d * (first - kindOf(other)[2]) if kindOf(other)[0] == 'defaults' and kindOf(other)[2] < first else other
-			   for at, other in enumerate(out) if at <= place or kindOf(other)[0] != 'reset']
-	return out, name
-
-
-def _legacyMoved(lines, place, best, delimiter, encoding):
-	"""The legacy line ``lines[best]`` (bytes, without its newline) as it goes in front of ``lines[place:best]``, reading
-	as it did where it was to a read at column count 1 (what the file was): its empty cells at the end are left off (that
-	read keeps none, and a wider count would fill them from the defaults), and where a defaults line comes in between,
-	the empty cells that read filled are filled in. A row with no value is its key alone."""
+	The key is one whose later line holds no value: every reader applies that line (a row at one column, a deletion at
+	more), so the key reads after it as it did. Else, unless a line 1 of one cell comes before the place (its readers
+	would read the stand-in as a row, and 3.39's strict read, which drops a wider line at one column, would gain it), a
+	key that no row with a value before the place names: at two columns or more the stand-in deletes a key not yet read,
+	at one it is a row the key's later line replaces. No such row: the line just goes."""
 	enc = encoding or 'utf8'
 	d = delimiter.encode(enc)
-	cells = lines[best].strip(b'\x00').rstrip(b'\r').split(d)
-	if any(_legacyLineKind(line.decode(enc, errors='replace'), 1, False, delimiter)[0] == 'defaults' for line in lines[place:best]):
-		held, defaults, row = {}, [], []
-		for line in lines[place:best + 1]:
-			row = _processLine(line.decode(enc, errors='replace'), held, 1, False, delimiter, defaults)[1]
-		for i in range(1, min(len(cells), len(row))):
-			if row[i] and not cells[i].decode(enc, errors='replace').rstrip():  # (a cell of whitespace is empty to the reader)
-				cells[i] = _encodeRow(_sanitize([row[i]], delimiter=delimiter), delimiter, encoding, 'replace')
-	while len(cells) > 1 and not cells[-1].decode(enc, errors='replace').rstrip():
-		cells.pop()
-	return d.join(cells)
+	texts = [line.decode(enc, errors='replace') for line in raw]
+	kinds = [_legacyLineKind(text, 1, False, delimiter) for text in texts]
+
+	def goes(i):
+		kind, key = kinds[i][:2]
+		return not (i == 0 and skipFirst) and kind == 'row' and i < dropAt.get(key.rstrip(), 0)
+
+	def valued(i):  # (a row that holds a value: a row, not a deletion, at two columns)
+		return _legacyLineKind(texts[i], 2, False, delimiter)[0] == 'row'
+
+	def keyed(start):
+		return next((i for i in range(start, len(raw)) if kinds[i][0] != 'skip'), None)
+	places = [keyed(1 if skipFirst else 0)] if widthFromLines else []
+	if both and places == [0]:
+		places.append(keyed(1))
+	stand = {}
+	for i in sorted((i for i in places if i is not None and goes(i)), reverse=True):  # (a later stand-in can come in an earlier's place)
+		nxt = next((j for j in range(i + 1, len(raw)) if j in stand or (kinds[j][0] != 'skip' and not goes(j))), None)
+		same = nxt is not None and (stand[nxt].count(d) + 1 if nxt in stand else kinds[nxt][2]) == kinds[i][2]
+		if same and both and i == 0:
+			stand[i] = b'#'  # (the count stays: only line 1's place, which a reader given the header skips, is kept)
+			continue
+		if nxt is None or same:
+			continue
+		later = [j for j in range(i + 1, len(raw)) if kinds[j][0] == 'row' and not goes(j)]
+		pick = [j for j in later if not valued(j)]
+		if not pick and not (i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):
+			named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
+			pick = [j for j in later if kinds[j][1].rstrip() not in named]
+		if pick:
+			stand[i] = raw[pick[0]].strip(b'\x00').rstrip(b'\r').split(d)[0] + d * (kinds[i][2] - 1)
+	return [stand.get(i, line) for i, line in enumerate(raw) if i in stand or not goes(i)]
 
 
 def _legacyFileWidth(lines, header, consumed, encoding, delimiter):
@@ -3139,13 +3132,18 @@ def _legacyWidthNow(fileName, header, verifyHeader, encoding, delimiter):
 		return None
 
 
-def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter):
+def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter, xHeader=False):
 	"""Delete ``keys`` from the legacy file where no line can: a file of one column, where a lone key is a row (and of
 	no column count yet, where it would make one). True when that is done: their lines are out of the file
 	(_legacyDropLines, which keeps the one column), or there were none. False when the file is of two columns or more
 	(_legacyFileWidth), or could not be read (a deletion line says it there; damage is reported): nothing is written.
 	``header`` is formatted and ``delimiter`` resolved. Only those lines go: this compacts nothing, and copies the others
 	as bytes.
+
+	``xHeader``: the caller is a --x-header one: line 1, when it is not ``header`` (_isHeaderLine), is a row to it, and a
+	reader given ``header`` skips it all the same and counts from the first keyed line after it. Both readers' count is
+	kept (_legacyDropLines, ``both``). Decided here, on the line 1 read under the rewrite lock the write is made under,
+	not on one read before it.
 
 	Read through the file's REWRITE lock and written under it, as ``TSVZed`` writes, so another process's write
 	(an append beside it) cannot fall between the read and the write: no retry, and none is lost. OSError when the
@@ -3164,17 +3162,20 @@ def _legacyDropKeys(fileName, keys, header, verifyHeader, encoding, delimiter):
 						seen.append(line)
 						yield line
 				width = _legacyFileWidth(tap(), header, consumed, encoding, delimiter)
-				raw = seen + list(lines) if width == 1 else None
+				lineOneIsRow = bool(xHeader and any(header) and seen
+									and not _isHeaderLine(header, seen[0].decode(encoding or 'utf8', errors='replace'), delimiter))
+				raw = seen + list(lines) if width == 1 or lineOneIsRow and width == -1 else None
 		except Exception as e:
 			_warn('TSVZ warning: {}: the file cannot be read ({}): the delete is written as a deletion line, which deletes '
 				  'nothing if the file is of one column'.format(fileName, e))
 			done.append(False)
 			return None
 		done.append(width <= 1)
-		if width != 1:
+		if not raw:
 			return None
-		fromLines = not _legacyHoldsHeader(raw[0], header, consumed, encoding, delimiter)
-		kept = _legacyDropLines(raw, dict.fromkeys((key.rstrip() for key in keys), len(raw)), consumed, fromLines, delimiter, encoding)[0]
+		fromLines = lineOneIsRow or not _legacyHoldsHeader(raw[0], header, consumed, encoding, delimiter)
+		kept = _legacyDropLines(raw, dict.fromkeys((key.rstrip() for key in keys), len(raw)), consumed and not lineOneIsRow,
+								fromLines, delimiter, encoding, lineOneIsRow)
 		return None if kept == raw else b''.join(line + b'\n' for line in kept)
 	if not os.path.isfile(fileName):
 		return False
@@ -5989,6 +5990,8 @@ class TSVZed(OrderedDict):
 				value = _fitRow(value, columns)  # (padded; a wider row is written whole)
 		else:
 			columns = len(value)  # taken by __setitem__ once the row is known to be writable
+		if self._appendWidth > len(value) and any(value[1:]):
+			value = _fitRow(value, self._appendWidth)  # (as wide as line 1 counts its cells: _legacyAppendWidth)
 		if defaults and len(defaults) > 1:
 			for i in range(1,len(value)):
 				if not value[i] and i < len(defaults) and defaults[i]:
@@ -6084,7 +6087,7 @@ class TSVZed(OrderedDict):
 			self.appendQueue.append(_specTombstoneLines(key, self.delimiter, self._specState.strip))
 			return self
 		if self.correctColumnNum > 1:
-			emptyLine = [key]+['']*(self.correctColumnNum-1)
+			emptyLine = [key]+['']*(self.correctColumnNum-1)  # (not padded to _appendWidth: only a row with a value is)
 		else:
 			emptyLine = [key]
 		if self.verbose:
@@ -6509,6 +6512,7 @@ memoryOnly:{self.memoryOnly}
 	_damaged = False
 	_readWhole = False  # setDefaults() gave memory defaults the file may not hold: its next change is read whole
 	_widthOpen = False  # the last whole read took no column count from the file: its first keyed line will set it
+	_appendWidth = 0  # what a row it appends is padded to, from line 1 as the last whole read or write left it (_legacyAppendWidth)
 	# A read under the file lock met damage another writer left (a compressed file: every read of it stops there, L5).
 	# Rows appended after it would be lost to the next read, so the next commit makes the file again from memory.
 	_remake = False
@@ -6681,11 +6685,12 @@ memoryOnly:{self.memoryOnly}
 			lines.append(_encodeRow(_sanitize(row,delimiter=delimiter),delimiter,encoding,errors,self.header))
 		return lines
 
-	def _snapshotForRewrite(self, f):
+	def _snapshotForRewrite(self, f, commit=False):
 		"""``(None, lines, queued)``, what a rewrite writes, and the queued rows, taken from the queue (_writeFile puts them
 		back if it stops). A healthy file (Q-D3): its lines (_fileLines) with the queued rows after them, line 1 widened to
 		the store's header when it is that header's beginning (_legacyWidened) and the lines
-		of drop items' keys left out (_legacyDropLines), compacted as a scrub compacts them (_legacyCompact). A file to
+		of drop items' keys left out (_legacyDropLines), compacted as a scrub compacts them (_legacyCompact), but for a
+		commit's (``commit``): it widens and compacts nothing. A file to
 		be made again: only what keeps its reading (_remadeLines); memory holds what was queued. Then, either way, what
 		memory holds that those lines do not say (_RewriteRows, a flat snapshot checked before anything is written: a
 		TSVZEncodeError changes nothing): rows that read otherwise (changed in place, put in memory straight, every row
@@ -6712,10 +6717,18 @@ memoryOnly:{self.memoryOnly}
 			consumed = bool(header) and self.verifyHeader
 			defaults = list(self._givenDefaults)
 			widened = None
-			if consumed and not remade:
-				widened = _legacyWidened(raw, header, encoding, delimiter, errors)
+			if consumed and not remade and not commit:
+				# A rewrite asked for decides on the lines as they read once the queued deletes are made, a lone key they take
+				# out being no row the widening would lose, whether or not the writer thread committed its delete first; the
+				# deletes are made on the same drop the commit makes (a stand-in where a line set a reader's count). A
+				# commit's (``commit``: the rewrite a one-column delete makes) carries out the queue and widens nothing: the
+				# delete changes nothing else for the file's other readers, so the next rewrite asked for widens line 1.
+				fromLines = not _legacyHoldsHeader(raw[0] if raw else None, header, consumed, encoding, delimiter)
+				widened = _legacyWidened(_legacyDropLines(raw, dropAt, consumed, fromLines, delimiter, encoding) if dropAt else raw,
+										 header, encoding, delimiter, errors)
 				if widened:
 					raw = widened
+					dropAt = {}  # (the deletes made: line 1 now holds the header, so no line sets a count)
 				elif widened is False:
 					_warnOnce(self, 'not-widened', self._fileName, 'line 1 is not widened to the header given: the file holds rows '
 							  'with no value, which read as deletions at two columns or more', self.teeLogger)
@@ -6735,15 +6748,11 @@ memoryOnly:{self.memoryOnly}
 			del line0
 			for _ in range(2):  # (twice when the lines say keys are live that are gone from memory, in a one-column file)
 				if dropAt:
-					raw, moved = _legacyDropLines(raw, dropAt, consumed, not matched, delimiter, encoding)
-					if moved is not None:
-						with self._memLock:  # (its line moved up, the key alone if it held no value: memory stays the file)
-							row = dict.get(self, moved)  # (a caller may have deleted it meanwhile)
-							if row is not None:
-								if not any(row[1:]):
-									OrderedDict.__setitem__(self, moved, [moved])
-								OrderedDict.move_to_end(self, moved, last=False)
-				kept = _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched)
+					raw = _legacyDropLines(raw, dropAt, consumed, not matched, delimiter, encoding)
+				# A commit's rewrite is a delete, not a compaction: only the deleted keys' lines go, as through every other
+				# door (_legacyDropKeys). A compaction at the store's count drops lines a reader at another count takes (a
+				# narrower line superseded at the store's one column is the only line 3.39's strict reader takes at two).
+				kept = raw if commit else _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched)
 				del raw
 				flags, diffWidth = self._readLines(kept, consumed, start, strict)
 				with self._memLock:
@@ -6759,9 +6768,9 @@ memoryOnly:{self.memoryOnly}
 				# A lone key is a row in a one-column file: a line cannot delete there. Their lines go instead.
 				raw, dropAt = kept, dict.fromkeys(gone, len(kept))
 			del flags
-			if dropAt and self.correctColumnNum == 1 and diffWidth > 1 and not header:
-				with self._memLock:
-					self.correctColumnNum = diffWidth  # (no one-cell line is left: the file now reads at another count)
+			# (no one-cell line is left: the file now reads at another count, and a reopen would read every row at it, so
+			# memory reads the file again once it is written, as it does for a widened line 1)
+			readAgain = bool(dropAt) and self.correctColumnNum == 1 and diffWidth > 1
 			tail = [_encodeRow(_sanitize([key] + [''] * (diffWidth - 1),delimiter=delimiter),delimiter,encoding,errors,self.header)
 					for key in gone]
 			# The store's defaults, when the lines do not end with them (plan Q2, answer c): one line padded to the
@@ -6809,7 +6818,7 @@ memoryOnly:{self.memoryOnly}
 			rows = _RewriteRows(kept, values, delimiter, encoding, errors, self.header, tail=tail)
 			# (memory reads the file again when its lines were widened to the header, or a file made again begins with a
 			# header wider than the rows memory holds: they are padded in the file, so memory follows)
-			rows.widened = bool(widened) or (remade and matched and 0 < self.correctColumnNum < len(header))
+			rows.widened = bool(widened) or readAgain or (remade and matched and 0 < self.correctColumnNum < len(header))
 			del values
 			rows.check()
 		except BaseException:
@@ -6835,16 +6844,16 @@ memoryOnly:{self.memoryOnly}
 		return (known is None or st.st_size != known[1] or _updateTimeNs(st) != self.externalFileUpdateTime
 				or (known[0][1] is not None and _fileIdentity(st) != known[0]))
 
-	def _writeFile(self, sync=True, snapshot=None):
+	def _writeFile(self, sync=True, snapshot=None, commit=False):
 		"""_writeFileStarted, unless the exit has let go of the store (False: nothing is written)."""
 		if not self._startWrite():
 			return False
 		try:
-			return self._writeFileStarted(sync, snapshot)
+			return self._writeFileStarted(sync, snapshot, commit)
 		finally:
 			self._endWrite()
 
-	def _writeFileStarted(self, sync=True, snapshot=None):
+	def _writeFileStarted(self, sync=True, snapshot=None, commit=False):
 		"""Write memory (or ``snapshot()``'s, a clear's) over the legacy file, whole (a compressed file as whole members;
 		written over the file, then cut to its end): True when all of it is on disk, False when the file could not be
 		opened or locked (reported); what stops it raises.
@@ -6878,7 +6887,7 @@ memoryOnly:{self.memoryOnly}
 						self._syncFrom(f, True)
 					elif sync is False and self._externalChange():
 						self.__teePrintOrNot(f"Warning: Overwriting external changes in {self._fileName}",'warning')
-					header, lines, queued = snapshot() if snapshot else self._snapshotForRewrite(f)
+					header, lines, queued = snapshot() if snapshot else self._snapshotForRewrite(f, commit)
 					if not sync or self._damaged or attempt == 2 or not self._changedSince(f):
 						break
 					# A writer that takes no lock appended while the rows were taken: taken in too, and taken again.
@@ -6899,9 +6908,9 @@ memoryOnly:{self.memoryOnly}
 				end = f.tell()  # its own bytes end here: a writer that takes no lock may append after them
 				self._damaged = self._remake = False
 				self.dirty = self.deSynced = False
-				# (a store left with no row may hold a file with no keyed line, whatever column count it had: its next keyed
-				# line sets the count, which a whole read takes, _syncFrom)
-				self._widthOpen = not self
+				first = header if header is not None else (getattr(lines, 'first', None) or [None])[0]
+				self._appendWidth = _legacyAppendWidth(self.header, None if first is None else first.decode(
+					self.encoding or 'utf8', errors='replace'), self.delimiter) if self.verifyHeader else 0  # (the line 1 it wrote)
 				if getattr(lines, 'widened', False) or not self:
 					self._readWidened(f)  # (no row left: the column count is what the file now says, as a reopen takes it)
 			except BaseException:
@@ -7058,6 +7067,7 @@ memoryOnly:{self.memoryOnly}
 		known = _KNOWN_NOTHING
 		damaged = False
 		widened = False
+		lineOne = [None]  # (the line 1 the read met: what every row appended is padded to, _legacyAppendWidth)
 		if f is not None:
 			codec = _fileCodec(self._fileName)
 			reader = _HashingReader(f)
@@ -7073,7 +7083,7 @@ memoryOnly:{self.memoryOnly}
 					try:
 						start = _legacyReadHeader(stream, self._fileName, self.header, self.verifyHeader, self.verbose,
 												  self.teeLogger, self.strict, self.delimiter, -1, self.encoding, reporter,
-												  widening=True, said=self._mismatchSaid)
+												  widening=True, said=self._mismatchSaid, seen=lineOne)
 						if start is not None:
 							# (the rows of a file another program widened are read loose, padded, the file untouched: a strict
 							# reader would drop every row narrower than the new count, and a rewrite then delete them)
@@ -7109,6 +7119,7 @@ memoryOnly:{self.memoryOnly}
 			if loaded.dirty:
 				self.dirty = True  # a key the file holds twice
 			self._followedWidening = widened
+			self._appendWidth = _legacyAppendWidth(self.header, lineOne[0], self.delimiter) if self.verifyHeader else 0
 			self._widthOpen = width <= 0
 			if width > 0:
 				self.correctColumnNum = width  # the column count the read took (the header's, when line 1 holds it)
@@ -7157,10 +7168,11 @@ memoryOnly:{self.memoryOnly}
 		self._call(self._hardMapToFile, False, True)
 		return self
 
-	def _hardMapToFile(self, sync=False, explicit=False):
-		"""hardMapToFile(); ``sync``: see _writeFile, ``explicit``: see _refuse. True when the file is written."""
+	def _hardMapToFile(self, sync=False, explicit=False, commit=False):
+		"""hardMapToFile(); ``sync``: see _writeFile, ``explicit``: see _refuse, ``commit``: see _snapshotForRewrite. True
+		when the file is written."""
 		try:
-			return self._writeFile(sync=sync) and self._rewritten()
+			return self._writeFile(sync=sync, commit=commit) and self._rewritten()
 		except TSVZEncodeError as e:
 			self._refuse('hardMapToFile()', e, explicit)
 		except Exception as e:
@@ -7194,8 +7206,8 @@ memoryOnly:{self.memoryOnly}
 			return self._hardMapToFile(sync, explicit)
 
 	def checkExternalChanges(self):
-		if self.deSynced:
-			return self
+		# (no early return when deSynced: the writer thread's tick may be reading the file as another process's append lands,
+		# and clear it on the bytes it saw; a caller's check then looks at the file itself)
 		if not self.monitor_external_changes:
 			return self
 		if self._spec:
@@ -7369,7 +7381,7 @@ memoryOnly:{self.memoryOnly}
 			# makes it, not begun with these rows alone (the next read would then drop every other row from memory).
 			# Damaged where every read stops (_remake): made again too; a rewrite refused, these rows are appended.
 			# A drop item says what no line can: the rewrite takes its key's lines out (and writes the queue).
-			if self._hardMapToFile(sync=self.monitor_external_changes if dropping and not missing else True):
+			if self._hardMapToFile(sync=self.monitor_external_changes if dropping and not missing else True, commit=True):
 				self._worked('append')
 				return self
 			if missing:
@@ -7706,6 +7718,7 @@ class TSVZedLite(MutableMapping):
 	--------
 	collections.abc.MutableMapping : The abstract base class that this class implements.
 	"""
+	_appendWidth = 0  # what a row it appends is padded to, from line 1 (_legacyAppendWidth)
 
 	#['__new__', '__repr__', '__hash__', '__lt__', '__le__', '__eq__', '__ne__', '__gt__', '__ge__', '__iter__', '__init__',
 	#  '__or__', '__ror__', '__ior__', '__len__', '__getitem__', '__setitem__', '__delitem__', '__contains__', '__sizeof__',
@@ -7960,14 +7973,27 @@ class TSVZedLite(MutableMapping):
 		# (the read works on self.defaults: a row is read at its offset with the defaults the file ends with; it
 		# starts from the store's own, as a fresh open does, not from those the last read left)
 		self.defaults = list(self._constructorDefaults)
+		lineOne = [None]  # (the line 1 the read met: what every row appended is padded to, _legacyAppendWidth)
 		width = _legacyRead(self._fileName, None, self.header, self.createIfNotExist, False, self.verifyHeader, self.verbose,
 							self.indexes, self.encoding if self.encoding else None, self.strict, self.delimiter, self.defaults,
-							-1, not self._inMemoryRows, self.errors)[1]
+							-1, not self._inMemoryRows, self.errors, lineOne)[1]
 		if self._givenColumns == -1 and width > 0:
 			# (as an open of this file: a one-column file is known from here on, and emptied it stays one column; any
 			# other count is read from the rows, not kept from a one-column file this was before a delete or a reload)
 			self.correctColumnNum = 1 if width == 1 else -1
+		self._appendWidth = _legacyAppendWidth(self.header, lineOne[0], self.delimiter) if self.verifyHeader else 0
 		return self
+
+	def _lineOneWidth(self):
+		"""_legacyAppendWidth of the file's line 1 as it is now, read (a clear's: load takes it from its own read): 0 without
+		a header to verify, or a line 1 to read."""
+		if not (any(self.header) and self.verifyHeader):
+			return 0
+		try:
+			line = _legacyFirstLine(self._fileName, self.encoding or 'utf8', None) if os.path.isfile(self._fileName) else ''
+		except Exception:  # (damage there: the read reported it)
+			return 0
+		return _legacyAppendWidth(self.header, line or None, self.delimiter)
 
 	def positions(self):
 		return self.indexes.values()
@@ -8001,6 +8027,7 @@ class TSVZedLite(MutableMapping):
 						 encoding=self.encoding, delimiter=self.delimiter, errors=self.errors)
 		if self.fileObj is not None:
 			self.fileObj.seek(0, os.SEEK_END)  # (and drops what it had read ahead)
+		self._appendWidth = self._lineOneWidth()  # (the line 1 the clear kept)
 		return self
 
 	def switchFile(self,newFileName,createIfNotExist = ...,verifyHeader = ...):
@@ -8100,7 +8127,7 @@ class TSVZedLite(MutableMapping):
 			return
 		if self.verbose:
 			eprint(f"Writing tombstone line for {key}")
-		self.__writeValues([key])
+		self.__writeValues([key])  # (not padded to _appendWidth: only a row with a value is)
 
 	def __readValuesAtPos(self,pos,key = ...):
 		if self._spec:
@@ -8186,6 +8213,8 @@ class TSVZedLite(MutableMapping):
 			newColumnNum = None
 		else:
 			newColumnNum = len(value)  # taken once the row is known to be writable
+		if self._appendWidth > len(value) and any(value[1:]):
+			value = _fitRow(value, self._appendWidth)  # (as wide as line 1 counts its cells: _legacyAppendWidth)
 		if self.defaults and len(self.defaults) > 1:
 			for i in range(1,len(value)):
 				if not value[i] and i < len(self.defaults) and self.defaults[i]:
@@ -8449,6 +8478,10 @@ def _serveCloseWriters():
 atexit.register(_serveCloseWriters)
 
 
+#: A line not read yet (_ServeStore._payload): None is a read that found no line 1.
+_UNREAD = object()
+
+
 class _ServeWriter(object):
 	"""The single appender of a store (spec §18.3): each batch of queued payloads is one write.
 
@@ -8630,16 +8663,20 @@ class _ServeStore(object):
 		self.header = header
 		return header
 
-	def _legacyHeaderNow(self, log):
-		"""``_legacyHeader`` for the file as it is now (a write, ``clear`` or ``scrub`` that does not read it); line 1 is
-		read under the READ lock (_legacyFirstLine)."""
+	def _lineOneNow(self):
+		"""The file's first line as it is now, read under the READ lock (_legacyFirstLine); None without a header given, for a
+		file that is missing or holds nothing, or a first line that cannot be read."""
 		line = None
 		if any(self.given) and os.path.isfile(self.path):
 			try:
 				line = _legacyFirstLine(self.path, 'utf8', self.teeLogger) or None
 			except Exception:  # a first line the codec cannot decode: the write or scrub that reads it reports it
 				pass
-		return self._legacyHeader(line, log)
+		return line
+
+	def _legacyHeaderNow(self, log):
+		"""``_legacyHeader`` for the file as it is now (a write, ``clear`` or ``scrub`` that does not read it)."""
+		return self._legacyHeader(self._lineOneNow(), log)
 
 	def _noteDirMtime(self, dirMtime):
 		self.dirMtime = dirMtime
@@ -8895,17 +8932,20 @@ class _ServeStore(object):
 				reporter.flush()
 
 	# -- writes ---------------------------------------------------------------
-	def _payload(self, rows, log):
-		"""Bytes for ``rows`` (``[(cells, marker), ...]``), formatted as the direct writers format them."""
+	def _payload(self, rows, log, first=_UNREAD):
+		"""Bytes for ``rows`` (``[(cells, marker), ...]``), formatted as the direct writers format them. ``first``: the
+		file's line 1 as _lineOneNow read it just before (a delete's, _dropKeys), else it is read here."""
 		if self.spec:
 			if rows and any(self.header):
 				_specCheckHeader(self.path, self.header, self.delimiter, self.strict, self.verbose, log)
 			return _specFormatRecords(rows, self.delimiter).encode('utf-8')
-		self._legacyHeaderNow(log)
+		if first is _UNREAD:
+			first = self._lineOneNow()  # (read once: the payload's header check takes it from here)
+		self._legacyHeader(first, log)
 		# Rows for a file that holds nothing yet are fitted to the header it is about to begin with.
 		assume = self.header if any(self.header) and _fileHoldsNothing(self.path) else None
 		return _legacyFormatPayload(self.path, [cells for cells, marker in rows], log, self.header, True, self.verbose,
-									'utf8', self.strict, self.delimiter, assume=assume)[0]
+									'utf8', self.strict, self.delimiter, assume=assume, given=self.given, first=first)[0]
 
 	def _tombstone(self, key):
 		"""Rows that delete ``key``: written with stripping off when it would strip ``key`` (spec §9.6)."""
@@ -8914,26 +8954,37 @@ class _ServeStore(object):
 	def _dropKeys(self, rows, log):
 		"""The deletions ``rows`` that are still to be written as lines (caller holds the lock). In a loose file of one
 		column, where a lone key is a row, the keys' lines are taken out of the file instead (_legacyDropKeys), once
-		everything queued is in it. A reset of the defaults is a line at every width."""
+		everything queued is in it. A reset of the defaults is a line at every width.
+
+		The file's width is asked with the header given, as the library's readers take it, even when line 1 is not it and
+		is a row to this command (_legacyHeader): a line is a deletion or a row by that one answer, so a reader given that
+		header reads what this command deleted the same way, and the command's own count is kept too (_legacyDropKeys,
+		``xHeader``).
+
+		Returns ``(rows, first)``: ``first`` is the line 1 read here for the header check, which the payload's check takes
+		too (_payload) when nothing was written since, or when no row is left to append; else _UNREAD (read again)."""
 		if self.spec:
-			return rows
+			return rows, _UNREAD
 		keys = [cells[0] for cells, marker in rows if cells[0] != DEFAULTS_INDICATOR_KEY]
-		header = self._legacyHeaderNow(log)
-		width = _legacyWidthNow(self.path, header, True, 'utf8', self.delimiter)
+		first = self._lineOneNow()
+		self._legacyHeader(first, log)  # (says a mismatch, and a strict store raises; whether line 1 is a row: _legacyDropKeys)
+		width = _legacyWidthNow(self.path, self.given, True, 'utf8', self.delimiter)
 		if not keys or width is None or width > 1:
-			return rows  # (a look at the first lines: what is queued cannot change them, so no wait for it)
+			return rows, first  # (a look at the first lines: what is queued cannot change them, so no wait for it)
 		self.writer.barrier()
-		if not _legacyDropKeys(self.path, keys, header, True, 'utf8', self.delimiter):
-			return rows
+		if not _legacyDropKeys(self.path, keys, self.given, True, 'utf8', self.delimiter, True):
+			return rows, _UNREAD
 		self.parts = None  # read again at the next request
-		return [row for row in rows if row[0][0] == DEFAULTS_INDICATOR_KEY]
+		rows = [row for row in rows if row[0][0] == DEFAULTS_INDICATOR_KEY]
+		return rows, (_UNREAD if rows else first)  # (a reset still to append is checked against line 1 as written)
 
 	def _durable(self, sync):
 		return sync or (self.spec and self.state is not None and self.state.writeAck == 'disk')
 
-	def _submit(self, rows, sync, log):
-		"""Queue ``rows`` (caller holds the lock); return ``(seq, durable)`` or None when there is nothing to write."""
-		payload = self._payload(rows, log)
+	def _submit(self, rows, sync, log, first=_UNREAD):
+		"""Queue ``rows`` (caller holds the lock); return ``(seq, durable)`` or None when there is nothing to write.
+		``first``: see _payload."""
+		payload = self._payload(rows, log, first)
 		if not payload:
 			return None
 		durable = self._durable(sync)
@@ -8973,8 +9024,8 @@ class _ServeStore(object):
 				if self.unreadable:
 					return False
 				rows = _specDeleteRows(rows, self.delimiter, self.state.strip, self.data)
-			rows = self._dropKeys(rows, log)
-			queued = self._submit(rows, sync, log)
+			rows, first = self._dropKeys(rows, log)
+			queued = self._submit(rows, sync, log, first)
 		self._ack(queued, written)
 		self._wrote(rows, log)
 		return True
@@ -8990,7 +9041,8 @@ class _ServeStore(object):
 			if row is None:
 				return None
 			row = list(row)
-			queued = self._submit(self._dropKeys(self._tombstone(key), log), sync, log)
+			rows, first = self._dropKeys(self._tombstone(key), log)
+			queued = self._submit(rows, sync, log, first)
 		self._ack(queued, written=True)  # the row is only popped once its tombstone is written
 		return row
 
@@ -9007,7 +9059,8 @@ class _ServeStore(object):
 			else:  # a dict is reversible from Python 3.8
 				key = next(reversed(self.data)) if hasattr(self.data, '__reversed__') else list(self.data)[-1]
 			row = list(self.data[key])
-			queued = self._submit(self._dropKeys(self._tombstone(key), log), sync, log)
+			rows, first = self._dropKeys(self._tombstone(key), log)
+			queued = self._submit(rows, sync, log, first)
 		self._ack(queued, written=True)
 		return row
 

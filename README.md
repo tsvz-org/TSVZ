@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.7**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.9**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -302,6 +302,115 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
+## Upgrading to 5.9 from 5.8
+
+The file formats are unchanged.
+
+- **A `TSVZed` delete's commit takes out only the deleted keys' lines, as `tsvz delete` does.** In a loose file of one
+  column a `TSVZed` delete is written by its commit (`commitAppendToFile()`, or the writer thread's), which rewrites the
+  file. 5.8 also compacted the file there, at the store's own column count, and so dropped lines that a reader counting
+  from another line takes: `id\tv\na\nb\t1\nb\t\t1\n` with `TSVZed(p, header='id\tv\tw')`, delete `a`, became
+  `id\tv\nb\nb\t\t1\n`, and 3.39's strict reader given no header, which reads two columns from line 1 and takes only
+  `b\t1`, lost `b`. 5.9 writes `id\tv\nb\nb\t1\nb\t\t1\n`, the bytes `tsvz delete` and a `TSVZedLite` write. What
+  shows: comments, empty lines and superseded lines stay until a rewrite you ask for (`hardMapToFile()`,
+  `rewrite(force=True)`, the automatic ones) or a scrub compacts the file (`a\n# n\nb\t1\nb\n`, delete `a`, is now
+  `b\n# n\nb\t1\nb\n`; 5.8 wrote `b\nb\n`), as in a file of two columns or more, where a delete is an appended line.
+  A program that keeps one store open on such a file and updates rows or deletes often should call `hardMapToFile()`
+  now and then: a one-column file whose lines get superseded keeps them until a rewrite, and each delete rewrites all of
+  it ([docs/limitations.md](docs/limitations.md), "A delete's commit compacts nothing").
+
+- **A delete under `--x-header` reads line 1 once.** `tsvz --x-header H delete` and `pop`, and a handler's `delete`,
+  `pop` and `popitem`, read line 1 twice at two columns or more: now about 5 ms less per delete on a 200k-row `.tsv.gz`
+  (15.0 ms to 9.4 to 10.2 ms) and 20 to 60 µs less on a `.tsv`.
+
+- Still as in 5.8: after a line 1 of one cell that is not the header given, a delete under that header can change a cell
+  for readers given it, and a rewrite that then widens line 1 makes the cell every reader's; and when line 1 holds a
+  value for the only key that could stand in (`d\tX\na\nd\tY\n`, delete `a` under `q`), nothing stands in, and 3.39's
+  loose reader given `q` goes from `[d]` to `[d, Y]` (deferred to 5.10: a stand-in there needs the two-count compaction).
+  See [docs/limitations.md](docs/limitations.md), "After a line 1 of one cell, a delete under a header can change a
+  cell for readers given it".
+
+## Upgrading to 5.8 from 5.7
+
+The file formats are unchanged.
+
+- **A delete leaves the other rows as every reader read them: no line moves.** In a loose
+  file of one column a delete takes the key's lines out (`tsvz delete`, `pop` and `popitem`,
+  a `tsvz serve` handler, a `TSVZedLite` delete, a `TSVZed` delete with its commit or
+  rewrite). When one of those lines set a reader's column count (the first keyed line, and
+  under `--x-header H` with line 1 not H also the first keyed line after line 1, which a
+  reader given H counts from) and the next line has another cell count, 5.6 and 5.7 moved a
+  row up into its place, and a cell or a key changed for some readers. Now the key of a later
+  row, with as many empty cells as the line had, takes the place (a stand-in), and every
+  other line stays where it was: `a\n#_defaults_#\t\tQ\nb\t1\n`, delete `a`, becomes
+  `b\n#_defaults_#\t\tQ\nb\t1\n` (5.7: `b\t1\n#_defaults_#\t\tQ\n`, where a `TSVZedLite` then read
+  `b` as `[b, 1, Q]`). A stand-in reads as nothing to every reader: at two columns or more it is
+  the deletion of a key not yet read, at one a row the key's own later line replaces. Under
+  `--x-header id`, `a\nb\t1\n` becomes `b\nb\t1\n` (a reader given `id` read `b` before and
+  still does), `id\tv\n# n\n` with `zz` deleted is left as it is (5.7 wrote `zz`, a row to
+  that reader), and when the next line has the same cell count a bare `#` keeps line 1's place
+  (`a\nb\n` becomes `#\nb\n`).
+
+  What shows: a file can hold a key twice after a delete (the stand-in and the key's own
+  line), so a store that reads it is dirty; readers that keep the file's order list that
+  key earlier; a `TSVZed`'s memory keeps its order (5.7 moved the row to the front), and a
+  one-column store keeps one column (5.7 took the count of the row it moved up); where no
+  stand-in can take the place of the line that set the count (after a line 1 of one cell, below), a `TSVZed`
+  reads the file again once its delete is written, so its memory holds what a reopen reads
+  (with a header given: `x\na\n#_defaults_#\t\tQ\nb\t1\n`, delete `a`: `b` is `[b, 1, Q]`, as the file now
+  reads it; with no header `b` stays `[b, 1]`). Under
+  `--x-header H` with line 1 not H, the command now rewrites the file where 5.7 appended a
+  line, when a reader given H reads at one column. Two shapes are left where a reader given
+  H can see a cell change: after a line 1 of one cell, and `d\tX\na\nd\tY\n` with `a` deleted under
+  header `q` (every key that could stand in is already named by a valued row before the gap, so only
+  3.39's loose reader given `q` changes, from `[d]` to `[d, Y]`): see
+  [docs/limitations.md](docs/limitations.md), "Readers given other arguments" and "After a line 1 of one cell, a delete
+  under a header can change a cell for readers given it" (deferred to 5.10).
+  A 3.39 strict reader of a one-column file still sees a new row when the last lone key is
+  deleted and only wider rows are left (`a\nb\t1\n`, delete `a`: it showed `a`, then shows
+  `b`), as with 5.6; upgrading that reader cures it (docs/limitations.md).
+
+- **A store emptied after a rewrite follows another process's append at the count its file
+  says.** After a rewrite, a store whose rows were then all deleted read the next append at
+  its header's count where a reopen takes the file's (`# n\n` under `header='id\tv'`, a
+  row `a\t\t1`: an appended `b\t2` read as `[b, 2]` at two columns, where a reopen reads three).
+
+- **A rewrite with a queued one-column delete decides on the lines the delete leaves, and a delete's own
+  commit widens nothing.** `TSVZed(p, header='id\tv')` on `id\n# n\na\n`, `del t['a']`, then
+  `hardMapToFile()` or `rewrite(force=True)` left `id\n` in some runs and `id\tv\n` in others, by whether
+  the writer thread's tick had committed the delete first: the widening was decided with `a`'s lone line,
+  a row the widening would lose, still in the lines. A rewrite asked for now decides on the lines as the
+  queued deletes leave them, stand-ins included (the same drop the commit makes), so line 1 widens to the
+  header (`id\tv\n`, 60 of 60 runs in each order) when nothing that reads as a row with no value is left,
+  and the file reads the same whichever came first, except
+  after the shape in [docs/limitations.md](docs/limitations.md), "After a line 1 of one cell, a delete under a header
+  can change a cell for readers given it": `TSVZed(p, header='id\tv')` on `id\na\n#_defaults_#\t\tQ\nb\t1\n`, delete `a`, commit, then
+  a rewrite writes `b\t1\tQ`, where with the delete still queued when the rewrite runs `b` reads `[b, 1]`. (The 31
+  header-less cases where everything is deleted write `''` or `\n`, and every reader reads them the same.) Under `id\tv\tw`, `id\tv\na\nb\t\n` with `a` deleted
+  was written `id\tv\tw\nb\t\n` when the delete was still queued, losing `b`; it is now `id\tv\nb\nb\t\n`
+  in every order. A delete's own commit (`commitAppendToFile()`, or the writer thread's) never widens line 1
+  (5.6 and 5.7 widened it in some files: `id\tv\na\na\t1\n` under `id\tv\tw`, delete `a`, became
+  `id\tv\tw\n`, which changed what a reader given that header saw), so the file's other readers read line 1 as
+  before; the next rewrite asked for widens it.
+
+- **`checkExternalChanges()` asks the file every time.** It returned at once while the store
+  had already noted a change, and the writer thread could be following the file just as
+  another process's append landed, then mark it seen on the bytes it read: the append
+  showed only after the next change (3 to 9 of 7680 runs of a follow sweep on a disk; 0 of
+  30,720 now). A call while a change is noted now costs what any call costs (about 30 us,
+  where it returned in 0.1 us).
+
+- **Every writer pads an appended row to the cells line 1 counts.** On a file whose line 1
+  holds the header given or widens it and ends in empty cells (`id\tv\tw\t`, a spreadsheet
+  export with an unnamed last column), `TSVZedLite(strict=False)`, `tsvz --x-header 'id\tv' set`, a handler
+  and `appendTabularFile(header='id\tv', strict=False)` appended `c\t4\t5` (with `strict=True` a header
+  that line 1 only widens raises "Header mismatch" there, in every version), which a strict reader given no
+  header, counting line 1's four cells, dropped. Each writer, `TSVZed` included, now pads a
+  row that holds a value as wide as line 1 is, empty cells at its end counted
+  (`c\t4\t5\t`), by one rule. A deletion line is not padded to it: each writer writes the line it wrote
+  in 5.7, which a reader counting cells the spec's way (tsvz-rs) reads as the deletion it is. `TSVZed` already did this for a widened line 1 in 5.7; it now
+  also does it for a line 1 that is the header with empty cells after it (`id\tv\t\t`).
+
 ## Upgrading to 5.7 from 5.6
 
 The file formats are unchanged.
@@ -364,8 +473,7 @@ The file formats are unchanged.
   for the same file without the mark) or ends in empty cells (it now writes its deletion lines
   and padded rows as wide as line 1 counts its cells: see the item above). So what 5.6 gets wrong in a loose one-column file
   stays for this version: a row moved up to keep a reader's column count can change a cell or
-  a key for some readers. A rule that moves no line is planned for 5.8. See [docs/limitations.md](docs/limitations.md), "The delete keeps
-  a reader's column count by moving a row".
+  a key for some readers. 5.8 moves no line: see [Upgrading to 5.8](#upgrading-to-58-from-57).
 
 ## Upgrading to 5.6 from 5.5
 

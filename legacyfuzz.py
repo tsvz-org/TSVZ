@@ -14,7 +14,7 @@ Modes (run inside Docker, see README at the bottom of this docstring):
 --ver, --ver-b and --old take the path of a TSVZ.py file; its label (in module names and the output) is the name
 of the folder holding it (`/f/54/TSVZ.py` is 54), or the file's own name when it is not called TSVZ.py. It starts
 processes and writes temporary files: run it in a container with capped memory and pids, never on a host as root, e.g.
-  docker run --rm --init --memory=2g --memory-swap=2g --pids-limit=512 --user 65534:65534 -e HOME=/tmp \
+  docker run --rm --init --memory=2g --pids-limit=512 --user 65534:65534 -e HOME=/tmp \
     -v "$PWD":/t:ro -v /path/to/old:/f:ro -w /tmp python:3.14 python3 /t/legacyfuzz.py pair --ver /f/54/TSVZ.py --ver-b /t/TSVZ.py ...
 
 Invariants (every check runs on a fresh copy of the file; "the reader" is readTabularFile given the
