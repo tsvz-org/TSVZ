@@ -14887,9 +14887,10 @@ def test_a_rewrite_with_a_queued_one_column_delete_widens_line_1_whatever_commit
 	# of a one-column file that a widened line 1 would lose: id\n when the delete was still queued, id\tv\n when the writer
 	# thread's tick had committed it first. With a gone nothing is lost, so a rewrite asked for widens line 1 in every
 	# order; the delete's own commit widens nothing (as in every version), so its other readers read line 1 as before; it
-	# compacts (5.10, for line 1's readers too): the comment goes.
+	# compacts (5.10, for line 1's readers too): the comment goes. (5.11: b stands in for a, so the store, which counts from
+	# the line after line 1, keeps its count: Q-A.)
 	if rewrite == 'none':
-		written = {b'id\n# n\na\n': b'id\n', b'id\n# n\na\nb\t1\n': b'id\nb\t1\n'}[text]
+		written = {b'id\n# n\na\n': b'id\n', b'id\n# n\na\nb\t1\n': b'id\nb\nb\t1\n'}[text]
 	p = str(tmp_path / 'q.tsv')
 	_touch(p, text)
 	before = TSVZ.readTabularFile(p, strict=True, verbose=False)
@@ -16963,7 +16964,8 @@ def test_a_lite_keeps_its_docstring():
 def test_a_store_that_took_a_delete_out_of_a_one_column_file_holds_what_a_reopen_reads(tmp_path, route):
 	# The deleted `a` set the file's count (one); without it the file reads at the defaults line's three, and a reopen reads
 	# b with Q. 5.07 moved b up into a's place and kept the count; the stand-in rule leaves the line, so memory follows the file
-	# as it does after a widening (the stand-in is none here: line 1 has one cell).
+	# as it does after a widening. 5.08 to 5.10 let nothing stand in after a line 1 of one cell, so b read [b, 1, Q] to the
+	# store and a reopen; from 5.11 b stands in (Q-A: the store counts from the line after line 1), and both read [b, 1].
 	p = str(tmp_path / 'z.tsv')
 	_touch(p, b'x\na\n#_defaults_#\t\tQ\nb\t1\n')
 	t = TSVZ.TSVZed(p, header='id', strict=False, verbose=False, append_check_delay=60)
@@ -16975,9 +16977,9 @@ def test_a_store_that_took_a_delete_out_of_a_one_column_file_holds_what_a_reopen
 	held = dict(t)
 	count = t.correctColumnNum
 	t.close()
-	assert _bytes(p) == b'x\n#_defaults_#\t\tQ\nb\t1\n'
+	assert _bytes(p) == b'x\nb\n#_defaults_#\t\tQ\nb\t1\n'
 	again = TSVZ.TSVZed(p, header='id', strict=False, verbose=False, append_check_delay=60, rewrite_on_load=False)
-	assert held == dict(again) == {'b': ['b', '1', 'Q']} and count == again.correctColumnNum
+	assert held == dict(again) == {'b': ['b', '1']} and count == again.correctColumnNum
 	again.close()
 
 
@@ -17103,3 +17105,39 @@ def test_the_readers_of_a_compaction_are_each_planned_once_and_a_twin_at_the_cou
 	lines = _lines(b'c\t\t2\nc\t3\t2\nc\t1\n')
 	readers = TSVZ._legacyCompactReaders(lines, 2, False, [D_, 'P'], '\t', 'utf8', False)
 	assert (3, False, False, ()) in readers and (2, False, False, [D_, 'P']) in readers
+
+
+# --------------------------------------------------------------------------
+# 5.11: the five entries deferred from 5.10 (docs/limitations.md)
+# --------------------------------------------------------------------------
+Q3_SHAPE = b'id\na\n#_defaults_#\t\tQ\nb\t1\n'
+
+
+@pytest.mark.parametrize('door', ['zed', 'lite'])
+def test_a_stores_own_delete_after_a_line_1_of_one_cell_takes_a_stand_in_from_a_row_with_a_value(tmp_path, door):
+	# Q-A (the user's answer of 2026-11-08: "A: stand-in in the store's own delete"). Under a header line 1 is not, the
+	# TSVZed and TSVZedLite(strict=False) doors count from the line after line 1; 5.08 to 5.10 let no row with a value stand
+	# in there after a line 1 of one cell, and the store, with every reader given its header, read b as [b, 1, Q]. b stands
+	# in now; 3.39's strict reader given no header, which drops b\t1 at line 1's one column, gains b (Q4's kind).
+	kwargs = {'strict': False} if door == 'lite' else {}
+	mem = _delete_reads_as_before(str(tmp_path / 'f.tsv'), Q3_SHAPE, 'a', b'id\nb\n#_defaults_#\t\tQ\nb\t1\n', 'id\tv', door,
+								  {'339-strict-plain': 'gained', '339-strict-L1': 'gained'}, **kwargs)
+	assert mem is None or mem == {'b': ['b', '1']}
+
+
+def test_the_commands_delete_after_a_line_1_of_one_cell_still_takes_no_stand_in_from_a_row_with_a_value(tmp_path):
+	# Q3 (2026-11-07) holds where its premise does: the command given --x-header H reads line 1 as a row.
+	_delete_reads_as_before(str(tmp_path / 'f.tsv'), Q3_SHAPE, 'a', b'id\n#_defaults_#\t\tQ\nb\t1\n', 'id\tv', 'cli', Q3)
+
+
+@pytest.mark.parametrize('door', ['zedq', 'zedcq'])
+def test_a_stores_delete_then_its_rewrite_writes_the_same_bytes_whichever_was_first(tmp_path, door):
+	# N1: with the delete committed before the rewrite, 5.08 to 5.10 widened line 1 and wrote the store's [b, 1, Q] for every
+	# reader (b\t1\tQ); with it still queued, everyone kept [b, 1]. The stand-in keeps [b, 1] in both orders.
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, Q3_SHAPE)
+	_door_deletes_then_rewrites(p, door, 'id\tv')
+	assert _bytes(p) == b'id\tv\n#_defaults_#\t\tQ\nb\t1\n'
+	for mod in (TSVZ, TSVZ_old):
+		for header in ('', 'id\tv'):
+			assert mod.readTabularFile(p, header=header, strict=False, verbose=False)['b'] == ['b', '1']

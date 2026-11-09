@@ -3170,10 +3170,12 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	``both`` a bare ``#`` keeps the place a header reader skips.
 
 	The key is one whose later line holds no value: every reader applies that line (a row at one column, a deletion at
-	more), so the key reads after it as it did. Else, unless a line 1 of one cell comes before the place (its readers
-	would read the stand-in as a row, and 3.39's strict read, which drops a wider line at one column, would gain it), a
-	key that no row with a value before the place names: at two columns or more the stand-in deletes a key not yet read,
-	at one it is a row the key's later line replaces. Else line 1's own key, when the first keyed line after the place is
+	more), so the key reads after it as it did. Else, unless a line 1 of one cell that the caller reads as a row comes
+	before the place (``both``: its readers would read the stand-in as a row, and 3.39's strict read, which drops a wider
+	line at one column, would gain it; Q3), a key that no row with a value before the place names (5.11: in a store's
+	own delete under a header line 1 is not, the store counts from the place, and a stand-in keeps its cells as they
+	read; 3.39's strict reader given no header gains the key, Q4's kind): at two columns or more the stand-in deletes a
+	key not yet read, at one it is a row the key's later line replaces. Else line 1's own key, when the first keyed line after the place is
 	a row of it as wide as line 1 (5.10): every reader that read line 1's row reads the key deleted at the stand-in and
 	takes that line back before any other key, and a compaction keeps that line for line 1's readers (_legacyCompact).
 	No such row: the line just goes."""
@@ -3205,7 +3207,7 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 			continue
 		later = [j for j in range(i + 1, len(raw)) if kinds[j][0] == 'row' and not goes(j)]
 		pick = [j for j in later if not valued(j)]
-		if not pick and not (i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):
+		if not pick and not (both and i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):
 			named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
 			pick = [j for j in later if kinds[j][1].rstrip() not in named]
 			if (not pick and nxt not in stand and kinds[nxt][0] == 'row' and kinds[nxt][1].rstrip() in named and valued(nxt)
