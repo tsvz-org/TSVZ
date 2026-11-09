@@ -420,6 +420,22 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   store's rewrite; 3.39's strict reader given no header or line 1 gains `b` there (the kind approved as Q4). The rest is
   deferred to 5.12 under the same rule.
 
+### A stand-in after a line 1 of two or more cells can reorder keys for readers given the header
+- Kind: deferred
+- What the operator sees: `d\tX\nc\nd\t1\na\t1\n` under header `d\tX\tz`, delete `c` through `TSVZedLite(strict=False)`,
+  a `TSVZed` delete and commit, or `tsvz --x-header` delete: each writes `d\tX\na\nd\t1\na\t1\n`, and a reopened store and
+  every reader given the header list `a, d` where memory lists `d, a`. No row or cell changes, only the order. In 5.10 a later
+  `TSVZed` rewrite widened line 1 and put the order back; 5.11 refuses that widening when the stand-in key's later line is
+  wider than the header (the user's Q-C answer, "Refuse the widening"), so the order stays. 1 case in 12,000 argument sets in
+  the 5.11 review's fuzz.
+- Why: the stand-in picks a key no valued row names; here line 1's own key would keep the order, but `_legacyDropLines`
+  tries it only when line 1's key's next line is as wide as line 1.
+- Plan (5.12): in `_legacyDropLines`, try line 1's key as the stand-in before a key no valued row names when the next keyed
+  line is line 1's key as wide as line 1 (by hand, `d\tX\nd\nd\t1\na\t1\n` keeps `d, a` for every reader).
+- Revisit when: 5.12.
+- Noted: 2026-11-09, found in the 5.11 review (pre-existing in 5.10, made lasting by Q-C); the main session's decision, not
+  asked (a deferral). Not a release gate: 5.11 keeps rows 5.10 lost, and only this order outlasts a rewrite.
+
 ### A TSVZedLite delete looks at the file's first lines every time
 - Kind: deferred
 - What the operator sees: unless the program gave a column count of two or more, each `delete`, `pop`
