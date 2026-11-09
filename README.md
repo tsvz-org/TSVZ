@@ -346,7 +346,7 @@ The file formats are unchanged.
   5.6 to 5.9 compacted a file the one-column rule reads as one column (a lone key is a row) for the readers at one column
   alone. A reader given defaults of two cells or more reads it at their count, and a scrub or a rewrite could drop the row
   it takes: `a\nc\t1\nc\t5\t6\nc\t3\n` with defaults `['#_defaults_#', '', '']` wrote `a\nc\t1\nc\t3\n` (strict readers given those
-  defaults lost `c`, which read `[c, 5, 6]`; with `['#_defaults_#', 'P', 'Q']` it wrote `a\nc\t3\n`, which no reader lost anything by); under a header that line 1 is not (`c\na\nb\t1\nb\t5\t6\nb\t3\n`, header `id\tv`) the same
+  defaults lost `c`, which read `[c, 5, 6]`; with `['#_defaults_#', 'P', 'Q']` it wrote `a\nc\t3\n`, and no reader lost anything); under a header that line 1 is not (`c\na\nb\t1\nb\t5\t6\nb\t3\n`, header `id\tv`) the same
   followed a scrub or a store's rewrite; and a strict store's rewrite of `a\nb\t1\nc\t1\nc\t5\t6\nc\t3\n` appended
   memory's row, so readers given no defaults saw `c` change from `[c, 3]` to `[c, 5, 6]`. Separately, a compaction took
   every reader to be given the store's or the scrub's defaults, at the count they give (the store's own, or line 1's). A
