@@ -17113,6 +17113,28 @@ def test_the_readers_of_a_compaction_are_each_planned_once_and_a_twin_at_the_cou
 Q3_SHAPE = b'id\na\n#_defaults_#\t\tQ\nb\t1\n'
 
 
+def _planned_views(path, line1, header, defaults):
+	"""What the readers a scrub given ``header`` and ``defaults`` keeps the file for read (_legacyCompactReaders), rows in
+	order: this version's and 3.39's readTabularFile, strict and loose, given the scrub's header and, when line 1 is not it,
+	no header and line 1 too; each given no defaults and the scrub's. (Readers given other arguments are the approved
+	"Readers given other arguments than the scrub's".)"""
+	heads = {header} | ({'', line1} if header and line1 != header else set())
+	out = []
+	for mod in (TSVZ, TSVZ_old):
+		for strict in (True, False):
+			for h in sorted(heads):
+				for d in (None, defaults):
+					kwargs = dict(header=h, strict=strict, verbose=False)
+					if d:
+						kwargs['defaults'] = list(d)
+					try:
+						with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+							out.append((mod.__name__, strict, h, bool(d), list(mod.readTabularFile(path, **kwargs).items())))
+					except Exception as e:
+						out.append((mod.__name__, strict, h, bool(d), type(e).__name__))
+	return out
+
+
 @pytest.mark.parametrize('door', ['zed', 'lite'])
 def test_a_stores_own_delete_after_a_line_1_of_one_cell_takes_a_stand_in_from_a_row_with_a_value(tmp_path, door):
 	# Q-A (the user's answer of 2026-11-08: "A: stand-in in the store's own delete"). Under a header line 1 is not, the
@@ -17173,3 +17195,34 @@ def test_a_widening_still_goes_when_a_later_line_no_wider_than_the_header_gives_
 	t.close()
 	assert _bytes(p) == written
 	assert TSVZ_old.readTabularFile(p, strict=True, verbose=False)['b'] == ['b', '2' if b'b\t2' in text else '1']
+
+
+def test_the_compaction_applies_a_defaults_line_wider_than_the_count_as_339_does(tmp_path):
+	# 3.39 cuts a #_defaults_# line to its count and fills it from the defaults in effect; when no value is left, it is
+	# strict again, and drops b\t9\t (three cells at two). 5.10 kept it lenient and dropped b\t5\t, the line it took last.
+	text = b'id\tv\nb\t1\t\nb\tX\nb\t5\t\n#_defaults_#\t\tP\nb\t9\t\n'
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, text)
+	defaults = [D_, '', 'Q']
+	before = _planned_views(p, 'id\tv', 'id\tv', defaults)
+	assert TSVZ_old.readTabularFile(p, header='id\tv', defaults=list(defaults), strict=True, verbose=False)['b'] == ['b', '5']
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		TSVZ.scrubTabularFile(p, header='id\tv', defaults=list(defaults))
+	assert _bytes(p) == text
+	assert _planned_views(p, 'id\tv', 'id\tv', defaults) == before
+
+
+@pytest.mark.parametrize('text, defaults', [
+	(b'a\nb\t1\n#_defaults_#\tP\nb\t2\t3\nb\t4\n', [D_, 'Q']),  # (a defaults line at one column: 3.39 cuts it to its key)
+	(b'id\tv\tw\nb\t1\n#_defaults_#\t\t\tR\nb\t2\nb\t3\t4\n', [D_, 'P', 'Q']),
+	(b'id\tv\nb\t1\t2\n#_defaults_#\tP\nb\t3\t4\n#_defaults_#\t\t\nb\t5\t6\nb\t7\n', [D_, '', 'Q']),
+])
+def test_the_compaction_keeps_what_339s_strict_reader_takes_after_a_defaults_line(tmp_path, text, defaults):
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, text)
+	line1 = text.split(b'\n')[0].decode()
+	header = line1 if line1.startswith('id') else ''
+	before = _planned_views(p, line1, header, defaults)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		TSVZ.scrubTabularFile(p, header=header, defaults=list(defaults))
+	assert _planned_views(p, line1, header, defaults) == before

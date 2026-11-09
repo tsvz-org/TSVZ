@@ -2874,7 +2874,12 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 	reader takes its column count from it (line 1 holds no key, or a header the reader does not take): a dead key's line
 	there is kept emptied (a deletion as wide as it was), or with the deletion that ends it."""
 	enc = encoding or 'utf8'
-	strictActive = strictActiveOld = len(defaults) > 1 and any(defaults[1:])
+	strictActive = len(defaults) > 1 and any(defaults[1:])
+	# 3.39's active defaults, cell by cell (5.11): it cuts or fills a #_defaults_# line to its count, fills the line's empty
+	# cells from the defaults before it, and takes the result; a line it then holds with no value beyond the key makes it
+	# strict again. Strict while they hold no value, so a line not as wide as its count is dropped.
+	oldDefaults = list(defaults)
+	strictActiveOld = any(oldDefaults[1:])
 
 	def keyed(i):  # (a keyed line to any reader)
 		return _legacyLineKind(raw[i].decode(enc, errors='replace'), 1, False, delimiter)[0] != 'skip'
@@ -2923,7 +2928,14 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 				continue  # (the same line again, nothing between them changing the defaults: it changes nothing)
 			boundaries.append(i)
 			strictActive = False if kind == 'reset' else (True if takes else strictActive)
-			strictActiveOld = False if kind == 'reset' else (True if takesOld else strictActiveOld)
+			if kind == 'reset':
+				if width != 1:  # (at one column a bare #_defaults_# is a row to 3.39, which keeps its defaults)
+					oldDefaults = [DEFAULTS_INDICATOR_KEY]
+			elif takesOld:
+				cells = _legacyCells(_legacyLineBody(text), delimiter)[:width]
+				cells += [''] * (width - len(cells))
+				oldDefaults = [cell or (oldDefaults[j] if 0 < j < len(oldDefaults) else '') for j, cell in enumerate(cells)]
+			strictActiveOld = any(oldDefaults[1:])
 		elif kind == 'delete':
 			slot = live.pop(key, None)
 			if slot is not None:
