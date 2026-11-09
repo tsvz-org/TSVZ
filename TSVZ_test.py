@@ -17269,3 +17269,44 @@ def test_the_compaction_keeps_what_339s_strict_reader_takes_after_a_defaults_lin
 	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
 		TSVZ.scrubTabularFile(p, header=header, defaults=list(defaults))
 	assert _planned_views(p, line1, header, defaults) == before
+
+
+@pytest.mark.parametrize('door', ['scrub', 'rewrite'])
+def test_a_scrub_keeps_the_order_for_readers_given_its_correct_column_num(tmp_path, door):
+	# A scrub given correctColumnNum and a header of another width compacted at the header's width alone: b\tP\t1, b's
+	# place for a reader at two columns (where the lone b is a deletion), went as superseded, and that reader read a
+	# before b. The count given is planned as one more reader. (A TSVZed given the count did the same at a rewrite, and
+	# the store itself read at it.)
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, b'a\nb\nb\tP\t1\na\t1\tP\nb\t1\t2\t3\n')
+	kwargs = dict(header='a', defaults=[D_, 'P'], correctColumnNum=2)
+
+	def views():
+		out = []
+		for mod in (TSVZ, TSVZ_old):
+			for strict in (True, False):
+				for count in (2, -1):
+					read = dict(kwargs, defaults=list(kwargs['defaults']), correctColumnNum=count, strict=strict, verbose=False)
+					with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+						out.append(list(mod.readTabularFile(p, **read).items()))
+		return out
+	before = views()
+	assert [list(rows) for rows in before[:1]] == [[('b', ['b', '1', '2', '3']), ('a', ['a', '1', 'P'])]]
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		if door == 'scrub':
+			TSVZ.scrubTabularFile(p, **dict(kwargs, defaults=list(kwargs['defaults'])))
+		else:
+			t = TSVZ.TSVZed(p, verbose=False, append_check_delay=60, rewrite_on_load=False,
+							**dict(kwargs, defaults=list(kwargs['defaults'])))
+			assert list(t) == ['b', 'a']
+			t.hardMapToFile()
+			t.close()
+	assert _bytes(p).startswith(b'a\nb\nb\tP\t1\n')
+	assert views() == before
+
+
+def test_a_correct_column_num_as_wide_as_the_scrubs_count_adds_no_reader():
+	lines = _lines(b'id\tv\na\t1\nb\t2\t3\n')
+	assert TSVZ._legacyCompactReaders(lines, 2, True, [], '\t', 'utf8', True, (2,)) == \
+		TSVZ._legacyCompactReaders(lines, 2, True, [], '\t', 'utf8', True)
+	assert (3, True, True, []) in TSVZ._legacyCompactReaders(lines, 2, True, [], '\t', 'utf8', True, (3, -1))

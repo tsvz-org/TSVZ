@@ -3055,7 +3055,7 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 	return kept, content, moved, lineLife, lifeEnd, width, alone
 
 
-def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, matched):
+def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, matched, counts=()):
 	"""The readers a compaction of the legacy lines ``raw`` keeps what they take for, as ``(width, consumed, matched,
 	defaults)`` (_legacyCompactPlan): the caller's, and, when it takes line 1 for a header line 1 does not hold, the readers that
 	count from line 1 as well: given no header (line 1 a row to them, at its count, or the defaults' as the caller's
@@ -3065,7 +3065,9 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 	caller's defaults. A reader given none is another reader: it reads at the file's own count, not the defaults', and a
 	strict one takes only the lines as wide as its count (3.39's) or at least as wide (5.5's), where defaults with a value
 	take every line. So each is listed again, given none and at the count it then reads at, where that count or the
-	strictness differs."""
+	strictness differs. ``counts``: column counts readers are given explicitly (a scrub's ``correctColumnNum``), each
+	another reader, given the caller's header and defaults, and none, where it differs from ``width`` (5.11)."""
+	explicit = sorted({count for count in counts if count > 0 and count != width})
 	readers = [(width, consumed, matched, defaults)]
 	# (the count each reader is given no defaults reads at: the file's. A header the file holds gives it, else the first
 	# keyed line's, line 1 left out for a reader that takes it for its header)
@@ -3095,10 +3097,14 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 		readers += [(w, c, m, ()) for (w, c, m), r in zip(own, readers)
 					if (valued or w != r[0])
 					and not (valued and w > 0 and counts.get(True, set()) <= {w} and (c or counts.get(False, set()) <= {w}))]
+	for count in explicit:
+		readers.append((count, consumed, matched, defaults))
+		if valued:
+			readers.append((count, consumed, matched, ()))  # (a strict one given none: the explicit count, its own strictness)
 	return readers
 
 
-def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched):
+def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched, counts=()):
 	"""One pass of _legacyCompact over the legacy lines ``raw`` (bytes, without their newline): ``(lines, emptied)``, the
 	lines kept, each a line of ``raw`` byte for byte and in its place, but for a key's last line moved up into its first
 	line's place and a dead key's protected line emptied (built from its own bytes), for every reader of
@@ -3113,7 +3119,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 	a plan that collapses a life keeps no other line of it.) Every reader then reads its own plan's rows, in its order:
 	a line kept for another reader falls inside a key's life whose first and last line the reader takes are kept, or in a
 	life whose end it reads."""
-	readers = _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, matched)
+	readers = _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, matched, counts)
 	if len(readers) == 1:
 		kept, content, moved = _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matched)[:3]
 		return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]], any(i not in moved for i in content)
@@ -3172,17 +3178,18 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 	return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]], any(i not in plan[2] for plan in every for i in plan[1])
 
 
-def _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched):
+def _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched, counts=()):
 	"""The legacy file whose lines are ``raw`` (bytes, without their newline) compacted by dropping lines (comments,
 	empty lines, superseded lines, dead keys' lines): what every reader given the caller's arguments takes from it,
 	of any version and either strictness, stays, and under a header line 1 does not hold what every reader that counts
-	from line 1 takes too (_legacyCompactReaders), because every line kept is kept as it is, in its place
+	from line 1 takes too, and every reader given a count of ``counts`` (_legacyCompactReaders), because every line kept
+	is kept as it is, in its place
 	(_legacyCompactOnce). Repeats while a pass empties a line (that can make another one droppable; a pass that empties
 	none left nothing new droppable in 64,000 compactions tried), at most 4 passes: stopping early is less compact, never
 	wrong."""
 	defaults = list(defaults) if defaults and defaults is not ... else []
 	for _ in range(4):
-		out, emptied = _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched)
+		out, emptied = _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched, counts)
 		changed = out != raw
 		raw = out
 		if not (changed and emptied):
@@ -3505,7 +3512,8 @@ def _legacyScrub(fileName,teeLogger = None,header = '',createIfNotExist = False,
 			__teePrintOrNot(f'Warning: Header mismatch in {fileName}. Keeping original header in file...','warning',teeLogger)
 		if _legacyReaderWidth(raw, formatted, consumed, matched, encoding, dlm) == 1:
 			width = 1  # (a file of one column is compacted as one, as a TSVZed rewrite does: its lone keys are rows)
-		lines = _legacyCompact(raw, width, consumed, givenDefaults, dlm, encoding, matched)
+		# (a correctColumnNum given is planned too where the header's width replaced it: readers given it read at it)
+		lines = _legacyCompact(raw, width, consumed, givenDefaults, dlm, encoding, matched, (correctColumnNum,))
 		del raw
 		if any(formatted) and (not verifyHeader or not lines) and (line0 is None or not _isHeaderLine(formatted, line0, dlm)):
 			# A header given and not checked goes first when line 1 is not it (line 1 stays, as line 2); a read that met
@@ -6955,7 +6963,8 @@ memoryOnly:{self.memoryOnly}
 				# superseded line, and each delete rewrites all of it (5.9). The compaction keeps what every count the file is
 				# read at takes (_legacyCompactReaders): one made at the store's count alone dropped a narrower line superseded
 				# there, the only line 3.39's strict reader takes at line 1's two (5.8).
-				kept = _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched)
+				# (a correctColumnNum the program gave is planned too: the store and its twins read at it, 5.11)
+				kept = _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched, (self._givenColumns,))
 				del raw
 				flags, diffWidth = self._readLines(kept, consumed, start, strict)
 				with self._memLock:
