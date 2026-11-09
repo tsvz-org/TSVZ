@@ -2898,6 +2898,7 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 	firstN, lastN = array.array('l'), array.array('l')
 	firstTakes, lastTakes = bytearray(), bytearray()
 	lastFull = bytearray()  # whether the last line is exactly W wide with a value in every cell: no defaults reach it
+	rowTaken = (None, bytearray(len(raw)), bytearray(len(raw)))  # (per strict reader, 1 and 2: a 1 for each row line it takes)
 	lineLife = array.array('l', [-1]) * len(raw) if lives else None
 	lifeEnd = array.array('l') if lives else None  # (a slot is a life: a key starts a new one after each deletion)
 	pinfo = {}  # protectable index holding a row -> (key, ncells)
@@ -2948,6 +2949,7 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 		else:
 			if i in protectable:
 				pinfo[i] = (key, n)
+			rowTaken[1][i], rowTaken[2][i] = mask & 1, mask >> 1
 			full = bool(boundaries) and n == width and all(  # (only a defaults line before it can matter)
 				c.strip() for c in _legacyCells(_legacyLineBody(text), delimiter)[1:])
 			slot = live.get(key)
@@ -2985,6 +2987,20 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 		kept[0] = 1
 	content = {}
 	moved = {}
+
+	def inOrder(slot, f):
+		# (5.11) Each strict reader that takes the key's first line takes its last, and one that does not, if it takes a line
+		# of the key, takes the last and no row of another key before its first: the moved line then reads to it as the
+		# last line did, and the key keeps its place among the keys it reads. (A reader that takes the first line and not
+		# the last would lose the key; one that takes neither, but a line between, would lose its value.)
+		for bit, rFirst in ((1, firstTaken[slot]), (2, firstTakenOld[slot])):
+			if rFirst < 0:
+				continue
+			if not lastTakes[slot] & bit:
+				return False
+			if not firstTakes[slot] & bit and rowTaken[bit].find(1, f + 1, rFirst) >= 0:
+				return False
+		return True
 	for slot in live.values():
 		f, l = first[slot], last[slot]
 		kept[f] = 1
@@ -2995,10 +3011,15 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 		# both strict readers take both lines, or (5.10) the two lines are as wide as each other and each strict reader
 		# takes both or none of the key's: a reader at any count, given any defaults, then takes both or neither, and
 		# reads the moved line as it read the last one, or not at all.
+		# 5.11: or, the two lines as wide as each other, each strict reader takes the moved line where it took the key
+		# before, as it read the last one, and finds no other key's row between (inOrder): a set and a delete of a key in a
+		# one-column file under wider defaults (c\t1, c\t) are one line again, where 3.39's strict reader took only the last.
 		if ((lastFull[slot] or bisect.bisect_right(boundaries, f) == bisect.bisect_left(boundaries, l))
-				and firstTakes[slot] == lastTakes[slot] and f not in still
-				and (firstTakes[slot] == 3 or (firstN[slot] == lastN[slot] and (firstTakes[slot] & 1 or firstTaken[slot] < 0)
-					and (firstTakes[slot] & 2 or firstTakenOld[slot] < 0)))
+				and f not in still
+				and ((firstTakes[slot] == lastTakes[slot]
+					and (firstTakes[slot] == 3 or (firstN[slot] == lastN[slot] and (firstTakes[slot] & 1 or firstTaken[slot] < 0)
+						and (firstTakes[slot] & 2 or firstTakenOld[slot] < 0))))
+					or (firstN[slot] == lastN[slot] and inOrder(slot, f)))
 				and f != 0 and (f not in (firstKeyed, after0) or firstN[slot] == lastN[slot])):
 			content[f] = raw[l]
 			moved[f] = l
@@ -3109,15 +3130,18 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 		return out
 	every = plans()
 
-	def agrees(other, i, line, emptied):
-		# (the same bytes there; or an emptied line, which reads as a deletion as wide, where the other reader keeps no
-		# line of that key's life: it reads the key deleted after it all the same)
+	def agrees(other, i, line, source):
+		# (the same bytes there; or an emptied line (``source`` None), which reads as a deletion as wide, where the other
+		# reader keeps no line of that key's life: it reads the key deleted after it all the same; or (5.11) a line moved
+		# from ``source``, the deletion that ends that life to the other reader: it reads the key deleted there instead,
+		# and a line of the life kept for another reader gets that deletion back after it)
 		if other[0][i]:
 			return other[1].get(i) == line
 		life = other[3][i]
-		return emptied and other[5] > 1 and life >= 0 and other[4][life] >= 0
+		return (life >= 0 and other[4][life] >= 0
+				and (other[4][life] == source if source is not None else other[5] > 1))
 	still = {i for plan in every for i, line in plan[1].items()
-			 if not all(agrees(other, i, line, i not in plan[2]) for other in every)}
+			 if not all(agrees(other, i, line, plan[2].get(i)) for other in every)}
 	if still:
 		every = plans(still)
 	union = 0
@@ -3125,8 +3149,10 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 		union |= int.from_bytes(plan[0], 'little')
 	kept = bytearray(union.to_bytes(len(raw), 'little'))
 	content = {}
+	movedFrom = {}
 	for plan in every:
 		content.update(plan[1])  # (where two plans have a line, the same bytes now)
+		movedFrom.update(plan[2])
 	changed = True
 	while changed:
 		changed = False
@@ -3138,8 +3164,9 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 				life = lineLife[i]
 				if life >= 0:
 					end = lifeEnd[life]
-					if end >= 0 and not kept[end]:
-						kept[end] = 1  # (a row kept for another reader: this one reads the key deleted after it)
+					if end >= 0 and not kept[end] and movedFrom.get(i) != end:
+						kept[end] = 1  # (a row kept for another reader: this one reads the key deleted after it; not when the
+						# line there is that deletion, moved up)
 						changed = True
 				i = extra.find(1, i + 1)
 	return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]], any(i not in plan[2] for plan in every for i in plan[1])

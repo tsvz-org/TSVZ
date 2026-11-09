@@ -16305,8 +16305,10 @@ def test_a_row_deleted_from_a_one_column_file_under_wider_defaults_stays_as_its_
 	del t['c']
 	t.hardMapToFile()
 	t.close()
-	# (5.10 review F3b: `c\t1` stays before it: a strict reader given no defaults takes `c\t` alone at one column, 5.5's both)
-	assert _bytes(p) == b'a\nb\nc\t1\nc\t\n#_defaults_#\tP\n'
+	# (5.10 review F3b kept `c\t1` before it: a strict reader given no defaults takes `c\t` alone at one column, 5.5's both.
+	# 5.11 moves `c\t` into its place again: each reader that takes the first line takes the last, and 3.39's strict reader,
+	# which takes the last alone, has no row of another key between them)
+	assert _bytes(p) == b'a\nb\nc\t\n#_defaults_#\tP\n'
 	t = TSVZ.TSVZed(p, defaults=['#_defaults_#', 'P'], verbose=False, append_check_delay=60)
 	assert 'c' not in t
 	t.close()
@@ -17195,6 +17197,47 @@ def test_a_widening_still_goes_when_a_later_line_no_wider_than_the_header_gives_
 	t.close()
 	assert _bytes(p) == written
 	assert TSVZ_old.readTabularFile(p, strict=True, verbose=False)['b'] == ['b', '2' if b'b\t2' in text else '1']
+
+
+@pytest.mark.parametrize('defaults', [[D_, 'P'], [D_, 'P', 'Q']])
+def test_a_set_and_a_delete_in_a_one_column_file_under_wider_defaults_leave_one_line(tmp_path, defaults):
+	# 5.10 kept the deleted key's value line as well as the c\t that marks it (2,003 lines after 1,000 rounds; 5.9: 1,003):
+	# 3.39's strict reader takes c\t alone at one column, 5.5's both, and the collapse needed both or neither. It needs now
+	# that each reader that takes the first line takes the last, and that no other key's row lies between for a reader
+	# that takes the last alone.
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, b'a\nb\nc\t1\n')
+	before = _every_view(p, 'a', '', defaults, without=('c',))
+	t = TSVZ.TSVZed(p, defaults=list(defaults), verbose=False, append_check_delay=60, rewrite_on_load=False)
+	try:
+		del t['c']
+		t.hardMapToFile()
+		for n in range(200):
+			t['k%d' % n] = ['k%d' % n, str(n)]
+			t.commitAppendToFile()
+			del t['k%d' % n]
+			t.hardMapToFile()
+	finally:
+		t.close()
+	# (one line per deleted key: the approved "A row deleted from a one-column file ... stays as its key"; with three cells
+	# the deletion is wider than c\t1, and the two stay)
+	assert _bytes(p).startswith(b'a\nb\nc\t\n' if len(defaults) == 2 else b'a\nb\nc\t1\nc\t\t\n')
+	assert len(_lines(_bytes(p))) <= 200 + 5
+	assert _every_view(p, 'a', '', defaults, without=['c'] + ['k%d' % n for n in range(200)]) == before
+
+
+@pytest.mark.parametrize('text', [
+	b'a\nb\nc\t1\nd\nc\t\n',  # (3.39's strict reader takes d, then c\t: c after d to it)
+	b'a\nc\t1\nd\nc\t\nd\t\n',
+])
+def test_the_collapse_keeps_a_key_after_the_rows_a_strict_reader_took_before_it(tmp_path, text):
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, text)
+	defaults = [D_, 'P']
+	before = _planned_views(p, 'a', '', defaults)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		TSVZ.scrubTabularFile(p, defaults=list(defaults))
+	assert _planned_views(p, 'a', '', defaults) == before
 
 
 def test_the_compaction_applies_a_defaults_line_wider_than_the_count_as_339_does(tmp_path):
