@@ -353,9 +353,10 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
 - **A `correctColumnNum` given to a scrub or a `TSVZed` is planned as a reader.** When the header has another width, a
   file the header makes one column was compacted at the header's width alone: `a\nb\nb\tP\t1\na\t1\tP\nb\t1\t2\t3\n`
   scrubbed with `header='a'`, `defaults=['#_defaults_#', 'P']` and `correctColumnNum=2` lost `b\tP\t1`, and every reader
-  given that header and count (the store itself, for a `TSVZed` given them) listed `a` before `b`. The count given is now
-  one more reader the compaction keeps the lines of (a scrub leaves that file as it is). No cell changed (5.9 wrote the same as
-  5.10). What shows: such files keep a line more after a scrub or a rewrite.
+  given that header and count listed `a` before `b`. The count given is now one more reader the compaction keeps the lines
+  of (a scrub leaves that file as it is); a `TSVZed` given a count keeps the lines for readers given its header, defaults
+  and count, though the store itself reads at the file's own count, whatever `correctColumnNum` it was given. No cell
+  changed (5.9 wrote the same as 5.10). What shows: such files keep a line more after a scrub or a rewrite.
 
 - The cost of a compaction is unchanged within measurement on a busy machine (a scrub of 200,000 rows: 0.9 to 1.04 of
   5.10's time, the same bytes).

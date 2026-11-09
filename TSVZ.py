@@ -6975,7 +6975,8 @@ memoryOnly:{self.memoryOnly}
 				# superseded line, and each delete rewrites all of it (5.9). The compaction keeps what every count the file is
 				# read at takes (_legacyCompactReaders): one made at the store's count alone dropped a narrower line superseded
 				# there, the only line 3.39's strict reader takes at line 1's two (5.8).
-				# (a correctColumnNum the program gave is planned too: the store and its twins read at it, 5.11)
+				# (a correctColumnNum the program gave is planned too, 5.11: the store reads at the file's count, but a reader
+				# given the store's header, defaults and count reads at it)
 				kept = _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched, (self._givenColumns,))
 				del raw
 				flags, diffWidth = self._readLines(kept, consumed, start, strict)

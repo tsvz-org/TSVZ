@@ -502,7 +502,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `TSVZedLite` ask the file, so they take the key's lines out and leave nothing, whatever was read first. Two exceptions for a
   `TSVZedLite`: a program that gave `correctColumnNum` of two or more is not asked about, so the delete is the appended line; and
   under a header that line 1 isn't, a copy of the key on line 1 stays, in the header's place. From 5.11 the deleted key's own value line goes at a rewrite
-  (5.10 kept `c\t1` before the `c\t`: one more line per deleted key).
+  when it is as wide as the deletion (5.10 kept `c\t1` before the `c\t`: one more line per deleted key); one of another
+  width stays with it (`c\t1` and `c\t\t` under defaults of three cells).
 - Why: a file that stays one column has no way to mark that deletion, so it needs a format change.
 - Revisit when: the next format change.
 - Approved: 2026-11-06, the user chose "Known limitation (Recommended)", and "Widen the entry (Recommended)" for the wider
@@ -514,12 +515,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `tsvz delete F a` (or a `TSVZedLite` or `TSVZed` delete). 3.39's strict `readTabularFile` reads at one column and drops
   `b\t1` as wider, so it showed only `a`; after the delete it shows `b`. 5.5 and later readers show `b` as `[b, 1]` before
   and after. 5.6 does exactly the same (its bytes `b\t1\n`, 5.8's `b\nb\t1\n`), in the same 5,235 cases of the depth-4
-  delete sweep.
+  delete sweep. From 5.11 the same reader also gains a stand-in key after a store's own delete under a header that line 1
+  is not: `TSVZed(p, header='id\tv')` (or `TSVZedLite(strict=False)`) on `id\na\n#_defaults_#\t\tQ\nb\t1\n`, delete `a`,
+  writes `id\nb\n#_defaults_#\t\tQ\nb\t1\n`, and 3.39's strict reader given no header or line 1 shows `b` as `[b]`, where it
+  showed `a`; the store and readers given the header keep `[b, 1]`. When `b`'s later line is wider than the header
+  (`b\t1\t2`), the stand-in also keeps line 1 one column at a rewrite (Q-C, "A file of lone keys does not widen").
 - Why: no layout serves both: 5.5's and later readers keep `[b, 1]` only if the file reads at one column or at two, and
   either needs a keyed line that 3.39's strict read takes as a row of `b`. A bare `#_defaults_#` would keep one column, but
   it is a row named `#_defaults_#` to every reader at one column.
 - Revisit when: nothing in the format can fix it; upgrading the reader from 3.39 cures it.
-- Approved: 2026-11-07, the user chose "Known limitation (Recommended)".
+- Approved: 2026-11-07, the user chose "Known limitation (Recommended)". The store's own delete: 2026-11-08, Q-A, the user
+  chose "A: stand-in in the store's own delete (Recommended)".
 
 ### pip 9 cannot upgrade from or uninstall 5.5 and earlier
 - Kind: known limitation
