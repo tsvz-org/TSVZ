@@ -421,14 +421,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   key before it when the as-wide line was not the next one (`d\tX\tW\na\nd\tY\ne\t1\t2\nd\t\tY\n`). Reverted in 5.9's
   review round 1; 5.10 builds it on the compaction that keeps what every count takes, for the next line only. A stand-in
   from a row with a value that is not as wide gives some reader a cell it did not read, which is the user's question.
-- Revisit when: 5.11, with the user's answer to the 5.09 design's question on the other shapes (a stand-in from a row
-  with a value at the deleting store's own place, or in every door, or neither).
+- Revisit when: 5.11, which builds the user's answer to the 5.09 design's question on the other shapes (a stand-in from
+  a row with a value at the deleting store's own place, or in every door, or neither): on 2026-11-08 they chose "A:
+  stand-in in the store's own delete".
 - Noted: 2026-11-07, a deferral under the user's standing rule that deferrals are noted, not asked. 2026-11-08: 5.09
   fixes one of the other two shapes of the entry (3.39's strict reader in the `TSVZed` delete + commit door). Shape 2
   (a line 1 of two cells that already names the key) was fixed in 5.09's first build and put back as deferred to 5.10
   with the two-count compaction (W1) in review round 1, after it lost rows for strict readers; same standing rule.
-  2026-11-08: 5.10 fixes shape 2 when line 1's key's next line is as wide as line 1; the rest waits for the user's
-  answer, deferred to 5.11 under the same rule.
+  2026-11-08: 5.10 fixes shape 2 when line 1's key's next line is as wide as line 1; the rest, deferred to 5.11 under
+  the same rule, follows the user's answer of the same day (above).
 
 ### A widening loses a key whose only line 3.39's strict reader takes holds no value
 - Kind: deferred
@@ -440,12 +441,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   the wider line and keep `b`. 5.6 to 5.8 do the same.
 - Why: the widening's rule (5.6) refuses a file with a key whose last line holds no value, and lets through a key that a
   later line gives a value; for 3.39's strict reader that later line is invisible when it is wider than the header.
-- Revisit when: 5.11, with the user's answer to the 5.09 design's question on it (Q-C: refuse the widening there, with the
-  warning a lone key gives, or widen and lose the key for that reader). 5.10's compaction is not the cause: the widening is
+- Revisit when: 5.11, which builds the user's answer to the 5.09 design's question on it (Q-C: refuse the widening there,
+  with the warning a lone key gives, or widen and lose the key for that reader): on 2026-11-08 they chose "Refuse the
+  widening". 5.10's compaction is not the cause: the widening is
   decided before it, and once line 1 holds the header the file is compacted for one count. Left unwidened (Q-C's refusal),
   the file is compacted for line 1's readers too (5.10), so the line 3.39's strict reader takes at line 1's one column stays.
 - Noted: 2026-11-08, found in the 5.09 design sweep; a deferral under the user's standing rule. 2026-11-08: not built in
-  5.10 (the user's answer is pending), deferred to 5.11 under the same rule.
+  5.10, deferred to 5.11 under the same rule, which builds the user's answer of the same day (above).
 
 ### A TSVZedLite delete looks at the file's first lines every time
 - Kind: deferred

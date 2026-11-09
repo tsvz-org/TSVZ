@@ -384,7 +384,7 @@ The file formats are unchanged.
   and a rewrite keeps that line for them (the first item). When `d`'s next line is wider or narrower than line 1, or
   another line comes first, nothing stands in, as before (`d\tX\na\nd\tY\tZ\n`).
 
-- Still as in 5.9, each waiting for a decision: after a line 1 of one cell that is not the header given, a delete under
+- Still as in 5.9, each planned for 5.11: after a line 1 of one cell that is not the header given, a delete under
   that header can change a cell for readers given it, and so can the item above when line 1's key's next line is not as
   wide as line 1; and a widening can
   lose, for 3.39's strict reader, a key whose only line it takes holds no value. See
