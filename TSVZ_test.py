@@ -17310,3 +17310,32 @@ def test_a_correct_column_num_as_wide_as_the_scrubs_count_adds_no_reader():
 	assert TSVZ._legacyCompactReaders(lines, 2, True, [], '\t', 'utf8', True, (2,)) == \
 		TSVZ._legacyCompactReaders(lines, 2, True, [], '\t', 'utf8', True)
 	assert (3, True, True, []) in TSVZ._legacyCompactReaders(lines, 2, True, [], '\t', 'utf8', True, (3, -1))
+
+
+def test_the_compaction_keeps_every_readers_view_of_random_files_under_defaults(tmp_path):
+	"""5.11's collapse and defaults rules on random small files: a scrub given each of several defaults and headers leaves
+	every reader (this version's and 3.39's readTabularFile, strict and loose, given no header, line 1 or the scrub's,
+	with no defaults and with the scrub's; and a TSVZed) reading the same rows in the same order."""
+	rng = random.Random(511)
+	p = str(tmp_path / 'f.tsv')
+	pool = ['a', 'b', 'c', 'c\t1', 'c\t', 'c\t1\t2', 'c\t\t2', 'b\t1', 'b\t', 'b\t1\t2', 'd', 'd\t1',
+			'#_defaults_#\tP', '#_defaults_#\t\tQ', '#_defaults_#', '#_defaults_#\t\t', '# n']
+	firsts = [None, 'a', 'id', 'id\tv', 'id\tv\tw', 'c\t1']
+	shrunk = 0
+	for _ in range(250):
+		first = rng.choice(firsts)
+		lines = ([first] if first else []) + [rng.choice(pool) for _ in range(rng.randint(2, 6))]
+		text = ('\n'.join(lines) + '\n').encode()
+		line1 = lines[0]
+		header = rng.choice(['', line1 if line1.startswith('id') else '', 'id\tv'])
+		defaults = rng.choice([None, [D_, 'P'], [D_, '', 'Q'], [D_, 'P', '']])
+		_touch(p, text)
+		before = _planned_views(p, line1, header, defaults)
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			try:
+				TSVZ.scrubTabularFile(p, header=header, defaults=list(defaults) if defaults else ..., strict=False)
+			except Exception:
+				continue
+		shrunk += len(_bytes(p)) < len(text)
+		assert _planned_views(p, line1, header, defaults) == before, (text, header, defaults, _bytes(p))
+	assert shrunk > 50
