@@ -334,7 +334,7 @@ The file formats are unchanged.
   the file is read at (the item above): 56 lines and 38 s, against 5.8's 61 lines and 36 s, and 5.8's losses are not back
   (`id\tv\na\nb\t1\nb\t\t1\n` with `TSVZed(p, header='id\tv\tw')`, delete `a`, still writes `id\tv\nb\nb\t1\nb\t\t1\n`,
   where 5.8 dropped the `b\t1` that 3.39's strict reader takes; the next item for the other). A commit compacts with the
-  store's own defaults, as a rewrite does: a reader given other defaults than the store's can see another file after it
+  store's own defaults, as a rewrite does: a reader given other defaults or another header than the store's can see another file after it
   (see [docs/limitations.md](docs/limitations.md), "Readers given other arguments"; 5.9's commit compacted nothing).
   What shows: comments,
   empty lines and superseded lines go at a delete's commit (`a\n# n\nb\t1\nb\n`, delete `a`, is `b\nb\n`, 5.8's bytes; 5.9
@@ -345,19 +345,19 @@ The file formats are unchanged.
   count it then reads at.**
   5.6 to 5.9 compacted a file the one-column rule reads as one column (a lone key is a row) for the readers at one column
   alone. A reader given defaults of two cells or more reads it at their count, and a scrub or a rewrite could drop the row
-  it takes: `a\nc\t1\nc\t5\t6\nc\t3\n` with three-cell defaults wrote `a\nc\t3\n` (strict readers given those defaults lost
-  `c`, which read `[c, 5, 6]`); under a header that line 1 is not (`c\na\nb\t1\nb\t5\t6\nb\t3\n`, header `id\tv`) the same
+  it takes: `a\nc\t1\nc\t5\t6\nc\t3\n` with defaults `['#_defaults_#', '', '']` wrote `a\nc\t1\nc\t3\n` (strict readers given those
+  defaults lost `c`, which read `[c, 5, 6]`; with `['#_defaults_#', 'P', 'Q']` it wrote `a\nc\t3\n`, which no reader lost anything by); under a header that line 1 is not (`c\na\nb\t1\nb\t5\t6\nb\t3\n`, header `id\tv`) the same
   followed a scrub or a store's rewrite; and a strict store's rewrite of `a\nb\t1\nc\t1\nc\t5\t6\nc\t3\n` appended
   memory's row, so readers given no defaults saw `c` change from `[c, 3]` to `[c, 5, 6]`. Separately, a compaction took
   every reader to be given the store's or the scrub's defaults, at the count they give (the store's own, or line 1's). A
   reader given none reads at the file's own count, and a strict one takes only the lines as wide as its count (3.39's) or
   at least as wide (5.5's), where defaults with a value take every line. Two shapes lost rows or changed cells for it:
   `id\na\t\nb\t\nb\t1\n` with `TSVZed(header='id', defaults=['#_defaults_#', 'P'])`, delete `a`, moved `b\t1` into `b\t`'s
-  place at the commit and at a rewrite (a rewrite in 5.4 to 5.10, the commit in 5.5 to 5.8 and 5.10; 5.9's commit
+  place at the commit and at a rewrite (a rewrite in 5.4 to 5.9, the commit in 5.5 to 5.8; 5.9's commit
   compacted nothing), and 3.39's strict reader given no defaults lost `b`; and, with no header, where the store's count
   comes from its defaults, `id\tv\tw\nb\t\t1\nb\t1\t2\nb\t1\n` with defaults `['#_defaults_#', 'P']` and a rewrite
   (`c\t\t2\nc\t3\t2\nc\t1\n` and `a\t1\t2\nk\t1\nk\t3\t4\t5\nk\t6\n` the same, scrubbed) changed `b` from `[b, 1, 2]`
-  to `[b, '', 1]` for every strict reader given no defaults (5.9 and 5.10; earlier versions were not tried). Both are readers of the compaction now, each
+  to `[b, '', 1]` for every strict reader given no defaults (5.5 to 5.9; 5.4 writes other bytes and changes more). Both are readers of the compaction now, each
   at the count it reads at. What shows: such files keep more lines after a rewrite, and a rewrite plans those readers
   where the count or the strictness differs (cost, see the first item). A deleted key's value line stays in a one-column
   file under wider defaults (`c\t1` before the `c\t` that marks `c` deleted in `a\nb\nc\t1\n` with value defaults): one

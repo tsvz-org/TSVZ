@@ -323,14 +323,14 @@ entries go last, in the same commit as the change:
   condition that holds at every count is that the two lines are as wide as each other.
   The review of 5.10 found the same mistake twice more, on the reader's arguments rather than its columns. F1: a file the
   one-column rule makes of one column was compacted for the readers at one column alone, though a reader given defaults of
-  two cells or more reads it at their count (`a\nc\t1\nc\t5\t6\nc\t3\n`, three-cell defaults: `c` lost for every strict
-  reader given them, 5.6 to 5.10). F3b: a strict reader given no defaults takes only the lines as wide as its count (3.39's)
+  two cells or more reads it at their count (`a\nc\t1\nc\t5\t6\nc\t3\n`, defaults `[D, '', '']`: written as `a\nc\t1\nc\t3\n`, and `c` lost for every strict
+  reader given them, 5.6 to 5.9 and 5.10's first builds). F3b: a strict reader given no defaults takes only the lines as wide as its count (3.39's)
   or at least as wide (5.5's), where the store's defaults, with a value in them, make every line taken (`id\na\t\nb\t\nb\t1\n`,
   `TSVZed(header='id', defaults=[D, 'P'])`, delete `a`: `b\t1` moved up into `b\t`'s place, and 3.39's strict reader lost `b`,
-  in a rewrite in 5.4 to 5.10 and in a commit in 5.5 to 5.8 and 5.10). F9 (round 2): the reader given none was planned at the
+  in a rewrite in 5.4 to 5.9 and in a commit in 5.5 to 5.8; 5.10's first builds did the same). F9 (round 2): the reader given none was planned at the
   caller's count, which a store or scrub with no header takes from its defaults, where a reader given none reads at the
   file's own (`id\tv\tw\nb\t\t1\nb\t1\t2\nb\t1\n`, defaults `[D, 'P']`, a rewrite: `b` from `[b, 1, 2]` to `[b, '', 1]` for 13
-  strict readers given none, 5.9 and 5.10). All three are readers of the compaction now: the defaults' count, and each
+  strict readers given none, 5.5 to 5.9 and 5.10's first builds). All three are readers of the compaction now: the defaults' count, and each
   reader again given none, at the count it then reads at.
 - Lesson: when one file is read at more than one count (or by more than one rule), a maintenance step keeps what each of
   those readers takes, and changes a line only where all of them agree. A step found right for only one reader is made

@@ -525,7 +525,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `TSVZedLite` ask the file, so they take the key's lines out and leave nothing, whatever was read first. Two exceptions for a
   `TSVZedLite`: a program that gave `correctColumnNum` of two or more is not asked about, so the delete is the appended line; and
   under a header that line 1 isn't, a copy of the key on line 1 stays, in the header's place.
-  From 5.10 a rewrite also keeps the deleted value's line, before the key's `c<TAB>` (see "A deleted key's value line stays in a one-column file under wider defaults", deferred).
 - Why: a file that stays one column has no way to mark that deletion, so it needs a format change.
 - Revisit when: the next format change.
 - Approved: 2026-11-06, the user chose "Known limitation (Recommended)", and "Widen the entry (Recommended)" for the wider
@@ -538,12 +537,39 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   well as the `c<TAB>` that marks it (`a\nb\nc\t1\nc\t\n#_defaults_#\tP\n`): one more line per deleted key, where 5.9 wrote
   `a\nb\nc\t\n#_defaults_#\tP\n`. 1,000 rounds of a set and a delete of a new key end at 2,003 lines, against 5.9's 1,003. Every
   reader's view is the same as with the one line.
+  The entry above, approved before 5.10, is unchanged; this one is the 5.10 addition to what its rewrite writes.
 - Why: the compaction plans a strict reader given no defaults too (5.10, review round 1), and that reader takes `c\t` alone at
   one column, where 5.5's takes both lines, so the two lines are not moved into one (the collapse needs every strict reader to
   take both or neither).
 - Revisit when: 5.11. The plan is an order-aware collapse: allow the move when each strict reader that takes the first line also
   takes the last, and no other key that reader takes lies between them.
 - Noted: 2026-11-08, found in the 5.10 re-review (F10); a deferral under the user's standing rule that deferrals are noted, not asked.
+
+### The compaction plan reads a #_defaults_# line wider than a reader's count wrongly for 3.39's strict reader
+- Kind: deferred
+- What the operator sees: a scrub (or a rewrite) of a file with a `#_defaults_#` line wider than a reader's column count can
+  change a cell for 3.39's strict reader given the scrub's own header and defaults:
+  `id\tv\nb\t1\t\nb\tX\nb\t5\t\n#_defaults_#\t\tP\nb\t9\t\n` with `header='id\tv', defaults=['#_defaults_#', '', 'Q']` is written as
+  `id\tv\nb\t1\t\nb\tX\n#_defaults_#\t\tP\nb\t9\t\n`, and that reader sees `b` go from `[b, 5]` to `[b, X]` (5.09 wrote the file
+  without `b\tX` and `b` went to `[b, 1]`, so it is not new in 5.10; 5.09 was right only by coincidence). No key is lost.
+- Why: 3.39 cuts such a defaults line down to its count and fills it from the active defaults; when every value lies beyond
+  the count, the line makes it strict again. The plan keeps one `strictActiveOld` flag per reader and assumes the reader
+  stays lenient after the line.
+- Revisit when: 5.11. The plan: in `_legacyCompactPlan`, keep 3.39's active defaults per column, and apply a defaults line the
+  way 3.39 does.
+- Noted: 2026-11-09, found in the 5.10 re-review (round 3); a deferral under the user's standing rule that deferrals are noted, not asked.
+
+### An explicit correctColumnNum is replaced by the header's width in a scrub
+- Kind: deferred
+- What the operator sees: a scrub given `correctColumnNum` and a header of another width plans the header's width, not the
+  count (`_legacyReaderWidth(...) == 1` override, TSVZ.py near line 3463). `a\nb\nb\tP\t1\na\t1\tP\nb\t1\t2\t3\n` with
+  `header='a', defaults=['#_defaults_#', 'P'], correctColumnNum=2` is written as `a\nb\na\t1\tP\nb\t1\t2\t3\n`, and every reader
+  given header `a` and `correctColumnNum=2` sees the key order go from b, a to a, b; no cell changes. 5.09 writes the same
+  bytes, so it is not new in 5.10.
+- Why: the compaction plans the readers it knows (the header's width, the defaults' count, line 1, none); an explicit count
+  that differs from the header's width is a reader it does not plan.
+- Revisit when: 5.11. The plan: plan the explicit count as one more reader when it differs from the header's width.
+- Noted: 2026-11-09, found in the 5.10 re-review (round 3); a deferral under the user's standing rule that deferrals are noted, not asked.
 
 ### 3.39's strict reader of a one-column file sees a new row when its last lone key is deleted
 - Kind: known limitation
