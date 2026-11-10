@@ -329,8 +329,9 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
   readers given the header. Another key's row first is deferred to 5.13
   ([docs/limitations.md](docs/limitations.md#after-a-line-1-of-two-or-more-cells-a-delete-before-another-keys-row-reorders-keys-for-readers-given-the-header)):
   `d\tX\nc\nb\t1\t2\na\n`, delete `c` under `q`, writes `d\tX\na\nb\t1\t2\na\n`, and a reopened store lists `a, b` where
-  memory lists `b, a`. Line 1's key next at another width (`d\tX\nc\nd\t1\t2\na\n`, `d\tX\tW\nc\nd\t1\na\n`), or a
-  defaults line first, is a known limitation:
+  memory lists `b, a`. A defaults line first is deferred to 5.13 too
+  ([docs/limitations.md](docs/limitations.md#after-a-line-1-of-two-or-more-cells-a-delete-before-a-defaults-line-reorders-keys-for-readers-given-the-header)).
+  Line 1's key next at another width (`d\tX\nc\nd\t1\t2\na\n`, `d\tX\tW\nc\nd\t1\na\n`) is a known limitation:
   [docs/limitations.md](docs/limitations.md#after-a-line-1-of-two-or-more-cells-a-delete-under-a-header-can-reorder-keys-for-readers-given-it).
 
 - **A `TSVZed` rewrite after such a delete can widen line 1 where 5.11 refused.** `d\tX\nc\nd\tY\nb\t1\t2\t3\n` under

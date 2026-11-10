@@ -434,24 +434,37 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: under a header that line 1 is not (`q`, or line 1 and one more cell), a delete of the first keyed
   line after line 1 (`tsvz --x-header`, `TSVZedLite(strict=False)`, a `TSVZed` delete and commit) leaves a one-cell
   stand-in. From 5.12 line 1's key stands in where its next line comes first after the place and is as wide as line 1,
-  and the readers given the header keep the order. Where line 1's key comes next at another width, or a defaults line
-  comes first, the stand-in is chosen as in 5.11 and comes first to the readers given the header:
-  `d\tX\nc\nd\t1\t2\na\n` (wider), `d\tX\tW\nc\nd\t1\na\n` (narrower) and `d\tX\nc\n#_defaults_#\t\tQ\nd\t1\na\n` (a
-  defaults line first), delete `c`, write `d\tX\na\nd\t1\t2\na\n`, `d\tX\tW\na\nd\t1\na\n` and
-  `d\tX\na\n#_defaults_#\t\tQ\nd\t1\na\n`. The store's memory lists `d, a`; a reopened store, `TSVZedLite` and every loose
-  `readTabularFile` given the header list `a, d`. No row or cell changes, and 5.11 writes the same bytes. Another key's
-  row first is deferred (the next entry).
+  and the readers given the header keep the order. Where line 1's key comes next at another width, the stand-in is chosen
+  as in 5.11 and comes first to the readers given the header: `d\tX\nc\nd\t1\t2\na\n` (wider) and `d\tX\tW\nc\nd\t1\na\n`
+  (narrower), delete `c`, write `d\tX\na\nd\t1\t2\na\n` and `d\tX\tW\na\nd\t1\na\n`. The store's memory lists `d, a`; a
+  reopened store, `TSVZedLite` and every loose `readTabularFile` given the header list `a, d`. No row or cell changes, and
+  5.11 writes the same bytes. Another key's row first, and a defaults line first, are deferred (the next two entries).
 - Why: a one-cell line of line 1's key is a deletion of that key to every reader that counts from line 1, so it can stand
   in only where the key's next line is one they all take. At another width a strict reader given no header drops that line
-  and loses the key: `d\tX\nd\nd\t1\t2\na\n` loses `d` for 3.39's, `d\tX\tW\nd\nd\t1\na\n` for every version's. Past a
-  defaults line it depends on that line and the reader's defaults: `d\tX\nd\n#_defaults_#\nd\t1\na\n` loses `d` for every
-  strict reader given no header and defaults such as `[#_defaults_#, P, Q]` (the bare line resets them, so `d\t1` is too
-  narrow there), and 5.12 does not look past a defaults line. Any other one-cell stand-in comes first to the readers given
-  the header.
+  and loses the key: `d\tX\nd\nd\t1\t2\na\n` loses `d` for 3.39's, `d\tX\tW\nd\nd\t1\na\n` for every version's. Any other
+  one-cell stand-in comes first to the readers given the header.
 - Revisit when: a layout that serves both readers turns up.
 - Approved: 2026-11-09, the user chose "Approve (Recommended)". Not asked for by the user: it remains from the 5.11
   deferral "A stand-in after a line 1 of two or more cells can reorder keys for readers given the header", which 5.12
-  fixes where line 1's key comes next as wide as line 1.
+  fixes where line 1's key comes next as wide as line 1. The question also named a defaults line first; that shape was
+  then found fixable and moved to a deferral (below), which narrows this entry.
+
+### After a line 1 of two or more cells, a delete before a defaults line reorders keys for readers given the header
+- Kind: deferred
+- What the operator sees: `d\tX\nc\n#_defaults_#\t\tQ\nd\t1\na\n` under header `q` (or `d\tX\tz`), delete `c` through a
+  `TSVZed` delete and commit, `tsvz --x-header` or `TSVZedLite(strict=False)`: 5.11 and 5.12 write
+  `d\tX\na\n#_defaults_#\t\tQ\nd\t1\na\n`. The store's memory lists `d, a`; a reopened store, `TSVZedLite` and every loose
+  `readTabularFile` given the header list `a, d`. No row or cell changes.
+- Why: 5.12 tries line 1's key only where its next line comes first after the place, and does not look past a defaults
+  line. Past one it depends on that line and the reader's defaults: `d\tX\nd\n#_defaults_#\nd\t1\na\n` loses `d` for every
+  strict reader given no header and defaults such as `[#_defaults_#, P, Q]` (the bare line resets them, so `d\t1` is too
+  narrow there). In the example file the defaults line keeps `d\t1` read: by hand, `d\tX\nd\n#_defaults_#\t\tQ\nd\t1\na\n`
+  serves every reader the 5.12 docs round ran (eight defaults sets, and four- and five-cell defaults), except that 3.39's
+  strict `readTabularFile(correctColumnNum=1)` given no header gains `d`, which the widened 3.39 entry covers.
+- Plan (5.13): let line 1's key stand in past defaults lines when its next line is as wide as line 1 and every planned
+  reader still takes that line after them; then run the exhaustive delete-door shapes again, with defaults lines.
+- Revisit when: 5.13.
+- Noted: 2026-11-09, found in the 5.12 docs round (5.11 writes the same bytes); a deferral, not asked.
 
 ### After a line 1 of two or more cells, a delete before another key's row reorders keys for readers given the header
 - Kind: deferred

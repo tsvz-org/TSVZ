@@ -371,7 +371,8 @@ entries go last, in the same commit as the change:
   header and the defaults was planned at line 1's one column only, so a line it takes could go: a cell changed for it, and
   after a bare `#_defaults_#` on line 1 a strict one lost a key.
 - Original design was wrong because: the candidates were ranked by what each keeps of rows and cells; line 1's key, which
-  keeps the order as well, was added later (5.10) and put after the others without asking whether it was safer than they
+  keeps the order as well (for every reader but 3.39's strict one given a count of one, which gains its row, as the widened
+  3.39 entry in docs/limitations.md says), was added later (5.10) and put after the others without asking whether it was safer than they
   are. The deferral's plan moved it before only one of them, and the other reordered the same way. The one-column rule's
   reader stood for "the reader given no header and the defaults", which reads at their count: one entry in the plan stood
   for two readers. The first build of the fix listed it also where it reads as the caller's reader does, and the copy was
