@@ -327,9 +327,10 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
   `a\nc\tX\nc\t2\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n` wrote `a\nc\tX\n#_defaults_#\t\t\t\nc\t1\n`, and a strict reader
   given no header and those defaults (every version) read `c` as `[c, X, '']` where it read `[c, 2, '']`. A bare
   `#_defaults_#` on line 1, which resets that reader's defaults: a scrub given `header='id\tv'` and the same defaults, or a
-  `TSVZed` given them that rewrites, made `#_defaults_#\nc\t1\nc\t2\t\nc\t3\n` into `#_defaults_#\nc\t3\n`, and `c`, whose
-  only line that strict reader takes is `c\t2\t`, was gone for it. The reader is now planned at the defaults' count too: the
-  first file becomes `a\nc\tX\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n`, the second stays as it is. It is not planned where it
+  `TSVZed` given them that rewrites, made `#_defaults_#\nc\t1\nc\t2\t\nc\t3\n` into `#_defaults_#\nc\t3\n` (the rewrite then
+  adds its defaults line, as every rewrite does), and `c`, whose only line that strict reader takes is `c\t2\t`, was gone
+  for it. The reader is now planned at the defaults' count too: the first file becomes
+  `a\nc\tX\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n`, the second keeps its lines. It is not planned where it
   reads every line as the caller's reader does (a lone key on line 1 at the caller's count, or a bare `#_defaults_#` where
   no line with a value has another width or the defaults hold none), so those files get 5.11's bytes. What shows: the
   files it keeps lines for are larger after a scrub or a rewrite than 5.11 made them.
