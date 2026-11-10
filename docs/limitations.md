@@ -655,8 +655,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   reopened store, `TSVZedLite` and every loose `readTabularFile` given the header list `a, d`. No row or cell changes, and
   5.11 writes the same bytes. From 5.14 another key's row first stands in where the deleted line had one cell (past
   defaults lines and resets too), and line 1's key is looked for past defaults lines whose first value is in their second
-  cell, or in their third where line 1 has two cells (README, "Upgrading to 5.14 from 5.13"). Three shapes are left, with
-  the same effect (5.12 and 5.13 write the same bytes in each):
+  cell, or in their third where line 1 has two cells (README, "Upgrading to 5.14 from 5.13"). The bytes shown are the
+  command's and `TSVZedLite`'s; from 5.14 a `TSVZed` delete and commit also compacts away the stand-in key's later line
+  without a value (`d\tX\na\nd\t1\t2\n`), which every reader reads as it reads the command's output. Three shapes are
+  left, with the same effect (5.12 and 5.13 choose the same stand-in in each):
   - **Line 1's key past a reset (a defaults line without a value).** `d\tX\nc\n#_defaults_#\t\nd\t1\na\n`, delete `c` under
     `q`, writes `d\tX\na\n#_defaults_#\t\nd\t1\na\n`; a reopened store lists `a, d` where memory lists `d, a`.
   - **Line 1's key past a defaults line whose first value comes later.** `d\tX\tW\nc\n#_defaults_#\t\tQ\nd\t1\t2\na\n` writes

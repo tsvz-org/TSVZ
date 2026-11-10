@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.13**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.14**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -377,10 +377,11 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
   rewrite of a file read as one column, given defaults of two cells or more and a count equal to theirs, planned the
   reader at that count twice (the one-column rule and the counts given each listed it). The bytes are the same; the
   second plan's time goes: a scrub of a 200,000-line one-column file given `[#_defaults_#, P]` and a count of two
-  takes 0.88 of 5.13's time, a `TSVZed` rewrite 0.85 (the median of five alternating runs).
+  takes 0.88 of 5.12's time, a `TSVZed` rewrite 0.85 (the median of five alternating runs; 5.13 compacts with 5.12's
+  code).
 
 - The cost of a compaction and of a delete is otherwise unchanged within measurement: a scrub or a `TSVZed` rewrite of
-  200,000 rows took 0.99 to 1.04 of 5.13's time in the 5.12 review's shapes, a `TSVZed` delete and commit 0.98, with
+  200,000 rows took 0.99 to 1.04 of 5.12's time in the 5.12 review's shapes, a `TSVZed` delete and commit 0.98, with
   the same bytes but for the stand-in; `tsvz --x-header q delete` where line 1's key now stands in past a defaults
   line, 0.75 (it no longer looks through the later lines for a key without a value). The peak memory is unchanged:
   a scrub of a one-column file of 230,002 lines peaks at 175 to 177 MB of resident memory (5.12: 180 to 182 MB, three runs
@@ -491,11 +492,11 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
   file sees a new row when its last lone key is deleted"
   ([docs/limitations.md](docs/limitations.md#339s-strict-reader-of-a-one-column-file-sees-a-new-row-when-its-last-lone-key-is-deleted)).
   Where another line comes first after the place, the stand-in is chosen as in 5.11 and can still come first to the
-  readers given the header. Another key's row first was deferred to 5.13; 5.14 builds it
+  readers given the header. Another key's row first was deferred; 5.14 builds it
   ([Upgrading to 5.14 from 5.13](#upgrading-to-514-from-513)):
   `d\tX\nc\nb\t1\t2\na\n`, delete `c` under `q`, writes `d\tX\na\nb\t1\t2\na\n`, and a reopened store lists `a, b` where
-  memory lists `b, a`. A defaults line first was deferred to 5.13 too; 5.14 builds it where the defaults line holds a
-  value.
+  memory lists `b, a`. A defaults line first was deferred too; 5.14 builds it where the defaults line's first value is
+  in its second cell, or in its third where line 1 has two cells.
   Line 1's key next at another width (`d\tX\nc\nd\t1\t2\na\n`, `d\tX\tW\nc\nd\t1\na\n`) is a known limitation:
   [docs/limitations.md](docs/limitations.md#after-a-line-1-of-two-or-more-cells-a-delete-under-a-header-can-reorder-keys-for-readers-given-it).
 
@@ -543,10 +544,10 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
   bytes on that file), and a scrub after a bare `#_defaults_#` on line 1, with defaults that hold a value and a row of
   another width, 1.14 times (the 5.12 review, the median of five alternating runs).
 
-- Deferred to 5.13: a compaction can keep a line no reader needs where it moves a key's last line up into its first
-  line's place only from the deletion that ends the other reader's life of the key. A `TSVZed` delete and commit of `c`
-  in `d\tX\nc\nd\t1\na\na\n`, given `q`, writes `d\tX\nd\nd\t1\na\na\n` (5.11: `d\tX\na\nd\t1\na\n`), and every reader reads both
-  alike. 5.14 builds it ([Upgrading to 5.14 from 5.13](#upgrading-to-514-from-513)).
+- Deferred, and built in 5.14 ([Upgrading to 5.14 from 5.13](#upgrading-to-514-from-513)): a compaction can keep a
+  line no reader needs where it moves a key's last line up into its first line's place only from the deletion that ends
+  the other reader's life of the key. A `TSVZed` delete and commit of `c` in `d\tX\nc\nd\t1\na\na\n`, given `q`, writes
+  `d\tX\nd\nd\t1\na\na\n` (5.11: `d\tX\na\nd\t1\na\n`), and every reader reads both alike.
 
 - Known, as in 5.11 (no layout serves both readers): after a line 1 of one cell, `tsvz --x-header H delete` followed by a
   rewrite of a `TSVZed` given H can change a cell for every reader, and a delete under a header whose line 1 already names

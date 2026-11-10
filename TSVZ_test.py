@@ -267,9 +267,9 @@ def test_basic_roundtrip():
 
 
 def test_version():
-	# (the scripts report the full form; pip and PyPI show it as 5.12)
-	assert TSVZ.version == '5.13'
-	assert TSVZ.__version__ == '5.13'
+	# (the scripts report the full form; pip and PyPI show it as 5.14)
+	assert TSVZ.version == '5.14'
+	assert TSVZ.__version__ == '5.14'
 	assert not hasattr(TSVZ, 'WalStore')
 
 
