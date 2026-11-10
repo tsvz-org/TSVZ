@@ -3135,9 +3135,12 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 	"""One pass of _legacyCompact over the legacy lines ``raw`` (bytes, without their newline): ``(lines, again)``, the
 	lines kept, each a line of ``raw`` byte for byte and in its place, but for a key's last line moved up into its first
 	line's place and a dead key's protected line emptied (built from its own bytes), for every reader of
-	_legacyCompactReaders; ``again`` whether another pass can drop more: a line was emptied, or (5.14) a move was weighed
+	_legacyCompactReaders; ``again`` whether another pass may drop more: a line was emptied, or (5.14) a move was weighed
 	against a later deletion of the key (agrees). Taken, the line it came from goes, and a key whose lines lay around
 	that line can then move; refused for a row of the key between, this pass drops that row and the next takes the move.
+	(A pass that says no can still leave a line droppable, rarely: its own drops can let the next pass's plan propose a
+	move it did not, as where another key's row between a key's first line and a strict reader's first line of it goes:
+	inOrder.)
 
 	With one reader, what its plan keeps (_legacyCompactPlan). With more, every line any of their plans keeps, and a
 	line moved or emptied only where every plan keeps that line with the same bytes, or (an emptied line, which is a
@@ -3232,7 +3235,9 @@ def _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched,
 	key: either can make another line droppable (id\na\nb\tX\na\nb\t under defaults of two cells: the second a moves up,
 	and only then can b's last line; b\nc\nc\t2\nc: c\t2 refuses c's move and is dropped, and only then is the move
 	free). Without the second rule a second scrub took what the first left, in 96 of 10,048 scrubs of random files; with
-	it in 2, the 2 where 5.13's does. At most 4 passes: stopping early is less compact, never wrong."""
+	it in 2, the 2 where 5.13's does; in longer random files with defaults lines and a count, 18,509 of 360,000 without
+	it and 13 with it, where 5.13's settles (and 5.13's own needs a second scrub in 235). At most 4 passes: stopping early
+	is less compact, never wrong."""
 	defaults = list(defaults) if defaults and defaults is not ... else []
 	for _ in range(4):
 		out, again = _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched, counts)
