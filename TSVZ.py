@@ -3281,9 +3281,9 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		if nxt is None or same:
 			continue
 		later = [j for j in range(i + 1, len(raw)) if kinds[j][0] == 'row' and not goes(j)]
-		named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}  # (keys a row with a value before the place names)
-		if (nxt not in stand and kinds[nxt][0] == 'row' and kinds[nxt][1].rstrip() in named and valued(nxt)
-				and kinds[nxt][2] == kinds[0][2]):
+		# (named: the keys a row with a value before the place names, which is line 1's key alone, and none at line 1's place)
+		named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
+		if kinds[nxt][1].rstrip() in named and valued(nxt) and kinds[nxt][2] == kinds[0][2]:
 			pick = [nxt]  # (line 1's key: its next line comes first after the place, as wide as line 1; 5.12: tried first)
 		else:
 			pick = [j for j in later if not valued(j)]
