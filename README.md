@@ -318,7 +318,14 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
   the widening is refused (Q-C), and the order stayed. Line 1's key is now tried first, when its next line comes first
   after the place and is as wide as line 1: `d\tX\nd\nd\t1\na\t1\n`, and every reader lists `d, a`. The same holds where a
   key whose later line holds no value stood in (`d\tX\nc\nd\t1\na\n`, 5.11: `d\tX\na\nd\t1\na\n`). No row or cell changes
-  for any reader.
+  for any reader given no header, the header, or line 1 for its header. One reader given a count sees the stand-in: 3.39's
+  strict `readTabularFile(correctColumnNum=1)` given no header, which takes only the one-cell lines of such a file, shows
+  `d` as `[d]` after the delete. In the first file it showed `a` the same way under 5.11; in the second 5.11 showed it
+  nothing new (the kind in [docs/limitations.md](docs/limitations.md), "3.39's strict reader of a one-column file sees a
+  new row when its last lone key is deleted"). Where another line comes first after the place (another key's row, line
+  1's key at another width, a defaults line), the stand-in is chosen as in 5.11 and can still come first to the readers
+  given the header: `d\tX\nc\nb\t1\t2\na\n`, delete `c`, writes `d\tX\na\nb\t1\t2\na\n`, and a reopened store lists
+  `a, b` where memory lists `b, a`.
 
 - **A `TSVZed` rewrite after such a delete can widen line 1 where 5.11 refused.** `d\tX\nc\nd\tY\nb\t1\t2\t3\n` under
   `d\tX\tz`, delete `c` (`tsvz --x-header`, `TSVZedLite(strict=False)` or a `TSVZed` delete), then `hardMapToFile()`:
@@ -356,7 +363,8 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
 - The cost of a compaction is unchanged within measurement (a scrub or a `TSVZed` rewrite of 200,000 rows: 0.97 to 1.05 of
   5.11's time, the same bytes), but where the reader above is planned: a scrub given a `correctColumnNum` other than the
   defaults' count, after a lone key on line 1 under a header line 1 does not hold, took 1.19 times 5.11's time (the same
-  bytes on that file).
+  bytes on that file), and a scrub after a bare `#_defaults_#` on line 1, with defaults that hold a value and a row of
+  another width, 1.14 times.
 
 - Deferred to 5.13: a compaction can keep a line no reader needs where it moves a key's last line up into its first
   line's place only from the deletion that ends the other reader's life of the key. A `TSVZed` delete and commit of `c`

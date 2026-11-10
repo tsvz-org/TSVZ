@@ -438,7 +438,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   family: `d\tX\nc\nd\t1\na\na\n` under header `q` (or `d\tX\tz`, `id\tv`), a `TSVZed` delete of `c` and its commit write `d\tX\nd\nd\t1\na\na\n` (5.11
   wrote `d\tX\na\nd\t1\na\n`): it keeps the `a\na` pair, since `agrees()` rejects moving the last `a` up for a reader given no
   header, which reads both lines as deletions of a key it never had. Every reader reads both files alike. The file is a
-  line or two larger, and compacting a scrub's output again changes nothing (5.12 review: in the delete doors 405 of
+  line or two larger, and compacting a scrub's output again never grows it (5.12 review: in the delete doors 405 of
   123,480 files' outputs were larger than 5.11's and 355 smaller, no reader worse).
 - Why: `agrees()` in `_legacyCompactOnce` accepts a line moved up into another line's place only when the deletion that
   ends the other reader's life of the key is the one the line came from. A later deletion of the same key with no row of
