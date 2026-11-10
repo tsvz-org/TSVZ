@@ -268,8 +268,8 @@ def test_basic_roundtrip():
 
 def test_version():
 	# (the scripts report the full form; pip and PyPI show it as 5.12)
-	assert TSVZ.version == '5.12'
-	assert TSVZ.__version__ == '5.12'
+	assert TSVZ.version == '5.13'
+	assert TSVZ.__version__ == '5.13'
 	assert not hasattr(TSVZ, 'WalStore')
 
 
@@ -3071,8 +3071,13 @@ def test_tsvzed_spec_sync_keeps_memory_while_writes_fail(tmp_path):
 	d.mkdir()
 	p = str(d / 'f.tsvz')
 	# (no tick of the writer thread meanwhile: with monitor_external_changes off, a tick between the next two
-	# statements ends the sync and clears deSynced)
+	# statements ends the sync and clears deSynced; and from 5.13 the sync's commit is a job that wakes the thread, so
+	# it is stopped and every write is driven from here)
 	t = TSVZ.TSVZed(p, append_check_delay=60, monitor_external_changes=False)
+	t.shutdownEvent.set()
+	t._wake.set()
+	t.appendThread.join(10)
+	assert not t.appendThread.is_alive()
 	t._activePath = str(d / 'nodir' / 'f.tsvz')
 	t['a'] = ['a', '1']
 	t.deSynced = True
@@ -3437,9 +3442,17 @@ def _during_reads(monkeypatch, trigger, action, afterLines=0):
 
 def _rewrites(path, contents):
 	"""An action that rewrites the part ``path`` in place, as a scrub does, with the next of ``contents``
-	while any are left (the list can be emptied to stop it). Give each another size than the bytes it replaces:
-	the (inode, size, mtime) stamp cannot tell a same-size rewrite within one timestamp tick."""
-	return lambda: contents and TSVZ._specRewriteInPlace(path, contents.pop(0))
+	while any are left (the list can be emptied to stop it; when another thread's read may be running the action,
+	under ``action.lock``, which a rewrite in progress holds: ``with action.lock: del contents[:]``). Give each
+	another size than the bytes it replaces: the (inode, size, mtime) stamp cannot tell a same-size rewrite
+	within one timestamp tick."""
+	lock = threading.RLock()
+
+	def action():
+		with lock:
+			return contents and TSVZ._specRewriteInPlace(path, contents.pop(0))
+	action.lock = lock
+	return action
 
 
 _TORN_EARLIER = 'the parts before the last kept changing while they were read (3 reads); the read may be torn'
@@ -3634,9 +3647,13 @@ def test_spec_tsvzed_reads_a_torn_store_again(tmp_path, monkeypatch, capsys):
 	_touch(p, b'a\t1\nb\t2\n')
 	_touch(p + '.1', b'z\t9\n')
 	flips = [b'c\t3\n', b'a\t1\nb\t2\n'] * 50
-	_during_reads(monkeypatch, p + '.1', _rewrites(p, flips))
+	rewrite = _rewrites(p, flips)
+	_during_reads(monkeypatch, p + '.1', rewrite)
 	t = TSVZ.TSVZed(p)
-	del flips[:]  # the store holds still again
+	# (the writer thread's own check reads the torn store again at once, 5.13: its read may be in the middle of a rewrite;
+	# that one is let finish, or the file changes once more after `steady` was read: 24 runs of 300 on 3.6)
+	with rewrite.lock:
+		del flips[:]  # the store holds still again
 	steady = dict(TSVZ.readTabularFile(p, verbose=False))
 	deadline = time.monotonic() + 10
 	while dict(t) != steady and time.monotonic() < deadline:
@@ -16764,18 +16781,109 @@ def test_a_loose_lite_delete_leaves_line_1_in_the_header_place(tmp_path):
 	assert _bytes(p) == b'a\n'
 
 
-def test_a_ctrl_c_that_python_3_6_turns_into_an_error_in_a_wait_stays_a_ctrl_c():
-	class Broken(object):
-		def wait(self, timeout):
-			try:
-				raise KeyboardInterrupt  # (the interrupt, and the lock error raised as it is handled: chained to it)
-			except KeyboardInterrupt:
-				raise RuntimeError('release unlocked lock')
-	with pytest.raises(KeyboardInterrupt):
-		TSVZ._waited(Broken(), 0.1)
-	done = threading.Event()
-	done.set()
-	assert TSVZ._waited(done, 0.1) is True
+def test_a_flag_does_what_a_threading_event_does():
+	flag = TSVZ._Flag()
+	assert not flag.is_set() and not flag.isSet()
+	assert flag.wait(0.01) is False and flag.wait(0) is False and flag.wait(-1) is False
+	flag.set()
+	flag.set()  # (twice: nothing to let go of the second time)
+	assert flag.is_set() and flag.isSet()
+	assert flag.wait() is True and flag.wait(0) is True and TSVZ._waited(flag, 0.1) is True
+	flag.clear()
+	assert not flag.is_set() and flag.wait(0.01) is False
+	woken = []
+	waiters = [threading.Thread(target=lambda: woken.append(flag.wait())) for _ in range(4)]
+	for waiter in waiters:
+		waiter.start()
+	deadline = time.time() + 10
+	while len(flag._waiters) < 4 and time.time() < deadline:
+		time.sleep(0.01)
+	flag.set()  # every waiter, with no timeout, is woken
+	for waiter in waiters:
+		waiter.join(10)
+	assert woken == [True] * 4 and not flag._waiters
+
+
+def test_a_ctrl_c_in_a_wait_for_the_writer_thread_leaves_nothing_another_thread_waits_for():
+	# A threading.Event holds its lock across Python code, and an interrupt can skip a with statement's exit (bpo-29988):
+	# on 3.6 a Ctrl-C there kept the lock, and the writer thread's next set() waited for it for ever (the exit hung after
+	# one Ctrl-C; 5.12's flaky Ctrl-C test). A _Flag's set() takes no lock: a waiter cut off by a Ctrl-C leaves its own
+	# lock in the list, held or let go of (put there by hand here), and set() and the other waiters go on.
+	flag = TSVZ._Flag()
+	held, let_go = threading.Lock(), threading.Lock()
+	held.acquire()
+	flag._waiters.extend([held, let_go])  # a wait cut off before set(), and one cut off after it
+	woken = []
+	waiter = threading.Thread(target=lambda: woken.append(flag.wait(10)))
+	waiter.start()
+	deadline = time.time() + 10
+	while len(flag._waiters) < 3 and time.time() < deadline:
+		time.sleep(0.01)
+	setter = threading.Thread(target=flag.set)
+	setter.start()
+	setter.join(10)
+	waiter.join(10)
+	assert not setter.is_alive() and woken == [True]
+	assert list(flag._waiters) == [held, let_go] and not held.locked()
+	flag.set()  # (again: what is left behind costs a release, which raises nothing)
+
+
+def test_a_section_lock_a_ctrl_c_left_held_is_let_go_of_by_its_holder():
+	# A KeyboardInterrupt can land just after a with statement takes its lock and before the block is set up, or where the
+	# block's exit never runs (bpo-29988): a plain lock was then held for ever. Taken here by hand, as such a Ctrl-C leaves it.
+	lock = TSVZ._SectionLock()
+	free = lambda: lock.acquire(False) and lock.release() is None  # (looked at from another thread)
+
+	def elsewhere(fn):
+		out = []
+		other = threading.Thread(target=lambda: out.append(fn()))
+		other.start()
+		other.join(10)
+		return out
+	lock.acquire()
+	assert elsewhere(free) == [False]
+	with lock:  # this thread's next section lets go of it first
+		assert elsewhere(free) == [False]
+	assert elsewhere(free) == [True]
+	lock.acquire()
+	lock.acquire()  # (twice: a Ctrl-C in each of two sections)
+	lock.letGo()
+	assert elsewhere(free) == [True]
+	lock.letGo()  # (nothing held: nothing to do)
+
+
+def test_a_store_whose_lock_a_ctrl_c_left_held_writes_and_ends(tmp_path):
+	# The writer thread's commit takes _memLock: held by this thread from a Ctrl-C in a set, it waited for ever, and so did
+	# the commit here and the exit (5.12: 70 of 960 Ctrl-Cs that ended a loop of sets hung the exit on 3.14, 4 on 3.6).
+	p = str(tmp_path / 's.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	t['a'] = ['a', '1']
+	t._memLock.acquire()  # as such a Ctrl-C leaves it
+	t.commitAppendToFile()  # let go of before the wait for the writer thread
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False)['a'] == ['a', '1']
+	t._memLock.acquire()
+	t['b'] = ['b', '2']  # and by the next set
+	t._memLock.acquire()
+	t.close()  # and by the close (_finish), as by the exit (_atExit)
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False)['b'] == ['b', '2']
+	t._memLock.acquire()
+	assert t._atExit() is None
+
+
+def test_a_serve_writer_takes_back_a_job_queued_after_its_last_batch(tmp_path):
+	store = TSVZ._ServeStore(str(tmp_path / 's.tsvz'), create=True)
+	writer = store.writer
+	writer.wait(writer.submit(b'a\t1\n', False))
+	writer.barrier()  # (nothing queued: at once)
+	store.close()
+	with pytest.raises(RuntimeError, match='closing'):
+		writer.submit(b'b\t2\n', False)
+	writer.closing = False  # a submit that looked before the close, and queued after the thread's last batch
+	with pytest.raises(RuntimeError, match='closing'):
+		writer.submit(b'b\t2\n', False)
+	assert not writer.queue
+	writer.barrier()
+	assert TSVZ.readTabularFile(str(tmp_path / 's.tsvz'), verbose=False) == {'a': ['a', '1']}
 
 
 def _a_wait_that_is_interrupted(monkeypatch):
@@ -16789,7 +16897,7 @@ def _a_wait_that_is_interrupted(monkeypatch):
 
 
 def test_a_call_waiting_for_the_writer_thread_waits_through_waited(tmp_path, monkeypatch):
-	# Both waits are in steps that _waited keeps a Ctrl-C in, on every Python: a plain Event.wait() is not that on 3.6.
+	# Both waits for the writer thread go through _waited, in steps: a Ctrl-C stops them on every platform.
 	t = TSVZ.TSVZed(str(tmp_path / 's.tsv'), verbose=False, append_check_delay=60)
 	waits = _a_wait_that_is_interrupted(monkeypatch)
 	with pytest.raises(KeyboardInterrupt):
@@ -16809,12 +16917,271 @@ def test_the_exit_waits_for_the_writer_thread_through_waited(tmp_path, monkeypat
 	t.close()
 
 
-def test_a_runtime_error_in_a_wait_that_is_no_ctrl_c_goes_up_as_it_is():
-	class Broken(object):
-		def wait(self, timeout):
-			raise RuntimeError('cannot join thread before it is started')
-	with pytest.raises(RuntimeError, match='cannot join'):
-		TSVZ._waited(Broken(), 0.1)
+#: ARGV: TSVZ's directory, 'tsvzed' or 'client', the file, and 'opcodes' (3.7 and later: a step is a bytecode, not a line).
+#: Writes to a store, a KeyboardInterrupt raised at each Python step of one write in turn (sys.settrace: the same steps on
+#: every run and every Python) and caught, as a program that catches a Ctrl-C and goes on does; then one more write, and
+#: the exit. Prints the steps after which this thread still held the store's lock ("held": a set, a delete or a commit
+#: another thread's set would wait for), then the number of steps.
+_INTERRUPTED_WRITES = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+how, p = sys.argv[2], sys.argv[3]
+opcodes = len(sys.argv) > 4
+held = []
+if how == 'tsvzed':
+	store = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)
+	def write(key):
+		store[key] = [key, 'v']
+		store.commitAppendToFile()  # (the wait for the writer thread: a job, a _Flag)
+else:
+	store = TSVZ.TSVZClient(p)  # no handler: the engine in this process, its _ServeWriter
+	def write(key):
+		store[key] = [key, 'v']
+left = [0]
+def tracer(frame, event, arg):
+	if left[0] <= 0:
+		return None
+	if opcodes:
+		frame.f_trace_opcodes = True
+	left[0] -= 1
+	if not left[0]:
+		raise KeyboardInterrupt
+	return tracer
+at = 0
+while left[0] == 0:  # until a write is done before its step `at`
+	at += 1
+	left[0] = at
+	sys.settrace(tracer)
+	try:
+		write('k%d' % at)
+	except KeyboardInterrupt:
+		if how == 'tsvzed' and store._memLock._is_owned():
+			held.append(at)
+	finally:
+		sys.settrace(None)
+write('last')
+print('held', held)
+print(at)
+"""
+
+
+@pytest.mark.parametrize('how, steps', [
+	('tsvzed', 'lines'),
+	pytest.param('tsvzed', 'opcodes', marks=pytest.mark.skipif(sys.version_info < (3, 7), reason='f_trace_opcodes')),
+	('client', 'lines'),
+])
+def test_a_ctrl_c_caught_in_a_write_leaves_the_store_writing_and_the_program_ending(tmp_path, how, steps):
+	# 5.12's threading.Event (a TSVZed's waits for its writer thread) and Condition (a TSVZClient's and the CLI's writer)
+	# held their lock while Python code ran, and a KeyboardInterrupt can skip a with statement's exit (bpo-29988): a
+	# Ctrl-C there left it held. A program that caught the Ctrl-C and went on writing waited for ever at its next commit,
+	# and one that ended hung at the exit; the interrupt at each step finds every such place. A TSVZed's set also lets
+	# go of its own lock where the Ctrl-C left it (5.13: no hold after the caught interrupt, at any step).
+	p = str(tmp_path / ('s.tsv' if how == 'tsvzed' else 's.tsvz'))
+	script = tmp_path / 'interrupted.py'
+	script.write_text(_INTERRUPTED_WRITES)
+	try:
+		# 120 s: the run takes a few seconds; only a write or an exit that waits for ever takes this long, on a machine
+		# the whole suite keeps busy.
+		done = subprocess.run([sys.executable, str(script), HERE, how, p] + (['opcodes'] if steps == 'opcodes' else []),
+							  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+	except subprocess.TimeoutExpired as e:
+		raise AssertionError('a write or the exit waited for ever after a Ctrl-C: {}'.format(e.stderr))
+	assert done.returncode == 0, done.stderr
+	assert 'held []' in done.stdout, done.stdout  # (the steps after which the thread still held the lock)
+	assert int(done.stdout.split()[-1]) > 20, done.stdout  # (the steps went through the wait for the writer thread)
+	assert TSVZ.readTabularFile(p, verbose=False)['last'] == ['last', 'v']
+
+
+
+def test_a_section_lock_whose_hold_a_signal_handler_let_go_of_exits_without_an_error():
+	# A signal handler that uses the store lands inside the section it interrupted. Its own section, or its wait for the writer
+	# thread, lets go of the hold (taking it for a Ctrl-C's), and the interrupted section's exit then found the lock not held:
+	# RuntimeError out of a set (5.13 before this). A check for the hold before the release leaves a gap a handler lands in.
+	lock = TSVZ._SectionLock()
+	with lock:
+		with lock:  # the handler's section: it lets go of the interrupted one's hold first
+			pass
+	assert not lock._is_owned()
+	with lock:
+		lock.letGo()  # the handler's wait for the writer thread
+	assert not lock._is_owned()
+	with pytest.raises(ValueError):  # (an error in the section goes up as it was)
+		with lock:
+			lock.letGo()
+			raise ValueError
+	with lock:
+		assert lock._is_owned()
+	assert not lock._is_owned()
+	acquired = []
+	other = threading.Thread(target=lambda: acquired.append(lock.acquire(False)))
+	other.start()
+	other.join(10)
+	assert acquired == [True]  # (nothing is left held by the sections above; the lock is the test's own)
+
+
+def _a_store_whose_next_queueing_runs_a_handler(path, handler):
+	"""A TSVZed whose next row queued (inside a set's section) first runs ``handler(store)``: where a signal handler lands."""
+	t = TSVZ.TSVZed(path, header='id\tv', verbose=False, rewrite_on_load=False, append_check_delay=60)
+	fired = []
+
+	class Queue(type(t.appendQueue)):
+		def append(self, item):
+			if not fired:
+				fired.append(1)
+				handler(t)
+			super().append(item)
+	t.appendQueue = Queue(t.appendQueue)
+	return t
+
+
+def _a_handler_that_sets_and_commits(t):
+	t['h'] = ['h', '1']
+	t.commitAppendToFile()
+
+
+@pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
+@pytest.mark.parametrize('handler', [lambda t: t.commitAppendToFile(), lambda t: t.__setitem__('h', ['h', '1']),
+									 _a_handler_that_sets_and_commits], ids=['commit', 'set', 'set-commit'])
+def test_a_signal_handler_that_uses_the_store_inside_a_set_does_not_break_the_set(tmp_path, ext, handler):
+	# 5.12 waited for ever in these (the handler waited for the lock its own thread held); 5.13 first raised "RuntimeError:
+	# cannot release un-acquired lock" out of the set, from its exit, and the program died.
+	p = str(tmp_path / ('h.' + ext))
+	t = _a_store_whose_next_queueing_runs_a_handler(p, handler)
+	t['a'] = ['a', '1']  # (the handler runs inside this set's section)
+	t['b'] = ['b', '2']
+	assert not t._memLock._is_owned()
+	t.close()
+	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
+	assert rows['a'] == ['a', '1'] and rows['b'] == ['b', '2']
+
+
+@pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
+def test_a_sigterm_handler_that_closes_the_store_and_exits_inside_a_set_exits_with_that_exit(tmp_path, ext):
+	# The common graceful stop. The exit of the interrupted set's section raised RuntimeError over the SystemExit (exit
+	# status 1 instead of 0, 14 runs of 40 on 3.14).
+	def stop(t):
+		t.close()
+		raise SystemExit(0)
+	p = str(tmp_path / ('h.' + ext))
+	t = _a_store_whose_next_queueing_runs_a_handler(p, stop)
+	with pytest.raises(SystemExit) as stopped:
+		t['a'] = ['a', '1']  # (the handler runs inside this set's section)
+	assert stopped.value.code == 0 and not t._memLock._is_owned()
+
+
+#: ARGV: TSVZ's directory, 'commit' or 'set', the file. A SIGALRM handler that uses the store, every 2 ms, while the main
+#: thread sets rows in a loop; 50 handler calls, then the close. Real signals: the handler lands wherever Python is.
+_HANDLER_IN_SETS = r"""
+import signal, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+how, p = sys.argv[2], sys.argv[3]
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+calls = [0]
+def handler(sig, frame):
+	calls[0] += 1
+	if how == 'commit':
+		t.commitAppendToFile()
+	else:
+		t['h%d' % calls[0]] = ['h', str(calls[0])]
+signal.signal(signal.SIGALRM, handler)
+signal.setitimer(signal.ITIMER_REAL, 0.002, 0.002)
+i = 0
+while calls[0] < 50:
+	k = 'k%d' % (i % 500)
+	t[k] = [k, str(i)]
+	i += 1
+signal.setitimer(signal.ITIMER_REAL, 0)
+t.close()
+print(i)
+"""
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='SIGALRM')
+@pytest.mark.parametrize('how', ['commit', 'set'])
+def test_a_real_signal_handler_that_uses_the_store_while_the_program_sets_rows_ends_normally(tmp_path, how):
+	p = str(tmp_path / 's.tsv')
+	script = tmp_path / 'handler.py'
+	script.write_text(_HANDLER_IN_SETS)
+	try:
+		# 120 s: the run takes about a second; only a wait for ever (5.12's) takes this long, on a machine the whole suite keeps busy.
+		done = subprocess.run([sys.executable, str(script), HERE, how, p], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+							  universal_newlines=True, timeout=120)
+	except subprocess.TimeoutExpired as e:
+		raise AssertionError('a handler that used the store waited for ever: {}'.format(e.stderr))
+	assert done.returncode == 0 and not done.stderr, done.stderr
+	assert len(TSVZ.readTabularFile(p, header='id\tv', verbose=False)) >= 50
+
+
+class _LeakyLock(TSVZ._SectionLock):
+	"""A section lock that a Ctrl-C leaves held, in the thread ``victim`` (the one that gets the Ctrl-C) only: ``where``
+	'enter', the interrupt lands after the acquire and before the block is set up (seen on 3.14); 'exit', the block's exit is
+	cut off before it lets go (3.6's end of a block, bpo-29988)."""
+	where = 'enter'
+	victim = None
+
+	def __enter__(self):
+		self.acquire()
+		if self.where == 'enter' and threading.current_thread() is self.victim:
+			raise KeyboardInterrupt
+		return True
+
+	def __exit__(self, *exc):
+		if self.where == 'exit' and threading.current_thread() is self.victim:
+			raise KeyboardInterrupt
+		self.release()
+
+
+_MUTATORS = [  # (the file, what is done to a store of the rows a and b; together the 11 sections a main thread changes memory in)
+	('tsv', 'setDefaults', lambda t: t.setDefaults(['id', 'q'])),
+	('tsv', 'set the defaults', lambda t: t.__setitem__(TSVZ.DEFAULTS_INDICATOR_KEY, [TSVZ.DEFAULTS_INDICATOR_KEY, 'q'])),
+	('tsv', 'set a row', lambda t: t.__setitem__('a', ['a', '2'])),
+	('tsv', 'delete the defaults', lambda t: t.__delitem__(TSVZ.DEFAULTS_INDICATOR_KEY)),
+	('tsv', 'delete a row', lambda t: t.__delitem__('a')),
+	('tsv', 'pop', lambda t: t.pop('a')),
+	('tsv', 'popitem', lambda t: t.popitem()),
+	('tsv', 'move_to_end', lambda t: t.move_to_end('a')),
+	('tsvz', 'set a row', lambda t: t.__setitem__('a', ['a', '2'])),
+	('tsvz', 'set a marker', lambda t: t.__setitem__('#_note_#', ['#_note_#', 'q'])),
+	('tsvz', 'delete a row', lambda t: t.__delitem__('a')),
+	('tsvz', 'pop', lambda t: t.pop('a')),
+	('tsvz', 'popitem', lambda t: t.popitem()),
+]
+
+
+@pytest.mark.parametrize('where', ['enter', 'exit'])
+@pytest.mark.parametrize('ext, name, mutate', _MUTATORS, ids=[ext + ' ' + name for ext, name, _ in _MUTATORS])
+def test_a_ctrl_c_that_leaves_a_sets_lock_held_is_let_go_of_by_the_set_it_goes_up_through(tmp_path, ext, name, mutate, where):
+	# A program that catches a Ctrl-C and goes on, after a Ctrl-C that landed where the section's exit never ran (15 and 17
+	# of 320 runs on 3.6, 12 and 2 of 320 on 3.14, in two measurements for 5.13): another thread's set, and a .tsv store's
+	# background appends, waited until this thread used the store again. The interrupt goes up through the method, which
+	# lets go of the hold.
+	t = TSVZ.TSVZed(str(tmp_path / ('f.' + ext)), header='id\tv', verbose=False, rewrite_on_load=False, append_check_delay=60)
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '2']
+	real = t._memLock
+	leaky = t._memLock = _LeakyLock()
+	leaky.where = where
+	leaky.victim = threading.current_thread()
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			mutate(t)
+		assert not leaky._is_owned(), 'the Ctrl-C left the lock held by this thread'
+		free = []
+
+		def probe():  # (another thread could take it: and lets go of it again)
+			got = leaky.acquire(False)
+			if got:
+				leaky.release()
+			free.append(got)
+		other = threading.Thread(target=probe)
+		other.start()
+		other.join(10)
+		assert free == [True]
+	finally:
+		t._memLock = real
+		t.close()
 
 
 # --------------------------------------------------------------------------
