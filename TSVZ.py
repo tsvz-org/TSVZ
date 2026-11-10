@@ -1318,7 +1318,6 @@ def _warnOnce(owner, kind, path, detail, teeLogger=None):
 
 
 _PATH_LOCKS = {}
-_PATH_LOCKS_GUARD = threading.Lock()
 
 
 def _pathLock(path):
@@ -1332,11 +1331,8 @@ def _pathLock(path):
 	readers do not take it.
 	"""
 	key = os.path.realpath(path)
-	with _PATH_LOCKS_GUARD:
-		lock = _PATH_LOCKS.get(key)
-		if lock is None:
-			lock = _PATH_LOCKS[key] = threading.RLock()
-		return lock
+	# (setdefault: one step, where a guard lock could be left held by a Ctrl-C and stop every thread's writes, see _Flag)
+	return _PATH_LOCKS.get(key) or _PATH_LOCKS.setdefault(key, threading.RLock())
 
 
 #: The lock modes of ``_lockFile`` (spec §18.6): READ, taken by readers that make state out of the file, shared, for the
@@ -1394,8 +1390,6 @@ def _locksAfterFork():
 	release it, and the parent's lockf locks are not inherited. Its open file description and flock locks are: each
 	descriptor that holds one is pointed at /dev/null, so the child holds none and the parent's lock is as it was (a
 	copy of a get_file_obj() holder then fails its writes with EBADF)."""
-	global _PATH_LOCKS_GUARD
-	_PATH_LOCKS_GUARD = threading.Lock()
 	_PATH_LOCKS.clear()
 	held = list(_HELD.items())
 	_HELD.clear()
@@ -5495,17 +5489,87 @@ def getListView(tsvzDic,header = [],delimiter = ...):
 		else:
 			return [header] + values
 
-def _waited(event, timeout):
-	"""``event.wait(timeout)``, where a Ctrl-C is a KeyboardInterrupt on every Python. On 3.6 a Ctrl-C that lands as the wait
-	takes its lock back can end it with RuntimeError "release unlocked lock", raised while the interrupt is handled (so its
-	``__context__`` is the KeyboardInterrupt): that is the Ctrl-C, and an error would stop the exit's wait for a queued row,
-	where a Ctrl-C keeps it (_stopLiveStores). Any other RuntimeError is not a Ctrl-C and goes up as it is."""
-	try:
-		return event.wait(timeout)
-	except RuntimeError as e:
-		if isinstance(e.__context__, KeyboardInterrupt):
-			raise KeyboardInterrupt
-		raise
+class _Flag(object):
+	"""threading.Event's is_set(), set(), clear() and wait(), with no lock that one thread holds while another waits
+	for it: what a store's writer thread and the threads that hand it work signal each other with (5.13).
+
+	A threading.Event holds its Condition's lock while Python code runs, and a KeyboardInterrupt can land where a
+	``with`` statement's exit never runs (CPython bpo-29988): a Ctrl-C there left the lock held for ever, and the writer
+	thread's next set() waited for it while the main thread waited for the writer (a program hung at exit after its
+	first Ctrl-C, about 1 run in 250 of the 3.6 suite's Ctrl-C test). Here the flag is an attribute, and each waiter
+	sleeps on a lock of its own that set() lets go of. A waiter puts its lock in before it looks at the flag, and set()
+	sets the flag before it lets go of the locks it finds: a waiter either sees the flag or is woken. A Ctrl-C anywhere
+	in a wait leaves its lock behind, which only ever costs a later set() a release; one inside set() leaves the waiters
+	it did not reach to wake at their timeout, as threading.Event's set() does when it is cut off before notify_all()."""
+	__slots__ = ('_on', '_waiters')
+
+	def __init__(self):
+		self._on = False
+		self._waiters = deque()  # each waiting thread's lock, held until a set(); taken out by that thread
+
+	def is_set(self):
+		return self._on
+
+	isSet = is_set  # (threading.Event's old name for it)
+
+	def set(self):
+		self._on = True
+		for bell in list(self._waiters):
+			try:
+				bell.release()
+			except RuntimeError:
+				pass  # let go of by an earlier set(): its waiter has not taken it out yet
+
+	def clear(self):
+		self._on = False
+
+	def wait(self, timeout=None):
+		"""True once the flag is set, or False once ``timeout`` seconds pass first (None: no limit), as Event.wait()."""
+		if self._on:
+			return True
+		bell = threading.Lock()
+		bell.acquire()
+		self._waiters.append(bell)
+		try:
+			return self._on or bell.acquire(True, -1 if timeout is None else max(timeout, 0)) or self._on
+		finally:
+			self._waiters.remove(bell)
+
+
+class _SectionLock(object):
+	"""A lock for sections that never nest, which a Ctrl-C cannot leave held for good: a TSVZed's _memLock (5.13).
+
+	A KeyboardInterrupt can land just after a ``with`` statement takes its lock and before the block is set up (seen on
+	3.14), or where the block's exit never runs (3.6's end of a block; CPython bpo-29988). A plain lock was then held for
+	ever, the writer thread waited for it, and the exit for the writer: in 5.12 a Ctrl-C that ended a loop of sets hung
+	the exit about 1 time in 14 on 3.14 and 1 in 250 on 3.6. This one is an RLock, which knows the thread that holds it,
+	and no section under it is entered from inside another (as a plain lock, that waited for ever): a thread that holds
+	it as it enters one, or as it waits for the writer thread (letGo), holds it from a Ctrl-C, and lets go of it first.
+	Another thread waits for such a hold until its holder next does either, or the exit does."""
+	__slots__ = ('_lock',)
+
+	def __init__(self):
+		self._lock = threading.RLock()
+
+	def letGo(self):
+		"""Let go of what a Ctrl-C left this thread holding; the caller is in no section."""
+		while self._lock._is_owned():
+			self._lock.release()
+
+	def __enter__(self):
+		self.letGo()
+		self._lock.acquire()
+		return self
+
+	def __exit__(self, *exc):
+		self._lock.release()
+
+
+def _waited(flag, timeout):
+	"""``flag.wait(timeout)`` (a _Flag): a thread's wait for the store's writer thread, which its callers make in steps
+	of ``timeout``, 0.1 s: a Ctrl-C stops a lock's wait only on POSIX, and a tenth of a second is too short for a person
+	to notice."""
+	return flag.wait(timeout)
 
 
 #: Every TSVZed and TSVZedLite not yet stopped, by id(): _stopLiveStores stops them at exit. Weak: a store
@@ -5752,8 +5816,9 @@ class TSVZed(OrderedDict):
 		Queue of lines waiting to be appended to the file.
 	writeLock : threading.Lock
 		Lock for ensuring thread-safe file operations.
-	shutdownEvent : threading.Event
-		Event signal for stopping the append worker thread.
+	shutdownEvent : _Flag
+		Set to stop the append worker thread: is_set(), set(), clear() and wait() as a threading.Event's (5.13: not a
+		threading.Event, whose lock a Ctrl-C can leave held, see _Flag).
 	appendThread : threading.Thread
 		Background thread that handles asynchronous file appending.
 	Methods
@@ -5799,7 +5864,9 @@ class TSVZed(OrderedDict):
 	- A legacy file (.tsv, .csv, .nsv, .psv, compressed or not) is written by the store's background thread
 	  only: rewrite(), mapToFile(), hardMapToFile(), commitAppendToFile(), clear(), reload() and close() hand
 	  it the job and wait for it, so a KeyboardInterrupt stops the wait, never the write. At exit, a write in
-	  progress is finished (a second Ctrl-C abandons it); a store with nothing to write is not waited for.
+	  progress is finished (a second Ctrl-C abandons it); a store with nothing to write is not waited for. A
+	  .tsvz-family store's commitAppendToFile(), clear() and reload() are handed to it the same way (5.13; they
+	  ran in the calling thread, whose Ctrl-C could leave writeLock held, and the writer thread waited for it).
 	- Its reads of a legacy file (the load, reload() and the background read) hold the file's READ lock, so
 	  another process's rewrite under the file lock is waited out, never met part way; its appends take the
 	  append lock (which, on Linux, readers do not wait for) and its rewrites the rewrite lock (_lockFile).
@@ -5890,10 +5957,10 @@ class TSVZed(OrderedDict):
 		self.deSynced = False
 		self.memoryOnly = False
 		self.writeLock = threading.Lock()
-		self._memLock = threading.Lock()  # held while memory and appendQueue change together (a set, a delete, reload's swap)
+		self._memLock = _SectionLock()  # held while memory and appendQueue change together (a set, a delete, reload's swap)
 		self._failures = {}  # legacy writes that fail, by kind: when each is tried again, see _failed()
 		self._reported = {}  # and the failures of each kind reported since it last went through
-		self.shutdownEvent = threading.Event()
+		self.shutdownEvent = _Flag()
 		if self._spec:
 			for flag, given in (('rewrite_on_load', rewrite_on_load), ('rewrite_on_exit', rewrite_on_exit),
 								('rewrite_interval', rewrite_interval)):
@@ -5908,8 +5975,8 @@ class TSVZed(OrderedDict):
 			self._writeFailing = False
 			self._specLoaded = False
 		self._requests = deque()  # the jobs _call hands the writer thread
-		self._wake = threading.Event()  # set when one is handed: the thread does not wait out its tick
-		self._workerDone = threading.Event()  # set as the writer thread ends (_workerRuns)
+		self._wake = _Flag()  # set when one is handed: the thread does not wait out its tick
+		self._workerDone = _Flag()  # set as the writer thread ends (_workerRuns)
 		self._workerPid = os.getpid()
 		self.appendThread  = threading.Thread(target=self._appendWorker,daemon=True)
 		self.appendThread.start()
@@ -5948,7 +6015,7 @@ class TSVZed(OrderedDict):
 
 	def reload(self):
 		if self._spec:
-			return self._specReload()
+			return self._call(self._specReload)
 		self._call(self._reload)
 		self._accepted()  # memory is the file again: a refusal met later is reported again
 		return self
@@ -6490,7 +6557,7 @@ class TSVZed(OrderedDict):
 
 	def clear_file(self):
 		if self._spec:
-			return self._specClearFile()
+			return self._call(self._specClearFile)
 		return self._call(self._clearFile, False)
 
 	def _clearFile(self, dropRows):
@@ -7479,7 +7546,8 @@ memoryOnly:{self.memoryOnly}
 		the write. Run here on that thread itself, or when it is not running (after close, in a forked child)."""
 		if self.appendThread is threading.current_thread() or not self._workerRuns():
 			return fn(*args)
-		job = [fn, args, threading.Event(), None, None]
+		self._memLock.letGo()  # (no section waits for the writer thread, which may need the lock: a hold is a Ctrl-C's)
+		job = [fn, args, _Flag(), None, None]
 		self._requests.append(job)
 		self._wake.set()
 		while not _waited(job[2], 0.1):  # in steps: a Ctrl-C stops the wait on every platform
@@ -7528,7 +7596,7 @@ memoryOnly:{self.memoryOnly}
 				job = self._requests.popleft()
 			except IndexError:
 				return
-			writes = job[0] != self._reload and job[0] != self._checkExternalChanges
+			writes = job[0] not in (self._reload, self._specReload, self._checkExternalChanges)
 			try:
 				if writes and not self._startWrite():
 					job[3] = None
@@ -7573,7 +7641,7 @@ memoryOnly:{self.memoryOnly}
 
 	def commitAppendToFile(self):
 		if self._spec:
-			return self._specCommit()
+			return self._call(self._specCommit)
 		return self._call(self._commit)
 
 	def _commit(self):
@@ -7762,6 +7830,7 @@ memoryOnly:{self.memoryOnly}
 		self.shutdownEvent.set()
 		self._wake.set()
 		if self.appendThread is not threading.current_thread():
+			self._memLock.letGo()  # (as _call)
 			while self._workerRuns():
 				_waited(self._workerDone, 0.1)  # in steps: a Ctrl-C stops the wait on every platform (not join(): _workerRuns)
 		_LIVE_STORES.pop(id(self), None)

@@ -3071,8 +3071,13 @@ def test_tsvzed_spec_sync_keeps_memory_while_writes_fail(tmp_path):
 	d.mkdir()
 	p = str(d / 'f.tsvz')
 	# (no tick of the writer thread meanwhile: with monitor_external_changes off, a tick between the next two
-	# statements ends the sync and clears deSynced)
+	# statements ends the sync and clears deSynced; and from 5.13 the sync's commit is a job that wakes the thread, so
+	# it is stopped and every write is driven from here)
 	t = TSVZ.TSVZed(p, append_check_delay=60, monitor_external_changes=False)
+	t.shutdownEvent.set()
+	t._wake.set()
+	t.appendThread.join(10)
+	assert not t.appendThread.is_alive()
 	t._activePath = str(d / 'nodir' / 'f.tsvz')
 	t['a'] = ['a', '1']
 	t.deSynced = True
@@ -16764,18 +16769,94 @@ def test_a_loose_lite_delete_leaves_line_1_in_the_header_place(tmp_path):
 	assert _bytes(p) == b'a\n'
 
 
-def test_a_ctrl_c_that_python_3_6_turns_into_an_error_in_a_wait_stays_a_ctrl_c():
-	class Broken(object):
-		def wait(self, timeout):
-			try:
-				raise KeyboardInterrupt  # (the interrupt, and the lock error raised as it is handled: chained to it)
-			except KeyboardInterrupt:
-				raise RuntimeError('release unlocked lock')
-	with pytest.raises(KeyboardInterrupt):
-		TSVZ._waited(Broken(), 0.1)
-	done = threading.Event()
-	done.set()
-	assert TSVZ._waited(done, 0.1) is True
+def test_a_flag_does_what_a_threading_event_does():
+	flag = TSVZ._Flag()
+	assert not flag.is_set() and not flag.isSet()
+	assert flag.wait(0.01) is False and flag.wait(0) is False and flag.wait(-1) is False
+	flag.set()
+	flag.set()  # (twice: nothing to let go of the second time)
+	assert flag.is_set() and flag.isSet()
+	assert flag.wait() is True and flag.wait(0) is True and TSVZ._waited(flag, 0.1) is True
+	flag.clear()
+	assert not flag.is_set() and flag.wait(0.01) is False
+	woken = []
+	waiters = [threading.Thread(target=lambda: woken.append(flag.wait())) for _ in range(4)]
+	for waiter in waiters:
+		waiter.start()
+	deadline = time.time() + 10
+	while len(flag._waiters) < 4 and time.time() < deadline:
+		time.sleep(0.01)
+	flag.set()  # every waiter, with no timeout, is woken
+	for waiter in waiters:
+		waiter.join(10)
+	assert woken == [True] * 4 and not flag._waiters
+
+
+def test_a_ctrl_c_in_a_wait_for_the_writer_thread_leaves_nothing_another_thread_waits_for():
+	# A threading.Event holds its lock across Python code, and an interrupt can skip a with statement's exit (bpo-29988):
+	# on 3.6 a Ctrl-C there kept the lock, and the writer thread's next set() waited for it for ever (the exit hung after
+	# one Ctrl-C; 5.12's flaky Ctrl-C test). A _Flag's set() takes no lock: a waiter cut off by a Ctrl-C leaves its own
+	# lock in the list, held or let go of (put there by hand here), and set() and the other waiters go on.
+	flag = TSVZ._Flag()
+	held, let_go = threading.Lock(), threading.Lock()
+	held.acquire()
+	flag._waiters.extend([held, let_go])  # a wait cut off before set(), and one cut off after it
+	woken = []
+	waiter = threading.Thread(target=lambda: woken.append(flag.wait(10)))
+	waiter.start()
+	deadline = time.time() + 10
+	while len(flag._waiters) < 3 and time.time() < deadline:
+		time.sleep(0.01)
+	setter = threading.Thread(target=flag.set)
+	setter.start()
+	setter.join(10)
+	waiter.join(10)
+	assert not setter.is_alive() and woken == [True]
+	assert list(flag._waiters) == [held, let_go] and not held.locked()
+	flag.set()  # (again: what is left behind costs a release, which raises nothing)
+
+
+def test_a_section_lock_a_ctrl_c_left_held_is_let_go_of_by_its_holder():
+	# A KeyboardInterrupt can land just after a with statement takes its lock and before the block is set up, or where the
+	# block's exit never runs (bpo-29988): a plain lock was then held for ever. Taken here by hand, as such a Ctrl-C leaves it.
+	lock = TSVZ._SectionLock()
+	free = lambda: lock._lock.acquire(False) and lock._lock.release() is None  # (looked at from another thread)
+
+	def elsewhere(fn):
+		out = []
+		other = threading.Thread(target=lambda: out.append(fn()))
+		other.start()
+		other.join(10)
+		return out
+	lock._lock.acquire()
+	assert elsewhere(free) == [False]
+	with lock:  # this thread's next section lets go of it first
+		assert elsewhere(free) == [False]
+	assert elsewhere(free) == [True]
+	lock._lock.acquire()
+	lock._lock.acquire()  # (twice: a Ctrl-C in each of two sections)
+	lock.letGo()
+	assert elsewhere(free) == [True]
+	lock.letGo()  # (nothing held: nothing to do)
+
+
+def test_a_store_whose_lock_a_ctrl_c_left_held_writes_and_ends(tmp_path):
+	# The writer thread's commit takes _memLock: held by this thread from a Ctrl-C in a set, it waited for ever, and so did
+	# the commit here and the exit (5.12: 70 of 960 Ctrl-Cs that ended a loop of sets hung the exit on 3.14, 4 on 3.6).
+	p = str(tmp_path / 's.tsv')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
+	t['a'] = ['a', '1']
+	t._memLock._lock.acquire()  # as such a Ctrl-C leaves it
+	t.commitAppendToFile()  # let go of before the wait for the writer thread
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False)['a'] == ['a', '1']
+	t._memLock._lock.acquire()
+	t['b'] = ['b', '2']  # and by the next set
+	t._memLock._lock.acquire()
+	t.close()  # and by the close (_finish), as by the exit (_atExit)
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False)['b'] == ['b', '2']
+	t._memLock._lock.acquire()
+	assert t._atExit() is None
+
 
 
 def _a_wait_that_is_interrupted(monkeypatch):
@@ -16789,7 +16870,7 @@ def _a_wait_that_is_interrupted(monkeypatch):
 
 
 def test_a_call_waiting_for_the_writer_thread_waits_through_waited(tmp_path, monkeypatch):
-	# Both waits are in steps that _waited keeps a Ctrl-C in, on every Python: a plain Event.wait() is not that on 3.6.
+	# Both waits for the writer thread go through _waited, in steps: a Ctrl-C stops them on every platform.
 	t = TSVZ.TSVZed(str(tmp_path / 's.tsv'), verbose=False, append_check_delay=60)
 	waits = _a_wait_that_is_interrupted(monkeypatch)
 	with pytest.raises(KeyboardInterrupt):
@@ -16808,13 +16889,6 @@ def test_the_exit_waits_for_the_writer_thread_through_waited(tmp_path, monkeypat
 	monkeypatch.undo()
 	t.close()
 
-
-def test_a_runtime_error_in_a_wait_that_is_no_ctrl_c_goes_up_as_it_is():
-	class Broken(object):
-		def wait(self, timeout):
-			raise RuntimeError('cannot join thread before it is started')
-	with pytest.raises(RuntimeError, match='cannot join'):
-		TSVZ._waited(Broken(), 0.1)
 
 
 # --------------------------------------------------------------------------

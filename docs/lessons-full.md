@@ -381,3 +381,32 @@ entries go last, in the same commit as the change:
 - Lesson: rank candidates by every invariant a reader relies on (rows, cells and order); one that keeps them all goes
   first, even when it came later. Plan each reader at the count it reads at, and add a reader to a plan only where an exact
   test says it can read otherwise: a copy of one already planned costs time and keeps lines.
+
+## 2026-11-09 TSVZ 5.13: shutdownEvent is a flag that holds no lock, and no lock another thread waits for is left to a Ctrl-C
+- Changed: `TSVZed.shutdownEvent` is a `_Flag`, not a `threading.Event`: the same `is_set()` (and `isSet()`), `set()`,
+  `clear()` and `wait()`, with the flag an attribute and each waiter asleep on a lock of its own that `set()` lets go of.
+  The store's other signals (a job's done, `_wake`, `_workerDone`) are `_Flag`s too, and the serve writer (a
+  `TSVZClient` without a handler, the CLI's one-shot commands, `tsvz serve`) hands its jobs over through a deque and a
+  `_Flag` each, where it had one `Condition`. `_memLock` is an RLock that a thread lets go of when it finds itself
+  holding it at the start of a section or before it waits for the writer thread. A `.tsvz` store's
+  `commitAppendToFile()`, `clear()` and `reload()` run on its writer thread, as a loose store's always did, so no other
+  thread takes `writeLock` while the store runs. `_pathLock()` lost its guard lock. 5.07's turning of 3.6's "release
+  unlocked lock" `RuntimeError` back into a Ctrl-C is gone: nothing raises it now.
+- Why we had to change: after a Ctrl-C a program could hang at exit, its write done or not, until a second Ctrl-C
+  (which abandons what is still queued). 5.12's suite showed it once: the Ctrl-C test hung about 1 run in 250 on 3.6.
+  Looking for it found the common case: a Ctrl-C that ended a loop of `store[k] = v` hung the exit in 70 of 960 runs on
+  3.14 and 4 of 960 on 3.6, and one that ended a loop of `.tsvz` writes and commits in 27 of 960 on 3.14. A program
+  that caught the Ctrl-C and went on hung at its next commit, and a `TSVZClient`'s at its exit.
+- Original design was wrong because: it took for granted that a `with` statement always lets go of its lock. In
+  CPython a KeyboardInterrupt can be raised just after the lock is taken and before the block is set up (3.14), or
+  after the block and before its exit runs (3.6; bpo-29988), and inside `threading.Event` and `Condition`, whose own
+  code holds their lock across Python code. The store's threads were built so that the writer thread waits for locks
+  that the main thread takes (the Events' and the Condition's, `_memLock`, a `.tsvz` store's `writeLock`) while the
+  main thread waits for the writer. 5.07 met the symptom on 3.6 (`RuntimeError: release unlocked lock` out of
+  `Condition.wait`) and turned it back into a Ctrl-C without asking what else a Ctrl-C at that point leaves behind.
+- Lesson: in Python, a Ctrl-C can land between almost any two bytecodes of the main thread, even inside threading's
+  own code, and skip a `with` statement's exit; never let another thread wait for a lock the main thread holds across
+  Python code. Signal with a flag and a lock per waiter that only `set()` lets go of; hand writes to the thread that owns
+  the file; where a lock must be shared, use one that knows its holder, and let the holder drop a hold it finds itself in
+  where it can be in no section. Find such places by raising the interrupt at every step of the code in turn
+  (`sys.settrace`), and test the operator's case too (a Ctrl-C that ends a loop of writes), where the rates are highest.
