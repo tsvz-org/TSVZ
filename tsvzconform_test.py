@@ -578,8 +578,9 @@ op = next((a for a in args if a in ops), None)
 store = args[args.index(op) + 1] if op and args.index(op) + 1 < len(args) else None
 if mode == 'hang' and op == 'read':
 	child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])
-	with open(os.environ['FAKE_PIDFILE'], 'w') as f:
+	with open(os.environ['FAKE_PIDFILE'] + '.tmp', 'w') as f:
 		f.write(str(child.pid))
+	os.replace(os.environ['FAKE_PIDFILE'] + '.tmp', os.environ['FAKE_PIDFILE'])  # whole or not there: the tests wait for it to be
 	time.sleep(600)
 if mode == 'crash' and op == 'len':
 	raise RuntimeError('crashed')
@@ -988,6 +989,8 @@ def test_main_usage_list_and_probe(small_corpus, tmp_path, capsys):
 
 
 def test_an_interrupt_prints_the_results_so_far(tmp_path):
+	# Each 300 s is run_main's limit that no test is about (the run takes seconds): no step times out before the Ctrl-C,
+	# which alone ends the fake's 600 s sleep, and a run that never gets there fails instead of holding the suite.
 	env = dict(os.environ, FAKE_PIDFILE=str(tmp_path / 'pid'))
 	proc = subprocess.Popen([sys.executable, os.path.join(HERE, 'tsvzconform.py'), '--impl', fake(tmp_path, 'hang'),
 		'--only', '20.2-len,20.4.3-terminal-output-is-a-table', '-j', '1', '--timeout', '300', '--work-dir', str(tmp_path / 'work')],
