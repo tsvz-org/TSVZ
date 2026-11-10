@@ -302,6 +302,38 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
+## Upgrading to 5.13 from 5.12
+
+The file formats are unchanged, and no file has to be rewritten.
+
+### A Ctrl-C and the writer threads
+
+- **A Ctrl-C no longer leaves a program hanging at exit.** A program that a Ctrl-C ended while it wrote to a store could
+  hang at exit, with or without its last write done, until a second Ctrl-C ended it, abandoning what was still queued.
+  In 5.12 a Ctrl-C that ended a loop of `store[k] = v` on a `TSVZed` hung the exit in 70 of 960 runs on Python 3.14 and
+  4 of 960 on 3.6; a `.tsvz` `TSVZed` written and committed in a loop, in 27 of 960 on 3.14; a Ctrl-C at the exit while
+  a write waited for another process's lock, about 1 in 250 on 3.6 (5.11 did the same). 5.13: none in 960 runs of each
+  on 3.6 and 3.14, and none in 6,000 runs of the suite's Ctrl-C test on 3.6 and 4,000 on 3.14. The cause was CPython's:
+  a KeyboardInterrupt can land just after a `with` statement takes its lock, or where the block's exit never runs
+  (bpo-29988), and inside `threading.Event` and `Condition`, whose own code holds their lock. The store's writer thread then waited for a lock the main thread had left held, and the exit for the
+  writer. No thread now waits for a lock that the main thread can be left holding: the store's threads signal each
+  other with flags that hold no lock, and the one lock they share is let go of by its holder when a Ctrl-C has left it
+  held. The same holds for a `TSVZClient` with no handler, whose exit hung the same way, and for `tsvz` commands.
+- **A program that catches a Ctrl-C and goes on keeps writing.** In 5.12 its next commit could wait for ever (the
+  writer thread waited for the lock the Ctrl-C left held), and a `TSVZClient`'s exit could.
+- **`TSVZed.shutdownEvent` is no longer a `threading.Event`.** It has the same `is_set()` (and `isSet()`), `set()`,
+  `clear()` and `wait()`, which behave as an Event's, but `isinstance(store.shutdownEvent, threading.Event)` is now
+  false, and an Event's internals (`_cond`, `_flag`) are not there. An Event holds its lock across Python code, which a
+  Ctrl-C can leave held: see [docs/lessons.md](docs/lessons.md).
+- **A `.tsvz` `TSVZed`'s `commitAppendToFile()`, `clear()` and `reload()` run on its writer thread**, as a loose store's
+  always did, so a Ctrl-C stops the wait for them, never the write. Each wakes the writer thread, which then also runs
+  its regular sync, as it does after a loose store's job.
+- A set costs a little more: a loop of 200,000 `store[k] = v` took 2 to 4% more time than 5.12 on 3.6, and the same
+  within the noise (about 1%) on 3.14.
+- `tsvzconform.py`: a part replaced twice in a case can no longer pass for the same file (the runner holds each part
+  open through the case, so its inode number goes to no other file), so `19.4-scrub-twice` always catches an
+  implementation that renames over the store.
+
 ## Upgrading to 5.12 from 5.11
 
 The file formats are unchanged. An upgrade needs nothing: no file has to be rewritten, and the API is the same. What

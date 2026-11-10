@@ -90,27 +90,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-10-24, the user chose "One writer thread (Recommended)", whose description said "At exit the
   program finishes a write in progress, and a second Ctrl-C abandons it."
 
-### A Ctrl-C at exit can leave the program waiting after the write is done
-- Kind: deferred
-- What the operator sees: rarely, a program that exits while a `TSVZed` still has a write to finish prints "TSVZ: the
-  write to X is being finished; Ctrl-C again to abandon it" after a Ctrl-C, the write completes and is on disk, and the
-  program then never ends; a second Ctrl-C ends it. On any Python: estimated at about 1 in 30,000 such Ctrl-Cs on 3.6 and
-  fewer on 3.14 (an estimate from the injection runs, not a field rate). 5.11 does the same. In the suite,
-  `TSVZ_lock_test.py::test_ctrl_c_at_exit_of_a_store_with_a_queued_row_keeps_waiting_and_writes_it` fails this way in
-  0.1–0.4% of runs on 3.6 (9 of 6,000 at 5.12, 5 of 6,000 at 5.11, `-n 64`) and 1 of 4,000 on 3.14: its Ctrl-C comes
-  0.7 s in, exactly 7 of the exit's 0.1 s wait steps, when the main thread runs Python code between two waits.
-- Why: the store's threads signal each other with `threading.Event`, which holds its Condition's lock while Python code
-  runs. A KeyboardInterrupt can land where the `with` block's exit never runs (CPython bpo-29988), so the main thread keeps
-  the lock; the writer's next `set()` waits for it, and the main thread waits for the writer. Reproduced by raising the
-  interrupt at each step of one wait round: 7 of 90 points hang on 3.6, 4 of 60 on 3.14 (scratchpad r512flake, 2026-11-09).
-- Plan (5.13): a small flag that never holds a lock across Python code (a plain attribute, and a lock that `set()`
-  releases) for the job's done signal, `_workerDone`, `_wake` and `shutdownEvent`; `_waited` becomes a plain wait. The
-  patch is written and passes both suites with 0 hangs in 6,000 + 4,000 test runs and 0 of 150 injection points.
-  `shutdownEvent` stops being a `threading.Event` (same methods), so that change gets its lesson. Check `_ServeWriter`,
-  which uses the same pattern, in the same round.
-- Revisit when: 5.13.
-- Noted: 2026-11-09, found when the 5.12 suite failed once on 3.6 (passed on reruns); a deferral, not asked.
-
 ### A write after close(), or in a forked child, can be cut by a Ctrl-C
 - Kind: known limitation
 - What the operator sees: a `TSVZed` has no writer thread once it is closed, nor in a child that `fork()` made, so
