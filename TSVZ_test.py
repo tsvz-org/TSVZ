@@ -17369,3 +17369,14 @@ def test_the_compaction_keeps_every_readers_view_of_random_files_under_defaults(
 		shrunk += len(_bytes(p)) < len(text)
 		assert _planned_views(p, line1, header, defaults) == before, (text, header, defaults, _bytes(p))
 	assert shrunk > 50
+
+
+def test_a_count_given_with_valued_defaults_adds_no_twin_where_every_valued_line_is_as_wide():
+	# (5.11 review: a scrub given correctColumnNum equal to its width and defaults with a value planned a reader given the
+	# count and no defaults even where no line differs from the count, and ran the multi-reader path: 1.37 times the time of
+	# 5.10 on 200,000 rows for the same bytes. The twin is needed only where a line with a value is not exactly that wide.)
+	lines = _lines(b'id\tv\na\t1\nb\t2\n#_defaults_#\tP\nc\t\n')
+	assert TSVZ._legacyCompactReaders(lines, 2, True, [D_, 'P'], '\t', 'utf8', True, (2,)) == \
+		TSVZ._legacyCompactReaders(lines, 2, True, [D_, 'P'], '\t', 'utf8', True)
+	lines = _lines(b'id\tv\na\t1\nb\t2\t3\n#_defaults_#\tP\n')
+	assert (2, True, True, ()) in TSVZ._legacyCompactReaders(lines, 2, True, [D_, 'P'], '\t', 'utf8', True, (2,))

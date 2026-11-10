@@ -3111,8 +3111,11 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 	for count in given:
 		if count != width:
 			readers.append((count, consumed, matched, defaults))
-		if valued and (count, consumed, matched, ()) not in readers:
-			readers.append((count, consumed, matched, ()))  # (a strict one given none: the count given, its own strictness)
+		if (valued and (count, consumed, matched, ()) not in readers
+				and not (counts.get(True, set()) <= {count} and (consumed or counts.get(False, set()) <= {count}))):
+			# (a strict one given none: the count given, its own strictness; as above, not where no line with a value differs
+			# from the count: it then takes the lines the reader given the defaults takes)
+			readers.append((count, consumed, matched, ()))
 	return readers
 
 
