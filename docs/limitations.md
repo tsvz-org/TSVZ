@@ -90,6 +90,27 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-10-24, the user chose "One writer thread (Recommended)", whose description said "At exit the
   program finishes a write in progress, and a second Ctrl-C abandons it."
 
+### A Ctrl-C at exit can leave the program waiting after the write is done
+- Kind: deferred
+- What the operator sees: rarely, a program that exits while a `TSVZed` still has a write to finish prints "TSVZ: the
+  write to X is being finished; Ctrl-C again to abandon it" after a Ctrl-C, the write completes and is on disk, and the
+  program then never ends; a second Ctrl-C ends it. On any Python: estimated at about 1 in 30,000 such Ctrl-Cs on 3.6 and
+  fewer on 3.14 (an estimate from the injection runs, not a field rate). 5.11 does the same. In the suite,
+  `TSVZ_lock_test.py::test_ctrl_c_at_exit_of_a_store_with_a_queued_row_keeps_waiting_and_writes_it` fails this way in
+  0.1–0.4% of runs on 3.6 (9 of 6,000 at 5.12, 5 of 6,000 at 5.11, `-n 64`) and 1 of 4,000 on 3.14: its Ctrl-C comes
+  0.7 s in, exactly 7 of the exit's 0.1 s wait steps, when the main thread runs Python code between two waits.
+- Why: the store's threads signal each other with `threading.Event`, which holds its Condition's lock while Python code
+  runs. A KeyboardInterrupt can land where the `with` block's exit never runs (CPython bpo-29988), so the main thread keeps
+  the lock; the writer's next `set()` waits for it, and the main thread waits for the writer. Reproduced by raising the
+  interrupt at each step of one wait round: 7 of 90 points hang on 3.6, 4 of 60 on 3.14 (scratchpad r512flake, 2026-11-09).
+- Plan (5.13): a small flag that never holds a lock across Python code (a plain attribute, and a lock that `set()`
+  releases) for the job's done signal, `_workerDone`, `_wake` and `shutdownEvent`; `_waited` becomes a plain wait. The
+  patch is written and passes both suites with 0 hangs in 6,000 + 4,000 test runs and 0 of 150 injection points.
+  `shutdownEvent` stops being a `threading.Event` (same methods), so that change gets its lesson. Check `_ServeWriter`,
+  which uses the same pattern, in the same round.
+- Revisit when: 5.13.
+- Noted: 2026-11-09, found when the 5.12 suite failed once on 3.6 (passed on reruns); a deferral, not asked.
+
 ### A write after close(), or in a forked child, can be cut by a Ctrl-C
 - Kind: known limitation
 - What the operator sees: a `TSVZed` has no writer thread once it is closed, nor in a child that `fork()` made, so
@@ -429,39 +450,95 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-11-09, the user chose "Known limitation (Recommended)" for the two shapes left after 5.11 (no layout
   serves both readers; the command's door is the approved Q3).
 
-### A stand-in after a line 1 of two or more cells can reorder keys for readers given the header
-- Kind: deferred
-- What the operator sees: `d\tX\nc\nd\t1\na\t1\n` under header `d\tX\tz`, delete `c` through `TSVZedLite(strict=False)`,
-  a `TSVZed` delete and commit, or `tsvz --x-header` delete: each writes `d\tX\na\nd\t1\na\t1\n`, and a reopened store and
-  every reader given the header list `a, d` where memory lists `d, a`. No row or cell changes, only the order. In 5.10 a later
-  `TSVZed` rewrite widened line 1 and put the order back; 5.11 refuses that widening when the stand-in key's later line is
-  wider than the header (the user's Q-C answer, "Refuse the widening"), so the order stays. 1 case in 12,000 argument sets in
-  the 5.11 review's fuzz.
-- Why: the stand-in picks a key no valued row names; here line 1's own key would keep the order, but `_legacyDropLines`
-  tries it only when line 1's key's next line is as wide as line 1.
-- Plan (5.12): in `_legacyDropLines`, try line 1's key as the stand-in before a key no valued row names when the next keyed
-  line is line 1's key as wide as line 1 (by hand, `d\tX\nd\nd\t1\na\t1\n` keeps `d, a` for every reader).
-- Revisit when: 5.12.
-- Noted: 2026-11-09, found in the 5.11 review (pre-existing in 5.10, made lasting by Q-C); the main session's decision, not
-  asked (a deferral). Not a release gate: 5.11 keeps rows 5.10 lost, and only this order outlasts a rewrite.
+### After a line 1 of two or more cells, a delete under a header can reorder keys for readers given it
+- Kind: known limitation
+- What the operator sees: under a header that line 1 is not (`q`, or line 1 and one more cell), a delete of the first keyed
+  line after line 1 (`tsvz --x-header`, `TSVZedLite(strict=False)`, a `TSVZed` delete and commit) leaves a one-cell
+  stand-in. From 5.12 line 1's key stands in where its next line comes first after the place and is as wide as line 1,
+  and the readers given the header keep the order. Where line 1's key comes next at another width, the stand-in is chosen
+  as in 5.11 and comes first to the readers given the header: `d\tX\nc\nd\t1\t2\na\n` (wider) and `d\tX\tW\nc\nd\t1\na\n`
+  (narrower), delete `c`, write `d\tX\na\nd\t1\t2\na\n` and `d\tX\tW\na\nd\t1\na\n`. The store's memory lists `d, a`; a
+  reopened store, `TSVZedLite` and every loose `readTabularFile` given the header list `a, d`. No row or cell changes, and
+  5.11 writes the same bytes. Another key's row first, and a defaults line first, are deferred (the next two entries).
+- Why: a one-cell line of line 1's key is a deletion of that key to every reader that counts from line 1, so it can stand
+  in only where the key's next line is one they all take. At another width a strict reader given no header drops that line
+  and loses the key: `d\tX\nd\nd\t1\t2\na\n` loses `d` for 3.39's, `d\tX\tW\nd\nd\t1\na\n` for every version's. Any other
+  one-cell stand-in comes first to the readers given the header.
+- Revisit when: a layout that serves both readers turns up.
+- Approved: 2026-11-09, the user chose "Approve (Recommended)". Not asked for by the user: it remains from the 5.11
+  deferral "A stand-in after a line 1 of two or more cells can reorder keys for readers given the header", which 5.12
+  fixes where line 1's key comes next as wide as line 1. The question also named a defaults line first; that shape was
+  then found fixable and moved to a deferral (below), which narrows this entry.
 
-### A reader given no header and the scrub's wider defaults is planned at one column after a line 1 of one cell
+### After a line 1 of two or more cells, a delete before a defaults line reorders keys for readers given the header
 - Kind: deferred
-- What the operator sees: under a header line 1 does not hold, with defaults of two or more cells and a width of two or more
-  (from the header or `correctColumnNum`), the compaction plans the reader given no header and the scrub's defaults at line
-  1's one cell, where that reader reads at the defaults' count (`_processLine`: defaults of two or more cells set the count);
-  only a scrub at width one plans it at the defaults' count. A line that reader needs can go: `tsvz`'s
-  `scrubTabularFile(p, header='id\tv', defaults=['#_defaults_#', 'P', ''], correctColumnNum=2)` on
-  `a\nc\tX\nc\t2\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n` writes `a\nc\tX\n#_defaults_#\t\t\t\nc\t1\n`, and a strict reader
-  given no header and those defaults (every version) reads `c` as `[c, X, '']` where it read `[c, 2, '']`. 5.10 kept `c\t2`
-  there by its wrong model of 3.39's defaults, and changed the same reader's view in 6 other files of the 5.11 review's
-  6,000 scrub argument sets (5.11: 6 the same, 1 fixed, this 1 new). Readers given the scrub's arguments read as before.
-- Why: `_legacyCompactReaders` lists the line-1 readers at line 1's count when it is one cell (the one-column rule) and adds
-  the reader at the defaults' count only when the caller's own width is one.
-- Plan (5.12): in `_legacyCompactReaders`, when `consumed and not matched`, line 1 has one cell and `len(defaults) > 1`, plan
-  `(len(defaults), False, False, defaults)` too, as the width-one branch does; fuzz the planned readers again.
-- Revisit when: 5.12.
-- Noted: 2026-11-09, found in the 5.11 final review; a deferral, not asked.
+- What the operator sees: `d\tX\nc\n#_defaults_#\t\tQ\nd\t1\na\n` under header `q` (or `d\tX\tz`), delete `c` through a
+  `TSVZed` delete and commit, `tsvz --x-header` or `TSVZedLite(strict=False)`: 5.11 and 5.12 write
+  `d\tX\na\n#_defaults_#\t\tQ\nd\t1\na\n`. The store's memory lists `d, a`; a reopened store, `TSVZedLite` and every loose
+  `readTabularFile` given the header list `a, d`. No row or cell changes.
+- Why: 5.12 tries line 1's key only where its next line comes first after the place, and does not look past a defaults
+  line. Past one it depends on that line and the reader's defaults: `d\tX\nd\n#_defaults_#\nd\t1\na\n` loses `d` for every
+  strict reader given no header and defaults such as `[#_defaults_#, P, Q]` (the bare line resets them, so `d\t1` is too
+  narrow there). In the example file the defaults line keeps `d\t1` read: by hand, `d\tX\nd\n#_defaults_#\t\tQ\nd\t1\na\n`
+  serves every reader the 5.12 docs round ran (eight defaults sets, and four- and five-cell defaults), except that 3.39's
+  strict `readTabularFile(correctColumnNum=1)` given no header gains `d`, which the widened 3.39 entry covers.
+- Plan (5.13): let line 1's key stand in past defaults lines when its next line is as wide as line 1 and every planned
+  reader still takes that line after them; then run the exhaustive delete-door shapes again, with defaults lines.
+- Revisit when: 5.13.
+- Noted: 2026-11-09, found in the 5.12 docs round (5.11 writes the same bytes); a deferral, not asked.
+
+### After a line 1 of two or more cells, a delete before another key's row reorders keys for readers given the header
+- Kind: deferred
+- What the operator sees: `d\tX\nc\nb\t1\t2\na\n` under header `q` (or `d\tX\tz`), delete `c` through a `TSVZed` delete and
+  commit, `tsvz --x-header` or `TSVZedLite(strict=False)`: 5.11 and 5.12 write `d\tX\na\nb\t1\t2\na\n`. The store's memory
+  lists `b, a`; a reopened store, `TSVZedLite` and every loose `readTabularFile` given the header list `a, b`, and the
+  readers given a count of one but 3.39's strict one list `d, a, b` where they listed `d, b, a`. No row or cell changes.
+- Why: where another key's row comes first after the place, the stand-in is a key whose later line holds no value (`a`),
+  as in 5.11, and it comes first to the readers that count from the place.
+- Plan (5.13): in the header doors, let the first row after the place stand in before a later key without a value. By
+  hand, `d\tX\nb\nb\t1\t2\na\n` keeps the order for every reader the 5.12 docs round ran (headers `q`, `d\tX\tz` and
+  `id\tv`, eight defaults sets): `b` comes first to the readers given the header anyway, and a reader that counts from line
+  1 reads it as the deletion of a key not yet read. It costs 3.39's strict `readTabularFile(correctColumnNum=1)` given no
+  header a row (`b` as `[b]`, where 5.11's `a` gave it nothing new), the kind "3.39's strict reader of a one-column file
+  sees a new row when its last lone key is deleted" covers since its 5.12 widening. Then run the exhaustive delete-door
+  shapes again.
+- Revisit when: 5.13.
+- Noted: 2026-11-09, found in the 5.12 final review (5.11 writes the same bytes); a deferral, not asked.
+
+### A compaction keeps a moved-up line only from the deletion that ends the other reader's life of the key
+- Kind: deferred
+- What the operator sees: a scrub, a `TSVZed` rewrite or a delete's commit can keep a line that no reader needs, once.
+  `id\nb\tX\nb\t\nb\t\na\t1\t\tX\na\t2\t\t2\n#_defaults_#\n` scrubbed with header `a`, defaults `[#_defaults_#, P, Q]` and count 2
+  keeps `b\tX` (`id\nb\tX\nb\t\nb\t\na\t2\t\t2\n#_defaults_#\n`; 5.11 wrote `id\nb\t\na\t2\t\t2\n#_defaults_#\n`). A reader's plan can also
+  keep a strict reader's first line of a key where no other key competes for its place. The delete door is the same
+  family: `d\tX\nc\nd\t1\na\na\n` under header `q` (or `d\tX\tz`, `id\tv`), a `TSVZed` delete of `c` and its commit write `d\tX\nd\nd\t1\na\na\n` (5.11
+  wrote `d\tX\na\nd\t1\na\n`): it keeps the `a\na` pair, since `agrees()` rejects moving the last `a` up for a reader given no
+  header, which reads both lines as deletions of a key it never had. Every reader reads both files alike. The file is a
+  line or two larger, and compacting a scrub's output again never grows it (5.12 review: in the delete doors 405 of
+  123,480 files' outputs were larger than 5.11's and 355 smaller, no reader worse).
+- Why: `agrees()` in `_legacyCompactOnce` accepts a line moved up into another line's place only when the deletion that
+  ends the other reader's life of the key is the one the line came from. A later deletion of the same key with no row of
+  it between would do as well: that reader reads the key deleted at the moved line, and read it dead from the first
+  deletion on. A move it rejects only keeps lines in their places, so it never loses a row.
+- Plan (5.13): accept that later deletion in `agrees()`, then measure it on the exhaustive planned-reader and delete-door
+  shapes again (the 5.12 review's relaxed variant made 408 of 1.31M outputs smaller and no reader worse; on the first
+  trace above it writes one line more than 5.11, so the build needs its own measurement).
+- Revisit when: 5.13.
+- Noted: 2026-11-09, found in the 5.12 review; a deferral, not asked.
+
+### A one-column compaction given a count equal to the defaults' count plans the same reader twice
+- Kind: deferred
+- What the operator sees: a scrub or a `TSVZed` rewrite of a file the one-column rule reads as one column, given defaults
+  of two cells or more and a count (`correctColumnNum`, a store's given column count) equal to the defaults' count, plans
+  the reader at that count twice: once from the one-column rule's branch and again from the loop over the counts given.
+  `_legacyCompactReaders([b'a', b'c'], 1, True, [D, 'P'], '\t', 'utf8', False, (2,))` returns `(2, True, False, [D, 'P'])`
+  twice. The bytes and every reader's view are the same; the cost is the second plan's time. 3,600 of 97,200 argument
+  sets of the 5.12 review's fuzz do it, in 5.11 and 5.12 alike.
+- Why: the two branches each add the reader, and neither looks at the other's.
+- Plan (5.13): in `_legacyCompactReaders`, do not add a reader the list already holds (the loop over the counts given does
+  that already for the readers given no defaults); one line, then the argument sets again.
+- Revisit when: 5.13.
+- Noted: 2026-11-09, found in the 5.12 review (pre-existing in 5.11); a deferral, not asked.
 
 ### A TSVZedLite delete looks at the file's first lines every time
 - Kind: deferred
@@ -563,12 +640,27 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   writes `id\nb\n#_defaults_#\t\tQ\nb\t1\n`, and 3.39's strict reader given no header or line 1 shows `b` as `[b]`, where it
   showed `a`; the store and readers given the header keep `[b, 1]`. When `b`'s later line is wider than the header
   (`b\t1\t2`), the stand-in also keeps line 1 one column at a rewrite (Q-C, "A file of lone keys does not widen").
+
+  From 5.12 the same reader given a count of one (`readTabularFile(p, strict=True, correctColumnNum=1)` with no header, or
+  with a header and `verifyHeader=False`) can also gain line 1's key after a delete under a header line 1 is not, where line
+  1 has two cells or more and line 1's key now stands in: `d\tX\nc\nd\t1\na\n`, delete `c` under `q` or `d\tX\tz`
+  (`tsvz --x-header`, `TSVZedLite(strict=False)`, a `TSVZed` delete and commit), writes `d\tX\nd\nd\t1\na\n` (5.11:
+  `d\tX\na\nd\t1\na\n`), and that reader, which takes only the one-cell lines, shows `d` as `[d]` beside `a`, where 5.11
+  left it `a` alone. In the 5.12 review's exhaustive delete sweep (123,480 files, each under two headers, through
+  `tsvz --x-header H delete`), 1,690 outputs differ from 5.11's: for this reader 720 gain a key under 5.12 and not under
+  5.11, 930 gain one under both (`d\tX\nc\nd\t1\na\t1\n`: 5.11 gives it `a`, 5.12 `d`), and 40 keep their keys but list
+  them in the store's order instead of their own (`d\tX\nc\nd\t1\na\nd\n`: `a, d` becomes `d, a`). Every other reader given
+  a count of one (3.39's loose, 5.5's and later strict or loose) reads all 1,690 as before.
 - Why: no layout serves both: 5.5's and later readers keep `[b, 1]` only if the file reads at one column or at two, and
   either needs a keyed line that 3.39's strict read takes as a row of `b`. A bare `#_defaults_#` would keep one column, but
-  it is a row named `#_defaults_#` to every reader at one column.
+  it is a row named `#_defaults_#` to every reader at one column. For the 5.12 delete: the stand-in must be one cell to
+  keep the count of the readers given the header, and the only keys whose one-cell line gives this reader nothing new are
+  keys with a later line without a value, which come first to the store's own readers (5.11's order change). The key it
+  gains is one the store has, and it loses none.
 - Revisit when: nothing in the format can fix it; upgrading the reader from 3.39 cures it.
 - Approved: 2026-11-07, the user chose "Known limitation (Recommended)". The store's own delete: 2026-11-08, Q-A, the user
-  chose "A: stand-in in the store's own delete (Recommended)".
+  chose "A: stand-in in the store's own delete (Recommended)". The delete under a header after a line 1 of two cells or
+  more (5.12): 2026-11-09, the user chose "Keep, widen the KL (Recommended)".
 
 ### pip 9 cannot upgrade from or uninstall 5.5 and earlier
 - Kind: known limitation

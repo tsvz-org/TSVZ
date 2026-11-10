@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.11**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.12**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -301,6 +301,93 @@ with no header (or `verifyHeader=False`), anything written to a file the damage 
 empty; the keys it sets or deletes then take its values, and the keys it left out keep
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
+
+## Upgrading to 5.12 from 5.11
+
+The file formats are unchanged. An upgrade needs nothing: no file has to be rewritten, and the API is the same. What
+changes is the bytes some deletes and compactions write, in loose files only (`.tsv`, `.csv`, `.nsv`, `.psv`).
+
+- **A delete under a header keeps the key order where line 1's key comes next, as wide as line 1.** Under a header that
+  line 1 is not, a reader given the header counts from the first keyed line after line 1, and when a delete takes that line out and the
+  next line has another cell count, a stand-in takes its place ("Upgrading to 5.8"). 5.10 and 5.11 tried line 1's own key
+  last, after a key whose later line holds no value and a key no row with a value names, and the key they took came first
+  to the readers that count from there: `d\tX\nc\nd\t1\na\t1\n`, delete `c` under `d\tX\tz` (`tsvz --x-header`, a handler,
+  a `TSVZed` delete and commit, `TSVZedLite(strict=False)`), wrote `d\tX\na\nd\t1\na\t1\n`, and a reopened store and every
+  loose reader given the header (a strict one refuses a line 1 that is not it) listed `a, d` where memory lists `d, a`. A store's rewrite widens line 1 and puts the order
+  back, but from 5.11 not where the stand-in key's later line is wider than the header (`d\tX\nc\nd\t1\na\t1\t2\t3\n`):
+  the widening is refused (Q-C), and the order stayed. Line 1's key is now tried first, when its next line comes first
+  after the place and is as wide as line 1: `d\tX\nd\nd\t1\na\t1\n`, and every reader lists `d, a`. The same holds where a
+  key whose later line holds no value stood in (`d\tX\nc\nd\t1\na\n`, 5.11: `d\tX\na\nd\t1\na\n`). No row or cell changes
+  for any reader given no header, the header, or line 1 for its header. One reader given a count sees the stand-in: 3.39's
+  strict `readTabularFile(correctColumnNum=1)` given no header (or a header and `verifyHeader=False`), which takes only
+  the one-cell lines of such a file, shows `d` as `[d]` after the delete. In the first file it showed `a` the same way
+  under 5.11; in the second 5.11 showed it nothing new. It gains a key the store has and loses none (in a few files it
+  lists its keys in the store's order instead of its own); this widens the approved "3.39's strict reader of a one-column
+  file sees a new row when its last lone key is deleted"
+  ([docs/limitations.md](docs/limitations.md#339s-strict-reader-of-a-one-column-file-sees-a-new-row-when-its-last-lone-key-is-deleted)).
+  Where another line comes first after the place, the stand-in is chosen as in 5.11 and can still come first to the
+  readers given the header. Another key's row first is deferred to 5.13
+  ([docs/limitations.md](docs/limitations.md#after-a-line-1-of-two-or-more-cells-a-delete-before-another-keys-row-reorders-keys-for-readers-given-the-header)):
+  `d\tX\nc\nb\t1\t2\na\n`, delete `c` under `q`, writes `d\tX\na\nb\t1\t2\na\n`, and a reopened store lists `a, b` where
+  memory lists `b, a`. A defaults line first is deferred to 5.13 too
+  ([docs/limitations.md](docs/limitations.md#after-a-line-1-of-two-or-more-cells-a-delete-before-a-defaults-line-reorders-keys-for-readers-given-the-header)).
+  Line 1's key next at another width (`d\tX\nc\nd\t1\t2\na\n`, `d\tX\tW\nc\nd\t1\na\n`) is a known limitation:
+  [docs/limitations.md](docs/limitations.md#after-a-line-1-of-two-or-more-cells-a-delete-under-a-header-can-reorder-keys-for-readers-given-it).
+
+- **A `TSVZed` rewrite after such a delete can widen line 1 where 5.11 refused.** `d\tX\nc\nd\tY\nb\t1\t2\t3\n` under
+  `d\tX\tz`, delete `c` (`tsvz --x-header`, `TSVZedLite(strict=False)` or a `TSVZed` delete), then `hardMapToFile()`:
+  5.11's stand-in was `b`, whose later line is wider than the header, so the rewrite refused the widening (Q-C) and wrote
+  `d\tX\nb\nd\tY\nb\t1\t2\t3\n`, and the loose readers given `d\tX\tz` listed `b, d` where memory lists `d, b`. The
+  stand-in is now `d`, whose later line `d\tY` is not wider than the header, so the widening loses no key, Q-C's refusal
+  does not apply, and the rewrite widens, as it does for any file: `d\tX\tz\nd\tY\t\nb\t1\t2\t3\n`, the bytes 5.11 writes
+  for the same file without the deleted line, and every reader given `d\tX\tz` lists `d, b`. Readers given other
+  arguments see what a widening shows them ("Upgrading to 5.6"): a strict reader given the old line 1 (`d\tX`) raises
+  "Header mismatch"; 3.39's loose reader given no header or the old line 1 reads `b` as `[b, 1, 2]` where it read
+  `[b, 1]` (its count follows line 1); a strict reader given no header and defaults of three cells gains `d` as
+  `[d, Y]`, the padded `d\tY\t` being as wide as its count. No reader loses a key (Q-C refuses a widening that would lose
+  one for 3.39's strict reader). This is the approved "Readers given other arguments than the scrub's can see a
+  different file after a scrub or a rewrite"
+  ([docs/limitations.md](docs/limitations.md#readers-given-other-arguments-than-the-scrubs-can-see-a-different-file-after-a-scrub-or-a-rewrite)).
+  The mirror goes the other way: in `d\tX\t\t\nc\nd\t1\t2\t3\na\t1\n` under `d\tX\tz`, delete `c`, then `hardMapToFile()`,
+  5.11's stand-in `a` let the rewrite widen (`d\tX\tz\nd\t1\t2\t3\na\t1\t\n`), and 5.12's stand-in `d`, whose next line is
+  wider than the header, makes it refuse the widening as Q-C says, warn once and write `d\tX\t\t\nd\nd\t1\t2\t3\na\t1\n`,
+  which every reader given no header, the header or line 1 reads as it read the file before the delete.
+
+- **A compaction keeps what a reader given no header and the defaults takes after a line 1 of one cell.** Under a header
+  line 1 does not hold, with defaults of two cells or more, that reader reads at the defaults' count; 5.11 planned it at
+  line 1's one cell unless the caller's own count was one, and a line it takes could go. A scrub given a count:
+  `scrubTabularFile(p, header='id\tv', defaults=['#_defaults_#', 'P', ''], correctColumnNum=2)` on
+  `a\nc\tX\nc\t2\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n` wrote `a\nc\tX\n#_defaults_#\t\t\t\nc\t1\n`, and a strict reader
+  given no header and those defaults (every version) read `c` as `[c, X, '']` where it read `[c, 2, '']`. A bare
+  `#_defaults_#` on line 1, which resets that reader's defaults: a scrub given `header='id\tv'` and the same defaults, or a
+  `TSVZed` given them that rewrites, made `#_defaults_#\nc\t1\nc\t2\t\nc\t3\n` into `#_defaults_#\nc\t3\n` (the rewrite then
+  adds its defaults line, as every rewrite does), and `c`, whose only line that strict reader takes is `c\t2\t`, was gone
+  for it. The reader is now planned at the defaults' count too: the first file becomes
+  `a\nc\tX\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n`, the second keeps its lines. It is not planned where it
+  reads every line as the caller's reader does (at the caller's count: a lone key on line 1, or a bare `#_defaults_#` where
+  no line with a value has another width or the defaults hold none), so those files get 5.11's bytes. What shows: a file
+  it is planned for can come out of a scrub or a rewrite larger than 5.11 left it, by the lines that reader takes, and in
+  about half of those files by a line no reader needs (the compaction is as cautious for it as for every reader it plans):
+  in a fuzz of such files, 103 of 18,000 scrubs and 104 of 18,000 rewrites wrote more than 5.11, 55 and 54 of them with
+  no reader's view changed (the 5.12 review's deeper fuzz: 0.43% to 0.49% of such compactions). Compacting again does
+  not grow them.
+
+- The cost of a compaction is unchanged within measurement (a scrub or a `TSVZed` rewrite of 200,000 rows: 0.94 to 1.04 of
+  5.11's time, the same bytes), but where the reader above is planned: a scrub given a `correctColumnNum` other than the
+  defaults' count, after a lone key on line 1 under a header line 1 does not hold, took 1.20 times 5.11's time (the same
+  bytes on that file), and a scrub after a bare `#_defaults_#` on line 1, with defaults that hold a value and a row of
+  another width, 1.14 times (the 5.12 review, the median of five alternating runs).
+
+- Deferred to 5.13: a compaction can keep a line no reader needs where it moves a key's last line up into its first
+  line's place only from the deletion that ends the other reader's life of the key. A `TSVZed` delete and commit of `c`
+  in `d\tX\nc\nd\t1\na\na\n`, given `q`, writes `d\tX\nd\nd\t1\na\na\n` (5.11: `d\tX\na\nd\t1\na\n`), and every reader reads both
+  alike. See [docs/limitations.md](docs/limitations.md#a-compaction-keeps-a-moved-up-line-only-from-the-deletion-that-ends-the-other-readers-life-of-the-key).
+
+- Known, as in 5.11 (no layout serves both readers): after a line 1 of one cell, `tsvz --x-header H delete` followed by a
+  rewrite of a `TSVZed` given H can change a cell for every reader, and a delete under a header whose line 1 already names
+  the key (`d\tX\na\nd\tY\tZ\n`, header `q`) can change a cell for 3.39's loose reader given it. See
+  [docs/limitations.md](docs/limitations.md), "After a line 1 of one cell, a delete under a header can change a cell for
+  readers given it".
 
 ## Upgrading to 5.11 from 5.10
 

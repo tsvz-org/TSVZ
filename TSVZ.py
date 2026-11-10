@@ -43,7 +43,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.11'
+version = '5.12'
 __version__ = version
 author = 'pan@zopyr.us'
 COMMIT_DATE = '2026-11-09'
@@ -3069,7 +3069,9 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 	"""The readers a compaction of the legacy lines ``raw`` keeps what they take for, as ``(width, consumed, matched,
 	defaults)`` (_legacyCompactPlan): the caller's, and, when it takes line 1 for a header line 1 does not hold, the readers that
 	count from line 1 as well: given no header (line 1 a row to them, at its count, or the defaults' as the caller's
-	reader takes them) and given line 1 for their header (a store that follows a widening of its header among them).
+	reader takes them; a line 1 of one cell at both, 5.12: at one, the one-column rule, so a reader at one column keeps its
+	lone keys, and at the defaults', which a reader given them reads at, where it can read otherwise than the caller's) and
+	given line 1 for their header (a store that follows a widening of its header among them).
 	The caller's reader then counts from the first keyed line after line 1 (or a program that does not follow a
 	widening, given the header line 1 widens), and its count is the one ``width`` gives. Each of these readers is given the
 	caller's defaults. A reader given none is another reader: it reads at the file's own count, not the defaults', and a
@@ -3084,18 +3086,19 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 	# keyed line's, line 1 left out for a reader that takes it for its header)
 	own = [(width if matched else _legacyFileWidth(itertools.islice(raw, 1, None) if consumed else raw, (), False, encoding, delimiter),
 			consumed, matched)]
+	lone = None  # (line 1 of one cell: its kind, 'row' for a lone key, 'reset' for a bare #_defaults_#)
 	if consumed and not matched and raw:
 		kind, _, cells, _ = _legacyLineKind(raw[0].decode(encoding or 'utf8', errors='replace'), 1, False, delimiter)
 		if kind != 'skip':
 			readers.append((cells if cells == 1 or len(defaults) < 2 else len(defaults), False, False, defaults))
 			readers.append((cells, True, True, defaults))
 			own += [(cells, False, False), (cells, True, True)]
+			if cells == 1:
+				lone = kind
 	if width == 1 and len(defaults) > 1 and not matched:
 		# A file the plan reads as one column (the one-column rule) is read at the defaults' count by a reader given them
 		# (5.6 to 5.10 kept it for the one-column readers only, and a row such a reader takes was dropped).
 		readers.append((len(defaults), consumed, matched, defaults))
-		if consumed and len(readers) > 2 and readers[1][0] != len(defaults):
-			readers.append((len(defaults), False, False, defaults))  # (not again when line 1's reader already reads there)
 	valued = len(defaults) > 1 and any(defaults[1:])
 	if valued or any(o[0] != r[0] for o, r in zip(own, readers)):
 		counts = {}  # line index (0, or 1 for every later line) -> the cell counts of its lines with a value
@@ -3108,6 +3111,15 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 		readers += [(w, c, m, ()) for (w, c, m), r in zip(own, readers)
 					if (valued or w != r[0])
 					and not (valued and w > 0 and counts.get(True, set()) <= {w} and (c or counts.get(False, set()) <= {w}))]
+	if lone and len(defaults) > 1 and (width != len(defaults) or (
+			lone == 'reset' and valued and not counts.get(True, set()) <= {len(defaults)})):
+		# A reader given no header and the defaults reads a line 1 of one cell at the defaults' count, not at line 1's (5.12;
+		# 5.11 listed it there only at a caller's count of one, and a line it takes could go). Not where it reads every line
+		# as the caller's reader: at the caller's count, after a lone key (the deletion of a key not yet read), or after a
+		# bare #_defaults_#, which leaves it as one given none, where the defaults hold no value or no line with a value
+		# differs from that count (a strict and a lenient reader then take the same lines). A plan of its own there kept
+		# lines no reader needs. (A line 1 of more cells: line 1's reader is listed at their count already.)
+		readers.append((len(defaults), False, False, defaults))
 	for count in given:
 		if count != width:
 			readers.append((count, consumed, matched, defaults))
@@ -3230,16 +3242,18 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	empty cells as the line had, so no reader's count changes. With the same count nothing is needed, but on line 1 with
 	``both`` a bare ``#`` keeps the place a header reader skips.
 
-	The key is one whose later line holds no value: every reader applies that line (a row at one column, a deletion at
-	more), so the key reads after it as it did. Else, unless a line 1 of one cell that the caller reads as a row comes
-	before the place (``both``: its readers would read the stand-in as a row, and 3.39's strict read, which drops a wider
-	line at one column, would gain it; Q3), a key that no row with a value before the place names (5.11: in a store's
-	own delete under a header line 1 is not, the store counts from the place, and a stand-in keeps its cells as they
-	read; 3.39's strict reader given no header gains the key, Q4's kind): at two columns or more the stand-in deletes a
-	key not yet read, at one it is a row the key's later line replaces. Else line 1's own key, when the first keyed line after the place is
-	a row of it as wide as line 1 (5.10): every reader that read line 1's row reads the key deleted at the stand-in and
-	takes that line back before any other key, and a compaction keeps that line for line 1's readers (_legacyCompact).
-	No such row: the line just goes."""
+	The key is line 1's own, when the first keyed line after the place is a row of it as wide as line 1 (5.10): every
+	reader that read line 1's row reads the key deleted at the stand-in and takes that line back before any other key, a
+	reader that counts from the place reads the key first there, as it read that line before, and a compaction keeps that
+	line for line 1's readers (_legacyCompact). 5.12 tries it first: any other key comes first to a reader that counts from
+	the place, and can so take another key's place in its order (5.10 and 5.11 tried it last). Else one whose later line
+	holds no value: every reader applies that line (a row at one column, a deletion at more), so the key reads after it as
+	it did. Else, unless a line 1 of one cell that the caller reads as a row comes before the place (``both``: its readers
+	would read the stand-in as a row, and 3.39's strict read, which drops a wider line at one column, would gain it; Q3),
+	a key that no row with a value before the place names (5.11: in a store's own delete under a header line 1 is not, the
+	store counts from the place, and a stand-in keeps its cells as they read; 3.39's strict reader given no header gains
+	the key, Q4's kind): at two columns or more the stand-in deletes a key not yet read, at one it is a row the key's
+	later line replaces. No such row: the line just goes."""
 	enc = encoding or 'utf8'
 	d = delimiter.encode(enc)
 	texts = [line.decode(enc, errors='replace') for line in raw]
@@ -3267,13 +3281,14 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		if nxt is None or same:
 			continue
 		later = [j for j in range(i + 1, len(raw)) if kinds[j][0] == 'row' and not goes(j)]
-		pick = [j for j in later if not valued(j)]
-		if not pick and not (both and i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):
-			named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
-			pick = [j for j in later if kinds[j][1].rstrip() not in named]
-			if (not pick and nxt not in stand and kinds[nxt][0] == 'row' and kinds[nxt][1].rstrip() in named and valued(nxt)
-					and kinds[nxt][2] == kinds[0][2]):
-				pick = [nxt]  # (line 1's key: its next line comes first after the place, as wide as line 1)
+		# (named: the keys a row with a value before the place names, which is line 1's key alone, and none at line 1's place)
+		named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
+		if kinds[nxt][1].rstrip() in named and valued(nxt) and kinds[nxt][2] == kinds[0][2]:
+			pick = [nxt]  # (line 1's key: its next line comes first after the place, as wide as line 1; 5.12: tried first)
+		else:
+			pick = [j for j in later if not valued(j)]
+			if not pick and not (both and i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):
+				pick = [j for j in later if kinds[j][1].rstrip() not in named]
 		if pick:
 			stand[i] = raw[pick[0]].strip(b'\x00').rstrip(b'\r').split(d)[0] + d * (kinds[i][2] - 1)
 	return [stand.get(i, line) for i, line in enumerate(raw) if i in stand or not goes(i)]

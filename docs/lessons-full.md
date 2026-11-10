@@ -357,3 +357,27 @@ entries go last, in the same commit as the change:
 - Lesson: a rule bought with one reader's cost holds only where its premise holds; when the premise is about who the
   deleting program is, it is decided per door, from that door's own reading. Model an old reader's state as the reader
   keeps it (a list is not a flag), and plan every reader the caller names, not only those the file implies.
+
+## 2026-11-09 TSVZ 5.12: a choice ranked by one invariant is checked against every invariant, and a reader joins a plan only where it can differ
+- Changed: the stand-in for a deleted line that set a reader's count tries line 1's own key first (when its next line
+  comes first after the place and is as wide as line 1), where 5.10 and 5.11 tried it last. The compaction plans the
+  reader given no header and the caller's defaults at the defaults' count after a line 1 of one cell, under a header line
+  1 does not hold, except where it reads every line as the caller's reader does (at the caller's count: a lone key on
+  line 1; a bare `#_defaults_#` where no line with a value has another width, or the defaults hold none).
+- Why we had to change: the candidates tried before line 1's key come first to a reader that counts from the place, so
+  the key order changed for a reopened store and every loose reader given the header (`d\tX\nc\nd\t1\na\t1\n`, delete `c`
+  under `d\tX\tz`: `a, d` where memory lists `d, a`), and where the stand-in key's later line is wider than the header,
+  5.11's refused widening (Q-C) made that last. The reader given no
+  header and the defaults was planned at line 1's one column only, so a line it takes could go: a cell changed for it, and
+  after a bare `#_defaults_#` on line 1 a strict one lost a key.
+- Original design was wrong because: the candidates were ranked by what each keeps of rows and cells; line 1's key, which
+  keeps the order as well (for every reader but 3.39's strict one given a count of one, which gains its row, as the widened
+  3.39 entry in docs/limitations.md says), was added later (5.10) and put after the others without asking whether it was safer than they
+  are. The deferral's plan moved it before only one of them, and the other reordered the same way. The one-column rule's
+  reader stood for "the reader given no header and the defaults", which reads at their count: one entry in the plan stood
+  for two readers. The first build of the fix listed it also where it reads as the caller's reader does, and the copy was
+  not free: the plans' agreement kept lines no reader needed (14 larger files in 36,000 fuzzed scrubs and rewrites) and
+  took about a fifth more time.
+- Lesson: rank candidates by every invariant a reader relies on (rows, cells and order); one that keeps them all goes
+  first, even when it came later. Plan each reader at the count it reads at, and add a reader to a plan only where an exact
+  test says it can read otherwise: a copy of one already planned costs time and keeps lines.
