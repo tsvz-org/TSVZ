@@ -14817,17 +14817,17 @@ def test_a_rewrite_by_a_store_whose_line_1_widens_its_header_keeps_what_line_1s_
 	# from line 1, lost b
 	(b'a\t\t1\na\nb\t\t1\nb\t1\n', 'id', {'zed': b'a\t\t1\nb\nb\t\t1\nb\t1\n', 'cliw': b'b\t\t\nb\nb\t\t1\nb\t1\n'}),
 	(b'a\t\t1\na\nb\t\t1\nb\t1\n', 'id\tv', {'zed': b'a\t\t1\nb\nb\t\t1\nb\t1\n', 'cliw': b'b\t\t\nb\nb\t\t1\nb\t1\n'}),
-	(b'd\tX\tW\na\nd\t\tY\ne\t1\t2\ne\t1\n', 'q', {'zed': b'd\tX\tW\ne\nd\t\tY\ne\t1\t2\ne\t1\n',
-															'cliw': b'd\tX\tW\ne\nd\t\tY\ne\t1\t2\ne\t1\n'}),
+	# (5.10 and 5.11: e stood in, and readers given q, which count from the stand-in's place, listed e before d. Line 1's
+	# key d is tried first now, its next line coming first after the place and as wide as line 1: no order changes)
+	(b'd\tX\tW\na\nd\t\tY\ne\t1\t2\ne\t1\n', 'q', {'zed': b'd\tX\tW\nd\nd\t\tY\ne\t1\t2\ne\t1\n',
+															'cliw': b'd\tX\tW\nd\nd\t\tY\ne\t1\t2\ne\t1\n'}),
 ])
 def test_a_delete_under_a_header_then_a_rewrite_keeps_what_line_1s_readers_take(tmp_path, door, text, H, written):
 	# As in 5.08 and 5.09, and not the rewrite's: a store given H reads line 1 as its header, so its delete takes out the a
-	# after it, which readers given no header read as a's deletion: they now show line 1's a. And b or e standing in moves it
-	# before d for readers given q, which count from the stand-in's place.
+	# after it, which readers given no header read as a's deletion: they now show line 1's a.
 	made = {name: 'ok+made' for name in ('cmd', 'new-strict-plain', 'new-loose-plain', '339-strict-plain', '339-loose-plain',
 										 'zed-loose-plain', 'zed-strict-plain', 'lite-plain')}
-	differ = {'zedq': made, 'zedcq': made}.get(door, {}) if text.startswith(b'a') else {
-		name: 'order' for name in ('new-loose-H', '339-loose-H', 'zed-loose-H')}
+	differ = {'zedq': made, 'zedcq': made}.get(door, {}) if text.startswith(b'a') else {}
 	_rewrite_reads_as_before(str(tmp_path / 'f.tsv'), text, H, written['cliw' if door == 'cliw' else 'zed'], door, differ)
 
 
