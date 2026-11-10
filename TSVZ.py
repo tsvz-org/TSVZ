@@ -5501,7 +5501,10 @@ class _Flag(object):
 	sleeps on a lock of its own that set() lets go of. A waiter puts its lock in before it looks at the flag, and set()
 	sets the flag before it lets go of the locks it finds: a waiter either sees the flag or is woken. A Ctrl-C anywhere
 	in a wait leaves its lock behind, which only ever costs a later set() a release; one inside set() leaves the waiters
-	it did not reach to wake at their timeout, as threading.Event's set() does when it is cut off before notify_all()."""
+	it did not reach to wake at their timeout, as threading.Event's set() does when it is cut off before notify_all().
+
+	It relies on the GIL: set()'s copy of the waiters is one step against another thread's append or remove. A
+	free-threaded build (which setup.py does not claim) could raise "deque mutated during iteration" there."""
 	__slots__ = ('_on', '_waiters')
 
 	def __init__(self):
@@ -5581,7 +5584,7 @@ class _SectionLock(_thread.RLock):
 def _waited(flag, timeout):
 	"""``flag.wait(timeout)`` (a _Flag): a thread's wait for the store's writer thread, which its callers make in steps
 	of ``timeout``, 0.1 s: a Ctrl-C stops a lock's wait only on POSIX, and a tenth of a second is too short for a person
-	to notice."""
+	to notice. (It is only ``flag.wait``, kept as the one place the tests stop a wait.)"""
 	return flag.wait(timeout)
 
 
