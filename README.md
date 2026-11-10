@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.10**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.11**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -314,7 +314,8 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
   `TSVZed(p, header='id\tv')` on `id\na\n#_defaults_#\t\tQ\nb\t1\n`, delete `a`, wrote `id\n#_defaults_#\t\tQ\nb\t1\n`, and `b`
   went from `[b, 1]` to `[b, 1, Q]`; the store's next rewrite then widened line 1 and wrote `b\t1\tQ` for every reader,
   but only when the delete had been committed first. Now `b` stands in, as it does after a line 1 of two cells or more:
-  `id\nb\n#_defaults_#\t\tQ\nb\t1\n`; the store and every reader given `id\tv` keep `[b, 1]`, and a rewrite writes
+  `id\nb\n#_defaults_#\t\tQ\nb\t1\n`; the store and every reader given `id\tv` read `b` as before (`[b, 1]`; 3.39's loose
+  reader, which cuts to line 2's one column, `[b]` before and after), and a rewrite writes
   `id\tv\n#_defaults_#\t\tQ\nb\t1\n` in either order. This is the user's answer to the 5.09 design's question (A). What
   shows: 3.39's strict `readTabularFile`, given no header or line 1, which reads that file at one column and drops `b\t1`,
   now shows `b` as `[b]` after the delete, a key it did not show before (the kind of change "3.39's strict reader of a
@@ -358,10 +359,10 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
   and count, though the store itself reads at the file's own count, whatever `correctColumnNum` it was given. No cell
   changed (5.9 wrote the same as 5.10). What shows: such files keep a line more after a scrub or a rewrite.
 
-- The cost of a compaction is unchanged within measurement on a busy machine (a scrub of 200,000 rows: 0.9 to 1.04 of
-  5.10's time, the same bytes).
+- The cost of a compaction is unchanged within measurement on a busy machine (a scrub of 200,000 rows: 0.9 to 1.06 of
+  5.10's time, the same bytes, also with a count and defaults with a value given).
 
-- Still as in 5.10, deferred to 5.12: after a line 1 of one cell, `tsvz --x-header H delete` followed by a rewrite of a
+- Known, as in 5.10 (no layout serves both readers): after a line 1 of one cell, `tsvz --x-header H delete` followed by a rewrite of a
   `TSVZed` given H can change a cell for every reader, and a delete under a header whose line 1 already names the key
   (`d\tX\na\nd\tY\tZ\n`, header `q`) can change a cell for 3.39's loose reader given it. See
   [docs/limitations.md](docs/limitations.md), "After a line 1 of one cell, a delete under a header can change a cell for

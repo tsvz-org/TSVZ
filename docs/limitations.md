@@ -194,7 +194,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   widens, so a plain reader's default-filled cell turns empty; and a store with no header, whose defaults are narrower than the
   file, leaves a plain reader without a default-filled cell. Every reader given the scrub's own arguments, of
   any version from 3.39, sees what it saw before. In fuzzing, about 1% of random files and argument sets, where 5.4
-  changed far more of these readers' views.
+  changed far more of these readers' views. From 5.11 the compaction models 3.39's defaults as that reader keeps them
+  (cell by cell; a bare `#_defaults_#` at one column is a row to it and resets nothing), so a line 5.10 kept for it by a
+  wrong model can go, and a reader given other arguments can see that: `a\na\na\tX\nb\t2\n#_defaults_#\nb\tX\t2\t1\na\t1\t\n`
+  scrubbed with header `a` (line 1 holds it) and defaults `#_defaults_#\t\tQ` drops `a\tX`, and a reader given no header but
+  those defaults, which reads at three columns, lists `b, a` where it listed `a, b`; no row or cell changes, and every
+  reader given the scrub's arguments reads as before (1 file in 6,000 argument sets of the 5.11 review's fuzz).
 
   A delete in a one-column file keeps every reader's column count from 5.08 (a stand-in key takes the place of a line
   that set one), with one shape left: under `--x-header H` (`tsvz delete`, `pop`, `popitem`, a handler given H), line 1
@@ -213,7 +218,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   5.6 (a file of one column); 2026-11-06, "Known limitation (Recommended)" for each of the three cell cases above;
   2026-11-07, "Known limitation (Recommended)" for the delete case, then a wider set of shapes. Narrowed in 5.08 to the shape
   the stand-in rule leaves (no stand-in from a row with a value after a line 1 of one cell), which the 2026-11-07 approval
-  covers. Narrowed in 5.10 (under a header line 1 does not hold, also kept for the readers that count from line 1).
+  covers. Narrowed in 5.10 (under a header line 1 does not hold, also kept for the readers that count from line 1). Widened
+  in 5.11 (2026-11-09, the user chose "Widen it (Recommended)"): a line 5.10 kept only by its wrong model of 3.39's
+  defaults can go, and a reader given no header but the scrub's defaults can then list keys in another order.
 
 ### A stdout nobody reads can abort or hold the exit
 - Kind: known limitation
@@ -385,7 +392,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 
 ### After a line 1 of one cell, a delete under a header can change a cell for readers given it
-- Kind: deferred
+- Kind: known limitation
 - What the operator sees: two shapes are left, one through the command's door and one with a line 1 of two cells; 5.11
   fixed the store's own doors (Noted, below).
   - **The command's delete, then a store's rewrite that widens line 1.** `tsvz --x-header 'id\tv' delete` (or a handler
@@ -409,8 +416,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   view (Q3, approved for the command's door); a store given H that rewrites later writes its own view, as a widening does.
   In shape 2 a stand-in of line 1's key is a row with a value to a reader at line 1's count, and a stand-in from a row
   with a value that is not as wide gives some reader a cell it did not read.
-- Revisit when: 5.12, with the user's answer on these two shapes (asked with 5.11: a known limitation, or a stand-in in
-  these doors too, at a cost to 3.39's strict reader).
+- Revisit when: someone reads such a file with 3.39 or a loose reader given the header and hits one of the two
+  shapes, or when loose files go.
 - Noted: 2026-11-07, a deferral under the user's standing rule that deferrals are noted, not asked. 2026-11-08: 5.09
   fixes one of the shapes (3.39's strict reader in the `TSVZed` delete + commit door); 5.10 fixes shape 2 when line 1's key's
   next line is as wide as line 1. 2026-11-09: 5.11 builds the user's answer of 2026-11-08 to Q-A, "A: stand-in in the
@@ -419,6 +426,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   writes the same bytes whether the delete was committed first or not (N1), and so does a `TSVZedLite` delete followed by a
   store's rewrite; 3.39's strict reader given no header or line 1 gains `b` there (the kind approved as Q4). The rest is
   deferred to 5.12 under the same rule.
+- Approved: 2026-11-09, the user chose "Known limitation (Recommended)" for the two shapes left after 5.11 (no layout
+  serves both readers; the command's door is the approved Q3).
 
 ### A stand-in after a line 1 of two or more cells can reorder keys for readers given the header
 - Kind: deferred
@@ -435,6 +444,24 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 5.12.
 - Noted: 2026-11-09, found in the 5.11 review (pre-existing in 5.10, made lasting by Q-C); the main session's decision, not
   asked (a deferral). Not a release gate: 5.11 keeps rows 5.10 lost, and only this order outlasts a rewrite.
+
+### A reader given no header and the scrub's wider defaults is planned at one column after a line 1 of one cell
+- Kind: deferred
+- What the operator sees: under a header line 1 does not hold, with defaults of two or more cells and a width of two or more
+  (from the header or `correctColumnNum`), the compaction plans the reader given no header and the scrub's defaults at line
+  1's one cell, where that reader reads at the defaults' count (`_processLine`: defaults of two or more cells set the count);
+  only a scrub at width one plans it at the defaults' count. A line that reader needs can go: `tsvz`'s
+  `scrubTabularFile(p, header='id\tv', defaults=['#_defaults_#', 'P', ''], correctColumnNum=2)` on
+  `a\nc\tX\nc\t2\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n` writes `a\nc\tX\n#_defaults_#\t\t\t\nc\t1\n`, and a strict reader
+  given no header and those defaults (every version) reads `c` as `[c, X, '']` where it read `[c, 2, '']`. 5.10 kept `c\t2`
+  there by its wrong model of 3.39's defaults, and changed the same reader's view in 6 other files of the 5.11 review's
+  6,000 scrub argument sets (5.11: 6 the same, 1 fixed, this 1 new). Readers given the scrub's arguments read as before.
+- Why: `_legacyCompactReaders` lists the line-1 readers at line 1's count when it is one cell (the one-column rule) and adds
+  the reader at the defaults' count only when the caller's own width is one.
+- Plan (5.12): in `_legacyCompactReaders`, when `consumed and not matched`, line 1 has one cell and `len(defaults) > 1`, plan
+  `(len(defaults), False, False, defaults)` too, as the width-one branch does; fuzz the planned readers again.
+- Revisit when: 5.12.
+- Noted: 2026-11-09, found in the 5.11 final review; a deferral, not asked.
 
 ### A TSVZedLite delete looks at the file's first lines every time
 - Kind: deferred
