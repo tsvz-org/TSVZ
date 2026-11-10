@@ -17601,3 +17601,28 @@ def test_a_reset_between_the_place_and_line_1s_key_keeps_5_12s_stand_in(tmp_path
 	assert _run('--x-header', 'q', 'delete', p, 'c')[0] == 0
 	assert _bytes(p) == b'd\tX\na\n#_defaults_#\t\nd\t1\na\n'
 	assert all('d' in read(p) for read in strict)
+
+
+@pytest.mark.parametrize('door', ['zed', 'cli', 'lite'])
+@pytest.mark.parametrize('H', ['q', 'd\tX\tz'])
+def test_the_first_row_after_the_place_stands_in_so_readers_given_the_header_keep_the_order(tmp_path, door, H):
+	# 5.11 and 5.12 let a stand in for c (a key whose later line holds no value): d\tX\na\nb\t1\t2\na\n, and a reopened store
+	# and every loose reader given the header, which count from the place, listed a, b where memory lists b, a. The first
+	# row after the place stands in now, before a later key without a value: those readers read b there first, as they
+	# read b\t1\t2 first before, and the readers that count from line 1 read it as the deletion of a key not yet read.
+	p = str(tmp_path / 'f.tsv')
+	text = b'd\tX\nc\nb\t1\t2\na\n'
+	kwargs = {'strict': False} if door == 'lite' else {}
+	_delete_reads_as_before(p, text, 'c', b'd\tX\nb\nb\t1\t2\na\n', H, door, None, **kwargs)
+	assert _store_order_after_delete(p, text, H, 'c') == (['b', 'a'], ['b', 'a'])
+	# (what it costs: 3.39's strict reader given a count of one, which takes only one-cell lines, shows b, as it shows line
+	# 1's key where that stands in: the approved 3.39 entry's kind)
+	assert _counted_one(p) == ['b', 'a']
+
+
+def test_without_a_line_1_of_two_cells_the_first_row_after_the_place_does_not_stand_in(tmp_path):
+	# (no header: the place is line 1, and 3.39's strict reader given none counts from it at one column and would gain b;
+	# a line 1 of one cell: its readers read the stand-in as a row too. 5.12's stand-in stays in both.)
+	p = str(tmp_path / 'f.tsv')
+	assert _deleted_by_a_store(p, b'c\nb\t1\t2\na\n', '', 'c') == b'a\nb\t1\t2\na\n'
+	assert _deleted_by_a_store(p, b'id\nc\nb\t1\t2\na\n', 'id\tv', 'c') == b'id\na\nb\t1\t2\n'  # (the commit compacts a\na)
