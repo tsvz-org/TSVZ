@@ -3070,8 +3070,8 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 	defaults)`` (_legacyCompactPlan): the caller's, and, when it takes line 1 for a header line 1 does not hold, the readers that
 	count from line 1 as well: given no header (line 1 a row to them, at its count, or the defaults' as the caller's
 	reader takes them; a line 1 of one cell at both, 5.12: at one, the one-column rule, so a reader at one column keeps its
-	lone keys, and at the defaults', which a reader given them reads at) and given line 1 for their header (a store that
-	follows a widening of its header among them).
+	lone keys, and at the defaults', which a reader given them reads at, where it can read otherwise than the caller's) and
+	given line 1 for their header (a store that follows a widening of its header among them).
 	The caller's reader then counts from the first keyed line after line 1 (or a program that does not follow a
 	widening, given the header line 1 widens), and its count is the one ``width`` gives. Each of these readers is given the
 	caller's defaults. A reader given none is another reader: it reads at the file's own count, not the defaults', and a
@@ -3086,27 +3086,19 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 	# keyed line's, line 1 left out for a reader that takes it for its header)
 	own = [(width if matched else _legacyFileWidth(itertools.islice(raw, 1, None) if consumed else raw, (), False, encoding, delimiter),
 			consumed, matched)]
-	oneCell = False  # (line 1 one cell, its readers listed at that count, and one given the defaults reads otherwise)
+	lone = None  # (line 1 of one cell: its kind, 'row' for a lone key, 'reset' for a bare #_defaults_#)
 	if consumed and not matched and raw:
 		kind, _, cells, _ = _legacyLineKind(raw[0].decode(encoding or 'utf8', errors='replace'), 1, False, delimiter)
 		if kind != 'skip':
 			readers.append((cells if cells == 1 or len(defaults) < 2 else len(defaults), False, False, defaults))
 			readers.append((cells, True, True, defaults))
 			own += [(cells, False, False), (cells, True, True)]
-			# (a lone key there is, at the defaults' count, the deletion of a key not yet read: at the caller's count that
-			# reader reads every line as the caller's does, and a plan of its own would only keep lines no reader needs.
-			# A bare #_defaults_# resets its defaults)
-			oneCell = cells == 1 and (kind != 'row' or width != len(defaults))
-	if len(defaults) > 1 and not matched:
+			if cells == 1:
+				lone = kind
+	if width == 1 and len(defaults) > 1 and not matched:
 		# A file the plan reads as one column (the one-column rule) is read at the defaults' count by a reader given them
 		# (5.6 to 5.10 kept it for the one-column readers only, and a row such a reader takes was dropped).
-		if width == 1:
-			readers.append((len(defaults), consumed, matched, defaults))
-		if oneCell:
-			# (so is a line 1 of one cell, to a reader given no header and the defaults, whatever the caller's count: 5.12;
-			# 5.11 listed it only at a caller's count of one, and a line that reader takes could go. A line 1 of more
-			# cells: line 1's reader is listed there already)
-			readers.append((len(defaults), False, False, defaults))
+		readers.append((len(defaults), consumed, matched, defaults))
 	valued = len(defaults) > 1 and any(defaults[1:])
 	if valued or any(o[0] != r[0] for o, r in zip(own, readers)):
 		counts = {}  # line index (0, or 1 for every later line) -> the cell counts of its lines with a value
@@ -3119,6 +3111,15 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 		readers += [(w, c, m, ()) for (w, c, m), r in zip(own, readers)
 					if (valued or w != r[0])
 					and not (valued and w > 0 and counts.get(True, set()) <= {w} and (c or counts.get(False, set()) <= {w}))]
+	if lone and len(defaults) > 1 and (width != len(defaults) or (
+			lone == 'reset' and valued and not counts.get(True, set()) <= {len(defaults)})):
+		# A reader given no header and the defaults reads a line 1 of one cell at the defaults' count, not at line 1's (5.12;
+		# 5.11 listed it there only at a caller's count of one, and a line it takes could go). Not where it reads every line
+		# as the caller's reader: at the caller's count, after a lone key (the deletion of a key not yet read), or after a
+		# bare #_defaults_#, which leaves it as one given none, where the defaults hold no value or no line with a value
+		# differs from that count (a strict and a lenient reader then take the same lines). A plan of its own there kept
+		# lines no reader needs. (A line 1 of more cells: line 1's reader is listed at their count already.)
+		readers.append((len(defaults), False, False, defaults))
 	for count in given:
 		if count != width:
 			readers.append((count, consumed, matched, defaults))

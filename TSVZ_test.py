@@ -17395,10 +17395,9 @@ def test_a_count_given_with_valued_defaults_adds_no_twin_where_every_valued_line
 ])
 def test_line_1s_key_stands_in_first_so_readers_given_the_header_keep_the_order(tmp_path, door, text, written):
 	# 5.10 and 5.11 let a stand in for c: d\tX\na\nd\t1\na\t1\n, and a reopened store and every reader given the header,
-	# which count from the place, listed a, d where memory lists d, a (from 5.11 a store's rewrite no longer put it back:
-	# Q-C refuses that widening). Line 1's key is tried first now, its next line coming first after the place and as wide
-	# as line 1: those readers read d there as they read that line before, and line 1's readers read d deleted and taken
-	# back at once.
+	# which count from the place, listed a, d where memory lists d, a. Line 1's key is tried first now, its next line coming
+	# first after the place and as wide as line 1: those readers read d there as they read that line before, and line 1's
+	# readers read d deleted and taken back at once.
 	p = str(tmp_path / 'f.tsv')
 	H = 'd\tX\tz'
 	kwargs = {'strict': False} if door == 'lite' else {}
@@ -17458,15 +17457,22 @@ def test_a_line_1_of_one_cell_plans_the_reader_given_no_header_and_the_defaults_
 	# (a lone key at the caller's count, the defaults': it is a deletion of a key not yet read to that reader, which then
 	# reads every line as the caller's reader does; a plan of its own kept lines no reader needs)
 	assert (3, False, False, defaults) not in TSVZ._legacyCompactReaders(lone, 3, True, defaults, '\t', 'utf8', False)
+	# (nor after a bare #_defaults_#, which leaves it as a reader given none, at the caller's count where every line with a
+	# value is as wide as that count, or the defaults hold none: a strict reader there takes what a lenient one takes)
+	wide = _lines(b'#_defaults_#\nc\tX\t1\nc\t2\t\n')
+	assert (3, False, False, defaults) not in TSVZ._legacyCompactReaders(wide, 3, True, defaults, '\t', 'utf8', False)
+	assert (3, False, False, [D_, '', '']) not in TSVZ._legacyCompactReaders(reset, 3, True, [D_, '', ''], '\t', 'utf8', False)
+	assert (3, False, False, [D_, '', '']) in TSVZ._legacyCompactReaders(reset, 2, True, [D_, '', ''], '\t', 'utf8', False)
 	# (a line 1 of two cells: line 1's reader given the defaults is listed at their count already, once)
 	readers = TSVZ._legacyCompactReaders(_lines(b'a\t1\nc\tX\n'), 2, True, defaults, '\t', 'utf8', False)
 	assert readers.count((3, False, False, defaults)) == 1
 
 
-def test_a_scrub_keeps_what_a_strict_reader_given_no_header_and_its_defaults_takes_after_a_bare_defaults_line_1(tmp_path):
+@pytest.mark.parametrize('door', ['scrub', 'rewrite'])
+def test_a_compaction_keeps_what_a_strict_reader_given_no_header_and_its_defaults_takes_after_a_bare_defaults_line_1(tmp_path, door):
 	# (found building 5.12) A bare #_defaults_# on line 1 resets the defaults of a reader given no header, which then reads
 	# at their count strictly: c\t2\t is the only line of c it takes. 5.11 planned that reader at one column only, and a
-	# scrub given the header id\tv and those defaults kept only c\t3: c was lost to it.
+	# scrub given the header id\tv and those defaults, or a TSVZed given them that rewrites, kept only c\t3: c was lost to it.
 	p = str(tmp_path / 'f.tsv')
 	defaults = [D_, 'P', '']
 	_touch(p, b'#_defaults_#\nc\t1\nc\t2\t\nc\t3\n')
@@ -17474,6 +17480,28 @@ def test_a_scrub_keeps_what_a_strict_reader_given_no_header_and_its_defaults_tak
 			  for mod in (TSVZ, TSVZ_old)}
 	assert before['TSVZ'] == {'c': ['c', '2', '']}
 	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-		TSVZ.scrubTabularFile(p, header='id\tv', defaults=list(defaults))
+		if door == 'scrub':
+			TSVZ.scrubTabularFile(p, header='id\tv', defaults=list(defaults))
+		else:
+			t = TSVZ.TSVZed(p, header='id\tv', defaults=list(defaults), verbose=False, append_check_delay=60, rewrite_on_load=False)
+			t._call(t.hardMapToFile)
+			t.close()
 	for mod in (TSVZ, TSVZ_old):
 		assert dict(mod.readTabularFile(p, defaults=list(defaults), strict=True, verbose=False)) == before[mod.__name__]
+
+
+def test_after_line_1s_key_stands_in_a_rewrite_widens_and_keeps_the_order_where_5_11_refused(tmp_path):
+	# (5.11: a stood in, and its later line is wider than the header, so a store's rewrite refused the widening (Q-C) and
+	# the order a, d stayed for every reader given the header. With d standing in, the rewrite widens line 1.)
+	p = str(tmp_path / 'f.tsv')
+	H = 'd\tX\tz'
+	_touch(p, b'd\tX\nc\nd\t1\na\t1\t2\t3\n')
+	assert _run('--x-header', H, 'delete', p, 'c')[0] == 0
+	assert _bytes(p) == b'd\tX\nd\nd\t1\na\t1\t2\t3\n'
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		t = TSVZ.TSVZed(p, header=H, verbose=False, append_check_delay=60, rewrite_on_load=False)
+		t.hardMapToFile()
+		t.close()
+	assert _bytes(p) == b'd\tX\tz\nd\t1\t\na\t1\t2\t3\n'
+	for mod in (TSVZ, TSVZ_old):
+		assert list(mod.readTabularFile(p, header=H, strict=False, verbose=False)) == ['d', 'a']
