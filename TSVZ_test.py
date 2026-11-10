@@ -17579,8 +17579,9 @@ def _deleted_by_a_store(p, text, H, key):
 def test_line_1s_key_stands_in_past_a_defaults_line_that_holds_a_value(tmp_path, door, H, defaults_line):
 	# 5.12 tried line 1's key only where its next line came first after the place, so with a defaults line between, a stood
 	# in (d\tX\na\n#_defaults_#\t\tQ\nd\t1\na\n), and a reopened store and the loose readers given the header listed a, d.
-	# Past defaults lines that hold a value, every reader that took line 1 takes a line as wide (no reader's defaults lose
-	# a value there), so line 1's key stands in.
+	# Past a defaults line whose first value is in its second cell, or in its third after a line 1 of two cells, every reader
+	# that took line 1 takes a line as wide (3.39 cuts a defaults line to its count and keeps that value), so line 1's key
+	# stands in (a first value that comes later: test_line_1s_key_does_not_stand_in_past_a_defaults_line_3_39_turns_strict_at).
 	p = str(tmp_path / 'f.tsv')
 	text = b'd\tX\nc\n' + defaults_line.replace(b'note', b'# note') + b'\nd\t1\na\n'
 	kwargs = {'strict': False} if door == 'lite' else {}

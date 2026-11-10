@@ -3295,8 +3295,8 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		# (a defaults line that holds a value, past which every reader that took line 1 takes a line as wide: 5.5 and later
 		# read it whole, but 3.39 cuts it to its count and fills it from its defaults' cells below that count. Given a count
 		# below the cell of the line's first value, and defaults whose values lie beyond the count (so that it read line 1),
-		# 3.39 holds no value after the line, reads strictly and drops a line not as wide as its count: line 1's key's next
-		# row, unless line 1 is that wide. So the first value is in the line's second cell, or in its third where line 1 has
+		# 3.39 holds no value after the line, reads strictly and drops a line of another width than its count: line 1's key's
+		# next row, unless line 1 is that wide. So the first value is in the line's second cell, or in its third where line 1 has
 		# two; at a count of one a stand-in is a row, and loses nothing. d\tX\tW\nd\n#_defaults_#\t\tQ\nd\t1\t2\n
 		# loses d for 3.39's strict reader given a count of two and the defaults [#_defaults_#, '', 'Q'].)
 		first = next(n for n, cell in enumerate(_legacyCells(_legacyLineBody(texts[i]), delimiter)) if n and cell)

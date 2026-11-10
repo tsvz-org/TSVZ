@@ -322,7 +322,10 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
   `readTabularFile(correctColumnNum=1)` given no header (or a header and `verifyHeader=False`), which takes only the
   one-cell lines of such a file, shows `b` as `[b]`, as it shows line 1's key where that stands in ("Upgrading to
   5.12", first bullet). It gains a key the store has and loses none; in a few files it lists its keys in the store's
-  order instead of its own. With no header, or after a line 1 of one cell, where the readers that count from line 1
+  order instead of its own. This widens the approved "3.39's strict reader of a one-column file sees a new row when its
+  last lone key is deleted", from line 1's key to the stand-in's
+  ([docs/limitations.md](docs/limitations.md#339s-strict-reader-of-a-one-column-file-sees-a-new-row-when-its-last-lone-key-is-deleted)).
+  With no header, or after a line 1 of one cell, where the readers that count from line 1
   would read the stand-in as a row, the stand-in is chosen as in 5.13. A store's rewrite after such a delete can
   refuse to widen line 1 where 5.13 widened: where the stand-in's key has a later row wider than the header
   (`d\tX\nc\nb\t1\t2\t3\na\na\t1\n`, delete `c` under `d\tX\tz`, then `hardMapToFile()`), Q-C refuses the widening,
@@ -331,17 +334,28 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
   also keep a line 5.13 dropped, where 5.13's stand-in key had collapsed with that key's own later line (2 of 6,000
   random files through a delete and a rewrite).
 
-- **Line 1's key stands in past defaults lines that hold a value.** 5.12 and 5.13 let line 1's key stand in only where
+- **Line 1's key stands in past defaults lines that hold a value early, and another key's past a reset.** 5.12 and 5.13 let line 1's key stand in only where
   its row came first after the place: with a defaults line between, a key whose later line holds no value stood in,
   and came first to the readers given the header: `d\tX\nc\n#_defaults_#\t\tQ\nd\t1\na\n`, delete `c` under `q`, wrote
-  `d\tX\na\n#_defaults_#\t\tQ\nd\t1\na\n`, and a reopened store listed `a, d` where memory lists `d, a`. The first row
-  after the place is now looked for past defaults lines that hold a value (such a line only adds values to a reader's
-  defaults, so a reader that took line 1 takes a line as wide after it): `d\tX\nd\n#_defaults_#\t\tQ\nd\t1\na\n`, and
-  every reader lists `d, a` (3.39's strict reader given a count of one shows `d`, as from 5.12 where line 1's key
-  stands in). The bullet above looks past them the same way. A defaults line without a value stops the search, and
-  5.13's stand-in stays there: it resets a reader's defaults, and a strict reader given wider defaults with a value,
-  which takes line 1, would not take a line as wide after it and would lose the key
-  (`d\tX\nc\n#_defaults_#\t\nd\t1\na\n` still reorders). This also narrows the approved "After a line 1 of one cell, a
+  `d\tX\na\n#_defaults_#\t\tQ\nd\t1\na\n`, and a reopened store listed `a, d` where memory lists `d, a`. Where no key
+  could stand in, none did, and the readers given the header took their column count from the defaults line:
+  `d\tX\nc\n#_defaults_#\tP\tR\nd\t1\n`, delete `c` under `q`, wrote `d\tX\n#_defaults_#\tP\tR\nd\t1\n`, and a
+  reopened store read `d` as `[d, 1, R]` where it read `[d, 1]`. The first row after the place is now looked for past
+  defaults lines whose first value is in their second cell, or in their third where line 1 has two cells: every
+  reader that took line 1 takes a line as wide after such a line. `d\tX\nd\n#_defaults_#\t\tQ\nd\t1\na\n`, and every
+  reader lists `d, a`; `d\tX\nd\n#_defaults_#\tP\tR\nd\t1\n`, and they read `d` as `[d, 1]` (3.39's strict reader
+  given a count of one shows `d`, as from 5.12 where line 1's key stands in). The search stops at a defaults line
+  without a value (a reset: a strict reader given wider defaults with a value, which takes line 1, would not take a line as
+  wide after it and would lose the key, `d\tX\nc\n#_defaults_#\t\nd\t1\na\n` still reorders), and at one whose first
+  value comes later: 3.39 cuts a defaults line to its count, so given a count below that value's cell, and defaults whose
+  values lie beyond the count (which made it take line 1), it holds no value after the line, reads strictly and drops a
+  row of another width than its count. A stand-in `d` for `d\tX\tW\nc\n#_defaults_#\t\tQ\nd\t1\t2\n` would lose `d` for 3.39's
+  strict `readTabularFile(correctColumnNum=2, defaults=['#_defaults_#', '', 'Q'])`, so nothing stands in there, as in 5.13.
+  The bullet above looks past every defaults line, a reset too, as its stand-in deletes another key that no reader that
+  counts from line 1 has read: `d\tX\nc\n#_defaults_#\t\nb\t1\t2\na\n`, delete `c` under `q`, wrote
+  `d\tX\na\n#_defaults_#\t\nb\t1\t2\na\n` and a reopened store listed `a, b` where memory lists `b, a`; it writes
+  `d\tX\nb\n#_defaults_#\t\nb\t1\t2\na\n` now, and every reader lists `b, a`.
+  This also narrows the approved "After a line 1 of one cell, a
   delete under a header can change a cell for readers given it" (shape 2): `d\tX\na\n#_defaults_#\tP\nd\tY\n`, delete
   `a` under `q`, wrote `d\tX\n#_defaults_#\tP\nd\tY\n`, and 3.39's loose reader given `q` read `d` as `[d, Y]` where
   it read `[d]`; 5.14 writes `d\tX\nd\n#_defaults_#\tP\nd\tY\n`, and it reads `[d]`.
@@ -368,7 +382,10 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
 - The cost of a compaction and of a delete is otherwise unchanged within measurement: a scrub or a `TSVZed` rewrite of
   200,000 rows took 0.99 to 1.04 of 5.13's time in the 5.12 review's shapes, a `TSVZed` delete and commit 0.98, with
   the same bytes but for the stand-in; `tsvz --x-header q delete` where line 1's key now stands in past a defaults
-  line, 0.75 (it no longer looks through the later lines for a key without a value).
+  line, 0.75 (it no longer looks through the later lines for a key without a value). The peak memory is unchanged:
+  a scrub of a one-column file of 230,002 lines peaks at 175 to 177 MB of resident memory (5.12: 180 to 182 MB, three runs
+  each) and a `TSVZed` rewrite at 201 to 203 MB (5.12: 201 to 203 MB); with a bare `#_defaults_#` on line 1, a scrub peaks at
+  206 to 207 MB (5.12: 206 to 207 MB).
 
 - Deferred to 5.15: a compaction can keep a strict reader's first line of a key where no other key competes for its
   place, once (`a\na\tX\na\t2\t\na\t\t2\n` scrubbed with header `id\tv`, defaults `[#_defaults_#, '', '']` and count 2

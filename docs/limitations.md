@@ -427,9 +427,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     every key that could stand in is already named by a valued row before the gap (line 1's own `d\tX`), so no stand-in
     goes there, and 3.39's loose reader given `q`, which counts from the gap's place, goes from `[d]` to `[d, Y, Z]`. From
     5.10 line 1's key stands in when the first keyed line after the gap is a row of it as wide as line 1
-    (`d\tX\na\nd\tY\n` becomes `d\tX\nd\nd\tY\n`), and from 5.14 also past defaults lines that hold a value
-    (`d\tX\na\n#_defaults_#\tP\nd\tY\n` becomes `d\tX\nd\n#_defaults_#\tP\nd\tY\n`); left are that line wider or
-    narrower than line 1 (as here), another key's line, or a defaults line without a value first.
+    (`d\tX\na\nd\tY\n` becomes `d\tX\nd\nd\tY\n`), and from 5.14 also past defaults lines whose first value is in their
+    second cell, or in their third where line 1 has two cells (`d\tX\na\n#_defaults_#\tP\nd\tY\n` becomes
+    `d\tX\nd\n#_defaults_#\tP\nd\tY\n`); left are that line wider or narrower than line 1 (as here), another key's line,
+    or a defaults line first that stops the search (a reset, or a first value that comes later).
   - No row is lost to any reader in these shapes but the old line-1 row that the widening by a rewrite asked for takes
     (README, "Upgrading to 5.8", item 3).
 - Why: no layout serves both readers. A reader given H counts from the line after line 1, so only a one-cell line keeps
@@ -460,17 +461,42 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   as in 5.11 and comes first to the readers given the header: `d\tX\nc\nd\t1\t2\na\n` (wider) and `d\tX\tW\nc\nd\t1\na\n`
   (narrower), delete `c`, write `d\tX\na\nd\t1\t2\na\n` and `d\tX\tW\na\nd\t1\na\n`. The store's memory lists `d, a`; a
   reopened store, `TSVZedLite` and every loose `readTabularFile` given the header list `a, d`. No row or cell changes, and
-  5.11 writes the same bytes. From 5.14 another key's row first stands in where the deleted line had one cell, and line 1's
-  key is looked for past defaults lines that hold a value (README, "Upgrading to 5.14 from 5.13").
+  5.11 writes the same bytes. From 5.14 another key's row first stands in where the deleted line had one cell (past
+  defaults lines and resets too), and line 1's key is looked for past defaults lines whose first value is in their second
+  cell, or in their third where line 1 has two cells (README, "Upgrading to 5.14 from 5.13"). Three shapes are left, with
+  the same effect (5.12 and 5.13 write the same bytes in each):
+  - **Line 1's key past a reset (a defaults line without a value).** `d\tX\nc\n#_defaults_#\t\nd\t1\na\n`, delete `c` under
+    `q`, writes `d\tX\na\n#_defaults_#\t\nd\t1\na\n`; a reopened store lists `a, d` where memory lists `d, a`.
+  - **Line 1's key past a defaults line whose first value comes later.** `d\tX\tW\nc\n#_defaults_#\t\tQ\nd\t1\t2\na\n` writes
+    `d\tX\tW\na\n#_defaults_#\t\tQ\nd\t1\t2\na\n`, listed `a, d`. Where no other key has a later line without a value,
+    nothing stands in, and the store's readers given the header count from the defaults line, so a cell changes (a count
+    change): `d\tX\tW\nc\n#_defaults_#\t\t\tR\nd\t1\t2\n` writes `d\tX\tW\n#_defaults_#\t\t\tR\nd\t1\t2\n`, and a reopened
+    store reads `d` as `[d, 1, 2, R]` where it read `[d, 1, 2]`.
+  - **Line 1's key at another width past a valued defaults line.** `d\tX\nc\n#_defaults_#\tP\nd\t1\t2\na\n` writes
+    `d\tX\na\n#_defaults_#\tP\nd\t1\t2\na\n`, listed `a, d`.
 - Why: a one-cell line of line 1's key is a deletion of that key to every reader that counts from line 1, so it can stand
   in only where the key's next line is one they all take. At another width a strict reader given no header drops that line
   and loses the key: `d\tX\nd\nd\t1\t2\na\n` loses `d` for 3.39's, `d\tX\tW\nd\nd\t1\na\n` for every version's. Any other
-  one-cell stand-in comes first to the readers given the header.
+  one-cell stand-in comes first to the readers given the header. The same holds past a defaults line, and no stand-in of
+  `d` serves these shapes: after a reset, a strict reader given no header and defaults of three cells with a value takes
+  line 1, and the reset clears the defaults it took it by, so it drops the row of `d` that follows as narrower than its
+  count, and the stand-in's deletion of `d` stays: 5.14's, 5.5's, 3.39's and `TSVZed`'s strict readers lose `d` (the review
+  checked them with the real readers). For a first value that comes later, 3.39 cuts a defaults line to its count: given a
+  count below that value's cell and defaults whose values lie beyond it (which made it take line 1), it holds no value
+  after the line, reads strictly and drops a row of another width than its count, so `d\tX\tW\nd\n#_defaults_#\t\tQ\nd\t1\t2\n` loses `d` for its strict
+  `readTabularFile(correctColumnNum=2, defaults=['#_defaults_#', '', 'Q'])`; at another width it is the shape above.
 - Revisit when: a layout that serves both readers turns up.
 - Approved: 2026-11-09, the user chose "Approve (Recommended)". Not asked for by the user: it remains from the 5.11
   deferral "A stand-in after a line 1 of two or more cells can reorder keys for readers given the header", which 5.12
   fixes where line 1's key comes next as wide as line 1. The question also named a defaults line first; that shape was
   then found fixable and moved to a deferral, which narrows this entry (5.14 builds it).
+- Noted: 2026-11-09, the 5.14 review (r514a): the part of "a defaults line first" that 5.14 builds is a defaults line whose
+  first value is in the second cell (the third where line 1 has two cells). The three shapes above are the rest, and no
+  stand-in can fix them: a `d` stand-in loses `d` for strict readers given no header and three-cell defaults with a
+  value (a reset), for 3.39's strict reader given a count below the value's cell (a first value that comes later), and
+  at another width as above. They are the part of the approved question that the 5.12 docs had moved out as fixable, folded
+  back in here, as its question named "a defaults line first". A reset before another key's row is not among them: that
+  key stands in past it (5.14).
 
 ### A compaction can keep a strict reader's first line of a key where no other key competes for its place
 - Kind: deferred
@@ -601,16 +627,33 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   5.11, 930 gain one under both (`d\tX\nc\nd\t1\na\t1\n`: 5.11 gives it `a`, 5.12 `d`), and 40 keep their keys but list
   them in the store's order instead of their own (`d\tX\nc\nd\t1\na\nd\n`: `a, d` becomes `d, a`). Every other reader given
   a count of one (3.39's loose, 5.5's and later strict or loose) reads all 1,690 as before.
+
+  From 5.14 the same reader given a count of one can also gain the key of another key's row that stands in, after a line 1
+  of two cells or more, where the deleted line had one cell and that row, which holds a value, comes first after it (past
+  defaults lines and resets too): `d\tX\nc\nb\t1\t2\na\n`, delete `c` under `q` or `d\tX\tz`, writes `d\tX\nb\nb\t1\t2\na\n`
+  (5.13: `d\tX\na\nb\t1\t2\na\n`), and that reader shows `b` as `[b]` beside `a`, where 5.13 showed it `a` alone. The
+  5.14 build's own sweep of 434,340 `tsvz --x-header H delete` runs found 3,600 where this reader gains the stand-in's key and
+  180 where it lists its keys in the store's order instead of its own; the stand-in past a reset
+  (`d\tX\nc\n#_defaults_#\t\nb\t1\t2\na\n`) adds about 2,016 more reader runs of the review's second sweep (116,676
+  files, each under two headers, 233,352 runs). In that second sweep 5.14's output differs from 5.12's in 20,536 runs, and
+  this reader, given no header or a header and `verifyHeader=False`, and any of five defaults sets, gains a key in
+  88,112 reader runs (5.14's total, line 1's key past a defaults line included) and lists the store's order in 3,840. It
+  loses no key, and no cell changes for it. Every other TSVZ.py reader reads these files as 5.12 did or better.
 - Why: no layout serves both: 5.5's and later readers keep `[b, 1]` only if the file reads at one column or at two, and
   either needs a keyed line that 3.39's strict read takes as a row of `b`. A bare `#_defaults_#` would keep one column, but
   it is a row named `#_defaults_#` to every reader at one column. For the 5.12 delete: the stand-in must be one cell to
   keep the count of the readers given the header, and the only keys whose one-cell line gives this reader nothing new are
   keys with a later line without a value, which come first to the store's own readers (5.11's order change). The key it
-  gains is one the store has, and it loses none.
+  gains is one the store has, and it loses none. The same holds for the 5.14 stand-in: another key's row that comes first
+  after the deleted line is the one key no reader that counts from line 1 has read, so its one-cell line deletes nothing
+  they read and keeps the store's own order; the only reader that can see it takes a one-cell line as a row. Any other
+  one-cell stand-in is a key that comes first to the store's readers (5.13's order change, which only a stand-in of this
+  kind avoids).
 - Revisit when: nothing in the format can fix it; upgrading the reader from 3.39 cures it.
 - Approved: 2026-11-07, the user chose "Known limitation (Recommended)". The store's own delete: 2026-11-08, Q-A, the user
   chose "A: stand-in in the store's own delete (Recommended)". The delete under a header after a line 1 of two cells or
-  more (5.12): 2026-11-09, the user chose "Keep, widen the KL (Recommended)".
+  more (5.12): 2026-11-09, the user chose "Keep, widen the KL (Recommended)". The stand-in of another key's row (5.14):
+  2026-11-09, the user chose "Widen it, keep the fix (Recommended)".
 
 ### pip 9 cannot upgrade from or uninstall 5.5 and earlier
 - Kind: known limitation
