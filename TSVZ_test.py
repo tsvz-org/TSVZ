@@ -14715,8 +14715,8 @@ def test_a_delete_commit_compacts_for_every_count_the_files_readers_read_at(tmp_
 	(b'd\tX\na\nd\tY\n', b'd\tX\nd\nd\tY\n', None),
 	# (d's next line wider than line 1: 3.39's strict reader at two columns would not take it back; nothing stands in)
 	(b'd\tX\na\nd\tY\tZ\n', b'd\tX\nd\tY\tZ\n', {'339-loose-H': 'cell'}),
-	# (a defaults line first: nothing stands in, as before)
-	(b'd\tX\na\n#_defaults_#\tP\nd\tY\n', b'd\tX\n#_defaults_#\tP\nd\tY\n', {'339-loose-H': 'cell'}),
+	# (a defaults line first: 5.10 to 5.12 let nothing stand in; from 5.13 d stands in past a defaults line that holds a value)
+	(b'd\tX\na\n#_defaults_#\tP\nd\tY\n', b'd\tX\nd\n#_defaults_#\tP\nd\tY\n', None),
 ])
 def test_line_1s_key_stands_in_when_its_next_line_is_as_wide_as_line_1(tmp_path, door, text, written, differ):
 	kwargs = {'strict': False} if door == 'lite' else {}
@@ -17540,3 +17540,64 @@ def test_a_delete_commit_moves_a_lone_key_up_past_its_later_deletion(tmp_path):
 	p = str(tmp_path / 'f.tsv')
 	mem = _delete_reads_as_before(p, b'd\tX\nc\nd\t1\na\na\n', 'c', b'd\tX\nd\nd\t1\na\n', 'q', 'zed')
 	assert list(mem) == ['d', 'a']
+
+
+def _store_order_after_delete(p, text, H, key):
+	"""(memory's keys after a TSVZed given ``H`` deletes ``key`` and commits, a reopened store's keys)."""
+	_touch(p, text)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		t = TSVZ.TSVZed(p, header=H, verbose=False, append_check_delay=60, rewrite_on_load=False)
+		del t[key]
+		t.commitAppendToFile()
+		mem = list(t)
+		t.close()
+		t = TSVZ.TSVZed(p, header=H, verbose=False, append_check_delay=60, rewrite_on_load=False)
+		again = list(t)
+		t.close()
+	return mem, again
+
+
+def _counted_one(p):
+	"""3.39's strict readTabularFile given a count of one and no header: it takes only the one-cell lines of a file."""
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		return list(TSVZ_old.readTabularFile(p, strict=True, verbose=False, correctColumnNum=1))
+
+
+def _deleted_by_a_store(p, text, H, key):
+	_touch(p, text)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		t = TSVZ.TSVZed(p, header=H, verbose=False, append_check_delay=60, rewrite_on_load=False)
+		del t[key]
+		t.commitAppendToFile()
+		t.close()
+	return _bytes(p)
+
+
+@pytest.mark.parametrize('door', ['zed', 'cli', 'lite'])
+@pytest.mark.parametrize('H', ['q', 'd\tX\tz'])
+@pytest.mark.parametrize('defaults_line', [b'#_defaults_#\t\tQ', b'#_defaults_#\tP', b'#_defaults_#\tP\nnote\n#_defaults_#\t\tQ'])
+def test_line_1s_key_stands_in_past_a_defaults_line_that_holds_a_value(tmp_path, door, H, defaults_line):
+	# 5.12 tried line 1's key only where its next line came first after the place, so with a defaults line between, a stood
+	# in (d\tX\na\n#_defaults_#\t\tQ\nd\t1\na\n), and a reopened store and the loose readers given the header listed a, d.
+	# Past defaults lines that hold a value, every reader that took line 1 takes a line as wide (no reader's defaults lose
+	# a value there), so line 1's key stands in.
+	p = str(tmp_path / 'f.tsv')
+	text = b'd\tX\nc\n' + defaults_line.replace(b'note', b'# note') + b'\nd\t1\na\n'
+	kwargs = {'strict': False} if door == 'lite' else {}
+	written = text.replace(b'\nc\n', b'\nd\n', 1)
+	_delete_reads_as_before(p, text, 'c', written.replace(b'# note\n', b'') if door == 'zed' else written, H, door, None, **kwargs)
+	assert _store_order_after_delete(p, text, H, 'c') == (['d', 'a'], ['d', 'a'])
+	assert _counted_one(p) == ['d', 'a']  # (the approved 3.39 entry: that reader shows line 1's key)
+
+
+def test_a_reset_between_the_place_and_line_1s_key_keeps_5_12s_stand_in(tmp_path):
+	# A defaults line with no value resets a reader's defaults: a strict reader given no header and defaults of three cells
+	# with a value takes d\tX (they fill it) and not d\t1 after the reset, so a stand-in of d would lose d for it.
+	p = str(tmp_path / 'f.tsv')
+	text = b'd\tX\nc\n#_defaults_#\t\nd\t1\na\n'
+	strict = [functools.partial(mod.readTabularFile, strict=True, verbose=False, defaults=[D_, 'P', 'Q']) for mod in (TSVZ, TSVZ_old)]
+	_touch(p, text)
+	assert all('d' in read(p) for read in strict)
+	assert _run('--x-header', 'q', 'delete', p, 'c')[0] == 0
+	assert _bytes(p) == b'd\tX\na\n#_defaults_#\t\nd\t1\na\n'
+	assert all('d' in read(p) for read in strict)

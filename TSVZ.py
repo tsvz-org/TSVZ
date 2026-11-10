@@ -3258,13 +3258,17 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	empty cells as the line had, so no reader's count changes. With the same count nothing is needed, but on line 1 with
 	``both`` a bare ``#`` keeps the place a header reader skips.
 
-	The key is line 1's own, when the first keyed line after the place is a row of it as wide as line 1 (5.10): every
-	reader that read line 1's row reads the key deleted at the stand-in and takes that line back before any other key, a
-	reader that counts from the place reads the key first there, as it read that line before, and a compaction keeps that
-	line for line 1's readers (_legacyCompact). 5.12 tries it first: any other key comes first to a reader that counts from
-	the place, and can so take another key's place in its order (5.10 and 5.11 tried it last). Else one whose later line
-	holds no value: every reader applies that line (a row at one column, a deletion at more), so the key reads after it as
-	it did. Else, unless a line 1 of one cell that the caller reads as a row comes before the place (``both``: its readers
+	The key is line 1's own, when the first row after the place is a row of it as wide as line 1 (5.10): every reader
+	that read line 1's row reads the key deleted at the stand-in and takes that line back before any other key, a reader
+	that counts from the place reads the key first there, as it read that line before, and a compaction keeps that line
+	for line 1's readers (_legacyCompact). 5.12 tries it first: any other key comes first to a reader that counts from
+	the place, and can so take another key's place in its order (5.10 and 5.11 tried it last). The first row is looked for
+	past defaults lines that hold a value (5.13): such a line only adds values to a reader's defaults, so a reader that took
+	line 1 takes a line as wide after it, as it did; a line without a value resets them, and the search stops there (a
+	strict reader given wider defaults with a value takes line 1 and not a line as wide after a reset, and would lose the
+	key). Else one whose later line holds no value: every reader applies that line (a row at one column, a deletion at
+	more), so the key reads after it as it did, though a reader that counts from the place then reads that key first.
+	Else, unless a line 1 of one cell that the caller reads as a row comes before the place (``both``: its readers
 	would read the stand-in as a row, and 3.39's strict read, which drops a wider line at one column, would gain it; Q3),
 	a key that no row with a value before the place names (5.11: in a store's own delete under a header line 1 is not, the
 	store counts from the place, and a stand-in keeps its cells as they read; 3.39's strict reader given no header gains
@@ -3284,12 +3288,15 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 
 	def keyed(start):
 		return next((i for i in range(start, len(raw)) if kinds[i][0] != 'skip'), None)
+
+	def after(i):  # (the next line a reader reads after i: a stand-in, or a keyed line that stays)
+		return next((j for j in range(i + 1, len(raw)) if j in stand or (kinds[j][0] != 'skip' and not goes(j))), None)
 	places = [keyed(1 if skipFirst else 0)] if widthFromLines else []
 	if both and places == [0]:
 		places.append(keyed(1))
 	stand = {}
 	for i in sorted((i for i in places if i is not None and goes(i)), reverse=True):  # (a later stand-in can come in an earlier's place)
-		nxt = next((j for j in range(i + 1, len(raw)) if j in stand or (kinds[j][0] != 'skip' and not goes(j))), None)
+		nxt = after(i)
 		same = nxt is not None and (stand[nxt].count(d) + 1 if nxt in stand else kinds[nxt][2]) == kinds[i][2]
 		if same and both and i == 0:
 			stand[i] = b'#'  # (the count stays: only line 1's place, which a reader given the header skips, is kept)
@@ -3299,8 +3306,14 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		later = [j for j in range(i + 1, len(raw)) if kinds[j][0] == 'row' and not goes(j)]
 		# (named: the keys a row with a value before the place names, which is line 1's key alone, and none at line 1's place)
 		named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
-		if kinds[nxt][1].rstrip() in named and valued(nxt) and kinds[nxt][2] == kinds[0][2]:
-			pick = [nxt]  # (line 1's key: its next line comes first after the place, as wide as line 1; 5.12: tried first)
+		# (the first row after the place, past defaults lines that hold a value, 5.13: no reader's defaults lose a value at
+		# one, so a reader that took line 1 takes a line as wide after them; a reset stops the search)
+		row = nxt
+		while row is not None and row not in stand and kinds[row][0] == 'defaults':
+			row = after(row)
+		key = kinds[row][1].rstrip() if row is not None and row not in stand and valued(row) else None
+		if key in named and kinds[row][2] == kinds[0][2]:
+			pick = [row]  # (line 1's key: its first row after the place, as wide as line 1; 5.12: tried first)
 		else:
 			pick = [j for j in later if not valued(j)]
 			if not pick and not (both and i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):
