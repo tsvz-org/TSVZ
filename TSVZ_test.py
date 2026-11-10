@@ -16905,14 +16905,18 @@ def test_the_exit_waits_for_the_writer_thread_through_waited(tmp_path, monkeypat
 	t.close()
 
 
-#: ARGV: TSVZ's directory, 'tsvzed' or 'client', the file. Writes to a store, a KeyboardInterrupt raised at each Python step
-#: of one write in turn (sys.settrace: the same steps on every run and every Python) and caught, as a program that catches
-#: a Ctrl-C and goes on does; then one more write, and the exit. Prints the number of steps.
+#: ARGV: TSVZ's directory, 'tsvzed' or 'client', the file, and 'opcodes' (3.7 and later: a step is a bytecode, not a line).
+#: Writes to a store, a KeyboardInterrupt raised at each Python step of one write in turn (sys.settrace: the same steps on
+#: every run and every Python) and caught, as a program that catches a Ctrl-C and goes on does; then one more write, and
+#: the exit. Prints the steps after which this thread still held the store's lock ("held": a set, a delete or a commit
+#: another thread's set would wait for), then the number of steps.
 _INTERRUPTED_WRITES = r"""
 import sys
 sys.path.insert(0, sys.argv[1])
 import TSVZ
 how, p = sys.argv[2], sys.argv[3]
+opcodes = len(sys.argv) > 4
+held = []
 if how == 'tsvzed':
 	store = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)
 	def write(key):
@@ -16926,6 +16930,8 @@ left = [0]
 def tracer(frame, event, arg):
 	if left[0] <= 0:
 		return None
+	if opcodes:
+		frame.f_trace_opcodes = True
 	left[0] -= 1
 	if not left[0]:
 		raise KeyboardInterrupt
@@ -16938,31 +16944,39 @@ while left[0] == 0:  # until a write is done before its step `at`
 	try:
 		write('k%d' % at)
 	except KeyboardInterrupt:
-		pass
+		if how == 'tsvzed' and store._memLock._is_owned():
+			held.append(at)
 	finally:
 		sys.settrace(None)
 write('last')
+print('held', held)
 print(at)
 """
 
 
-@pytest.mark.parametrize('how', ['tsvzed', 'client'])
-def test_a_ctrl_c_caught_in_a_write_leaves_the_store_writing_and_the_program_ending(tmp_path, how):
+@pytest.mark.parametrize('how, steps', [
+	('tsvzed', 'lines'),
+	pytest.param('tsvzed', 'opcodes', marks=pytest.mark.skipif(sys.version_info < (3, 7), reason='f_trace_opcodes')),
+	('client', 'lines'),
+])
+def test_a_ctrl_c_caught_in_a_write_leaves_the_store_writing_and_the_program_ending(tmp_path, how, steps):
 	# 5.12's threading.Event (a TSVZed's waits for its writer thread) and Condition (a TSVZClient's and the CLI's writer)
 	# held their lock while Python code ran, and a KeyboardInterrupt can skip a with statement's exit (bpo-29988): a
 	# Ctrl-C there left it held. A program that caught the Ctrl-C and went on writing waited for ever at its next commit,
-	# and one that ended hung at the exit; the interrupt at each step finds every such place.
+	# and one that ended hung at the exit; the interrupt at each step finds every such place. A TSVZed's set also lets
+	# go of its own lock where the Ctrl-C left it (5.13: no hold after the caught interrupt, at any step).
 	p = str(tmp_path / ('s.tsv' if how == 'tsvzed' else 's.tsvz'))
 	script = tmp_path / 'interrupted.py'
 	script.write_text(_INTERRUPTED_WRITES)
 	try:
 		# 120 s: the run takes a few seconds; only a write or an exit that waits for ever takes this long, on a machine
 		# the whole suite keeps busy.
-		done = subprocess.run([sys.executable, str(script), HERE, how, p], stdout=subprocess.PIPE,
-							  stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+		done = subprocess.run([sys.executable, str(script), HERE, how, p] + (['opcodes'] if steps == 'opcodes' else []),
+							  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
 	except subprocess.TimeoutExpired as e:
 		raise AssertionError('a write or the exit waited for ever after a Ctrl-C: {}'.format(e.stderr))
 	assert done.returncode == 0, done.stderr
+	assert 'held []' in done.stdout, done.stdout  # (the steps after which the thread still held the lock)
 	assert int(done.stdout.split()[-1]) > 20, done.stdout  # (the steps went through the wait for the writer thread)
 	assert TSVZ.readTabularFile(p, verbose=False)['last'] == ['last', 'v']
 
@@ -16991,7 +17005,7 @@ def test_a_section_lock_whose_hold_a_signal_handler_let_go_of_exits_without_an_e
 	other = threading.Thread(target=lambda: acquired.append(lock.acquire(False)))
 	other.start()
 	other.join(10)
-	assert acquired == [True]  # (nothing is left held by the sections above)
+	assert acquired == [True]  # (nothing is left held by the sections above; the lock is the test's own)
 
 
 def _a_store_whose_next_queueing_runs_a_handler(path, handler):
@@ -17086,6 +17100,75 @@ def test_a_real_signal_handler_that_uses_the_store_while_the_program_sets_rows_e
 		raise AssertionError('a handler that used the store waited for ever: {}'.format(e.stderr))
 	assert done.returncode == 0 and not done.stderr, done.stderr
 	assert len(TSVZ.readTabularFile(p, header='id\tv', verbose=False)) >= 50
+
+
+class _LeakyLock(TSVZ._SectionLock):
+	"""A section lock that a Ctrl-C leaves held, in the thread ``victim`` (the one that gets the Ctrl-C) only: ``where``
+	'enter', the interrupt lands after the acquire and before the block is set up (seen on 3.14); 'exit', the block's exit is
+	cut off before it lets go (3.6's end of a block, bpo-29988)."""
+	where = 'enter'
+	victim = None
+
+	def __enter__(self):
+		self.acquire()
+		if self.where == 'enter' and threading.current_thread() is self.victim:
+			raise KeyboardInterrupt
+		return True
+
+	def __exit__(self, *exc):
+		if self.where == 'exit' and threading.current_thread() is self.victim:
+			raise KeyboardInterrupt
+		self.release()
+
+
+_MUTATORS = [  # (the file, what is done to a store of the rows a and b; together the 11 sections a main thread changes memory in)
+	('tsv', 'setDefaults', lambda t: t.setDefaults(['id', 'q'])),
+	('tsv', 'set the defaults', lambda t: t.__setitem__(TSVZ.DEFAULTS_INDICATOR_KEY, [TSVZ.DEFAULTS_INDICATOR_KEY, 'q'])),
+	('tsv', 'set a row', lambda t: t.__setitem__('a', ['a', '2'])),
+	('tsv', 'delete the defaults', lambda t: t.__delitem__(TSVZ.DEFAULTS_INDICATOR_KEY)),
+	('tsv', 'delete a row', lambda t: t.__delitem__('a')),
+	('tsv', 'pop', lambda t: t.pop('a')),
+	('tsv', 'popitem', lambda t: t.popitem()),
+	('tsv', 'move_to_end', lambda t: t.move_to_end('a')),
+	('tsvz', 'set a row', lambda t: t.__setitem__('a', ['a', '2'])),
+	('tsvz', 'set a marker', lambda t: t.__setitem__('#_note_#', ['#_note_#', 'q'])),
+	('tsvz', 'delete a row', lambda t: t.__delitem__('a')),
+	('tsvz', 'pop', lambda t: t.pop('a')),
+	('tsvz', 'popitem', lambda t: t.popitem()),
+]
+
+
+@pytest.mark.parametrize('where', ['enter', 'exit'])
+@pytest.mark.parametrize('ext, name, mutate', _MUTATORS, ids=[ext + ' ' + name for ext, name, _ in _MUTATORS])
+def test_a_ctrl_c_that_leaves_a_sets_lock_held_is_let_go_of_by_the_set_it_goes_up_through(tmp_path, ext, name, mutate, where):
+	# A program that catches a Ctrl-C and goes on, after a Ctrl-C that landed where the section's exit never ran (17 of 320
+	# runs on 3.6, 2 of 320 on 3.14 in the review of 5.13): another thread's set, and a .tsv store's background appends,
+	# waited until this thread used the store again. The interrupt goes up through the method, which lets go of the hold.
+	t = TSVZ.TSVZed(str(tmp_path / ('f.' + ext)), header='id\tv', verbose=False, rewrite_on_load=False, append_check_delay=60)
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '2']
+	real = t._memLock
+	leaky = t._memLock = _LeakyLock()
+	leaky.where = where
+	leaky.victim = threading.current_thread()
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			mutate(t)
+		assert not leaky._is_owned(), 'the Ctrl-C left the lock held by this thread'
+		free = []
+
+		def probe():  # (another thread could take it: and lets go of it again)
+			got = leaky.acquire(False)
+			if got:
+				leaky.release()
+			free.append(got)
+		other = threading.Thread(target=probe)
+		other.start()
+		other.join(10)
+		assert free == [True]
+	finally:
+		t._memLock = real
+		t.close()
 
 
 # --------------------------------------------------------------------------

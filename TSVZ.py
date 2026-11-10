@@ -5547,7 +5547,11 @@ class _SectionLock(_thread.RLock):
 	the exit about 1 time in 14 on 3.14 and 1 in 250 on 3.6. This one is an RLock, which knows the thread that holds it.
 	None of TSVZ's sections is entered from inside another (with a plain lock, that waited for ever): a thread that holds
 	it as it enters one, or as it waits for the writer thread (letGo), holds it from a Ctrl-C, and lets go of it first.
-	Another thread waits for such a hold until its holder next does either, or the exit does.
+	Another thread waits for such a hold until its holder next does either, or the exit does. A set, delete, pop or move
+	that a Ctrl-C goes up through lets go too (``except BaseException: letGo(); raise``, for a Ctrl-C that skipped the
+	exit of its ``with`` statement), so a program that catches the Ctrl-C and goes on holds nothing: 17 of 320 write loops
+	ended by a caught Ctrl-C left the hold on 3.6, 2 of 320 on 3.14, before. Left are a second Ctrl-C landing inside that
+	clause, and the sections the writer thread's work runs in the main thread (after close(), in a forked child).
 
 	A signal handler that uses the store is not TSVZ's code: it runs inside the section it interrupted, and its own section
 	(or its wait for the writer thread) lets go of the interrupted one's hold. The exit of the interrupted section then
@@ -6009,10 +6013,14 @@ class TSVZed(OrderedDict):
 			self._givenDefaults = list(defaults)
 			self.defaults = defaults
 			return
-		with self._memLock:  # (a read's swap sees either both of these or neither)
-			self._givenDefaults = list(defaults)  # (the defaults a whole read starts from)
-			self._readWhole = True  # memory's defaults now differ from the file's: another process's change is read whole
-			self.defaults = defaults
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # (a read's swap sees either both of these or neither)
+				self._givenDefaults = list(defaults)  # (the defaults a whole read starts from)
+				self._readWhole = True  # memory's defaults now differ from the file's: another process's change is read whole
+				self.defaults = defaults
+		except BaseException:
+			self._memLock.letGo()
+			raise
 
 	def load(self):
 		self.reload()
@@ -6222,41 +6230,49 @@ class TSVZed(OrderedDict):
 			# and before memory, the queue or the column count change.
 			self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
 		if key == DEFAULTS_INDICATOR_KEY:
-			with self._memLock:  # with memory and the queue: a reload sets the column count under it too
-				self.correctColumnNum = newColumnNum
-				self.defaults = value
-				if self.verbose:
-					self.__teePrintOrNot(f"Defaults set to {value}")
-				if not self.memoryOnly:
-					self.appendQueue.append(value)
-					self.lastUpdateTime = get_time_ns()
+			try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+				with self._memLock:  # with memory and the queue: a reload sets the column count under it too
+					self.correctColumnNum = newColumnNum
+					self.defaults = value
 					if self.verbose:
-						self.__teePrintOrNot(f"Appending Defaults {key} to the appendQueue")
+						self.__teePrintOrNot(f"Defaults set to {value}")
+					if not self.memoryOnly:
+						self.appendQueue.append(value)
+						self.lastUpdateTime = get_time_ns()
+						if self.verbose:
+							self.__teePrintOrNot(f"Appending Defaults {key} to the appendQueue")
+			except BaseException:
+				self._memLock.letGo()
+				raise
 			return
 		if self.verbose:
 			self.__teePrintOrNot(f"Setting {key} to {value}")
-		with self._memLock:  # memory and the queue change together: see reload()
-			self.correctColumnNum = newColumnNum
-			if key in self:
-				if self[key] == value:
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # memory and the queue change together: see reload()
+				self.correctColumnNum = newColumnNum
+				if key in self:
+					if self[key] == value:
+						if self.verbose:
+							self.__teePrintOrNot(f"Key {key} already exists with the same value")
+						return
+					self.dirty = True
+				# update the dictionary,
+				super().__setitem__(key,value)
+				if self.memoryOnly:
 					if self.verbose:
-						self.__teePrintOrNot(f"Key {key} already exists with the same value")
+						self.__teePrintOrNot(f"Key {key} updated in memory only")
 					return
-				self.dirty = True
-			# update the dictionary,
-			super().__setitem__(key,value)
-			if self.memoryOnly:
+				elif key.startswith('#'):
+					if self.verbose:
+						self.__teePrintOrNot(f"Key {key} updated in memory only as it starts with #")
+					return
 				if self.verbose:
-					self.__teePrintOrNot(f"Key {key} updated in memory only")
-				return
-			elif key.startswith('#'):
-				if self.verbose:
-					self.__teePrintOrNot(f"Key {key} updated in memory only as it starts with #")
-				return
-			if self.verbose:
-				self.__teePrintOrNot(f"Appending {key} to the appendQueue")
-			self.appendQueue.append(value)
-			self.lastUpdateTime = get_time_ns()
+					self.__teePrintOrNot(f"Appending {key} to the appendQueue")
+				self.appendQueue.append(value)
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 		# if not self.appendThread.is_alive():
 		#     self.commitAppendToFile()
 		# else:
@@ -6348,32 +6364,40 @@ class TSVZed(OrderedDict):
 			return self._specDelItem(key)
 		key = self._nameKey(key)
 		if key == DEFAULTS_INDICATOR_KEY:
-			with self._memLock:
-				self.defaults = [DEFAULTS_INDICATOR_KEY]
-				if self.verbose:
-					self.__teePrintOrNot("Defaults cleared")
-				if not self.memoryOnly:
-					self.__appendEmptyLine(key)
+			try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+				with self._memLock:
+					self.defaults = [DEFAULTS_INDICATOR_KEY]
 					if self.verbose:
-						self.__teePrintOrNot(f"Appending empty default line {key}")
+						self.__teePrintOrNot("Defaults cleared")
+					if not self.memoryOnly:
+						self.__appendEmptyLine(key)
+						if self.verbose:
+							self.__teePrintOrNot(f"Appending empty default line {key}")
+			except BaseException:
+				self._memLock.letGo()
+				raise
 			return
 		# delete the key from the dictionary and update the file
-		with self._memLock:  # memory and the queue change together: see reload()
-			if key not in self:
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # memory and the queue change together: see reload()
+				if key not in self:
+					if self.verbose:
+						self.__teePrintOrNot(f"Key {key} not found")
+					return
+				self._checkDelete(key)
+				row = dict.get(self, key)
+				super().__delitem__(key)
+				if self.memoryOnly or key.startswith('#'):
+					if self.verbose:
+						self.__teePrintOrNot(f"Key {key} deleted in memory")
+					return
+				self._deleteLine(key, row)
 				if self.verbose:
-					self.__teePrintOrNot(f"Key {key} not found")
-				return
-			self._checkDelete(key)
-			row = dict.get(self, key)
-			super().__delitem__(key)
-			if self.memoryOnly or key.startswith('#'):
-				if self.verbose:
-					self.__teePrintOrNot(f"Key {key} deleted in memory")
-				return
-			self._deleteLine(key, row)
-			if self.verbose:
-				self.__teePrintOrNot(f"Appending empty line {key}")
-			self.lastUpdateTime = get_time_ns()
+					self.__teePrintOrNot(f"Appending empty line {key}")
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 		
 	def _oneColumn(self, row):
 		"""True when a deletion line of the legacy row ``row`` would be the key alone and read as a row: the store has one
@@ -6424,41 +6448,49 @@ class TSVZed(OrderedDict):
 			del self[key]
 			return
 		self._checkWritable(value)
-		with self._memLock:  # memory and the queue change together: see _specReload
-			if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
-				self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
-				return
-			_specFill(value, self.defaults)
-			record = _specFormatRecord(value, self.delimiter)
-			self.correctColumnNum = _specPadRow(value, self._specState, self.correctColumnNum if self.correctColumnNum > 0 else -1)
-			if key in self:
-				if OrderedDict.__getitem__(self, key) == value:
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # memory and the queue change together: see _specReload
+				if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
+					self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
 					return
-				self.dirty = True
-			OrderedDict.__setitem__(self, key, value)
-			if self.memoryOnly:
-				return
-			self.appendQueue.append(record)
-			self.lastUpdateTime = get_time_ns()
+				_specFill(value, self.defaults)
+				record = _specFormatRecord(value, self.delimiter)
+				self.correctColumnNum = _specPadRow(value, self._specState, self.correctColumnNum if self.correctColumnNum > 0 else -1)
+				if key in self:
+					if OrderedDict.__getitem__(self, key) == value:
+						return
+					self.dirty = True
+				OrderedDict.__setitem__(self, key, value)
+				if self.memoryOnly:
+					return
+				self.appendQueue.append(record)
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 
 	def _specSetMarker(self, key, value):
 		"""Write a reserved-key marker (design §5.2 e); official markers also update the reader state."""
 		self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
 		keyLower = key.lower()
-		with self._memLock:  # the reader state and the queue change together: see _specReload
-			if keyLower in _SPEC_MARKER_KEYS:
-				reporter = _Reporter(self._fileName, self.teeLogger)
-				applied = _specApplyMarker(self._specState, keyLower, value[1:], reporter, None)
-				reporter.flush()
-				if not applied:
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # the reader state and the queue change together: see _specReload
+				if keyLower in _SPEC_MARKER_KEYS:
+					reporter = _Reporter(self._fileName, self.teeLogger)
+					applied = _specApplyMarker(self._specState, keyLower, value[1:], reporter, None)
+					reporter.flush()
+					if not applied:
+						return
+					self.defaults = list(self._specState.defaults)
+				if self.verbose:
+					self.__teePrintOrNot(f"Marker {key} set to {value[1:]}")
+				if self.memoryOnly:
 					return
-				self.defaults = list(self._specState.defaults)
-			if self.verbose:
-				self.__teePrintOrNot(f"Marker {key} set to {value[1:]}")
-			if self.memoryOnly:
-				return
-			self.appendQueue.append(_specFormatRecord(value, self.delimiter, marker=True))
-			self.lastUpdateTime = get_time_ns()
+				self.appendQueue.append(_specFormatRecord(value, self.delimiter, marker=True))
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 
 	def _specDelItem(self, key):
 		key = self._nameKey(key)
@@ -6466,17 +6498,21 @@ class TSVZed(OrderedDict):
 			# A lone marker key resets that marker (spec §12.1).
 			self._specSetMarker(key, [key])
 			return
-		with self._memLock:  # memory and the queue change together: see _specReload
-			if key not in self:
-				if self.verbose:
-					self.__teePrintOrNot(f"Key {key} not found")
-				return
-			self._checkDelete(key)
-			OrderedDict.__delitem__(self, key)
-			if self.memoryOnly:
-				return
-			self.__appendEmptyLine(key)
-			self.lastUpdateTime = get_time_ns()
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # memory and the queue change together: see _specReload
+				if key not in self:
+					if self.verbose:
+						self.__teePrintOrNot(f"Key {key} not found")
+					return
+				self._checkDelete(key)
+				OrderedDict.__delitem__(self, key)
+				if self.memoryOnly:
+					return
+				self.__appendEmptyLine(key)
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 
 	def _specCommit(self):
 		"""Append the queued records to the active part (design §5.4).
@@ -6639,16 +6675,20 @@ memoryOnly:{self.memoryOnly}
 
 	def popitem(self, last=True):
 		# Not OrderedDict.popitem: before Python 3.11 it goes through self[key] and del self[key], which strip the key.
-		with self._memLock:  # memory and the queue change together: see reload()
-			if not OrderedDict.__len__(self):
-				raise KeyError('dictionary is empty')
-			key = next(OrderedDict.__reversed__(self)) if last else next(OrderedDict.__iter__(self))
-			self._checkDelete(key)
-			value = OrderedDict.__getitem__(self, key)
-			OrderedDict.__delitem__(self, key)
-			if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
-				self._deleteLine(key, value)
-			self.lastUpdateTime = get_time_ns()
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # memory and the queue change together: see reload()
+				if not OrderedDict.__len__(self):
+					raise KeyError('dictionary is empty')
+				key = next(OrderedDict.__reversed__(self)) if last else next(OrderedDict.__iter__(self))
+				self._checkDelete(key)
+				value = OrderedDict.__getitem__(self, key)
+				OrderedDict.__delitem__(self, key)
+				if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
+					self._deleteLine(key, value)
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 		return key, value
 	
 	__marker = object()
@@ -6660,18 +6700,22 @@ memoryOnly:{self.memoryOnly}
 
 		'''
 		key = self._nameKey(key)
-		with self._memLock:  # memory and the queue change together: see reload()
-			if not OrderedDict.__contains__(self, key):
-				if default is self.__marker:
-					raise KeyError(key)
-				return default
-			# Not OrderedDict.pop: before Python 3.11 it goes through del self[key], which writes a tombstone too.
-			self._checkDelete(key)
-			value = OrderedDict.__getitem__(self, key)
-			OrderedDict.__delitem__(self, key)
-			if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
-				self._deleteLine(key, value)
-			self.lastUpdateTime = get_time_ns()
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # memory and the queue change together: see reload()
+				if not OrderedDict.__contains__(self, key):
+					if default is self.__marker:
+						raise KeyError(key)
+					return default
+				# Not OrderedDict.pop: before Python 3.11 it goes through del self[key], which writes a tombstone too.
+				self._checkDelete(key)
+				value = OrderedDict.__getitem__(self, key)
+				OrderedDict.__delitem__(self, key)
+				if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
+					self._deleteLine(key, value)
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 		return value
 	
 	def move_to_end(self, key, last=True):
@@ -6694,20 +6738,24 @@ memoryOnly:{self.memoryOnly}
 			# rewrite only when one is due. (A stat, so a loop of moves stays cheap.)
 			self.checkExternalChanges()
 			self._call(self._rewrite, False, None, True)
-		with self._memLock:
-			if not dict.__contains__(self, key):
-				raise KeyError(key)
-			moved = [(k, row) for k, row in OrderedDict.items(self) if k != key] if not last else [(key, dict.get(self, key))]
-			if not self.memoryOnly:  # refused before memory or the queue change, as a set or a delete is
-				for k, row in moved:
-					if not k.startswith('#'):
-						self._checkDelete(k)
-						self._checkWritable(row)
-			OrderedDict.move_to_end(self, key, last)
-			if not self.memoryOnly:
-				for k, row in moved:
-					self._queueMove(k, row)
-				self.lastUpdateTime = get_time_ns()
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:
+				if not dict.__contains__(self, key):
+					raise KeyError(key)
+				moved = [(k, row) for k, row in OrderedDict.items(self) if k != key] if not last else [(key, dict.get(self, key))]
+				if not self.memoryOnly:  # refused before memory or the queue change, as a set or a delete is
+					for k, row in moved:
+						if not k.startswith('#'):
+							self._checkDelete(k)
+							self._checkWritable(row)
+				OrderedDict.move_to_end(self, key, last)
+				if not self.memoryOnly:
+					for k, row in moved:
+						self._queueMove(k, row)
+					self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 		return self
 
 	def _queueMove(self, key, row):
