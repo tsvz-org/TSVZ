@@ -17415,3 +17415,65 @@ def test_line_1s_key_stands_in_first_so_readers_given_the_header_keep_the_order(
 		assert list(t) == ['d', 'a']
 	finally:
 		t.close()
+
+
+def test_a_scrub_keeps_what_a_reader_given_no_header_and_its_defaults_takes_after_a_line_1_of_one_cell(tmp_path):
+	# 5.11 planned the reader given no header and the scrub's defaults at line 1's one cell (the one-column rule), where it
+	# reads at the defaults' three: c\t2\t, the last line it takes of c, went, and it read c as [c, X, ''] where it read
+	# [c, 2, '']. It is planned at the defaults' count too now, as a scrub at one column planned it.
+	p = str(tmp_path / 'f.tsv')
+	text = b'a\nc\tX\nc\t2\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n'
+	defaults = [D_, 'P', '']
+	_touch(p, text)
+
+	def views():
+		out = []
+		for mod in (TSVZ, TSVZ_old):
+			for s in (True, False):
+				for h in ('', 'a'):
+					for d in (None, defaults):
+						kwargs = dict(header=h, strict=s, verbose=False)
+						if d:
+							kwargs['defaults'] = list(d)
+						with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+							out.append((mod.__name__, s, h, bool(d), list(mod.readTabularFile(p, **kwargs).items())))
+		return out
+	before = views()
+	assert ('TSVZ', True, '', True, [('c', ['c', '2', ''])]) in before
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		TSVZ.scrubTabularFile(p, header='id\tv', defaults=list(defaults), correctColumnNum=2)
+	assert _bytes(p) == b'a\nc\tX\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n'
+	assert views() == before
+
+
+def test_a_line_1_of_one_cell_plans_the_reader_given_no_header_and_the_defaults_at_their_count():
+	defaults = [D_, 'P', '']
+	lone = _lines(b'a\nc\tX\nc\t2\n')
+	reset = _lines(b'#_defaults_#\nc\tX\nc\t2\n')
+	for lines, widths in ((lone, (1, 2)), (reset, (1, 2, 3))):
+		for width in widths:
+			readers = TSVZ._legacyCompactReaders(lines, width, True, defaults, '\t', 'utf8', False)
+			assert (3, False, False, defaults) in readers and (1, False, False, defaults) in readers, (lines, width)
+			assert len(readers) == len({(w, c, m, tuple(d)) for w, c, m, d in readers}), readers
+	# (a lone key at the caller's count, the defaults': it is a deletion of a key not yet read to that reader, which then
+	# reads every line as the caller's reader does; a plan of its own kept lines no reader needs)
+	assert (3, False, False, defaults) not in TSVZ._legacyCompactReaders(lone, 3, True, defaults, '\t', 'utf8', False)
+	# (a line 1 of two cells: line 1's reader given the defaults is listed at their count already, once)
+	readers = TSVZ._legacyCompactReaders(_lines(b'a\t1\nc\tX\n'), 2, True, defaults, '\t', 'utf8', False)
+	assert readers.count((3, False, False, defaults)) == 1
+
+
+def test_a_scrub_keeps_what_a_strict_reader_given_no_header_and_its_defaults_takes_after_a_bare_defaults_line_1(tmp_path):
+	# (found building 5.12) A bare #_defaults_# on line 1 resets the defaults of a reader given no header, which then reads
+	# at their count strictly: c\t2\t is the only line of c it takes. 5.11 planned that reader at one column only, and a
+	# scrub given the header id\tv and those defaults kept only c\t3: c was lost to it.
+	p = str(tmp_path / 'f.tsv')
+	defaults = [D_, 'P', '']
+	_touch(p, b'#_defaults_#\nc\t1\nc\t2\t\nc\t3\n')
+	before = {mod.__name__: dict(mod.readTabularFile(p, defaults=list(defaults), strict=True, verbose=False))
+			  for mod in (TSVZ, TSVZ_old)}
+	assert before['TSVZ'] == {'c': ['c', '2', '']}
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		TSVZ.scrubTabularFile(p, header='id\tv', defaults=list(defaults))
+	for mod in (TSVZ, TSVZ_old):
+		assert dict(mod.readTabularFile(p, defaults=list(defaults), strict=True, verbose=False)) == before[mod.__name__]
