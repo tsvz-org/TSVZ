@@ -3265,10 +3265,12 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	keepsAValue): a reader that took line 1 takes a line as wide after such a line, as it did. A line without a value resets
 	a reader's defaults, and the search stops there (a strict reader given wider defaults with a value takes line 1 and not a
 	line as wide after a reset, and would lose the key), and so does a line whose first value comes later (3.39 cuts a
-	defaults line to its count, and given a count below that cell it loses the key). Else (5.14), after a line 1 of two cells or more, where the place has one cell (a reader that counts from it
-	reads at one column), that first row's key when the row holds a value: those readers read the key first there, as they
-	read that row first before, and line 1's readers, at two columns or more, read the stand-in as the deletion of a key not
-	yet read (3.39's strict reader given a count of one, which takes only one-cell lines, gains it, as it gains line 1's
+	defaults line to its count, and given a count below that cell it loses the key). Else (5.14), after a line 1 of two cells
+	or more, where the place has one cell (a reader that counts from it reads at one column), the first row of another key
+	when it holds a value, past every defaults line, a reset too (a stand-in of line 1's key would be lost there, but
+	another key's deletes a key not yet read, whatever the defaults): those readers read the key first there, as they read
+	that row first before, and line 1's readers, at two columns or more, read the stand-in as the deletion of a key not yet
+	read (3.39's strict reader given a count of one, which takes only one-cell lines, gains it, as it gains line 1's
 	key). Else one whose later line holds no value: every reader applies that line (a row at one column, a deletion at
 	more), so the key reads after it as it did, though a reader that counts from the place then reads that key first.
 	Else, unless a line 1 of one cell that the caller reads as a row comes before the place (``both``: its readers
@@ -3326,10 +3328,15 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		while row is not None and row not in stand and kinds[row][0] == 'defaults' and keepsAValue(row):
 			row = after(row)
 		key = kinds[row][1].rstrip() if row is not None and row not in stand and valued(row) else None
+		# (another key's first row: past a reset too, as its stand-in deletes a key not yet read, whatever the defaults)
+		other = row
+		while other is not None and other not in stand and kinds[other][0] in ('defaults', 'reset'):
+			other = after(other)
+		otherKey = kinds[other][1].rstrip() if other is not None and other not in stand and valued(other) else None
 		if key in named and kinds[row][2] == kinds[0][2]:
 			pick = [row]  # (line 1's key: its first row after the place, as wide as line 1; 5.12: tried first)
-		elif key is not None and key not in named and i > 0 and kinds[0][0] != 'skip' and kinds[0][2] > 1 and kinds[i][2] == 1:
-			pick = [row]  # (5.14: another key's first row after the place, after a line 1 of two cells or more, at one cell)
+		elif otherKey is not None and otherKey not in named and i > 0 and kinds[0][0] != 'skip' and kinds[0][2] > 1 and kinds[i][2] == 1:
+			pick = [other]  # (5.14: another key's first row after the place, after a line 1 of two cells or more, at one cell)
 		else:
 			pick = [j for j in later if not valued(j)]
 			if not pick and not (both and i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):

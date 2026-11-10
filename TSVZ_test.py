@@ -17646,3 +17646,13 @@ def test_line_1s_key_does_not_stand_in_past_a_defaults_line_3_39_turns_strict_at
 		assert _run('--x-header', 'q', 'delete', p, 'c')[0] == 0
 		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
 			assert 'd' in read(p), _bytes(p)
+
+
+@pytest.mark.parametrize('reset', [b'#_defaults_#\t', b'#_defaults_#\t\t'])
+def test_the_first_row_of_another_key_stands_in_past_a_reset(tmp_path, reset):
+	# (a reset stops line 1's key's search, not another key's: its stand-in deletes a key no reader that counts from line 1
+	# has read, whatever its defaults)
+	p = str(tmp_path / 'f.tsv')
+	text = b'd\tX\nc\n' + reset + b'\nb\t1\t2\na\n'
+	_delete_reads_as_before(p, text, 'c', text.replace(b'\nc\n', b'\nb\n', 1), 'q', 'cli', None)
+	assert _store_order_after_delete(p, text, 'q', 'c') == (['b', 'a'], ['b', 'a'])
