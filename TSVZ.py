@@ -3230,16 +3230,18 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	empty cells as the line had, so no reader's count changes. With the same count nothing is needed, but on line 1 with
 	``both`` a bare ``#`` keeps the place a header reader skips.
 
-	The key is one whose later line holds no value: every reader applies that line (a row at one column, a deletion at
-	more), so the key reads after it as it did. Else, unless a line 1 of one cell that the caller reads as a row comes
-	before the place (``both``: its readers would read the stand-in as a row, and 3.39's strict read, which drops a wider
-	line at one column, would gain it; Q3), a key that no row with a value before the place names (5.11: in a store's
-	own delete under a header line 1 is not, the store counts from the place, and a stand-in keeps its cells as they
-	read; 3.39's strict reader given no header gains the key, Q4's kind): at two columns or more the stand-in deletes a
-	key not yet read, at one it is a row the key's later line replaces. Else line 1's own key, when the first keyed line after the place is
-	a row of it as wide as line 1 (5.10): every reader that read line 1's row reads the key deleted at the stand-in and
-	takes that line back before any other key, and a compaction keeps that line for line 1's readers (_legacyCompact).
-	No such row: the line just goes."""
+	The key is line 1's own, when the first keyed line after the place is a row of it as wide as line 1 (5.10): every
+	reader that read line 1's row reads the key deleted at the stand-in and takes that line back before any other key, a
+	reader that counts from the place reads the key first there, as it read that line before, and a compaction keeps that
+	line for line 1's readers (_legacyCompact). 5.12 tries it first: any other key comes first to a reader that counts from
+	the place, and can so take another key's place in its order (5.10 and 5.11 tried it last). Else one whose later line
+	holds no value: every reader applies that line (a row at one column, a deletion at more), so the key reads after it as
+	it did. Else, unless a line 1 of one cell that the caller reads as a row comes before the place (``both``: its readers
+	would read the stand-in as a row, and 3.39's strict read, which drops a wider line at one column, would gain it; Q3),
+	a key that no row with a value before the place names (5.11: in a store's own delete under a header line 1 is not, the
+	store counts from the place, and a stand-in keeps its cells as they read; 3.39's strict reader given no header gains
+	the key, Q4's kind): at two columns or more the stand-in deletes a key not yet read, at one it is a row the key's
+	later line replaces. No such row: the line just goes."""
 	enc = encoding or 'utf8'
 	d = delimiter.encode(enc)
 	texts = [line.decode(enc, errors='replace') for line in raw]
@@ -3267,13 +3269,14 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		if nxt is None or same:
 			continue
 		later = [j for j in range(i + 1, len(raw)) if kinds[j][0] == 'row' and not goes(j)]
-		pick = [j for j in later if not valued(j)]
-		if not pick and not (both and i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):
-			named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
-			pick = [j for j in later if kinds[j][1].rstrip() not in named]
-			if (not pick and nxt not in stand and kinds[nxt][0] == 'row' and kinds[nxt][1].rstrip() in named and valued(nxt)
-					and kinds[nxt][2] == kinds[0][2]):
-				pick = [nxt]  # (line 1's key: its next line comes first after the place, as wide as line 1)
+		named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}  # (keys a row with a value before the place names)
+		if (nxt not in stand and kinds[nxt][0] == 'row' and kinds[nxt][1].rstrip() in named and valued(nxt)
+				and kinds[nxt][2] == kinds[0][2]):
+			pick = [nxt]  # (line 1's key: its next line comes first after the place, as wide as line 1; 5.12: tried first)
+		else:
+			pick = [j for j in later if not valued(j)]
+			if not pick and not (both and i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):
+				pick = [j for j in later if kinds[j][1].rstrip() not in named]
 		if pick:
 			stand[i] = raw[pick[0]].strip(b'\x00').rstrip(b'\r').split(d)[0] + d * (kinds[i][2] - 1)
 	return [stand.get(i, line) for i, line in enumerate(raw) if i in stand or not goes(i)]

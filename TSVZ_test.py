@@ -17380,3 +17380,38 @@ def test_a_count_given_with_valued_defaults_adds_no_twin_where_every_valued_line
 		TSVZ._legacyCompactReaders(lines, 2, True, [D_, 'P'], '\t', 'utf8', True)
 	lines = _lines(b'id\tv\na\t1\nb\t2\t3\n#_defaults_#\tP\n')
 	assert (2, True, True, ()) in TSVZ._legacyCompactReaders(lines, 2, True, [D_, 'P'], '\t', 'utf8', True, (2,))
+
+
+# --------------------------------------------------------------------------
+# 5.12: the two entries deferred from 5.11 (docs/limitations.md)
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize('door', ['zed', 'cli', 'lite'])
+@pytest.mark.parametrize('text, written', [
+	# (the deferred case: a, which no row with a value before the place names)
+	(b'd\tX\nc\nd\t1\na\t1\n', b'd\tX\nd\nd\t1\na\t1\n'),
+	# (a key whose later line holds no value, tried first in 5.11, comes first to those readers as well)
+	(b'd\tX\nc\nd\t1\na\n', b'd\tX\nd\nd\t1\na\n'),
+	(b'd\tX\nc\nd\t1\na\t\n', b'd\tX\nd\nd\t1\na\t\n'),
+])
+def test_line_1s_key_stands_in_first_so_readers_given_the_header_keep_the_order(tmp_path, door, text, written):
+	# 5.10 and 5.11 let a stand in for c: d\tX\na\nd\t1\na\t1\n, and a reopened store and every reader given the header,
+	# which count from the place, listed a, d where memory lists d, a (from 5.11 a store's rewrite no longer put it back:
+	# Q-C refuses that widening). Line 1's key is tried first now, its next line coming first after the place and as wide
+	# as line 1: those readers read d there as they read that line before, and line 1's readers read d deleted and taken
+	# back at once.
+	p = str(tmp_path / 'f.tsv')
+	H = 'd\tX\tz'
+	kwargs = {'strict': False} if door == 'lite' else {}
+	readers = _every_reader(H, 'd\tX')
+	_touch(p, text)
+	before = {name: read(p) for name, read in readers}
+	mem = _delete_reads_as_before(p, text, 'c', written, H, door, None, **kwargs)
+	assert mem is None or list(mem) == ['d', 'a']
+	for name, read in readers:
+		if before[name] is not None:
+			assert list(read(p)) == [key for key in before[name] if key != 'c'], name
+	t = TSVZ.TSVZed(p, header=H, verbose=False, append_check_delay=60, createIfNotExist=False, rewrite_on_load=False)
+	try:
+		assert list(t) == ['d', 'a']
+	finally:
+		t.close()
