@@ -316,7 +316,7 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
   holds no value, which comes first to those readers: `d\tX\nc\nb\t1\t2\na\n`, delete `c` under `q`
   (`tsvz --x-header`, a handler, a `TSVZed` delete and commit, `TSVZedLite(strict=False)`), wrote
   `d\tX\na\nb\t1\t2\na\n`, and a reopened store and every loose reader given the header listed `a, b` where memory
-  lists `b, a`. That row's key stands in now: `d\tX\nb\nb\t1\t2\na\n`, and every reader lists `b, a`; the readers that
+  lists `b, a`. That row's key stands in now: `d\tX\nb\nb\t1\t2\na\n`, and those readers list `b, a` too; the readers that
   count from line 1 read the stand-in as the deletion of a key not yet read. No row or cell changes for any reader
   given no header, the header, or line 1 for its header. One reader given a count sees the stand-in: 3.39's strict
   `readTabularFile(correctColumnNum=1)` given no header (or a header and `verifyHeader=False`), which takes only the
@@ -342,8 +342,8 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
   `d\tX\nc\n#_defaults_#\tP\tR\nd\t1\n`, delete `c` under `q`, wrote `d\tX\n#_defaults_#\tP\tR\nd\t1\n`, and a
   reopened store read `d` as `[d, 1, R]` where it read `[d, 1]`. The first row after the place is now looked for past
   defaults lines whose first value is in their second cell, or in their third where line 1 has two cells: every
-  reader that took line 1 takes a line as wide after such a line. `d\tX\nd\n#_defaults_#\t\tQ\nd\t1\na\n`, and every
-  reader lists `d, a`; `d\tX\nd\n#_defaults_#\tP\tR\nd\t1\n`, and they read `d` as `[d, 1]` (3.39's strict reader
+  reader that took line 1 takes a line as wide after such a line. `d\tX\nd\n#_defaults_#\t\tQ\nd\t1\na\n`, and the
+  readers given the header list `d, a`; `d\tX\nd\n#_defaults_#\tP\tR\nd\t1\n`, and they read `d` as `[d, 1]` (3.39's strict reader
   given a count of one shows `d`, as from 5.12 where line 1's key stands in). The search stops at a defaults line
   without a value (a reset: a strict reader given wider defaults with a value, which takes line 1, would not take a line as
   wide after it and would lose the key, `d\tX\nc\n#_defaults_#\t\nd\t1\na\n` still reorders), and at one whose first
@@ -354,7 +354,7 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
   The bullet above looks past every defaults line, a reset too, as its stand-in deletes another key that no reader that
   counts from line 1 has read: `d\tX\nc\n#_defaults_#\t\nb\t1\t2\na\n`, delete `c` under `q`, wrote
   `d\tX\na\n#_defaults_#\t\nb\t1\t2\na\n` and a reopened store listed `a, b` where memory lists `b, a`; it writes
-  `d\tX\nb\n#_defaults_#\t\nb\t1\t2\na\n` now, and every reader lists `b, a`.
+  `d\tX\nb\n#_defaults_#\t\nb\t1\t2\na\n` now, and the readers given the header list `b, a`.
   This also narrows the approved "After a line 1 of one cell, a
   delete under a header can change a cell for readers given it" (shape 2): `d\tX\na\n#_defaults_#\tP\nd\tY\n`, delete
   `a` under `q`, wrote `d\tX\n#_defaults_#\tP\nd\tY\n`, and 3.39's loose reader given `q` read `d` as `[d, Y]` where
