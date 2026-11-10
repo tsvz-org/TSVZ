@@ -5552,15 +5552,17 @@ class _SectionLock(_thread.RLock):
 	it as it enters one, or as it waits for the writer thread (letGo), holds it from a Ctrl-C, and lets go of it first.
 	Another thread waits for such a hold until its holder next does either, or the exit does. A set, delete, pop or move
 	that a Ctrl-C goes up through lets go too (``except BaseException: letGo(); raise``, for a Ctrl-C that skipped the
-	exit of its ``with`` statement), so a program that catches the Ctrl-C and goes on holds nothing: 17 of 320 write loops
-	ended by a caught Ctrl-C left the hold on 3.6, 2 of 320 on 3.14, before. Left are a second Ctrl-C landing inside that
-	clause, and the sections the writer thread's work runs in the main thread (after close(), in a forked child).
+	exit of its ``with`` statement), so a program that catches the Ctrl-C and goes on holds nothing: in two runs of 320
+	write loops ended by a caught Ctrl-C, 15 and 17 left the hold on 3.6 and 12 and 2 on 3.14, before. Left are a second
+	Ctrl-C landing inside that clause, and the sections the writer thread's work runs in the main thread (after close(),
+	in a forked child).
 
 	A signal handler that uses the store is not TSVZ's code: it runs inside the section it interrupted, and its own section
 	(or its wait for the writer thread) lets go of the interrupted one's hold. The exit of the interrupted section then
 	finds the lock not held, and ignores that (__exit__; a check of the hold before the release leaves a gap that a handler
-	lands in). The rest of that section runs without the lock; at worst, as far as checked, a line is written twice (the last wins) or memory
-	and the file differ until the next reload, and both need the writer thread to rewrite or reload in those microseconds.
+	lands in). The rest of that section runs without the lock; at worst, as far as checked, a line is written twice (the
+	last wins) or memory and the file differ until the next reload, and both need the writer thread to rewrite or reload
+	in those microseconds.
 	(Its exit is a Python method, about 0.1 microsecond a section dearer than the RLock's own on 3.6, 0.04 on 3.14.)"""
 	__slots__ = ()
 

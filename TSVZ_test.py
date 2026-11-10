@@ -17141,9 +17141,10 @@ _MUTATORS = [  # (the file, what is done to a store of the rows a and b; togethe
 @pytest.mark.parametrize('where', ['enter', 'exit'])
 @pytest.mark.parametrize('ext, name, mutate', _MUTATORS, ids=[ext + ' ' + name for ext, name, _ in _MUTATORS])
 def test_a_ctrl_c_that_leaves_a_sets_lock_held_is_let_go_of_by_the_set_it_goes_up_through(tmp_path, ext, name, mutate, where):
-	# A program that catches a Ctrl-C and goes on, after a Ctrl-C that landed where the section's exit never ran (17 of 320
-	# runs on 3.6, 2 of 320 on 3.14 in the review of 5.13): another thread's set, and a .tsv store's background appends,
-	# waited until this thread used the store again. The interrupt goes up through the method, which lets go of the hold.
+	# A program that catches a Ctrl-C and goes on, after a Ctrl-C that landed where the section's exit never ran (15 and 17
+	# of 320 runs on 3.6, 12 and 2 of 320 on 3.14, in two measurements for 5.13): another thread's set, and a .tsv store's
+	# background appends, waited until this thread used the store again. The interrupt goes up through the method, which
+	# lets go of the hold.
 	t = TSVZ.TSVZed(str(tmp_path / ('f.' + ext)), header='id\tv', verbose=False, rewrite_on_load=False, append_check_delay=60)
 	t['a'] = ['a', '1']
 	t['b'] = ['b', '2']
