@@ -2903,7 +2903,6 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 	lineLife = array.array('l', [-1]) * len(raw) if lives else None
 	lifeEnd = array.array('l') if lives else None  # (a slot is a life: a key starts a new one after each deletion)
 	rowBefore = array.array('l', [-1]) * len(raw) if lives else None
-	lastRow = {}  # key -> its last row line so far (with ``lives``)
 	pinfo = {}  # protectable index holding a row -> (key, ncells)
 	killer = {}  # protectable index whose key died -> the deletion that ended it
 	lastDelete = {}  # key -> its last deletion
@@ -2948,8 +2947,8 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 						killer[j] = i
 				if lives:
 					lifeEnd[slot] = i
-			if lives:
-				rowBefore[i] = lastRow.get(key, -1)
+			if lives:  # (no row of the key since its last deletion: the last row before that one)
+				rowBefore[i] = last[slot] if slot is not None else rowBefore[lastDelete[key]] if key in lastDelete else -1
 			lastDelete[key] = i
 		else:
 			if i in protectable:
@@ -2985,7 +2984,6 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 					lastTakenOld[slot] = i
 			if lives:
 				lineLife[i] = slot
-				lastRow[key] = i
 	kept = bytearray(len(raw))  # (one byte a line: whether it is kept)
 	for i in boundaries:
 		kept[i] = 1
