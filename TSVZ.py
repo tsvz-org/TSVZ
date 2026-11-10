@@ -5538,16 +5538,23 @@ class _Flag(object):
 
 
 class _SectionLock(_thread.RLock):
-	"""A lock for sections that never nest, which a Ctrl-C cannot leave held for good: a TSVZed's _memLock (5.13).
+	"""A lock for sections that TSVZ's own code never nests, which a Ctrl-C cannot leave held for good: a TSVZed's _memLock
+	(5.13).
 
 	A KeyboardInterrupt can land just after a ``with`` statement takes its lock and before the block is set up (seen on
 	3.14), or where the block's exit never runs (3.6's end of a block; CPython bpo-29988). A plain lock was then held for
 	ever, the writer thread waited for it, and the exit for the writer: in 5.12 a Ctrl-C that ended a loop of sets hung
-	the exit about 1 time in 14 on 3.14 and 1 in 250 on 3.6. This one is an RLock, which knows the thread that holds it,
-	and no section under it is entered from inside another (as a plain lock, that waited for ever): a thread that holds
+	the exit about 1 time in 14 on 3.14 and 1 in 250 on 3.6. This one is an RLock, which knows the thread that holds it.
+	None of TSVZ's sections is entered from inside another (with a plain lock, that waited for ever): a thread that holds
 	it as it enters one, or as it waits for the writer thread (letGo), holds it from a Ctrl-C, and lets go of it first.
-	Another thread waits for such a hold until its holder next does either, or the exit does. (A subclass: its exit is
-	the RLock's own, about 0.2 microseconds less a section than a Python one on 3.6.)"""
+	Another thread waits for such a hold until its holder next does either, or the exit does.
+
+	A signal handler that uses the store is not TSVZ's code: it runs inside the section it interrupted, and its own section
+	(or its wait for the writer thread) lets go of the interrupted one's hold. The exit of the interrupted section then
+	finds the lock not held, and ignores that (__exit__; a check of the hold before the release leaves a gap that a handler
+	lands in). The rest of that section runs without the lock; at worst, as far as checked, a line is written twice (the last wins) or memory
+	and the file differ until the next reload, and both need the writer thread to rewrite or reload in those microseconds.
+	(Its exit is a Python method, about 0.1 microsecond a section dearer than the RLock's own on 3.6, 0.04 on 3.14.)"""
 	__slots__ = ()
 
 	def letGo(self):
@@ -5559,6 +5566,12 @@ class _SectionLock(_thread.RLock):
 		if self._is_owned():
 			self.letGo()
 		return self.acquire()
+
+	def __exit__(self, *exc):
+		try:
+			self.release()
+		except RuntimeError:
+			pass  # not held: a signal handler that used the store inside the section let go of it (letGo)
 
 
 def _waited(flag, timeout):

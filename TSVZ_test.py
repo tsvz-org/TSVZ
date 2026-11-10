@@ -16967,6 +16967,127 @@ def test_a_ctrl_c_caught_in_a_write_leaves_the_store_writing_and_the_program_end
 	assert TSVZ.readTabularFile(p, verbose=False)['last'] == ['last', 'v']
 
 
+
+def test_a_section_lock_whose_hold_a_signal_handler_let_go_of_exits_without_an_error():
+	# A signal handler that uses the store lands inside the section it interrupted. Its own section, or its wait for the writer
+	# thread, lets go of the hold (taking it for a Ctrl-C's), and the interrupted section's exit then found the lock not held:
+	# RuntimeError out of a set (5.13 before this). A check for the hold before the release leaves a gap a handler lands in.
+	lock = TSVZ._SectionLock()
+	with lock:
+		with lock:  # the handler's section: it lets go of the interrupted one's hold first
+			pass
+	assert not lock._is_owned()
+	with lock:
+		lock.letGo()  # the handler's wait for the writer thread
+	assert not lock._is_owned()
+	with pytest.raises(ValueError):  # (an error in the section goes up as it was)
+		with lock:
+			lock.letGo()
+			raise ValueError
+	with lock:
+		assert lock._is_owned()
+	assert not lock._is_owned()
+	acquired = []
+	other = threading.Thread(target=lambda: acquired.append(lock.acquire(False)))
+	other.start()
+	other.join(10)
+	assert acquired == [True]  # (nothing is left held by the sections above)
+
+
+def _a_store_whose_next_queueing_runs_a_handler(path, handler):
+	"""A TSVZed whose next row queued (inside a set's section) first runs ``handler(store)``: where a signal handler lands."""
+	t = TSVZ.TSVZed(path, header='id\tv', verbose=False, rewrite_on_load=False, append_check_delay=60)
+	fired = []
+
+	class Queue(type(t.appendQueue)):
+		def append(self, item):
+			if not fired:
+				fired.append(1)
+				handler(t)
+			super().append(item)
+	t.appendQueue = Queue(t.appendQueue)
+	return t
+
+
+def _a_handler_that_sets_and_commits(t):
+	t['h'] = ['h', '1']
+	t.commitAppendToFile()
+
+
+@pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
+@pytest.mark.parametrize('handler', [lambda t: t.commitAppendToFile(), lambda t: t.__setitem__('h', ['h', '1']),
+									 _a_handler_that_sets_and_commits], ids=['commit', 'set', 'set-commit'])
+def test_a_signal_handler_that_uses_the_store_inside_a_set_does_not_break_the_set(tmp_path, ext, handler):
+	# 5.12 waited for ever in these (the handler waited for the lock its own thread held); 5.13 first raised "RuntimeError:
+	# cannot release un-acquired lock" out of the set, from its exit, and the program died.
+	p = str(tmp_path / ('h.' + ext))
+	t = _a_store_whose_next_queueing_runs_a_handler(p, handler)
+	t['a'] = ['a', '1']  # (the handler runs inside this set's section)
+	t['b'] = ['b', '2']
+	assert not t._memLock._is_owned()
+	t.close()
+	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
+	assert rows['a'] == ['a', '1'] and rows['b'] == ['b', '2']
+
+
+@pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
+def test_a_sigterm_handler_that_closes_the_store_and_exits_inside_a_set_exits_with_that_exit(tmp_path, ext):
+	# The common graceful stop. The exit of the interrupted set's section raised RuntimeError over the SystemExit (exit
+	# status 1 instead of 0, 14 runs of 40 on 3.14).
+	def stop(t):
+		t.close()
+		raise SystemExit(0)
+	p = str(tmp_path / ('h.' + ext))
+	t = _a_store_whose_next_queueing_runs_a_handler(p, stop)
+	with pytest.raises(SystemExit) as stopped:
+		t['a'] = ['a', '1']  # (the handler runs inside this set's section)
+	assert stopped.value.code == 0 and not t._memLock._is_owned()
+
+
+#: ARGV: TSVZ's directory, 'commit' or 'set', the file. A SIGALRM handler that uses the store, every 2 ms, while the main
+#: thread sets rows in a loop; 50 handler calls, then the close. Real signals: the handler lands wherever Python is.
+_HANDLER_IN_SETS = r"""
+import signal, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+how, p = sys.argv[2], sys.argv[3]
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+calls = [0]
+def handler(sig, frame):
+	calls[0] += 1
+	if how == 'commit':
+		t.commitAppendToFile()
+	else:
+		t['h%d' % calls[0]] = ['h', str(calls[0])]
+signal.signal(signal.SIGALRM, handler)
+signal.setitimer(signal.ITIMER_REAL, 0.002, 0.002)
+i = 0
+while calls[0] < 50:
+	k = 'k%d' % (i % 500)
+	t[k] = [k, str(i)]
+	i += 1
+signal.setitimer(signal.ITIMER_REAL, 0)
+t.close()
+print(i)
+"""
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='SIGALRM')
+@pytest.mark.parametrize('how', ['commit', 'set'])
+def test_a_real_signal_handler_that_uses_the_store_while_the_program_sets_rows_ends_normally(tmp_path, how):
+	p = str(tmp_path / 's.tsv')
+	script = tmp_path / 'handler.py'
+	script.write_text(_HANDLER_IN_SETS)
+	try:
+		# 120 s: the run takes about a second; only a wait for ever (5.12's) takes this long, on a machine the whole suite keeps busy.
+		done = subprocess.run([sys.executable, str(script), HERE, how, p], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+							  universal_newlines=True, timeout=120)
+	except subprocess.TimeoutExpired as e:
+		raise AssertionError('a handler that used the store waited for ever: {}'.format(e.stderr))
+	assert done.returncode == 0 and not done.stderr, done.stderr
+	assert len(TSVZ.readTabularFile(p, header='id\tv', verbose=False)) >= 50
+
+
 # --------------------------------------------------------------------------
 # 5.08 release review, round 1
 # --------------------------------------------------------------------------
