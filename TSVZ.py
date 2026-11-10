@@ -27,6 +27,7 @@ import re
 import shutil
 import stat
 import threading
+import _thread
 import time
 import sys
 import weakref
@@ -43,10 +44,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.12'
+version = '5.13'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-11-09'
+COMMIT_DATE = '2026-11-10'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -1318,7 +1319,6 @@ def _warnOnce(owner, kind, path, detail, teeLogger=None):
 
 
 _PATH_LOCKS = {}
-_PATH_LOCKS_GUARD = threading.Lock()
 
 
 def _pathLock(path):
@@ -1332,11 +1332,8 @@ def _pathLock(path):
 	readers do not take it.
 	"""
 	key = os.path.realpath(path)
-	with _PATH_LOCKS_GUARD:
-		lock = _PATH_LOCKS.get(key)
-		if lock is None:
-			lock = _PATH_LOCKS[key] = threading.RLock()
-		return lock
+	# (setdefault: one step, where a guard lock could be left held by a Ctrl-C and stop every thread's writes, see _Flag)
+	return _PATH_LOCKS.get(key) or _PATH_LOCKS.setdefault(key, threading.RLock())
 
 
 #: The lock modes of ``_lockFile`` (spec §18.6): READ, taken by readers that make state out of the file, shared, for the
@@ -1394,8 +1391,6 @@ def _locksAfterFork():
 	release it, and the parent's lockf locks are not inherited. Its open file description and flock locks are: each
 	descriptor that holds one is pointed at /dev/null, so the child holds none and the parent's lock is as it was (a
 	copy of a get_file_obj() holder then fails its writes with EBADF)."""
-	global _PATH_LOCKS_GUARD
-	_PATH_LOCKS_GUARD = threading.Lock()
 	_PATH_LOCKS.clear()
 	held = list(_HELD.items())
 	_HELD.clear()
@@ -5495,17 +5490,108 @@ def getListView(tsvzDic,header = [],delimiter = ...):
 		else:
 			return [header] + values
 
-def _waited(event, timeout):
-	"""``event.wait(timeout)``, where a Ctrl-C is a KeyboardInterrupt on every Python. On 3.6 a Ctrl-C that lands as the wait
-	takes its lock back can end it with RuntimeError "release unlocked lock", raised while the interrupt is handled (so its
-	``__context__`` is the KeyboardInterrupt): that is the Ctrl-C, and an error would stop the exit's wait for a queued row,
-	where a Ctrl-C keeps it (_stopLiveStores). Any other RuntimeError is not a Ctrl-C and goes up as it is."""
-	try:
-		return event.wait(timeout)
-	except RuntimeError as e:
-		if isinstance(e.__context__, KeyboardInterrupt):
-			raise KeyboardInterrupt
-		raise
+class _Flag(object):
+	"""threading.Event's is_set(), set(), clear() and wait(), with no lock that one thread holds while another waits
+	for it: what a store's writer thread and the threads that hand it work signal each other with (5.13).
+
+	A threading.Event holds its Condition's lock while Python code runs, and a KeyboardInterrupt can land where a
+	``with`` statement's exit never runs (CPython bpo-29988): a Ctrl-C there left the lock held for ever, and the writer
+	thread's next set() waited for it while the main thread waited for the writer (a program hung at exit after its
+	first Ctrl-C, about 1 run in 250 of the 3.6 suite's Ctrl-C test). Here the flag is an attribute, and each waiter
+	sleeps on a lock of its own that set() lets go of. A waiter puts its lock in before it looks at the flag, and set()
+	sets the flag before it lets go of the locks it finds: a waiter either sees the flag or is woken. A Ctrl-C anywhere
+	in a wait leaves its lock behind, which only ever costs a later set() a release; one inside set() leaves the waiters
+	it did not reach to wake at their timeout, as threading.Event's set() does when it is cut off before notify_all().
+
+	It relies on the GIL: set()'s copy of the waiters is one step against another thread's append or remove. A
+	free-threaded build (which setup.py does not claim) could raise "deque mutated during iteration" there."""
+	__slots__ = ('_on', '_waiters')
+
+	def __init__(self):
+		self._on = False
+		self._waiters = deque()  # each waiting thread's lock, held until a set(); taken out by that thread
+
+	def is_set(self):
+		return self._on
+
+	isSet = is_set  # (threading.Event's old name for it)
+
+	def set(self):
+		self._on = True
+		for bell in list(self._waiters):
+			try:
+				bell.release()
+			except RuntimeError:
+				pass  # let go of by an earlier set(): its waiter has not taken it out yet
+
+	def clear(self):
+		self._on = False
+
+	def wait(self, timeout=None):
+		"""True once the flag is set, or False once ``timeout`` seconds pass first (None: no limit), as Event.wait()."""
+		if self._on:
+			return True
+		bell = threading.Lock()
+		bell.acquire()
+		self._waiters.append(bell)
+		try:
+			return self._on or bell.acquire(True, -1 if timeout is None else max(timeout, 0)) or self._on
+		finally:
+			self._waiters.remove(bell)
+
+
+class _SectionLock(_thread.RLock):
+	"""A lock for sections that TSVZ's own code never nests, which a Ctrl-C cannot leave held for good: a TSVZed's _memLock
+	(5.13).
+
+	A KeyboardInterrupt can land just after a ``with`` statement takes its lock and before the block is set up (seen on
+	3.14), or where the block's exit never runs (3.6's end of a block; CPython bpo-29988). A plain lock was then held for
+	ever, the writer thread waited for it, and the exit for the writer: in 5.12 a Ctrl-C that ended a loop of sets hung
+	the exit about 1 time in 14 on 3.14 and 1 in 250 on 3.6. This one is an RLock, which knows the thread that holds it.
+	None of TSVZ's sections is entered from inside another (with a plain lock, that waited for ever): a thread that holds
+	it as it enters one, or as it waits for the writer thread (letGo), holds it from a Ctrl-C, and lets go of it first.
+	Another thread waits for such a hold until its holder next does either, or the exit does. A set, delete, pop or move
+	that a Ctrl-C goes up through lets go too (``except BaseException: letGo(); raise``, for a Ctrl-C that skipped the
+	exit of its ``with`` statement), so a program that catches the Ctrl-C and goes on holds nothing: in two runs of 320
+	write loops ended by a caught Ctrl-C, 15 and 17 left the hold on 3.6 and 12 and 2 on 3.14, before. Left are a second
+	Ctrl-C landing inside that clause, and the sections the writer thread's work runs in the main thread (after close(),
+	in a forked child).
+
+	A signal handler that uses the store is not TSVZ's code: it runs inside the section it interrupted, and its own section
+	(or its wait for the writer thread) lets go of the interrupted one's hold. The exit of the interrupted section then
+	finds the lock not held, and ignores that (__exit__; a check of the hold before the release leaves a gap that a handler
+	lands in). The rest of that section runs without the lock. When the writer thread rewrites meanwhile, a line is written
+	twice (the last wins). When it reads the file into memory meanwhile (the handler's own reload() or clear(), another
+	thread's reload, the sync with another process's write that follows a commit: the handler's whole wait for the writer
+	thread, not microseconds), a change the section made in memory and had not yet queued is undone in memory and written
+	all the same: memory and the file differ on that key until the next reload, a delete of a row set so does nothing, and
+	a loose store's next rewrite writes memory's side (measured: README, "Upgrading to 5.13"; docs/limitations.md). A
+	handler that sets the section's own key does the same: memory keeps its row, the file ends with the section's line.
+	(Its exit is a Python method, about 0.1 microsecond a section dearer than the RLock's own on 3.6, 0.04 on 3.14.)"""
+	__slots__ = ()
+
+	def letGo(self):
+		"""Let go of what a Ctrl-C left this thread holding; the caller is in no section."""
+		while self._is_owned():
+			self.release()
+
+	def __enter__(self):
+		if self._is_owned():
+			self.letGo()
+		return self.acquire()
+
+	def __exit__(self, *exc):
+		try:
+			self.release()
+		except RuntimeError:
+			pass  # not held: a signal handler that used the store inside the section let go of it (letGo)
+
+
+def _waited(flag, timeout):
+	"""``flag.wait(timeout)`` (a _Flag): a thread's wait for the store's writer thread, which its callers make in steps
+	of ``timeout``, 0.1 s: a Ctrl-C stops a lock's wait only on POSIX, and a tenth of a second is too short for a person
+	to notice. (It is only ``flag.wait``, kept as the one place the tests stop a wait.)"""
+	return flag.wait(timeout)
 
 
 #: Every TSVZed and TSVZedLite not yet stopped, by id(): _stopLiveStores stops them at exit. Weak: a store
@@ -5752,8 +5838,9 @@ class TSVZed(OrderedDict):
 		Queue of lines waiting to be appended to the file.
 	writeLock : threading.Lock
 		Lock for ensuring thread-safe file operations.
-	shutdownEvent : threading.Event
-		Event signal for stopping the append worker thread.
+	shutdownEvent : _Flag
+		Set to stop the append worker thread: is_set(), set(), clear() and wait() as a threading.Event's (5.13: not a
+		threading.Event, whose lock a Ctrl-C can leave held, see _Flag).
 	appendThread : threading.Thread
 		Background thread that handles asynchronous file appending.
 	Methods
@@ -5799,7 +5886,9 @@ class TSVZed(OrderedDict):
 	- A legacy file (.tsv, .csv, .nsv, .psv, compressed or not) is written by the store's background thread
 	  only: rewrite(), mapToFile(), hardMapToFile(), commitAppendToFile(), clear(), reload() and close() hand
 	  it the job and wait for it, so a KeyboardInterrupt stops the wait, never the write. At exit, a write in
-	  progress is finished (a second Ctrl-C abandons it); a store with nothing to write is not waited for.
+	  progress is finished (a second Ctrl-C abandons it); a store with nothing to write is not waited for. A
+	  .tsvz-family store's commitAppendToFile(), clear() and reload() are handed to it the same way (5.13; they
+	  ran in the calling thread, whose Ctrl-C could leave writeLock held, and the writer thread waited for it).
 	- Its reads of a legacy file (the load, reload() and the background read) hold the file's READ lock, so
 	  another process's rewrite under the file lock is waited out, never met part way; its appends take the
 	  append lock (which, on Linux, readers do not wait for) and its rewrites the rewrite lock (_lockFile).
@@ -5890,10 +5979,10 @@ class TSVZed(OrderedDict):
 		self.deSynced = False
 		self.memoryOnly = False
 		self.writeLock = threading.Lock()
-		self._memLock = threading.Lock()  # held while memory and appendQueue change together (a set, a delete, reload's swap)
+		self._memLock = _SectionLock()  # held while memory and appendQueue change together (a set, a delete, reload's swap)
 		self._failures = {}  # legacy writes that fail, by kind: when each is tried again, see _failed()
 		self._reported = {}  # and the failures of each kind reported since it last went through
-		self.shutdownEvent = threading.Event()
+		self.shutdownEvent = _Flag()
 		if self._spec:
 			for flag, given in (('rewrite_on_load', rewrite_on_load), ('rewrite_on_exit', rewrite_on_exit),
 								('rewrite_interval', rewrite_interval)):
@@ -5908,8 +5997,8 @@ class TSVZed(OrderedDict):
 			self._writeFailing = False
 			self._specLoaded = False
 		self._requests = deque()  # the jobs _call hands the writer thread
-		self._wake = threading.Event()  # set when one is handed: the thread does not wait out its tick
-		self._workerDone = threading.Event()  # set as the writer thread ends (_workerRuns)
+		self._wake = _Flag()  # set when one is handed: the thread does not wait out its tick
+		self._workerDone = _Flag()  # set as the writer thread ends (_workerRuns)
 		self._workerPid = os.getpid()
 		self.appendThread  = threading.Thread(target=self._appendWorker,daemon=True)
 		self.appendThread.start()
@@ -5933,10 +6022,14 @@ class TSVZed(OrderedDict):
 			self._givenDefaults = list(defaults)
 			self.defaults = defaults
 			return
-		with self._memLock:  # (a read's swap sees either both of these or neither)
-			self._givenDefaults = list(defaults)  # (the defaults a whole read starts from)
-			self._readWhole = True  # memory's defaults now differ from the file's: another process's change is read whole
-			self.defaults = defaults
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # (a read's swap sees either both of these or neither)
+				self._givenDefaults = list(defaults)  # (the defaults a whole read starts from)
+				self._readWhole = True  # memory's defaults now differ from the file's: another process's change is read whole
+				self.defaults = defaults
+		except BaseException:
+			self._memLock.letGo()
+			raise
 
 	def load(self):
 		self.reload()
@@ -5948,7 +6041,7 @@ class TSVZed(OrderedDict):
 
 	def reload(self):
 		if self._spec:
-			return self._specReload()
+			return self._call(self._specReload)
 		self._call(self._reload)
 		self._accepted()  # memory is the file again: a refusal met later is reported again
 		return self
@@ -6146,41 +6239,49 @@ class TSVZed(OrderedDict):
 			# and before memory, the queue or the column count change.
 			self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
 		if key == DEFAULTS_INDICATOR_KEY:
-			with self._memLock:  # with memory and the queue: a reload sets the column count under it too
-				self.correctColumnNum = newColumnNum
-				self.defaults = value
-				if self.verbose:
-					self.__teePrintOrNot(f"Defaults set to {value}")
-				if not self.memoryOnly:
-					self.appendQueue.append(value)
-					self.lastUpdateTime = get_time_ns()
+			try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+				with self._memLock:  # with memory and the queue: a reload sets the column count under it too
+					self.correctColumnNum = newColumnNum
+					self.defaults = value
 					if self.verbose:
-						self.__teePrintOrNot(f"Appending Defaults {key} to the appendQueue")
+						self.__teePrintOrNot(f"Defaults set to {value}")
+					if not self.memoryOnly:
+						self.appendQueue.append(value)
+						self.lastUpdateTime = get_time_ns()
+						if self.verbose:
+							self.__teePrintOrNot(f"Appending Defaults {key} to the appendQueue")
+			except BaseException:
+				self._memLock.letGo()
+				raise
 			return
 		if self.verbose:
 			self.__teePrintOrNot(f"Setting {key} to {value}")
-		with self._memLock:  # memory and the queue change together: see reload()
-			self.correctColumnNum = newColumnNum
-			if key in self:
-				if self[key] == value:
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # memory and the queue change together: see reload()
+				self.correctColumnNum = newColumnNum
+				if key in self:
+					if self[key] == value:
+						if self.verbose:
+							self.__teePrintOrNot(f"Key {key} already exists with the same value")
+						return
+					self.dirty = True
+				# update the dictionary,
+				super().__setitem__(key,value)
+				if self.memoryOnly:
 					if self.verbose:
-						self.__teePrintOrNot(f"Key {key} already exists with the same value")
+						self.__teePrintOrNot(f"Key {key} updated in memory only")
 					return
-				self.dirty = True
-			# update the dictionary,
-			super().__setitem__(key,value)
-			if self.memoryOnly:
+				elif key.startswith('#'):
+					if self.verbose:
+						self.__teePrintOrNot(f"Key {key} updated in memory only as it starts with #")
+					return
 				if self.verbose:
-					self.__teePrintOrNot(f"Key {key} updated in memory only")
-				return
-			elif key.startswith('#'):
-				if self.verbose:
-					self.__teePrintOrNot(f"Key {key} updated in memory only as it starts with #")
-				return
-			if self.verbose:
-				self.__teePrintOrNot(f"Appending {key} to the appendQueue")
-			self.appendQueue.append(value)
-			self.lastUpdateTime = get_time_ns()
+					self.__teePrintOrNot(f"Appending {key} to the appendQueue")
+				self.appendQueue.append(value)
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 		# if not self.appendThread.is_alive():
 		#     self.commitAppendToFile()
 		# else:
@@ -6272,32 +6373,40 @@ class TSVZed(OrderedDict):
 			return self._specDelItem(key)
 		key = self._nameKey(key)
 		if key == DEFAULTS_INDICATOR_KEY:
-			with self._memLock:
-				self.defaults = [DEFAULTS_INDICATOR_KEY]
-				if self.verbose:
-					self.__teePrintOrNot("Defaults cleared")
-				if not self.memoryOnly:
-					self.__appendEmptyLine(key)
+			try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+				with self._memLock:
+					self.defaults = [DEFAULTS_INDICATOR_KEY]
 					if self.verbose:
-						self.__teePrintOrNot(f"Appending empty default line {key}")
+						self.__teePrintOrNot("Defaults cleared")
+					if not self.memoryOnly:
+						self.__appendEmptyLine(key)
+						if self.verbose:
+							self.__teePrintOrNot(f"Appending empty default line {key}")
+			except BaseException:
+				self._memLock.letGo()
+				raise
 			return
 		# delete the key from the dictionary and update the file
-		with self._memLock:  # memory and the queue change together: see reload()
-			if key not in self:
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # memory and the queue change together: see reload()
+				if key not in self:
+					if self.verbose:
+						self.__teePrintOrNot(f"Key {key} not found")
+					return
+				self._checkDelete(key)
+				row = dict.get(self, key)
+				super().__delitem__(key)
+				if self.memoryOnly or key.startswith('#'):
+					if self.verbose:
+						self.__teePrintOrNot(f"Key {key} deleted in memory")
+					return
+				self._deleteLine(key, row)
 				if self.verbose:
-					self.__teePrintOrNot(f"Key {key} not found")
-				return
-			self._checkDelete(key)
-			row = dict.get(self, key)
-			super().__delitem__(key)
-			if self.memoryOnly or key.startswith('#'):
-				if self.verbose:
-					self.__teePrintOrNot(f"Key {key} deleted in memory")
-				return
-			self._deleteLine(key, row)
-			if self.verbose:
-				self.__teePrintOrNot(f"Appending empty line {key}")
-			self.lastUpdateTime = get_time_ns()
+					self.__teePrintOrNot(f"Appending empty line {key}")
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 		
 	def _oneColumn(self, row):
 		"""True when a deletion line of the legacy row ``row`` would be the key alone and read as a row: the store has one
@@ -6348,41 +6457,49 @@ class TSVZed(OrderedDict):
 			del self[key]
 			return
 		self._checkWritable(value)
-		with self._memLock:  # memory and the queue change together: see _specReload
-			if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
-				self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
-				return
-			_specFill(value, self.defaults)
-			record = _specFormatRecord(value, self.delimiter)
-			self.correctColumnNum = _specPadRow(value, self._specState, self.correctColumnNum if self.correctColumnNum > 0 else -1)
-			if key in self:
-				if OrderedDict.__getitem__(self, key) == value:
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # memory and the queue change together: see _specReload
+				if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
+					self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
 					return
-				self.dirty = True
-			OrderedDict.__setitem__(self, key, value)
-			if self.memoryOnly:
-				return
-			self.appendQueue.append(record)
-			self.lastUpdateTime = get_time_ns()
+				_specFill(value, self.defaults)
+				record = _specFormatRecord(value, self.delimiter)
+				self.correctColumnNum = _specPadRow(value, self._specState, self.correctColumnNum if self.correctColumnNum > 0 else -1)
+				if key in self:
+					if OrderedDict.__getitem__(self, key) == value:
+						return
+					self.dirty = True
+				OrderedDict.__setitem__(self, key, value)
+				if self.memoryOnly:
+					return
+				self.appendQueue.append(record)
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 
 	def _specSetMarker(self, key, value):
 		"""Write a reserved-key marker (design §5.2 e); official markers also update the reader state."""
 		self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
 		keyLower = key.lower()
-		with self._memLock:  # the reader state and the queue change together: see _specReload
-			if keyLower in _SPEC_MARKER_KEYS:
-				reporter = _Reporter(self._fileName, self.teeLogger)
-				applied = _specApplyMarker(self._specState, keyLower, value[1:], reporter, None)
-				reporter.flush()
-				if not applied:
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # the reader state and the queue change together: see _specReload
+				if keyLower in _SPEC_MARKER_KEYS:
+					reporter = _Reporter(self._fileName, self.teeLogger)
+					applied = _specApplyMarker(self._specState, keyLower, value[1:], reporter, None)
+					reporter.flush()
+					if not applied:
+						return
+					self.defaults = list(self._specState.defaults)
+				if self.verbose:
+					self.__teePrintOrNot(f"Marker {key} set to {value[1:]}")
+				if self.memoryOnly:
 					return
-				self.defaults = list(self._specState.defaults)
-			if self.verbose:
-				self.__teePrintOrNot(f"Marker {key} set to {value[1:]}")
-			if self.memoryOnly:
-				return
-			self.appendQueue.append(_specFormatRecord(value, self.delimiter, marker=True))
-			self.lastUpdateTime = get_time_ns()
+				self.appendQueue.append(_specFormatRecord(value, self.delimiter, marker=True))
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 
 	def _specDelItem(self, key):
 		key = self._nameKey(key)
@@ -6390,17 +6507,21 @@ class TSVZed(OrderedDict):
 			# A lone marker key resets that marker (spec §12.1).
 			self._specSetMarker(key, [key])
 			return
-		with self._memLock:  # memory and the queue change together: see _specReload
-			if key not in self:
-				if self.verbose:
-					self.__teePrintOrNot(f"Key {key} not found")
-				return
-			self._checkDelete(key)
-			OrderedDict.__delitem__(self, key)
-			if self.memoryOnly:
-				return
-			self.__appendEmptyLine(key)
-			self.lastUpdateTime = get_time_ns()
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # memory and the queue change together: see _specReload
+				if key not in self:
+					if self.verbose:
+						self.__teePrintOrNot(f"Key {key} not found")
+					return
+				self._checkDelete(key)
+				OrderedDict.__delitem__(self, key)
+				if self.memoryOnly:
+					return
+				self.__appendEmptyLine(key)
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 
 	def _specCommit(self):
 		"""Append the queued records to the active part (design §5.4).
@@ -6408,8 +6529,13 @@ class TSVZed(OrderedDict):
 		Records stay queued until the write succeeds; a failure is reported once
 		and retried on the next tick. Nothing raised here may reach the worker.
 		"""
-		with self.writeLock:
-			return self._specCommitLocked()
+		if not self._startWrite():  # (the exit let go of the store: no write starts that the interpreter's end could cut)
+			return self
+		try:
+			with self.writeLock:
+				return self._specCommitLocked()
+		finally:
+			self._endWrite()
 
 	def _specCommitLocked(self):
 		# The caller holds self.writeLock (a non-reentrant lock).
@@ -6490,7 +6616,7 @@ class TSVZed(OrderedDict):
 
 	def clear_file(self):
 		if self._spec:
-			return self._specClearFile()
+			return self._call(self._specClearFile)
 		return self._call(self._clearFile, False)
 
 	def _clearFile(self, dropRows):
@@ -6558,16 +6684,20 @@ memoryOnly:{self.memoryOnly}
 
 	def popitem(self, last=True):
 		# Not OrderedDict.popitem: before Python 3.11 it goes through self[key] and del self[key], which strip the key.
-		with self._memLock:  # memory and the queue change together: see reload()
-			if not OrderedDict.__len__(self):
-				raise KeyError('dictionary is empty')
-			key = next(OrderedDict.__reversed__(self)) if last else next(OrderedDict.__iter__(self))
-			self._checkDelete(key)
-			value = OrderedDict.__getitem__(self, key)
-			OrderedDict.__delitem__(self, key)
-			if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
-				self._deleteLine(key, value)
-			self.lastUpdateTime = get_time_ns()
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # memory and the queue change together: see reload()
+				if not OrderedDict.__len__(self):
+					raise KeyError('dictionary is empty')
+				key = next(OrderedDict.__reversed__(self)) if last else next(OrderedDict.__iter__(self))
+				self._checkDelete(key)
+				value = OrderedDict.__getitem__(self, key)
+				OrderedDict.__delitem__(self, key)
+				if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
+					self._deleteLine(key, value)
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 		return key, value
 	
 	__marker = object()
@@ -6579,18 +6709,22 @@ memoryOnly:{self.memoryOnly}
 
 		'''
 		key = self._nameKey(key)
-		with self._memLock:  # memory and the queue change together: see reload()
-			if not OrderedDict.__contains__(self, key):
-				if default is self.__marker:
-					raise KeyError(key)
-				return default
-			# Not OrderedDict.pop: before Python 3.11 it goes through del self[key], which writes a tombstone too.
-			self._checkDelete(key)
-			value = OrderedDict.__getitem__(self, key)
-			OrderedDict.__delitem__(self, key)
-			if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
-				self._deleteLine(key, value)
-			self.lastUpdateTime = get_time_ns()
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:  # memory and the queue change together: see reload()
+				if not OrderedDict.__contains__(self, key):
+					if default is self.__marker:
+						raise KeyError(key)
+					return default
+				# Not OrderedDict.pop: before Python 3.11 it goes through del self[key], which writes a tombstone too.
+				self._checkDelete(key)
+				value = OrderedDict.__getitem__(self, key)
+				OrderedDict.__delitem__(self, key)
+				if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
+					self._deleteLine(key, value)
+				self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 		return value
 	
 	def move_to_end(self, key, last=True):
@@ -6613,20 +6747,24 @@ memoryOnly:{self.memoryOnly}
 			# rewrite only when one is due. (A stat, so a loop of moves stays cheap.)
 			self.checkExternalChanges()
 			self._call(self._rewrite, False, None, True)
-		with self._memLock:
-			if not dict.__contains__(self, key):
-				raise KeyError(key)
-			moved = [(k, row) for k, row in OrderedDict.items(self) if k != key] if not last else [(key, dict.get(self, key))]
-			if not self.memoryOnly:  # refused before memory or the queue change, as a set or a delete is
-				for k, row in moved:
-					if not k.startswith('#'):
-						self._checkDelete(k)
-						self._checkWritable(row)
-			OrderedDict.move_to_end(self, key, last)
-			if not self.memoryOnly:
-				for k, row in moved:
-					self._queueMove(k, row)
-				self.lastUpdateTime = get_time_ns()
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._memLock:
+				if not dict.__contains__(self, key):
+					raise KeyError(key)
+				moved = [(k, row) for k, row in OrderedDict.items(self) if k != key] if not last else [(key, dict.get(self, key))]
+				if not self.memoryOnly:  # refused before memory or the queue change, as a set or a delete is
+					for k, row in moved:
+						if not k.startswith('#'):
+							self._checkDelete(k)
+							self._checkWritable(row)
+				OrderedDict.move_to_end(self, key, last)
+				if not self.memoryOnly:
+					for k, row in moved:
+						self._queueMove(k, row)
+					self.lastUpdateTime = get_time_ns()
+		except BaseException:
+			self._memLock.letGo()
+			raise
 		return self
 
 	def _queueMove(self, key, row):
@@ -7479,7 +7617,8 @@ memoryOnly:{self.memoryOnly}
 		the write. Run here on that thread itself, or when it is not running (after close, in a forked child)."""
 		if self.appendThread is threading.current_thread() or not self._workerRuns():
 			return fn(*args)
-		job = [fn, args, threading.Event(), None, None]
+		self._memLock.letGo()  # (no section waits for the writer thread, which may need the lock: a hold is a Ctrl-C's)
+		job = [fn, args, _Flag(), None, None]
 		self._requests.append(job)
 		self._wake.set()
 		while not _waited(job[2], 0.1):  # in steps: a Ctrl-C stops the wait on every platform
@@ -7528,7 +7667,7 @@ memoryOnly:{self.memoryOnly}
 				job = self._requests.popleft()
 			except IndexError:
 				return
-			writes = job[0] != self._reload and job[0] != self._checkExternalChanges
+			writes = job[0] not in (self._reload, self._specReload, self._checkExternalChanges)
 			try:
 				if writes and not self._startWrite():
 					job[3] = None
@@ -7573,7 +7712,7 @@ memoryOnly:{self.memoryOnly}
 
 	def commitAppendToFile(self):
 		if self._spec:
-			return self._specCommit()
+			return self._call(self._specCommit)
 		return self._call(self._commit)
 
 	def _commit(self):
@@ -7762,26 +7901,29 @@ memoryOnly:{self.memoryOnly}
 		self.shutdownEvent.set()
 		self._wake.set()
 		if self.appendThread is not threading.current_thread():
+			self._memLock.letGo()  # (as _call)
 			while self._workerRuns():
 				_waited(self._workerDone, 0.1)  # in steps: a Ctrl-C stops the wait on every platform (not join(): _workerRuns)
 		_LIVE_STORES.pop(id(self), None)
 
 	def _atExit(self):
-		"""What _stopLiveStores does with a store left running at exit. A legacy store with nothing to write (nothing
-		queued, not dirty, damaged or to be made again, no rewrite_on_exit, no write job handed to its writer thread or
-		under way there) is let go of without waiting for that thread, a daemon, which may be waiting for another
+		"""What _stopLiveStores does with a store left running at exit. A store with nothing to write (nothing queued, no
+		write job handed to its writer thread or under way there; a legacy one also not dirty, damaged or to be made
+		again, no rewrite_on_exit) is let go of without waiting for that thread, a daemon, which may be waiting for another
 		process's lock to read the file: a program whose store waits in its load ends at one Ctrl-C. From then on the
 		thread starts no write (_startWrite), so none is cut short as the interpreter ends."""
 		self._exiting = True
-		if not self._spec:
-			with self._memLock:
+		with self._memLock:
+			if self._spec:  # (a .tsvz store is never rewritten at exit: only its queue is written)
+				self._letGo = not (self.appendQueue or self._requests or self._writing)
+			else:
 				self._letGo = not (self.appendQueue or self.dirty or self._damaged or self._remake or self.rewrite_on_exit
 								   or self._requests or self._writing)
-			if self._letGo:
-				self.shutdownEvent.set()
-				self._wake.set()
-				_LIVE_STORES.pop(id(self), None)
-				return None
+		if self._letGo:
+			self.shutdownEvent.set()
+			self._wake.set()
+			_LIVE_STORES.pop(id(self), None)
+			return None
 		return self.stopAppendThread()
 	
 	def get_file_obj(self,modes = 'ab'):
@@ -8728,19 +8870,19 @@ _UNREAD = object()
 class _ServeWriter(object):
 	"""The single appender of a store (spec §18.3): each batch of queued payloads is one write.
 
-	``submit`` returns a sequence number; ``wait`` blocks until that payload
-	is written (or written and fsync'd). The thread never takes the store's
-	state lock.
+	``submit`` returns a job; ``wait`` blocks until it is written (and fsync'd, for a ``durable`` one) and raises its
+	write error. The thread never takes the store's state lock, and no thread ever waits for a lock another one holds:
+	jobs go through a deque, and each says it is done with a _Flag. 5.12's Condition was one lock that every thread
+	took, and a Ctrl-C can leave a lock held (bpo-29988, see _Flag): the thread then waited for it for ever, and so did
+	the exit's close() (a TSVZClient's, a CLI command's).
 	"""
 
 	def __init__(self, store):
 		self.store = store
-		self.cond = threading.Condition()
-		self.queue = []
-		self.submitted = 0
-		self.written = 0
-		self.durable = 0
-		self.failures = deque(maxlen=64)
+		self.queue = deque()  # the jobs: [payload, durable, done (a _Flag), error]; a barrier's has no payload
+		self.wake = _Flag()  # set when a job is queued and when the store closes
+		self.busy = False  # True from before the thread takes a batch until its jobs are done (barrier)
+		self.stopped = False  # True once the thread takes its last batch (_queue)
 		self.unsynced = False
 		self.closing = False
 		self.failing = None  # the last write error, until a batch is written again
@@ -8749,68 +8891,84 @@ class _ServeWriter(object):
 		self.thread.start()
 		_SERVE_OPEN_WRITERS.add(self)
 
-	def submit(self, payload, durable):
-		with self.cond:
-			if self.closing:
-				raise RuntimeError('the store is closing')
-			self.submitted += 1
-			self.queue.append((self.submitted, payload, durable))
-			self.cond.notify_all()
-			return self.submitted
+	def _queue(self, job):
+		"""Hand ``job`` to the thread: False when it had taken its last batch and the job was not in it."""
+		self.queue.append(job)
+		self.wake.set()
+		if self.stopped:
+			try:
+				self.queue.remove(job)
+				return False
+			except ValueError:
+				pass  # taken: in the last batch
+		return True
 
-	def wait(self, seq, durable=False):
-		"""Block until payload ``seq`` is written (``durable``: and fsync'd); raise its write error."""
-		with self.cond:
-			while (self.durable if durable else self.written) < seq:
-				self.cond.wait()
-			for first, last, error in self.failures:
-				if first <= seq <= last:
-					raise error
+	def submit(self, payload, durable):
+		job = [payload, durable, _Flag(), None]
+		if self.closing or not self._queue(job):
+			raise RuntimeError('the store is closing')
+		return job
+
+	@staticmethod
+	def wait(job):
+		"""Block until ``job`` is written (a durable one: and fsync'd); raise its write error."""
+		job[2].wait()
+		if job[3] is not None:
+			raise job[3]
 
 	def barrier(self):
 		"""Block until everything submitted so far is written (spec §21.8 read-your-writes)."""
-		with self.cond:
-			while self.written < self.submitted:
-				self.cond.wait()
+		# The queue looked at before busy: a job queued before this that is not in it any more was taken while busy was
+		# True, which stays True until the job is done.
+		if self.queue or self.busy:
+			job = [b'', False, _Flag(), None]  # done once every job before it is
+			if self._queue(job):
+				job[2].wait()
+			else:
+				self.thread.join()  # (its last batch: written once it ends)
 
 	def close(self):
 		"""Write everything queued, fsync it, and stop the thread."""
-		with self.cond:
-			self.closing = True
-			self.cond.notify_all()
+		self.closing = True
+		self.wake.set()
 		self.thread.join()
 		_SERVE_OPEN_WRITERS.discard(self)
 		self.store = None  # no cycle: a closed store's rows are freed now, not by the collector at exit
 
 	def _run(self):
-		while True:
-			with self.cond:
-				while not self.queue and not self.closing:
-					self.cond.wait()
-				if not self.queue:
+		while not self.stopped:
+			self.wake.wait()
+			self.wake.clear()
+			# Closing: this batch is the last. A job queued from here on is in it or taken back by its submit (_queue);
+			# one queued before is in it.
+			self.stopped = self.closing
+			self.busy = True
+			batch = []
+			while True:
+				try:
+					batch.append(self.queue.popleft())
+				except IndexError:
 					break
-				batch, self.queue = self.queue, []
-			durable = any(entry[2] for entry in batch)
+			writes = [job for job in batch if job[0]]
 			error = None
-			try:
-				self.store._append(b''.join(entry[1] for entry in batch), durable)
-			except Exception as e:
-				error = e
-				_warn('TSVZ error: {}: a batch of {} writes failed: {}'.format(self.store.path, len(batch), e),
-					  self.store.teeLogger)
-			with self.cond:
-				last = batch[-1][0]
-				self.written = last
-				if durable or error is not None:
-					self.durable = last
+			if writes:
+				durable = any(job[1] for job in writes)
+				try:
+					self.store._append(b''.join(job[0] for job in writes), durable)
+				except Exception as e:
+					error = e
+					_warn('TSVZ error: {}: a batch of {} writes failed: {}'.format(self.store.path, len(writes), e),
+						  self.store.teeLogger)
 				if error is not None:
-					self.failures.append((batch[0][0], last, error))
 					self.failing = str(error) or type(error).__name__
 				else:
 					self.failing = None
 					if not durable:
 						self.unsynced = True
-				self.cond.notify_all()
+			for job in batch:
+				job[3] = error if job[0] else None
+				job[2].set()
+			self.busy = False
 		if self.unsynced:
 			try:
 				self.store._fsync()
@@ -9225,7 +9383,7 @@ class _ServeStore(object):
 		return sync or (self.spec and self.state is not None and self.state.writeAck == 'disk')
 
 	def _submit(self, rows, sync, log, first=_UNREAD):
-		"""Queue ``rows`` (caller holds the lock); return ``(seq, durable)`` or None when there is nothing to write.
+		"""Queue ``rows`` (caller holds the lock); return ``(job, durable)`` or None when there is nothing to write.
 		``first``: see _payload."""
 		payload = self._payload(rows, log, first)
 		if not payload:
@@ -9237,10 +9395,8 @@ class _ServeStore(object):
 		"""Acknowledge per spec §21.9: after fsync for ``disk``; after the write when ``written``; else at once."""
 		if queued is None:
 			return
-		if queued[1]:
-			self.writer.wait(queued[0], durable=True)
-		elif written:
-			self.writer.wait(queued[0])
+		if queued[1] or written:
+			self.writer.wait(queued[0])  # (a durable job is done once it is fsync'd)
 
 	def write(self, rows, sync, log, written=False):
 		"""Append ``rows`` (``[(cells, marker), ...]``) as one batch: ``set`` and its bulk input."""

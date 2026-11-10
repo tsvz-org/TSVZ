@@ -907,10 +907,14 @@ def match_stdout(matcher, data, delimiter, live=False, line_delimiter=None):
 PartState = collections.namedtuple('PartState', 'raw data ino mode')
 
 
-def snapshot_store(store):
-	"""Every part's raw bytes, decompressed bytes (None if the runner cannot decompress), inode and mode."""
+def snapshot_store(store, hold=None):
+	"""Every part's raw bytes, decompressed bytes (None if the runner cannot decompress), inode and mode. ``hold``: a
+	list that gets an open descriptor of each part (POSIX), which keeps its inode number from going to another file
+	while the case runs: else a part replaced twice can come back with the number it had, and look the same file."""
 	parts = {}
 	for path in store_parts(store):
+		if hold is not None and os.name == 'posix':
+			hold.append(os.open(path, os.O_RDONLY))
 		info = os.stat(path)
 		with open(path, 'rb') as f:
 			raw = f.read()
@@ -1535,7 +1539,16 @@ class CaseRun(object):
 				observed = observe(self.store)
 			except CodecUnavailable as e:
 				raise Skip('the runner cannot read %s parts' % e)
-		self.before = Before(snapshot_store(self.store), observed)
+		held = []
+		self.before = Before(snapshot_store(self.store, held), observed)
+		try:
+			self.run_steps()
+		finally:
+			for fd in held:
+				os.close(fd)
+
+	def run_steps(self):
+		case = self.case
 		steps = case.steps or expand_expect(case.expect)
 		problems = []
 		try:
