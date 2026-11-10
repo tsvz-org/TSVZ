@@ -332,8 +332,11 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
   for it. The reader is now planned at the defaults' count too: the first file becomes
   `a\nc\tX\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n`, the second keeps its lines. It is not planned where it
   reads every line as the caller's reader does (a lone key on line 1 at the caller's count, or a bare `#_defaults_#` where
-  no line with a value has another width or the defaults hold none), so those files get 5.11's bytes. What shows: the
-  files it keeps lines for are larger after a scrub or a rewrite than 5.11 made them.
+  no line with a value has another width or the defaults hold none), so those files get 5.11's bytes. What shows: a file
+  it is planned for can come out of a scrub or a rewrite larger than 5.11 left it, by the lines that reader takes, and in
+  about half of those files by a line no reader needs (the compaction is as cautious for it as for every reader it plans):
+  in a fuzz of such files, 103 of 18,000 scrubs and 104 of 18,000 rewrites wrote more than 5.11, 55 and 54 of them with
+  no reader's view changed. Compacting again does not grow them.
 
 - The cost of a compaction is unchanged within measurement (a scrub or a `TSVZed` rewrite of 200,000 rows: 0.97 to 1.05 of
   5.11's time, the same bytes), but where the reader above is planned: a scrub given a `correctColumnNum` other than the
