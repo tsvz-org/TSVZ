@@ -258,6 +258,26 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 5.15.
 - Noted: 2026-11-10, found in the 5.13 final review; a deferral, not asked.
 
+### A forked child's rows on an inherited store reach the file only through its own commit
+- Kind: deferred
+- What the operator sees: a child that `fork()` made from a program with an open `TSVZed` sets rows on that store.
+  They reach the file only through the child's own `commitAppendToFile()`: its `close()` and its exit write nothing
+  (5.13 final review, `.tsv` and `.tsvz`; 5.12 the same). Found by reading, not run: that commit also writes the queue
+  the child inherited, the rows the parent had queued and not yet written at the fork, which the parent writes as
+  well, so they are written twice; and when the parent changed such a key after the fork and committed first, the
+  child's commit writes the older value last, so it wins in the file while the parent's memory holds the newer one.
+- Why: the child has no writer thread (`_workerRuns()` compares the store's `_workerPid` with `os.getpid()`), and its
+  queue is a copy of the parent's at the fork.
+- Plan (5.15): the store notes its pid (`_workerPid`). In a forked child, the first write or commit drops the
+  inherited queue, since the parent writes those rows, so the queue holds only what the child sets; the child's
+  `close()` and a normal exit write those. The check is at the write, not at the fork: Python 3.6 has no
+  `os.register_at_fork`. `multiprocessing`'s fork children end by `os._exit`, which skips exit handlers, so there only
+  an explicit `close()` or commit writes; a README line says so. Then a test: a child's set and exit, set and
+  `close()`, and set and commit with rows the parent had queued at the fork, each row once in the file and the
+  parent's later value last.
+- Revisit when: 5.15.
+- Noted: 2026-11-10, found in the 5.13 final review; the user chose "Fix in 5.15 (Recommended)".
+
 ### A first Ctrl-C in the exit's first steps abandons the queued rows
 - Kind: deferred
 - What the operator sees: at exit, `_stopLiveStores()` writes what each store still has queued; a first Ctrl-C

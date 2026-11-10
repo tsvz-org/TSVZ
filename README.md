@@ -352,6 +352,9 @@ The file formats are unchanged, and no file has to be rewritten.
   (`appendTabularFile`, `scrubTabularFile`, `clearTabularFile`) are not let go of the same way: a caught Ctrl-C that
   left one held can make another thread of the program that uses the same client, store or path wait for ever (not
   the exit, except of a path's writer thread). Planned for 5.15 (docs/limitations.md).
+- **Not covered yet either:** rows that a child `fork()` made sets on a store it inherited reach the file only through
+  its own `commitAppendToFile()`: its `close()` and its exit write nothing, and that commit also writes the rows the
+  parent had queued at the fork (5.12 the same). Planned for 5.15 (docs/limitations.md).
 - **`TSVZed.shutdownEvent` is no longer a `threading.Event`.** It has the same `is_set()` (and `isSet()`), `set()`,
   `clear()` and `wait()`, which behave as an Event's, but `isinstance(store.shutdownEvent, threading.Event)` is now
   false, and an Event's internals (`_cond`, `_flag`) are not there. An Event holds its lock across Python code, which a
