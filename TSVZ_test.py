@@ -18024,3 +18024,58 @@ def test_the_first_row_of_another_key_stands_in_past_a_reset(tmp_path, reset):
 	text = b'd\tX\nc\n' + reset + b'\nb\t1\t2\na\n'
 	_delete_reads_as_before(p, text, 'c', text.replace(b'\nc\n', b'\nb\n', 1), 'q', 'cli', None)
 	assert _store_order_after_delete(p, text, 'q', 'c') == (['b', 'a'], ['b', 'a'])
+
+
+@pytest.mark.parametrize('text, header, defaults, once', [
+	(b'b\nc\nc\t2\nc\n', '', [D_, 'P'], b'b\nc\n'),
+	(b'c\na\na\tX\t2\na\n', '', [D_, ''], b'c\na\n'),
+	(b'id\tv\na\na\tX\na\n', 'id\tv\tw', None, b'id\tv\na\n'),
+	(b'id\na\nb\tX\na\nb\t\n', '', [D_, 'P'], b'id\na\nb\t\n'),
+	(b'id\na\t1\t1\nb\t\nd\tX\nb\tX\nd\tX\nb\t\nd\t\n', 'id\tz', [D_, 'P'], b'id\na\t1\t1\nb\t\nd\t\n'),
+])
+def test_a_scrub_leaves_nothing_for_a_second_scrub_where_it_weighed_a_later_deletion(tmp_path, text, header, defaults, once):
+	# 5.14's agrees() takes a lone key's last line up into its first line's place past a later deletion of the key, where
+	# the other reader reads no row of the key between them. Either way that goes, a second scrub then dropped more, where
+	# 5.13 wrote the first scrub's bytes and stayed there. Refused (the first three: the other reader reads c\t2 between):
+	# the pass drops that row, dead to both readers, and only the next finds the move free (b\nc\nc\n, then b\nc\n).
+	# Taken (the fourth): the second a goes, which lay between b's lines, and only the next pass moves b's last line up
+	# (id\na\nb\tX\nb\t\n, then id\na\nb\t\n). The fifth is both, one after the other. The compaction runs the pass
+	# again itself.
+	p = str(tmp_path / 'f.tsv')
+	kwargs = dict(header=header, strict=False)
+	if defaults:
+		kwargs['defaults'] = list(defaults)
+	line1 = text.split(b'\n')[0].decode()
+	_touch(p, text)
+	before = _planned_views(p, line1, header, defaults)
+	for _ in range(2):  # (the second scrub changes nothing)
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			TSVZ.scrubTabularFile(p, **kwargs)
+		assert _bytes(p) == once
+		assert _planned_views(p, line1, header, defaults) == before
+
+
+def test_a_pass_that_weighed_a_later_deletion_asks_for_another():
+	# (the pass itself: refusing the move, then taking it, it says another pass can drop more; the third weighs nothing)
+	args = (1, False, [D_, 'P'], '\t', 'utf8', False)
+	lines, again = TSVZ._legacyCompactOnce([b'b', b'c', b'c\t2', b'c'], *args)
+	assert (lines, again) == ([b'b', b'c', b'c'], True)
+	assert TSVZ._legacyCompactOnce(lines, *args) == ([b'b', b'c'], True)
+	assert TSVZ._legacyCompactOnce([b'b', b'c'], *args) == ([b'b', b'c'], False)
+	assert TSVZ._legacyCompact([b'b', b'c', b'c\t2', b'c'], *args) == [b'b', b'c']
+
+
+def test_a_rewrite_leaves_nothing_for_a_second_rewrite_where_it_weighed_a_later_deletion(tmp_path):
+	# (the same through a TSVZed rewrite: 5.14 before this wrote id\tv\na\na\n, and id\tv\na\n at the next rewrite)
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, b'id\tv\na\na\tX\na\n')
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		t = TSVZ.TSVZed(p, header='id\tv\tw', strict=False, verbose=False, append_check_delay=60, rewrite_on_load=False)
+		try:
+			t.hardMapToFile()
+			first = _bytes(p)
+			t.hardMapToFile()
+			second = _bytes(p)
+		finally:
+			t.close()
+	assert first == second == b'id\tv\na\n'

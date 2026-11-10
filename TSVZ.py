@@ -3132,10 +3132,12 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 
 
 def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched, counts=()):
-	"""One pass of _legacyCompact over the legacy lines ``raw`` (bytes, without their newline): ``(lines, emptied)``, the
+	"""One pass of _legacyCompact over the legacy lines ``raw`` (bytes, without their newline): ``(lines, again)``, the
 	lines kept, each a line of ``raw`` byte for byte and in its place, but for a key's last line moved up into its first
 	line's place and a dead key's protected line emptied (built from its own bytes), for every reader of
-	_legacyCompactReaders; ``emptied`` whether a line was emptied (a pass that empties none leaves nothing new droppable).
+	_legacyCompactReaders; ``again`` whether another pass can drop more: a line was emptied, or (5.14) a move was weighed
+	against a later deletion of the key (agrees). Taken, the line it came from goes, and a key whose lines lay around
+	that line can then move; refused for a row of the key between, this pass drops that row and the next takes the move.
 
 	With one reader, what its plan keeps (_legacyCompactPlan). With more, every line any of their plans keeps, and a
 	line moved or emptied only where every plan keeps that line with the same bytes, or (an emptied line, which is a
@@ -3165,6 +3167,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 			out.append(plan)
 		return out
 	every = plans()
+	weighed = []  # (the places of moves weighed against a later deletion of the key: 5.14)
 
 	def agrees(other, i, line, source):
 		# (the same bytes there; or an emptied line (``source`` None), which reads as a deletion as wide, where the other
@@ -3180,8 +3183,12 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 		if source is None:
 			return life >= 0 and other[4][life] >= 0 and other[5] > 1
 		end = other[4][life] if life >= 0 else i
-		return end == source or (0 <= end < source and other[3][source] < 0 and -2 - other[3][source] < end
-								 and not other[0][source])
+		if end == source:
+			return True
+		if not (0 <= end < source and other[3][source] < 0 and not other[0][source]):
+			return False
+		weighed.append(i)  # (taken or refused, the next pass may drop more: ``again``)
+		return -2 - other[3][source] < end
 	still = {i for plan in every for i, line in plan[1].items()
 			 if not all(agrees(other, i, line, plan[2].get(i)) for other in every)}
 	if still:
@@ -3211,7 +3218,8 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 						# line there is a deletion of it to this reader, moved up: that deletion, or a later one, 5.14)
 						changed = True
 				i = extra.find(1, i + 1)
-	return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]], any(i not in plan[2] for plan in every for i in plan[1])
+	return ([content.get(i, raw[i]) for i in range(len(raw)) if kept[i]],
+			bool(weighed) or any(i not in plan[2] for plan in every for i in plan[1]))
 
 
 def _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched, counts=()):
@@ -3220,15 +3228,17 @@ def _legacyCompact(raw, width, consumed, defaults, delimiter, encoding, matched,
 	of any version and either strictness, stays, and under a header line 1 does not hold what every reader that counts
 	from line 1 takes too, and every reader given a count of ``counts`` (_legacyCompactReaders), because every line kept
 	is kept as it is, in its place
-	(_legacyCompactOnce). Repeats while a pass empties a line (that can make another one droppable; a pass that empties
-	none left nothing new droppable in 64,000 compactions tried), at most 4 passes: stopping early is less compact, never
-	wrong."""
+	(_legacyCompactOnce). Repeats while a pass empties a line, or (5.14) weighs a move against a later deletion of the
+	key: either can make another line droppable (id\na\nb\tX\na\nb\t under defaults of two cells: the second a moves up,
+	and only then can b's last line; b\nc\nc\t2\nc: c\t2 refuses c's move and is dropped, and only then is the move
+	free). Without the second rule a second scrub took what the first left, in 96 of 10,048 scrubs of random files; with
+	it in 2, the 2 where 5.13's does. At most 4 passes: stopping early is less compact, never wrong."""
 	defaults = list(defaults) if defaults and defaults is not ... else []
 	for _ in range(4):
-		out, emptied = _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched, counts)
+		out, again = _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matched, counts)
 		changed = out != raw
 		raw = out
-		if not (changed and emptied):
+		if not (changed and again):
 			break
 	return raw
 
