@@ -3121,7 +3121,8 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 		# lines no reader needs. (A line 1 of more cells: line 1's reader is listed at their count already.)
 		readers.append((len(defaults), False, False, defaults))
 	for count in given:
-		if count != width:
+		if count != width and (count, consumed, matched, defaults) not in readers:
+			# (not again where the one-column rule listed it at the defaults' count: a second plan of the same reader, 5.13)
 			readers.append((count, consumed, matched, defaults))
 		if (valued and (count, consumed, matched, ()) not in readers
 				and not (counts.get(True, set()) <= {count} and (consumed or counts.get(False, set()) <= {count}))):

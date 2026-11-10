@@ -17505,3 +17505,14 @@ def test_after_line_1s_key_stands_in_a_rewrite_widens_and_keeps_the_order_where_
 	assert _bytes(p) == b'd\tX\tz\nd\t1\t\na\t1\t2\t3\n'
 	for mod in (TSVZ, TSVZ_old):
 		assert list(mod.readTabularFile(p, header=H, strict=False, verbose=False)) == ['d', 'a']
+
+
+# --------------------------------------------------------------------------
+# 5.13: the compaction entries deferred from 5.12 (docs/limitations.md)
+# --------------------------------------------------------------------------
+def test_a_one_column_compaction_given_the_defaults_count_plans_that_reader_once():
+	# The one-column rule's branch and the loop over the counts given each listed the reader at the defaults' count.
+	for consumed in (True, False):
+		readers = TSVZ._legacyCompactReaders([b'a', b'c'], 1, consumed, [D_, 'P'], '\t', 'utf8', False, (2,))
+		assert readers.count((2, consumed, False, [D_, 'P'])) == 1, readers
+		assert len(readers) == len({(w, c, m, tuple(d)) for w, c, m, d in readers}), readers
