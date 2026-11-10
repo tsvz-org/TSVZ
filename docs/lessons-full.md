@@ -362,8 +362,8 @@ entries go last, in the same commit as the change:
 - Changed: the stand-in for a deleted line that set a reader's count tries line 1's own key first (when its next line
   comes first after the place and is as wide as line 1), where 5.10 and 5.11 tried it last. The compaction plans the
   reader given no header and the caller's defaults at the defaults' count after a line 1 of one cell, under a header line
-  1 does not hold, except where it reads every line as the caller's reader does (a lone key on line 1 at the caller's
-  count; a bare `#_defaults_#` where no line with a value has another width, or the defaults hold none).
+  1 does not hold, except where it reads every line as the caller's reader does (at the caller's count: a lone key on
+  line 1; a bare `#_defaults_#` where no line with a value has another width, or the defaults hold none).
 - Why we had to change: the candidates tried before line 1's key come first to a reader that counts from the place, so
   the key order changed for a reopened store and every loose reader given the header (`d\tX\nc\nd\t1\na\t1\n`, delete `c`
   under `d\tX\tz`: `a, d` where memory lists `d, a`), and where the stand-in key's later line is wider than the header,

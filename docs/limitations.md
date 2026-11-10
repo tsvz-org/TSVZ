@@ -429,6 +429,41 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-11-09, the user chose "Known limitation (Recommended)" for the two shapes left after 5.11 (no layout
   serves both readers; the command's door is the approved Q3).
 
+### A compaction keeps a moved-up line only from the deletion that ends the other reader's life of the key
+- Kind: deferred
+- What the operator sees: a scrub, a `TSVZed` rewrite or a delete's commit can keep a line that no reader needs, once.
+  `id\nb\tX\nb\t\nb\t\na\t1\t\tX\na\t2\t\t2\n#_defaults_#\n` scrubbed with header `a`, defaults `[#_defaults_#, P, Q]` and count 2
+  keeps `b\tX` (`id\nb\tX\nb\t\nb\t\na\t2\t\t2\n#_defaults_#\n`; 5.11 wrote `id\nb\t\na\t2\t\t2\n#_defaults_#\n`). A reader's plan can also
+  keep a strict reader's first line of a key where no other key competes for its place. The delete door is the same
+  family: `d\tX\nc\nd\t1\na\na\n` under header `q` (or `d\tX\tz`, `id\tv`), a `TSVZed` delete of `c` and its commit write `d\tX\nd\nd\t1\na\na\n` (5.11
+  wrote `d\tX\na\nd\t1\na\n`): it keeps the `a\na` pair, since `agrees()` rejects moving the last `a` up for a reader given no
+  header, which reads both lines as deletions of a key it never had. Every reader reads both files alike. The file is a
+  line or two larger, and compacting a scrub's output again changes nothing (5.12 review: in the delete doors 405 of
+  123,480 files' outputs were larger than 5.11's and 355 smaller, no reader worse).
+- Why: `agrees()` in `_legacyCompactOnce` accepts a line moved up into another line's place only when the deletion that
+  ends the other reader's life of the key is the one the line came from. A later deletion of the same key with no row of
+  it between would do as well: that reader reads the key deleted at the moved line, and read it dead from the first
+  deletion on. A move it rejects only keeps lines in their places, so it never loses a row.
+- Plan (5.13): accept that later deletion in `agrees()`, then measure it on the exhaustive planned-reader and delete-door
+  shapes again (the 5.12 review's relaxed variant made 408 of 1.31M outputs smaller and no reader worse; on the first
+  trace above it writes one line more than 5.11, so the build needs its own measurement).
+- Revisit when: 5.13.
+- Noted: 2026-11-09, found in the 5.12 review; a deferral, not asked.
+
+### A one-column compaction given a count equal to the defaults' count plans the same reader twice
+- Kind: deferred
+- What the operator sees: a scrub or a `TSVZed` rewrite of a file the one-column rule reads as one column, given defaults
+  of two cells or more and a count (`correctColumnNum`, a store's given column count) equal to the defaults' count, plans
+  the reader at that count twice: once from the one-column rule's branch and again from the loop over the counts given.
+  `_legacyCompactReaders([b'a', b'c'], 1, True, [D, 'P'], '\t', 'utf8', False, (2,))` returns `(2, True, False, [D, 'P'])`
+  twice. The bytes and every reader's view are the same; the cost is the second plan's time. 3,600 of 97,200 argument
+  sets of the 5.12 review's fuzz do it, in 5.11 and 5.12 alike.
+- Why: the two branches each add the reader, and neither looks at the other's.
+- Plan (5.13): in `_legacyCompactReaders`, do not add a reader the list already holds (the loop over the counts given does
+  that already for the readers given no defaults); one line, then the argument sets again.
+- Revisit when: 5.13.
+- Noted: 2026-11-09, found in the 5.12 review (pre-existing in 5.11); a deferral, not asked.
+
 ### A TSVZedLite delete looks at the file's first lines every time
 - Kind: deferred
 - What the operator sees: unless the program gave a column count of two or more, each `delete`, `pop`

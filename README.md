@@ -320,6 +320,21 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
   key whose later line holds no value stood in (`d\tX\nc\nd\t1\na\n`, 5.11: `d\tX\na\nd\t1\na\n`). No row or cell changes
   for any reader.
 
+- **A `TSVZed` rewrite after such a delete can widen line 1 where 5.11 refused.** `d\tX\nc\nd\tY\nb\t1\t2\t3\n` under
+  `d\tX\tz`, delete `c` (`tsvz --x-header`, `TSVZedLite(strict=False)` or a `TSVZed` delete), then `hardMapToFile()`:
+  5.11's stand-in was `b`, whose later line is wider than the header, so the rewrite refused the widening (Q-C) and wrote
+  `d\tX\nb\nd\tY\nb\t1\t2\t3\n`, and the loose readers given `d\tX\tz` listed `b, d` where memory lists `d, b`. The
+  stand-in is now `d`, whose later line `d\tY` is not wider than the header, so the widening loses no key, Q-C's refusal
+  does not apply, and the rewrite widens, as it does for any file: `d\tX\tz\nd\tY\t\nb\t1\t2\t3\n`, the bytes 5.11 writes
+  for the same file without the deleted line, and every reader given `d\tX\tz` lists `d, b`. Readers given other
+  arguments see what a widening shows them ("Upgrading to 5.6"): a strict reader given the old line 1 (`d\tX`) raises
+  "Header mismatch"; 3.39's loose reader given no header or the old line 1 reads `b` as `[b, 1, 2]` where it read
+  `[b, 1]` (its count follows line 1); a strict reader given no header and defaults of three cells gains `d` as
+  `[d, Y]`, the padded `d\tY\t` being as wide as its count. No reader loses a key (Q-C refuses a widening that would lose
+  one for 3.39's strict reader). This is the approved "Readers given other arguments than the scrub's can see a
+  different file after a scrub or a rewrite"
+  ([docs/limitations.md](docs/limitations.md#readers-given-other-arguments-than-the-scrubs-can-see-a-different-file-after-a-scrub-or-a-rewrite)).
+
 - **A compaction keeps what a reader given no header and the defaults takes after a line 1 of one cell.** Under a header
   line 1 does not hold, with defaults of two cells or more, that reader reads at the defaults' count; 5.11 planned it at
   line 1's one cell unless the caller's own count was one, and a line it takes could go. A scrub given a count:
@@ -331,7 +346,7 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
   adds its defaults line, as every rewrite does), and `c`, whose only line that strict reader takes is `c\t2\t`, was gone
   for it. The reader is now planned at the defaults' count too: the first file becomes
   `a\nc\tX\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n`, the second keeps its lines. It is not planned where it
-  reads every line as the caller's reader does (a lone key on line 1 at the caller's count, or a bare `#_defaults_#` where
+  reads every line as the caller's reader does (at the caller's count: a lone key on line 1, or a bare `#_defaults_#` where
   no line with a value has another width or the defaults hold none), so those files get 5.11's bytes. What shows: a file
   it is planned for can come out of a scrub or a rewrite larger than 5.11 left it, by the lines that reader takes, and in
   about half of those files by a line no reader needs (the compaction is as cautious for it as for every reader it plans):
@@ -342,6 +357,11 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
   5.11's time, the same bytes), but where the reader above is planned: a scrub given a `correctColumnNum` other than the
   defaults' count, after a lone key on line 1 under a header line 1 does not hold, took 1.19 times 5.11's time (the same
   bytes on that file).
+
+- Deferred to 5.13: a compaction can keep a line no reader needs where it moves a key's last line up into its first
+  line's place only from the deletion that ends the other reader's life of the key. A `TSVZed` delete and commit of `c`
+  in `d\tX\nc\nd\t1\na\na\n`, given `q`, writes `d\tX\nd\nd\t1\na\na\n` (5.11: `d\tX\na\nd\t1\na\n`), and every reader reads both
+  alike. See [docs/limitations.md](docs/limitations.md#a-compaction-keeps-a-moved-up-line-only-from-the-deletion-that-ends-the-other-readers-life-of-the-key).
 
 - Known, as in 5.11 (no layout serves both readers): after a line 1 of one cell, `tsvz --x-header H delete` followed by a
   rewrite of a `TSVZed` given H can change a cell for every reader, and a delete under a header whose line 1 already names
