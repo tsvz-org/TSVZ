@@ -94,8 +94,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: deferred
 - What the operator sees: rarely, a program that exits while a `TSVZed` still has a write to finish prints "TSVZ: the
   write to X is being finished; Ctrl-C again to abandon it" after a Ctrl-C, the write completes and is on disk, and the
-  program then never ends; a second Ctrl-C ends it. On any Python: estimated at about 1 in 30,000 such Ctrl-Cs on 3.6 and
-  fewer on 3.14 (an estimate from the injection runs, not a field rate). 5.11 does the same. In the suite,
+  program then never ends; a second Ctrl-C ends it. On any Python. 5.11 does the same. Correction (2026-11-09, after the
+  5.12 release): this entry first said "about 1 in 30,000 such Ctrl-Cs on 3.6", which covered only a Ctrl-C during the
+  exit wait. A Ctrl-C that ends a loop of writes to a `TSVZed` can leave the store's memory lock held, so the writer and
+  the exit wait for ever (a second Ctrl-C then abandons the write still waiting): 70 of 960 runs on 3.14 and 4 of 960 on
+  3.6 for a `.tsv` store, 27 of 960 on 3.14 for a `.tsvz` store with commits (measured for 5.13, which fixes it). In the suite,
   `TSVZ_lock_test.py::test_ctrl_c_at_exit_of_a_store_with_a_queued_row_keeps_waiting_and_writes_it` fails this way in
   0.1–0.4% of runs on 3.6 (9 of 6,000 at 5.12, 5 of 6,000 at 5.11, `-n 64`) and 1 of 4,000 on 3.14: its Ctrl-C comes
   0.7 s in, exactly 7 of the exit's 0.1 s wait steps, when the main thread runs Python code between two waits.
