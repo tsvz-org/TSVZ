@@ -336,3 +336,24 @@ entries go last, in the same commit as the change:
   those readers takes, and changes a line only where all of them agree. A step found right for only one reader is made
   right for every reader, not taken out of the door where the loss showed: it may be what pays for something else. A
   condition checked at one count must be one that holds at every count a reader can take.
+
+## 2026-11-09 TSVZ 5.11: a rule follows its premise to the doors where it holds, and an old reader is modelled as it is
+- Changed: the stand-in rule's clause "no row with a value stands in after a line 1 of one cell" (Q3, 5.08) now applies
+  only where the deleting program reads line 1 as a row (`tsvz --x-header H delete`, a handler); in a `TSVZed` or a
+  `TSVZedLite(strict=False)` given H, a row with a value stands in (the user's answer to Q-A, 2026-11-08). The compaction
+  models 3.39's defaults cell by cell (a `#_defaults_#` line cut to the count, filled from the defaults before it), where it
+  kept one "strict or not" flag; it plans a `correctColumnNum` the caller gave as one more reader; a key's lines collapse
+  when each strict reader takes the moved line where it read the key before; and a widening is refused when a key's only
+  line 3.39's strict reader takes holds no value (Q-C).
+- Why we had to change: in the store's doors the clause protected 3.39's strict reader at the cost of the deleting store's
+  own view (`b` read `[b, 1, Q]` after the delete, and the store's next widening wrote it for everyone, but only in one
+  order). The flag kept 3.39's strict reader lenient after a defaults line that made it strict again, and a scrub changed a
+  cell for it. The count a caller gave was not planned, and the key order changed for the caller's own readers.
+- Original design was wrong because: Q3 was decided for the command's door, where the deleting program reads line 1 as a
+  row; the premise is false in a store given H, which counts from the line after line 1, and the rule was applied in every
+  door all the same. The flag stood for a list of per-column values, and two states of the list that differ for the reader
+  were one state of the flag. The plan listed the readers it could infer from the file and the header, not the one the
+  caller named.
+- Lesson: a rule bought with one reader's cost holds only where its premise holds; when the premise is about who the
+  deleting program is, it is decided per door, from that door's own reading. Model an old reader's state as the reader
+  keeps it (a list is not a flag), and plan every reader the caller names, not only those the file implies.
