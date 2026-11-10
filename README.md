@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.12**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.13**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -325,15 +325,33 @@ The file formats are unchanged, and no file has to be rewritten.
   thread's set and a loose store's background appends are not held off until the program next uses the store (of 320
   write loops ended by a caught Ctrl-C, the main thread kept the lock in 15 and 17 on 3.6 and in 12 and 2 on 3.14 in two
   measurements before; now none in 320 on each). Only a second Ctrl-C landing in the clause that lets go, or a hold
-  left in a section that runs in the caller's thread after `close()` or in a forked child, can leave it.
-- **A signal handler that uses the store works inside a set.** A handler that commits (flush on `SIGUSR1`) or sets a row,
+  left in a section that runs in the caller's thread after `close()` or in a forked child, can leave it. There a Ctrl-C
+  can also leave the store's `writeLock` held, which nothing lets go of, and the program's next commit or rewrite of
+  that store then waits for ever (a known limitation; 5.12 the same, and in every `.tsvz` commit), and a `.tsvz`
+  commit cut there can drop the rows it had taken from the queue (5.12 the same; planned for 5.15). See
+  docs/limitations.md.
+- **A signal handler that uses the store no longer hangs a set.** A handler that commits (flush on `SIGUSR1`) or sets a row,
   or one that calls `close()` and exits (`SIGTERM`), runs inside whatever the main thread was doing, a set included. In
   5.12 the program waited for ever in 5 to 11 of 40 runs on 3.14 and in 19 to 40 of 40 on 3.6, whichever of the three the
   handler did; the store's lock now accepts that a handler let go of it, and the set goes on (none in 40 on each).
+  The set or delete the handler landed in then goes on without the lock. When the writer thread reads the file into
+  memory while the handler waits for it (the handler's own `reload()` or `clear()`, another thread's `reload()`, or the
+  sync with another process's write, which follows each commit), a change that the set or delete had made in memory and
+  not yet queued is undone in memory and written all the same. Memory and the file then differ on that one key until the
+  next reload: a row just set is in the file and not in memory, where a `del` of it does nothing and a loose store's
+  next rewrite takes it out of the file; a row just deleted is back in memory, and a loose store's next rewrite writes
+  it back. In a loop of sets and deletes with a handler about every millisecond: no key in 13,000 sets by the handler on
+  3.14 and 23,000 on 3.6, nor in 17,000 and 73,000 commits by it with nothing else reading the file; 3 to 6 keys in
+  1,400 to 2,100 commits while another process appended to the file (3.14), and 1 to 8 in 120 to 430 `reload()`s by the
+  handler. A handler that sets the very key the set or delete was changing does the same: memory keeps the handler's
+  row, and the file ends with the section's line. A handler that only sets rows of other keys, or sets a flag the main
+  loop acts on, is not affected. Planned for 5.15 (docs/limitations.md). When the writer thread rewrites a loose store's
+  file meanwhile instead, the change is written twice, by the rewrite and by the line queued after it: the last wins, so
+  readers read the same rows, and the next rewrite drops the extra line (a known limitation).
 - **Not covered yet:** a `TSVZClient`'s lock, a `tsvz serve` store's and the lock a one-shot call takes on a path
   (`appendTabularFile`, `scrubTabularFile`, `clearTabularFile`) are not let go of the same way: a caught Ctrl-C that
   left one held can make another thread of the program that uses the same client, store or path wait for ever (not
-  the exit, except of a path's writer thread). Planned for 5.14 (docs/limitations.md).
+  the exit, except of a path's writer thread). Planned for 5.15 (docs/limitations.md).
 - **`TSVZed.shutdownEvent` is no longer a `threading.Event`.** It has the same `is_set()` (and `isSet()`), `set()`,
   `clear()` and `wait()`, which behave as an Event's, but `isinstance(store.shutdownEvent, threading.Event)` is now
   false, and an Event's internals (`_cond`, `_flag`) are not there. An Event holds its lock across Python code, which a
@@ -344,10 +362,14 @@ The file formats are unchanged, and no file has to be rewritten.
   queued, no write under way: a load is no write) is let go of at once, as a loose store is, so a Ctrl-C during a long
   load ends the program, where it first waited for the whole load (6.45 s after one Ctrl-C on a 1.5M-row store). It
   still takes up to a second or two on a big store, while the load thread keeps the interpreter busy (a loose
-  store's does too; 5.12's `.tsvz` load, in the main thread, ended in 0.1 s): planned for 5.14 (docs/limitations.md).
+  store's does too; 5.12's `.tsvz` load, in the main thread, ended in 0.1 s): planned for 5.15 (docs/limitations.md).
 - A set costs a little more: a loop of 200,000 `store[k] = v` (15 alternating runs each, medians, a host at a load of 80
   to 115) took 1.53 s in 5.12 and 1.63 s in 5.13 on 3.6 (7% more), 0.96 s and 0.97 s on 3.14 (2% more); the noise between
   runs is about 4%.
+- A `.tsvz` store's `commitAppendToFile()` costs what a loose store's does, a round trip to the writer thread: 3,000
+  sets each committed at once (on tmpfs, medians of five alternating runs) took 0.069 s in 5.12 and 0.109 s in 5.13
+  on 3.14 (0.084 s and 0.137 s on 3.6), and a commit with nothing queued about 11 microseconds (13 on 3.6) where
+  5.12 took 0.2. A loose store's commit is unchanged or a little faster.
 - `tsvzconform.py`: a part replaced twice in a case can no longer pass for the same file (the runner holds each part
   open through the case, so its inode number goes to no other file), so `19.4-scrub-twice` always catches an
   implementation that renames over the store.

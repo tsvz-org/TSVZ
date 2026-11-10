@@ -105,20 +105,77 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     (`appendTabularFile`, `scrubTabularFile`, `clearTabularFile`, an in-place rewrite of a part, making a missing file).
     A Ctrl-C that left it held there makes a writer of the same path in this process wait for ever, and so its exit (5.12
     the same).
-  - One narrower case is worse than 5.12 (found by reading, not run): a program with an open `.tsvz` `TSVZed` on path P
-    catches a Ctrl-C that landed in a one-shot call on the same P, then calls `commitAppendToFile()` before the writer
-    thread's next tick. 5.12 committed in the calling thread, which the RLock let in; 5.13's commit waits for the writer
-    thread, which waits for the lock the main thread still holds.
+  - One narrower case is worse than 5.12 (run in the 5.13 final review with the hold made by hand): a program with an
+    open `.tsvz` `TSVZed` on path P catches a Ctrl-C that landed in a one-shot call on the same P, then calls
+    `commitAppendToFile()` before the writer thread's next tick. 5.12 committed in the calling thread, which the RLock
+    let in (0.04 s); 5.13's commit waits for the writer thread, which waits for the lock the main thread still holds
+    (for ever, as both versions' exit does when the commit is left to the writer thread's tick).
 - Why: they are RLocks that TSVZ's code does nest (the scrub of a `.tsvz` part runs `_specBackupPart`, which takes the
   path lock again, inside `_specRewriteInPlace`'s hold of it), so `_SectionLock`'s "a thread that finds itself holding it
   holds it from a Ctrl-C" is not true of them. The mutators' fix (5.13: `except BaseException: letGo(); raise` around each
   `with`) lets go of every hold, outer ones too. What fits is a lock that counts its holds, so an except clause lets go
   down to the depth its section began at.
-- Plan (5.14): a counting subclass of the RLock for these three, the except clause at each main-thread `with` on them,
+- Plan (5.15): a counting subclass of the RLock for these three, the except clause at each main-thread `with` on them,
   then the interrupted-writes sweep (`TSVZ_test.py::_INTERRUPTED_WRITES`) run on a `TSVZClient` and on the one-shot
   calls with a hold check after each caught interrupt, and the narrower case above built as a test.
-- Revisit when: 5.14.
-- Noted: 2026-11-09, found in the 5.13 review; a deferral, not asked.
+- Revisit when: 5.15.
+- Noted: 2026-11-09, found in the 5.13 review; a deferral, not asked. 2026-11-10: moved to 5.15, as the compaction
+  release comes first.
+
+### A signal handler that uses a store inside a set or delete can leave memory and the file apart on that key
+- Kind: deferred
+- What the operator sees: a program whose signal handler uses a `TSVZed` (flush on `SIGUSR1`: `commitAppendToFile()`;
+  `reload()` on `SIGHUP`; `clear()`) while its main thread sets and deletes rows. When the signal lands inside a set
+  or delete, between its change of memory and its queueing of the line, and the writer thread reads the file into
+  memory while the handler waits for it (the handler's own `reload()` or `clear()`, another thread's `reload()`, or
+  the sync with another process's write, which follows each commit), the change is undone in memory and written all
+  the same. A row just set is then in the file and not in memory: `store[k]` misses it, a `del store[k]` does nothing
+  (the row stays in the file), and a loose store's next rewrite takes it out of the file. A row just deleted is back
+  in memory while the file has its deletion, and a loose store's next rewrite writes it back. A `.tsvz` store's
+  memory follows the file again at its next reload. Nothing is reported. In a loop of sets and deletes with a handler
+  about every millisecond (5.13 final review): no key in 13,000 sets by the handler on 3.14 and 23,000 on 3.6, nor in
+  17,000 and 73,000 commits by it with nothing else reading the file; 3 to 6 keys in 1,400 to 2,100 commits while
+  another process appended to the file (3.14); 1 to 8 keys in 120 to 430 `reload()`s by the handler (3.14); 8 and 13
+  keys in 790 and 940 commits while another thread called `reload()` in a loop (3.14; 7 and 12 in 3,100 and 4,600 on
+  3.6). 5.12 waited for ever at the first such signal that landed inside a set (18 of 18 runs, within seconds).
+  A handler that sets the very key the interrupted set or delete was changing does the same without the writer thread
+  (found by reading, not run): memory keeps the handler's row, and the file ends with the section's line, queued after
+  the handler's.
+- Why: the handler runs inside the section it interrupted and has to let go of that section's lock before it waits
+  for the writer thread, which needs it; the rest of the section then runs without the lock. A handler that only sets
+  rows of other keys, or sets a flag the main loop acts on, is not affected. When the writer thread rewrites the file
+  instead, the line is written twice: the next entry.
+- Plan (5.15): a section that finds, at its end, that its lock was taken from it makes its change of memory again
+  under the lock (a set puts its row, a delete drops its key), so memory agrees with what it queued; a test with the
+  handler run at each step of a set, a delete, a pop and a move, for `reload()`, `clear()` and a commit beside
+  another process's append, and with a handler that sets the section's own key.
+- Revisit when: 5.15.
+- Noted: 2026-11-10, measured in the 5.13 final review; a deferral, not asked. It is wider than the "memory and file can
+  differ until the next reload" of the question the user approved on 2026-11-10 (the next entry), and plans its fix.
+
+### A signal handler that uses a store inside a set or delete can write that line twice
+- Kind: known limitation
+- What the operator sees: a program whose signal handler uses a loose (`.tsv`-family) `TSVZed` (a commit, a rewrite, a
+  set) while its main thread sets and deletes rows in it. When the signal lands inside a set or delete, between its
+  change of memory and its queueing of the line, the rest of that set or delete runs without the store's lock (5.12
+  waited for ever there).
+  If the writer thread rewrites the file meanwhile (the handler's own `rewrite()`, `mapToFile()` or `hardMapToFile()`,
+  a commit that rewrites, as a one-column delete's does, or a rewrite that thread starts on its own), the rewrite
+  writes memory with the change in it, and the line queued after it writes the change again: the file holds that row,
+  or that deletion, twice. The last wins, so every reader reads the same rows; the file is a line longer until its
+  next rewrite. A `.tsvz` store is never rewritten from memory, so it does not meet this. Not measured; the measured
+  cases of the same window, where memory and the file differ, are the entry above.
+- Why: the handler runs inside the section it interrupted and has to let go of its lock; the section cannot tell that
+  a rewrite ran meanwhile without more state to compare. The line costs the file a few bytes and no reader anything.
+  The fix planned in the entry above does not remove it: the section makes its change of memory again under the lock,
+  and its line is still queued after the rewrite that already wrote the change.
+- Revisit when: someone sees a file grow this way, or the 5.15 work on these sections finds a way to skip the line that
+  costs no more than it saves.
+- Approved: 2026-11-10, the user chose "Approve as KL (Recommended)" on the question: "a program's own signal handler
+  that writes to a store while the main thread is part way through writing to the same store. 5.12 deadlocked here
+  for ever. 5.13 goes on, but the rest of the interrupted write runs without its lock: the file can get a duplicate
+  line, or memory and file can differ until the next reload." This entry is the duplicate line; memory and the file
+  differing is the deferral above, which is wider (a loose store's next rewrite can lose the set or undo the delete).
 
 ### A Ctrl-C during a long load takes a second or so to end the program
 - Kind: deferred
@@ -133,12 +190,18 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   Ctrl-C's traceback and shuts down. They share the GIL, and each file read by the main thread waits up to the 5 ms
   switch interval for it. On 3.14 the traceback took 0.92 s to print at the default interval and 0.06 s at 0.2 ms, and the
   process ended 1.3 s after the Ctrl-C against 0.28 s.
-- Plan (5.14): stop a load when a Ctrl-C ended the wait for it: a flag the part reader polls once per chunk (it reads in
+- Plan (5.15): stop a load when a Ctrl-C ended the wait for it: a flag the part reader polls once per chunk (it reads in
   chunks already), set by `_call` for a load job, so the load changes nothing in memory and the writer thread stops
   taking the GIL; the loose store's `_readFrom` the same. Check that the worker thread survives the cancel.
-- Revisit when: 5.14.
+  With it: a job whose wait a Ctrl-C ended and that has not started is taken back. Today it still runs later, and for
+  `clear()` that is after whatever the program set once it caught the Ctrl-C: those rows go from a loose store's
+  memory and file (5.12 the same), and from a `.tsvz` store's file while its memory keeps them (new in 5.13: 5.12's
+  `.tsvz` clear ran in the calling thread and was cut where the Ctrl-C landed). In the final review's sweep, 45 of the
+  227 steps of a `.tsvz` `clear()` (those of its wait) lost the two rows set after the caught interrupt.
+- Revisit when: 5.15.
 - Noted: 2026-11-09, found when the fix for the `.tsvz` load's wait was measured in the 5.13 fix round; a deferral, not
-  asked.
+  asked. 2026-11-10: the interrupted `clear()` added (5.13 final review); moved to 5.15, as the compaction release
+  comes first.
 
 ### A write after close(), or in a forked child, can be cut by a Ctrl-C
 - Kind: known limitation
@@ -150,6 +213,86 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   thread again in both cases, with its lifetime to get right.
 - Revisit when: someone writes through a closed store or from a forked child and hits it.
 - Approved: 2026-10-29, the user chose "Known limitation (Recommended)".
+
+### A second Ctrl-C inside a set's clean-up, or a Ctrl-C in a write made after close() or in a forked child, can leave a lock held
+- Kind: known limitation
+- What the operator sees: a program that catches a Ctrl-C and goes on.
+  - Two Ctrl-Cs microseconds apart, the second landing where a set, delete, pop or move lets go of the store's lock
+    after the first: the main thread keeps the lock until it next uses the store (its next set, delete, commit or
+    `close()`, or the exit, lets go of it). Until then another thread's set or delete waits, and a loose store's
+    background appends wait. With interrupts 0.7 ms apart, 4 of 97,000 on 3.6; none in 1.2 million single interrupts
+    and none in 1,280 real Ctrl-Cs.
+  - After `close()`, or in a child that `fork()` made, a store has no writer thread, and `commitAppendToFile()`,
+    `rewrite()`, `mapToFile()`, `clear()` and `reload()` run in the caller's thread. A Ctrl-C there can leave the
+    store's lock held (let go of as above), or its `writeLock`, which nothing lets go of: the program's next commit
+    or rewrite of that store then waits for ever. With an interrupt at each bytecode of one such commit or rewrite:
+    `writeLock` left held at 6 to 13 steps of about 1,000 to 9,400 (3.14 and 3.11; none at 3.6's line steps). 5.12 did
+    the same in these two cases, and in every `.tsvz` commit of a running store, which ran in the caller's thread
+    there. What the cut write leaves in the file is the entry above; the rows a cut `.tsvz` commit drops, the
+    deferral below.
+- Why: `writeLock` is held for the caller across calls by `get_file_obj()`, so a thread that finds itself holding
+  it cannot take that for a Ctrl-C's leftover; whatever lets go of a lock is itself code a second Ctrl-C can land in;
+  calls after `close()` and writes from forked children are rare.
+- Revisit when: someone hits it, or a closed store or a forked child gets a writer thread.
+- Approved: 2026-11-10, the user chose "Approve as KL (Recommended)" on the question: "One rare case is left, for a
+  program that catches Ctrl-C and keeps running: a second Ctrl-C landing inside the cleanup that lets go of the lock,
+  or a write after close() or in a forked child, can still leave a store's lock held, and another thread then waits
+  for ever (as in 5.12)." The wording is the 5.13 final review's, which adds the `writeLock` case: its hang hits the
+  program's own next commit, not only another thread.
+
+### A .tsvz commit after close() or in a forked child that a Ctrl-C cuts can drop the rows it took from the queue
+- Kind: deferred
+- What the operator sees: after `close()`, or in a child that `fork()` made, a `.tsvz` store's `commitAppendToFile()`
+  runs in the caller's thread. A Ctrl-C that lands after it took the queued rows from the queue and before it wrote
+  them drops them: memory holds them, the file does not, and no later commit writes them. With an interrupt at each
+  bytecode of one such commit (5.13 final review): the queued row dropped at 582 of 996 steps. 5.12 did the same
+  there, and in every `.tsvz` commit of a running store, which ran in the caller's thread: a Ctrl-C that ended a loop
+  of sets and commits lost rows the program had set in 21 of 320 runs on 3.14 and 15 of 320 on 3.6 (5.13: none in
+  1,280, as such a commit now runs on the writer thread).
+- Why: `_specCommitLocked` puts the rows back on the queue only for an `Exception`; a KeyboardInterrupt goes up past
+  it.
+- Plan (5.15): an `except BaseException` in `_specCommitLocked` that puts the rows back and raises. A Ctrl-C that
+  lands after the write, before the commit returns, then has them written again at the next commit: a line written
+  twice (the last wins), which costs a few bytes where the drop costs the rows. Then a test: an interrupt
+  at each step of a `.tsvz` commit after `close()`, and the row in the file after the next commit.
+- Revisit when: 5.15.
+- Noted: 2026-11-10, found in the 5.13 final review; a deferral, not asked.
+
+### A first Ctrl-C in the exit's first steps abandons the queued rows
+- Kind: deferred
+- What the operator sees: at exit, `_stopLiveStores()` writes what each store still has queued; a first Ctrl-C
+  meanwhile keeps waiting ("TSVZ: the write to X is being finished; Ctrl-C again to abandon it"), and only a second
+  abandons the write. A first Ctrl-C that lands in the exit's own first steps, before its handling of a store begins
+  (the function's start, the list of stores, the loop), abandons every store at once, as a second would: the rows
+  still queued are not written. With an interrupt at each instruction of `_stopLiveStores()` and a row queued (5.13
+  final review): 11 to 13 steps lost it in 5.13, 12 to 15 in 5.12. The window is the first microseconds of the exit.
+- Why: the first Ctrl-C is caught around each store's `_atExit()`; one outside it reaches the clause that abandons.
+- Plan (5.15): take a first KeyboardInterrupt anywhere in `_stopLiveStores()` as the first: the `try` as the
+  function's first statement, and a loop that on a first one sets `interrupted`, says so, and goes through the stores
+  still live again (a stopped store has left `_LIVE_STORES`), so that only a second abandons. Then the exit sweep as a
+  test: no single interrupt loses the queued row, on `.tsv` and `.tsvz`.
+- Revisit when: 5.15.
+- Noted: 2026-11-10, found in the 5.13 final review; a deferral, not asked.
+
+### The suite's interrupt sweep covers a set and a commit only
+- Kind: deferred
+- What the operator sees: nothing in the library. `TSVZ_test.py::_INTERRUPTED_WRITES` raises a KeyboardInterrupt at
+  each step of a `TSVZed`'s set and commit (and a `TSVZClient`'s set) and checks the store's lock after each. The other
+  operations a Ctrl-C can land in (a delete, pop, popitem, `move_to_end`, `setDefaults`, `reload()`, `clear()`,
+  `rewrite()`, `close()`, a commit or rewrite after `close()`) were swept only by the 5.13 final review's own script,
+  which is not in the repo, so a change that leaves a hold there would pass the suite. The review stepped by
+  `sys.monitoring` on 3.12 and later, which gives every instruction from the first call, where the suite's settrace
+  opcode events start late.
+- Why: the sweep was written for the hang 5.13 fixed, which a set and a commit show.
+- Plan (5.15), with the work on these locks: the review's 14 operations on `.tsv` and `.tsvz` in the suite, stepped by
+  `sys.monitoring` on 3.12 and later, with its checks after each caught interrupt (the hold, another thread's set,
+  memory against the file after `close()`); the steps of 3.14's `NOT_TAKEN` instructions in pop, popitem and
+  `move_to_end` left out (a real signal's KeyboardInterrupt is not raised there); the cases after `close()` checked
+  against the known limitation "A second Ctrl-C inside a set's clean-up, or a Ctrl-C in a write made after close() or
+  in a forked child, can leave a lock held", not for no hold. The review ran about 20,000 cases per Python: measure the
+  suite's time with it, and put what does not fit the default run behind a marker.
+- Revisit when: 5.15.
+- Noted: 2026-11-10, found in the 5.13 final review; a deferral, not asked.
 
 ### A compressed file whose text has no final newline takes an appended member as lines of its own
 - Kind: known limitation

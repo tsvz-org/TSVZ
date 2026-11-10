@@ -47,7 +47,7 @@ elif os.name == 'posix':
 version = '5.13'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-11-09'
+COMMIT_DATE = '2026-11-10'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -5560,9 +5560,13 @@ class _SectionLock(_thread.RLock):
 	A signal handler that uses the store is not TSVZ's code: it runs inside the section it interrupted, and its own section
 	(or its wait for the writer thread) lets go of the interrupted one's hold. The exit of the interrupted section then
 	finds the lock not held, and ignores that (__exit__; a check of the hold before the release leaves a gap that a handler
-	lands in). The rest of that section runs without the lock; at worst, as far as checked, a line is written twice (the
-	last wins) or memory and the file differ until the next reload, and both need the writer thread to rewrite or reload
-	in those microseconds.
+	lands in). The rest of that section runs without the lock. When the writer thread rewrites meanwhile, a line is written
+	twice (the last wins). When it reads the file into memory meanwhile (the handler's own reload() or clear(), another
+	thread's reload, the sync with another process's write that follows a commit: the handler's whole wait for the writer
+	thread, not microseconds), a change the section made in memory and had not yet queued is undone in memory and written
+	all the same: memory and the file differ on that key until the next reload, a delete of a row set so does nothing, and
+	a loose store's next rewrite writes memory's side (measured: README, "Upgrading to 5.13"; docs/limitations.md). A
+	handler that sets the section's own key does the same: memory keeps its row, the file ends with the section's line.
 	(Its exit is a Python method, about 0.1 microsecond a section dearer than the RLock's own on 3.6, 0.04 on 3.14.)"""
 	__slots__ = ()
 
