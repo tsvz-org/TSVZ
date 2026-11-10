@@ -6471,8 +6471,13 @@ class TSVZed(OrderedDict):
 		Records stay queued until the write succeeds; a failure is reported once
 		and retried on the next tick. Nothing raised here may reach the worker.
 		"""
-		with self.writeLock:
-			return self._specCommitLocked()
+		if not self._startWrite():  # (the exit let go of the store: no write starts that the interpreter's end could cut)
+			return self
+		try:
+			with self.writeLock:
+				return self._specCommitLocked()
+		finally:
+			self._endWrite()
 
 	def _specCommitLocked(self):
 		# The caller holds self.writeLock (a non-reentrant lock).
@@ -7832,21 +7837,23 @@ memoryOnly:{self.memoryOnly}
 		_LIVE_STORES.pop(id(self), None)
 
 	def _atExit(self):
-		"""What _stopLiveStores does with a store left running at exit. A legacy store with nothing to write (nothing
-		queued, not dirty, damaged or to be made again, no rewrite_on_exit, no write job handed to its writer thread or
-		under way there) is let go of without waiting for that thread, a daemon, which may be waiting for another
+		"""What _stopLiveStores does with a store left running at exit. A store with nothing to write (nothing queued, no
+		write job handed to its writer thread or under way there; a legacy one also not dirty, damaged or to be made
+		again, no rewrite_on_exit) is let go of without waiting for that thread, a daemon, which may be waiting for another
 		process's lock to read the file: a program whose store waits in its load ends at one Ctrl-C. From then on the
 		thread starts no write (_startWrite), so none is cut short as the interpreter ends."""
 		self._exiting = True
-		if not self._spec:
-			with self._memLock:
+		with self._memLock:
+			if self._spec:  # (a .tsvz store is never rewritten at exit: only its queue is written)
+				self._letGo = not (self.appendQueue or self._requests or self._writing)
+			else:
 				self._letGo = not (self.appendQueue or self.dirty or self._damaged or self._remake or self.rewrite_on_exit
 								   or self._requests or self._writing)
-			if self._letGo:
-				self.shutdownEvent.set()
-				self._wake.set()
-				_LIVE_STORES.pop(id(self), None)
-				return None
+		if self._letGo:
+			self.shutdownEvent.set()
+			self._wake.set()
+			_LIVE_STORES.pop(id(self), None)
+			return None
 		return self.stopAppendThread()
 	
 	def get_file_obj(self,modes = 'ab'):

@@ -754,6 +754,93 @@ def test_ctrl_c_in_a_store_waiting_on_another_process_lets_the_program_exit(tmp_
 		_kill(store, holder)
 
 
+#: A .tsvz TSVZed whose load, on its writer thread, takes a minute (a 1.5M-row store takes 6 s; this one is made slow).
+SLOW_SPEC_LOAD = r'''
+p = ARGS[0]
+signal = __import__('signal')
+signal.signal(signal.SIGINT, signal.default_int_handler)
+real = T.TSVZed._specReload
+def slow(self):
+	say('loading')
+	time.sleep(60)
+	return real(self)
+T.TSVZed._specReload = slow
+T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
+say('done')
+'''
+
+
+def test_ctrl_c_during_a_tsvz_load_ends_the_program_at_once(tmp_path):
+	# 5.13 moved a .tsvz store's load to its writer thread, where a Ctrl-C stops only the wait; the exit then waited for the
+	# whole load as for a write (6.45 s after one Ctrl-C on a 1.5M-row store, where 5.12 ended in 0.17 s; ending it sooner took
+	# three, the second saying a write was being finished). A load writes nothing, so the exit lets go of the store.
+	p = str(tmp_path / 'f.tsvz')
+	store = _child(SLOW_SPEC_LOAD, p, env=dict(os.environ, PYTHONUNBUFFERED='1'))
+	try:
+		_expect(store, 'loading')
+		store.send_signal(signal.SIGINT)
+		try:
+			# 20 s: the exit takes well under a second; the 60 s load is what a program that waits for it takes.
+			out, err = store.communicate(timeout=20)
+		except subprocess.TimeoutExpired:
+			raise AssertionError('one Ctrl-C did not end the program during a .tsvz load')
+		assert store.returncode != 0 and b'done' not in out
+		assert b'being finished' not in err, err
+	finally:
+		_kill(store)
+
+
+def test_a_tsvz_commit_notes_its_write_so_the_exit_never_lets_go_of_one_under_way(tmp_path):
+	# The writer thread's own tick commits inline, with no job: without a note of the write (_startWrite) its commit, the
+	# queue already taken, looked like nothing to write, and the exit let go of the store in the middle of its append.
+	t = TSVZ.TSVZed(str(tmp_path / 'f.tsvz'), header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)
+	try:
+		seen = []
+		real = t._specCommitLocked
+		t._specCommitLocked = lambda: seen.append((threading.current_thread() is threading.main_thread(), t._writing)) or real()
+		t['a'] = ['a', '1']
+		t._specCommit()  # (what the writer thread's tick calls, called here)
+		assert (True, 1) in seen  # noted while it wrote (the exit waits for it)
+	finally:
+		t._finish()
+
+
+def test_a_tsvz_store_the_exit_let_go_of_writes_only_what_another_thread_asks_for(tmp_path):
+	p = str(tmp_path / 'f.tsvz')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)
+	try:
+		t['a'] = ['a', '1']
+		t.commitAppendToFile()
+		before = open(p, 'rb').read()
+		assert t._atExit() is None and t._letGo  # nothing to write (a load is no write): let go of, as a legacy store is
+		assert not t._workerRuns()  # every write now runs in the thread that asks for it
+		assert t._workerDone.wait(10)  # the writer thread ended, writing nothing
+		t['late'] = ['late', 'L']
+		results = []
+		unattended = threading.Thread(target=lambda: results.append(t._specCommit()))
+		t.appendThread, real = unattended, t.appendThread
+		unattended.start()
+		unattended.join()
+		t.appendThread = real
+		assert results == [t] and open(p, 'rb').read() == before  # the writer thread starts no write of its own
+		t.commitAppendToFile()  # this thread's: written
+		assert TSVZ.readTabularFile(p, header='id\tv')['late'] == ['late', 'L']
+	finally:
+		t._finish()
+
+
+def test_a_tsvz_store_with_a_row_queued_is_not_let_go_of_by_the_exit(tmp_path):
+	p = str(tmp_path / 'f.tsvz')
+	t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)
+	try:
+		t['a'] = ['a', '1']
+		t._atExit()
+		assert not t._letGo  # a row is queued: the exit waits for the writer thread, which writes it
+		assert TSVZ.readTabularFile(p, header='id\tv')['a'] == ['a', '1']
+	finally:
+		t._finish()
+
+
 def test_ctrl_c_at_close_of_a_store_with_a_queued_row_ends_after_three(tmp_path, kind):
 	# The store has a row to write and waits for another process's lock. A Ctrl-C stops close()'s wait; at exit the
 	# write in progress is waited for again, a Ctrl-C there says it is being finished, and the next abandons it: three
