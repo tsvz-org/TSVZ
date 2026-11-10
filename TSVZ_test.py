@@ -16820,7 +16820,7 @@ def test_a_section_lock_a_ctrl_c_left_held_is_let_go_of_by_its_holder():
 	# A KeyboardInterrupt can land just after a with statement takes its lock and before the block is set up, or where the
 	# block's exit never runs (bpo-29988): a plain lock was then held for ever. Taken here by hand, as such a Ctrl-C leaves it.
 	lock = TSVZ._SectionLock()
-	free = lambda: lock._lock.acquire(False) and lock._lock.release() is None  # (looked at from another thread)
+	free = lambda: lock.acquire(False) and lock.release() is None  # (looked at from another thread)
 
 	def elsewhere(fn):
 		out = []
@@ -16828,13 +16828,13 @@ def test_a_section_lock_a_ctrl_c_left_held_is_let_go_of_by_its_holder():
 		other.start()
 		other.join(10)
 		return out
-	lock._lock.acquire()
+	lock.acquire()
 	assert elsewhere(free) == [False]
 	with lock:  # this thread's next section lets go of it first
 		assert elsewhere(free) == [False]
 	assert elsewhere(free) == [True]
-	lock._lock.acquire()
-	lock._lock.acquire()  # (twice: a Ctrl-C in each of two sections)
+	lock.acquire()
+	lock.acquire()  # (twice: a Ctrl-C in each of two sections)
 	lock.letGo()
 	assert elsewhere(free) == [True]
 	lock.letGo()  # (nothing held: nothing to do)
@@ -16846,15 +16846,15 @@ def test_a_store_whose_lock_a_ctrl_c_left_held_writes_and_ends(tmp_path):
 	p = str(tmp_path / 's.tsv')
 	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, append_check_delay=60)
 	t['a'] = ['a', '1']
-	t._memLock._lock.acquire()  # as such a Ctrl-C leaves it
+	t._memLock.acquire()  # as such a Ctrl-C leaves it
 	t.commitAppendToFile()  # let go of before the wait for the writer thread
 	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False)['a'] == ['a', '1']
-	t._memLock._lock.acquire()
+	t._memLock.acquire()
 	t['b'] = ['b', '2']  # and by the next set
-	t._memLock._lock.acquire()
+	t._memLock.acquire()
 	t.close()  # and by the close (_finish), as by the exit (_atExit)
 	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False)['b'] == ['b', '2']
-	t._memLock._lock.acquire()
+	t._memLock.acquire()
 	assert t._atExit() is None
 
 
