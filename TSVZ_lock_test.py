@@ -821,12 +821,16 @@ def test_ctrl_c_at_exit_of_a_store_with_a_queued_row_keeps_waiting_and_writes_it
 		holder = _hold(p, 'native', kind=kind)
 		open(p + '.go', 'w').close()
 		_expect(store, 'exiting')
+		# 0.7 s: the exit is waiting for the writer thread by then (it starts within milliseconds of "exiting"), and 0.7 s is
+		# 7 of that wait's 0.1 s steps: the Ctrl-C lands as the main thread runs Python code between two of them, where
+		# 5.12's threading.Event could be left holding its lock (the exit then hung, about 1 run in 250 on 3.6). On purpose:
+		# a Ctrl-C off the step boundary would hide such a bug, not fix it.
 		time.sleep(0.7)
 		store.send_signal(signal.SIGINT)
-		time.sleep(1.5)
+		time.sleep(1.5)  # an exit the Ctrl-C ended is gone in milliseconds; 1.5 s allows for a loaded host
 		assert store.poll() is None, 'the exit did not wait for the queued row'
 		_release(p)
-		out, err = store.communicate(timeout=20)
+		out, err = store.communicate(timeout=20)  # the write and the exit take well under 1 s: only a hang takes 20 s
 		assert b'being finished' in err, err
 	finally:
 		_release(p)
