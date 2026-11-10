@@ -8797,19 +8797,19 @@ _UNREAD = object()
 class _ServeWriter(object):
 	"""The single appender of a store (spec §18.3): each batch of queued payloads is one write.
 
-	``submit`` returns a sequence number; ``wait`` blocks until that payload
-	is written (or written and fsync'd). The thread never takes the store's
-	state lock.
+	``submit`` returns a job; ``wait`` blocks until it is written (and fsync'd, for a ``durable`` one) and raises its
+	write error. The thread never takes the store's state lock, and no thread ever waits for a lock another one holds:
+	jobs go through a deque, and each says it is done with a _Flag. 5.12's Condition was one lock that every thread
+	took, and a Ctrl-C can leave a lock held (bpo-29988, see _Flag): the thread then waited for it for ever, and so did
+	the exit's close() (a TSVZClient's, a CLI command's).
 	"""
 
 	def __init__(self, store):
 		self.store = store
-		self.cond = threading.Condition()
-		self.queue = []
-		self.submitted = 0
-		self.written = 0
-		self.durable = 0
-		self.failures = deque(maxlen=64)
+		self.queue = deque()  # the jobs: [payload, durable, done (a _Flag), error]; a barrier's has no payload
+		self.wake = _Flag()  # set when a job is queued and when the store closes
+		self.busy = False  # True from before the thread takes a batch until its jobs are done (barrier)
+		self.stopped = False  # True once the thread takes its last batch (_queue)
 		self.unsynced = False
 		self.closing = False
 		self.failing = None  # the last write error, until a batch is written again
@@ -8818,68 +8818,84 @@ class _ServeWriter(object):
 		self.thread.start()
 		_SERVE_OPEN_WRITERS.add(self)
 
-	def submit(self, payload, durable):
-		with self.cond:
-			if self.closing:
-				raise RuntimeError('the store is closing')
-			self.submitted += 1
-			self.queue.append((self.submitted, payload, durable))
-			self.cond.notify_all()
-			return self.submitted
+	def _queue(self, job):
+		"""Hand ``job`` to the thread: False when it had taken its last batch and the job was not in it."""
+		self.queue.append(job)
+		self.wake.set()
+		if self.stopped:
+			try:
+				self.queue.remove(job)
+				return False
+			except ValueError:
+				pass  # taken: in the last batch
+		return True
 
-	def wait(self, seq, durable=False):
-		"""Block until payload ``seq`` is written (``durable``: and fsync'd); raise its write error."""
-		with self.cond:
-			while (self.durable if durable else self.written) < seq:
-				self.cond.wait()
-			for first, last, error in self.failures:
-				if first <= seq <= last:
-					raise error
+	def submit(self, payload, durable):
+		job = [payload, durable, _Flag(), None]
+		if self.closing or not self._queue(job):
+			raise RuntimeError('the store is closing')
+		return job
+
+	@staticmethod
+	def wait(job):
+		"""Block until ``job`` is written (a durable one: and fsync'd); raise its write error."""
+		job[2].wait()
+		if job[3] is not None:
+			raise job[3]
 
 	def barrier(self):
 		"""Block until everything submitted so far is written (spec §21.8 read-your-writes)."""
-		with self.cond:
-			while self.written < self.submitted:
-				self.cond.wait()
+		# The queue looked at before busy: a job queued before this that is not in it any more was taken while busy was
+		# True, which stays True until the job is done.
+		if self.queue or self.busy:
+			job = [b'', False, _Flag(), None]  # done once every job before it is
+			if self._queue(job):
+				job[2].wait()
+			else:
+				self.thread.join()  # (its last batch: written once it ends)
 
 	def close(self):
 		"""Write everything queued, fsync it, and stop the thread."""
-		with self.cond:
-			self.closing = True
-			self.cond.notify_all()
+		self.closing = True
+		self.wake.set()
 		self.thread.join()
 		_SERVE_OPEN_WRITERS.discard(self)
 		self.store = None  # no cycle: a closed store's rows are freed now, not by the collector at exit
 
 	def _run(self):
-		while True:
-			with self.cond:
-				while not self.queue and not self.closing:
-					self.cond.wait()
-				if not self.queue:
+		while not self.stopped:
+			self.wake.wait()
+			self.wake.clear()
+			# Closing: this batch is the last. A job queued from here on is in it or taken back by its submit (_queue);
+			# one queued before is in it.
+			self.stopped = self.closing
+			self.busy = True
+			batch = []
+			while True:
+				try:
+					batch.append(self.queue.popleft())
+				except IndexError:
 					break
-				batch, self.queue = self.queue, []
-			durable = any(entry[2] for entry in batch)
+			writes = [job for job in batch if job[0]]
 			error = None
-			try:
-				self.store._append(b''.join(entry[1] for entry in batch), durable)
-			except Exception as e:
-				error = e
-				_warn('TSVZ error: {}: a batch of {} writes failed: {}'.format(self.store.path, len(batch), e),
-					  self.store.teeLogger)
-			with self.cond:
-				last = batch[-1][0]
-				self.written = last
-				if durable or error is not None:
-					self.durable = last
+			if writes:
+				durable = any(job[1] for job in writes)
+				try:
+					self.store._append(b''.join(job[0] for job in writes), durable)
+				except Exception as e:
+					error = e
+					_warn('TSVZ error: {}: a batch of {} writes failed: {}'.format(self.store.path, len(writes), e),
+						  self.store.teeLogger)
 				if error is not None:
-					self.failures.append((batch[0][0], last, error))
 					self.failing = str(error) or type(error).__name__
 				else:
 					self.failing = None
 					if not durable:
 						self.unsynced = True
-				self.cond.notify_all()
+			for job in batch:
+				job[3] = error if job[0] else None
+				job[2].set()
+			self.busy = False
 		if self.unsynced:
 			try:
 				self.store._fsync()
@@ -9294,7 +9310,7 @@ class _ServeStore(object):
 		return sync or (self.spec and self.state is not None and self.state.writeAck == 'disk')
 
 	def _submit(self, rows, sync, log, first=_UNREAD):
-		"""Queue ``rows`` (caller holds the lock); return ``(seq, durable)`` or None when there is nothing to write.
+		"""Queue ``rows`` (caller holds the lock); return ``(job, durable)`` or None when there is nothing to write.
 		``first``: see _payload."""
 		payload = self._payload(rows, log, first)
 		if not payload:
@@ -9306,10 +9322,8 @@ class _ServeStore(object):
 		"""Acknowledge per spec §21.9: after fsync for ``disk``; after the write when ``written``; else at once."""
 		if queued is None:
 			return
-		if queued[1]:
-			self.writer.wait(queued[0], durable=True)
-		elif written:
-			self.writer.wait(queued[0])
+		if queued[1] or written:
+			self.writer.wait(queued[0])  # (a durable job is done once it is fsync'd)
 
 	def write(self, rows, sync, log, written=False):
 		"""Append ``rows`` (``[(cells, marker), ...]``) as one batch: ``set`` and its bulk input."""

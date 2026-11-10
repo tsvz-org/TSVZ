@@ -16858,6 +16858,21 @@ def test_a_store_whose_lock_a_ctrl_c_left_held_writes_and_ends(tmp_path):
 	assert t._atExit() is None
 
 
+def test_a_serve_writer_takes_back_a_job_queued_after_its_last_batch(tmp_path):
+	store = TSVZ._ServeStore(str(tmp_path / 's.tsvz'), create=True)
+	writer = store.writer
+	writer.wait(writer.submit(b'a\t1\n', False))
+	writer.barrier()  # (nothing queued: at once)
+	store.close()
+	with pytest.raises(RuntimeError, match='closing'):
+		writer.submit(b'b\t2\n', False)
+	writer.closing = False  # a submit that looked before the close, and queued after the thread's last batch
+	with pytest.raises(RuntimeError, match='closing'):
+		writer.submit(b'b\t2\n', False)
+	assert not writer.queue
+	writer.barrier()
+	assert TSVZ.readTabularFile(str(tmp_path / 's.tsvz'), verbose=False) == {'a': ['a', '1']}
+
 
 def _a_wait_that_is_interrupted(monkeypatch):
 	waits = []
@@ -16889,6 +16904,67 @@ def test_the_exit_waits_for_the_writer_thread_through_waited(tmp_path, monkeypat
 	monkeypatch.undo()
 	t.close()
 
+
+#: ARGV: TSVZ's directory, 'tsvzed' or 'client', the file. Writes to a store, a KeyboardInterrupt raised at each Python step
+#: of one write in turn (sys.settrace: the same steps on every run and every Python) and caught, as a program that catches
+#: a Ctrl-C and goes on does; then one more write, and the exit. Prints the number of steps.
+_INTERRUPTED_WRITES = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+how, p = sys.argv[2], sys.argv[3]
+if how == 'tsvzed':
+	store = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)
+	def write(key):
+		store[key] = [key, 'v']
+		store.commitAppendToFile()  # (the wait for the writer thread: a job, a _Flag)
+else:
+	store = TSVZ.TSVZClient(p)  # no handler: the engine in this process, its _ServeWriter
+	def write(key):
+		store[key] = [key, 'v']
+left = [0]
+def tracer(frame, event, arg):
+	if left[0] <= 0:
+		return None
+	left[0] -= 1
+	if not left[0]:
+		raise KeyboardInterrupt
+	return tracer
+at = 0
+while left[0] == 0:  # until a write is done before its step `at`
+	at += 1
+	left[0] = at
+	sys.settrace(tracer)
+	try:
+		write('k%d' % at)
+	except KeyboardInterrupt:
+		pass
+	finally:
+		sys.settrace(None)
+write('last')
+print(at)
+"""
+
+
+@pytest.mark.parametrize('how', ['tsvzed', 'client'])
+def test_a_ctrl_c_caught_in_a_write_leaves_the_store_writing_and_the_program_ending(tmp_path, how):
+	# 5.12's threading.Event (a TSVZed's waits for its writer thread) and Condition (a TSVZClient's and the CLI's writer)
+	# held their lock while Python code ran, and a KeyboardInterrupt can skip a with statement's exit (bpo-29988): a
+	# Ctrl-C there left it held. A program that caught the Ctrl-C and went on writing waited for ever at its next commit,
+	# and one that ended hung at the exit; the interrupt at each step finds every such place.
+	p = str(tmp_path / ('s.tsv' if how == 'tsvzed' else 's.tsvz'))
+	script = tmp_path / 'interrupted.py'
+	script.write_text(_INTERRUPTED_WRITES)
+	try:
+		# 120 s: the run takes a few seconds; only a write or an exit that waits for ever takes this long, on a machine
+		# the whole suite keeps busy.
+		done = subprocess.run([sys.executable, str(script), HERE, how, p], stdout=subprocess.PIPE,
+							  stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+	except subprocess.TimeoutExpired as e:
+		raise AssertionError('a write or the exit waited for ever after a Ctrl-C: {}'.format(e.stderr))
+	assert done.returncode == 0, done.stderr
+	assert int(done.stdout.split()[-1]) > 20, done.stdout  # (the steps went through the wait for the writer thread)
+	assert TSVZ.readTabularFile(p, verbose=False)['last'] == ['last', 'v']
 
 
 # --------------------------------------------------------------------------
