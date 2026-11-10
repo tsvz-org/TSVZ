@@ -319,17 +319,35 @@ The file formats are unchanged, and no file has to be rewritten.
   writer. No thread now waits for a lock that the main thread can be left holding: the store's threads signal each
   other with flags that hold no lock, and the one lock they share is let go of by its holder when a Ctrl-C has left it
   held. The same holds for a `TSVZClient` with no handler, whose exit hung the same way, and for `tsvz` commands.
-- **A program that catches a Ctrl-C and goes on keeps writing.** In 5.12 its next commit could wait for ever (the
-  writer thread waited for the lock the Ctrl-C left held), and a `TSVZClient`'s exit could.
+- **A program that catches a Ctrl-C and goes on keeps writing, and holds nothing back.** In 5.12 its next commit could
+  wait for ever (the writer thread waited for the lock the Ctrl-C left held), and a `TSVZClient`'s exit could. A set,
+  delete, pop, `move_to_end` or `setDefaults` that a Ctrl-C goes up through now lets go of the store's lock, so another
+  thread's set and a loose store's background appends are not held off until the program next uses the store (of 320
+  write loops ended by a caught Ctrl-C, the main thread kept the lock in 15 and 17 on 3.6 and in 12 and 2 on 3.14 in two
+  measurements before; now none in 320 on each). Only a second Ctrl-C landing in the clause that lets go, or a hold
+  left in a section that runs in the caller's thread after `close()` or in a forked child, can leave it.
+- **A signal handler that uses the store works inside a set.** A handler that commits (flush on `SIGUSR1`) or sets a row,
+  or one that calls `close()` and exits (`SIGTERM`), runs inside whatever the main thread was doing, a set included. In
+  5.12 the program waited for ever in 5 to 11 of 40 runs on 3.14 and in 19 to 40 of 40 on 3.6, whichever of the three the
+  handler did; the store's lock now accepts that a handler let go of it, and the set goes on (none in 40 on each).
+- **Not covered yet:** a `TSVZClient`'s lock, a `tsvz serve` store's and the lock a one-shot call takes on a path
+  (`appendTabularFile`, `scrubTabularFile`, `clearTabularFile`) are not let go of the same way: a caught Ctrl-C that
+  left one held can make another thread of the program that uses the same client, store or path wait for ever (not
+  the exit, except of a path's writer thread). Planned for 5.14 (docs/limitations.md).
 - **`TSVZed.shutdownEvent` is no longer a `threading.Event`.** It has the same `is_set()` (and `isSet()`), `set()`,
   `clear()` and `wait()`, which behave as an Event's, but `isinstance(store.shutdownEvent, threading.Event)` is now
   false, and an Event's internals (`_cond`, `_flag`) are not there. An Event holds its lock across Python code, which a
   Ctrl-C can leave held: see [docs/lessons.md](docs/lessons.md).
 - **A `.tsvz` `TSVZed`'s `commitAppendToFile()`, `clear()` and `reload()` run on its writer thread**, as a loose store's
   always did, so a Ctrl-C stops the wait for them, never the write. Each wakes the writer thread, which then also runs
-  its regular sync, as it does after a loose store's job.
-- A set costs a little more: a loop of 200,000 `store[k] = v` took 2 to 4% more time than 5.12 on 3.6, and the same
-  within the noise (about 1%) on 3.14.
+  its regular sync, as it does after a loose store's job. At exit a `.tsvz` store with nothing to write (nothing
+  queued, no write under way: a load is no write) is let go of at once, as a loose store is, so a Ctrl-C during a long
+  load ends the program, where it first waited for the whole load (6.45 s after one Ctrl-C on a 1.5M-row store). It
+  still takes up to a second or two on a big store, while the load thread keeps the interpreter busy (a loose
+  store's does too; 5.12's `.tsvz` load, in the main thread, ended in 0.1 s): planned for 5.14 (docs/limitations.md).
+- A set costs a little more: a loop of 200,000 `store[k] = v` (15 alternating runs each, medians, a host at a load of 80
+  to 115) took 1.53 s in 5.12 and 1.63 s in 5.13 on 3.6 (7% more), 0.96 s and 0.97 s on 3.14 (2% more); the noise between
+  runs is about 4%.
 - `tsvzconform.py`: a part replaced twice in a case can no longer pass for the same file (the runner holds each part
   open through the case, so its inode number goes to no other file), so `19.4-scrub-twice` always catches an
   implementation that renames over the store.
