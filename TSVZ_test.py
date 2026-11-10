@@ -3442,9 +3442,17 @@ def _during_reads(monkeypatch, trigger, action, afterLines=0):
 
 def _rewrites(path, contents):
 	"""An action that rewrites the part ``path`` in place, as a scrub does, with the next of ``contents``
-	while any are left (the list can be emptied to stop it). Give each another size than the bytes it replaces:
-	the (inode, size, mtime) stamp cannot tell a same-size rewrite within one timestamp tick."""
-	return lambda: contents and TSVZ._specRewriteInPlace(path, contents.pop(0))
+	while any are left (the list can be emptied to stop it; when another thread's read may be running the action,
+	under ``action.lock``, which a rewrite in progress holds: ``with action.lock: del contents[:]``). Give each
+	another size than the bytes it replaces: the (inode, size, mtime) stamp cannot tell a same-size rewrite
+	within one timestamp tick."""
+	lock = threading.RLock()
+
+	def action():
+		with lock:
+			return contents and TSVZ._specRewriteInPlace(path, contents.pop(0))
+	action.lock = lock
+	return action
 
 
 _TORN_EARLIER = 'the parts before the last kept changing while they were read (3 reads); the read may be torn'
@@ -3639,9 +3647,13 @@ def test_spec_tsvzed_reads_a_torn_store_again(tmp_path, monkeypatch, capsys):
 	_touch(p, b'a\t1\nb\t2\n')
 	_touch(p + '.1', b'z\t9\n')
 	flips = [b'c\t3\n', b'a\t1\nb\t2\n'] * 50
-	_during_reads(monkeypatch, p + '.1', _rewrites(p, flips))
+	rewrite = _rewrites(p, flips)
+	_during_reads(monkeypatch, p + '.1', rewrite)
 	t = TSVZ.TSVZed(p)
-	del flips[:]  # the store holds still again
+	# (the writer thread's own check reads the torn store again at once, 5.13: its read may be in the middle of a rewrite;
+	# that one is let finish, or the file changes once more after `steady` was read: 24 runs of 300 on 3.6)
+	with rewrite.lock:
+		del flips[:]  # the store holds still again
 	steady = dict(TSVZ.readTabularFile(p, verbose=False))
 	deadline = time.monotonic() + 10
 	while dict(t) != steady and time.monotonic() < deadline:
