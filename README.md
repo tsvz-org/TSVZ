@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.11**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.12**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -301,6 +301,49 @@ with no header (or `verifyHeader=False`), anything written to a file the damage 
 empty; the keys it sets or deletes then take its values, and the keys it left out keep
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
+
+## Upgrading to 5.12 from 5.11
+
+The file formats are unchanged. An upgrade needs nothing: no file has to be rewritten, and the API is the same. What
+changes is the bytes some deletes and compactions write, in loose files only (`.tsv`, `.csv`, `.nsv`, `.psv`).
+
+- **A delete under a header keeps the key order after a line 1 of two cells or more.** Under a header that line 1 is not,
+  a reader given the header counts from the first keyed line after line 1, and when a delete takes that line out and the
+  next line has another cell count, a stand-in takes its place ("Upgrading to 5.8"). 5.10 and 5.11 tried line 1's own key
+  last, after a key whose later line holds no value and a key no row with a value names, and the key they took came first
+  to the readers that count from there: `d\tX\nc\nd\t1\na\t1\n`, delete `c` under `d\tX\tz` (`tsvz --x-header`, a handler,
+  a `TSVZed` delete and commit, `TSVZedLite(strict=False)`), wrote `d\tX\na\nd\t1\na\t1\n`, and a reopened store and every
+  loose reader given the header (a strict one refuses a line 1 that is not it) listed `a, d` where memory lists `d, a`. A store's rewrite widens line 1 and puts the order
+  back, but from 5.11 not where the stand-in key's later line is wider than the header (`d\tX\nc\nd\t1\na\t1\t2\t3\n`):
+  the widening is refused (Q-C), and the order stayed. Line 1's key is now tried first, when its next line comes first
+  after the place and is as wide as line 1: `d\tX\nd\nd\t1\na\t1\n`, and every reader lists `d, a`. The same holds where a
+  key whose later line holds no value stood in (`d\tX\nc\nd\t1\na\n`, 5.11: `d\tX\na\nd\t1\na\n`). No row or cell changes
+  for any reader.
+
+- **A compaction keeps what a reader given no header and the defaults takes after a line 1 of one cell.** Under a header
+  line 1 does not hold, with defaults of two cells or more, that reader reads at the defaults' count; 5.11 planned it at
+  line 1's one cell unless the caller's own count was one, and a line it takes could go. A scrub given a count:
+  `scrubTabularFile(p, header='id\tv', defaults=['#_defaults_#', 'P', ''], correctColumnNum=2)` on
+  `a\nc\tX\nc\t2\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n` wrote `a\nc\tX\n#_defaults_#\t\t\t\nc\t1\n`, and a strict reader
+  given no header and those defaults (every version) read `c` as `[c, X, '']` where it read `[c, 2, '']`. A bare
+  `#_defaults_#` on line 1, which resets that reader's defaults: a scrub given `header='id\tv'` and the same defaults, or a
+  `TSVZed` given them that rewrites, made `#_defaults_#\nc\t1\nc\t2\t\nc\t3\n` into `#_defaults_#\nc\t3\n`, and `c`, whose
+  only line that strict reader takes is `c\t2\t`, was gone for it. The reader is now planned at the defaults' count too: the
+  first file becomes `a\nc\tX\n#_defaults_#\t\t\t\nc\t2\t\nc\t1\n`, the second stays as it is. It is not planned where it
+  reads every line as the caller's reader does (a lone key on line 1 at the caller's count, or a bare `#_defaults_#` where
+  no line with a value has another width or the defaults hold none), so those files get 5.11's bytes. What shows: the
+  files it keeps lines for are larger after a scrub or a rewrite than 5.11 made them.
+
+- The cost of a compaction is unchanged within measurement (a scrub or a `TSVZed` rewrite of 200,000 rows: 0.97 to 1.05 of
+  5.11's time, the same bytes), but where the reader above is planned: a scrub given a `correctColumnNum` other than the
+  defaults' count, after a lone key on line 1 under a header line 1 does not hold, took 1.19 times 5.11's time (the same
+  bytes on that file).
+
+- Known, as in 5.11 (no layout serves both readers): after a line 1 of one cell, `tsvz --x-header H delete` followed by a
+  rewrite of a `TSVZed` given H can change a cell for every reader, and a delete under a header whose line 1 already names
+  the key (`d\tX\na\nd\tY\tZ\n`, header `q`) can change a cell for 3.39's loose reader given it. See
+  [docs/limitations.md](docs/limitations.md), "After a line 1 of one cell, a delete under a header can change a cell for
+  readers given it".
 
 ## Upgrading to 5.11 from 5.10
 
