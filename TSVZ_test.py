@@ -17516,3 +17516,27 @@ def test_a_one_column_compaction_given_the_defaults_count_plans_that_reader_once
 		readers = TSVZ._legacyCompactReaders([b'a', b'c'], 1, consumed, [D_, 'P'], '\t', 'utf8', False, (2,))
 		assert readers.count((2, consumed, False, [D_, 'P'])) == 1, readers
 		assert len(readers) == len({(w, c, m, tuple(d)) for w, c, m, d in readers}), readers
+
+
+def test_a_compaction_moves_a_line_up_where_a_later_deletion_ends_the_other_readers_life_of_the_key(tmp_path):
+	# 5.12's agrees() took a key's last line moved up into its first line's place only where the deletion that ends the
+	# other reader's life of the key was that line itself. Here the one-column plans move the second b\t up into b\tX's
+	# place, and the reader given no header and the defaults (three columns) reads b deleted at the first b\t: the move was
+	# refused and every line kept. A later deletion of the key, with no row of it between, reads the same to that reader.
+	p = str(tmp_path / 'f.tsv')
+	text = b'id\nb\tX\nb\t\nb\t\na\t1\t\tX\na\t2\t\t2\n#_defaults_#\n'
+	defaults = [D_, 'P', 'Q']
+	_touch(p, text)
+	before = _planned_views(p, 'id', 'a', defaults)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		TSVZ.scrubTabularFile(p, header='a', defaults=list(defaults), correctColumnNum=2)
+	assert _bytes(p) == b'id\nb\t\na\t2\t\t2\n#_defaults_#\n'  # (5.11's bytes; 5.12 kept b\tX and both b\t lines)
+	assert _planned_views(p, 'id', 'a', defaults) == before
+
+
+def test_a_delete_commit_moves_a_lone_key_up_past_its_later_deletion(tmp_path):
+	# (the delete door: the store given q reads a\na as a row and its value, and the readers that count from line 1 read
+	# both as deletions of a key they never had; 5.12 kept the pair)
+	p = str(tmp_path / 'f.tsv')
+	mem = _delete_reads_as_before(p, b'd\tX\nc\nd\t1\na\na\n', 'c', b'd\tX\nd\nd\t1\na\n', 'q', 'zed')
+	assert list(mem) == ['d', 'a']

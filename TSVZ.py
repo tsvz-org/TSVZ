@@ -2859,12 +2859,13 @@ def _legacyLineKind(text, width, strictActive, delimiter):
 
 def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matched, still=(), lives=False):
 	"""What one reader's compaction of the legacy lines ``raw`` (bytes, without their newline) keeps:
-	``(kept, content, moved, lineLife, lifeEnd, width, alone)``, ``width`` the column count it reads at, ``alone`` whether
-	line 1 is a row or a deletion to it and no other keyed line has line 1's key. ``kept`` has a 1 for each line kept, each a line of ``raw`` byte for
+	``(kept, content, moved, lineLife, lifeEnd, width, alone, rowBefore)``, ``width`` the column count it reads at,
+	``alone`` whether line 1 is a row or a deletion to it and no other keyed line has line 1's key. ``kept`` has a 1 for each line kept, each a line of ``raw`` byte for
 	byte and in its place, but for those in ``content`` (index -> bytes): a key's last line moved up into its first line's
 	place (``moved``: first -> last) and a dead key's protected line emptied (built from its own bytes). ``still``: the
 	indexes where no line is moved in or emptied. With ``lives``, the key lives this reader reads: ``lineLife`` gives each
-	row line its life's number (-1 for any other line), ``lifeEnd`` each life the deletion that ends it (-1: none).
+	row line its life's number (-1 for any other line), ``lifeEnd`` each life the deletion that ends it (-1: none),
+	``rowBefore`` each deletion line the last row line of its key before it (-1: none).
 
 	``width`` is the column count of the reader (-1: taken from the first keyed line), ``consumed`` whether it takes line
 	1 for its header, ``matched`` whether line 1 holds that header, ``defaults`` the caller's.
@@ -2901,6 +2902,8 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 	rowTaken = (None, bytearray(len(raw)), bytearray(len(raw)))  # (per strict reader, 1 and 2: a 1 for each row line it takes)
 	lineLife = array.array('l', [-1]) * len(raw) if lives else None
 	lifeEnd = array.array('l') if lives else None  # (a slot is a life: a key starts a new one after each deletion)
+	rowBefore = array.array('l', [-1]) * len(raw) if lives else None
+	lastRow = {}  # key -> its last row line so far (with ``lives``)
 	pinfo = {}  # protectable index holding a row -> (key, ncells)
 	killer = {}  # protectable index whose key died -> the deletion that ended it
 	lastDelete = {}  # key -> its last deletion
@@ -2945,6 +2948,8 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 						killer[j] = i
 				if lives:
 					lifeEnd[slot] = i
+			if lives:
+				rowBefore[i] = lastRow.get(key, -1)
 			lastDelete[key] = i
 		else:
 			if i in protectable:
@@ -2980,6 +2985,7 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 					lastTakenOld[slot] = i
 			if lives:
 				lineLife[i] = slot
+				lastRow[key] = i
 	kept = bytearray(len(raw))  # (one byte a line: whether it is kept)
 	for i in boundaries:
 		kept[i] = 1
@@ -3062,7 +3068,7 @@ def _legacyCompactPlan(raw, width, consumed, defaults, delimiter, encoding, matc
 		key0 = _legacyLineKind(raw[0].decode(enc, errors='replace'), width, False, delimiter)[1]
 		if key0 is not None and key0 not in live and key0 in lastDelete:
 			kept[lastDelete[key0]] = 1
-	return kept, content, moved, lineLife, lifeEnd, width, alone
+	return kept, content, moved, lineLife, lifeEnd, width, alone, rowBefore
 
 
 def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, matched, counts=()):
@@ -3140,9 +3146,12 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 
 	With one reader, what its plan keeps (_legacyCompactPlan). With more, every line any of their plans keeps, and a
 	line moved or emptied only where every plan keeps that line with the same bytes, or (an emptied line, which is a
-	deletion as wide) a reader at two columns or more keeps no line of that key's life there; else no plan moves or
-	empties it, and each keeps those lines as they are. A line one plan keeps is then another's to read as well: where
-	it is a row of a key that reader reads as deleted after it, the deletion stays. (No line stays for a reader that moved
+	deletion as wide) a reader at two columns or more keeps no line of that key's life there, or (a moved line) the
+	other reader keeps no line there and reads the line it came from as a deletion of a key it already reads dead: the
+	deletion that ends the life the line moved to is in (5.11), or one before it with no row of the key between, or the
+	line moved to is itself one (5.13); else no plan moves or empties it, and each keeps those lines as they are. A line
+	one plan keeps is then another's to read as well: where it is a row of a key that reader reads as deleted after it,
+	the deletion stays. (No line stays for a reader that moved
 	a key's last line into its first line's place: a move survives only when every plan moves the same bytes there, and
 	a plan that collapses a life keeps no other line of it.) Every reader then reads its own plan's rows, in its order:
 	a line kept for another reader falls inside a key's life whose first and last line the reader takes are kept, or in a
@@ -3168,12 +3177,18 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 		# (the same bytes there; or an emptied line (``source`` None), which reads as a deletion as wide, where the other
 		# reader keeps no line of that key's life: it reads the key deleted after it all the same; or (5.11) a line moved
 		# from ``source``, the deletion that ends that life to the other reader: it reads the key deleted there instead,
-		# and a line of the life kept for another reader gets that deletion back after it)
+		# and a line of the life kept for another reader gets that deletion back after it. 5.13: or a later deletion of
+		# the key to it, with no row of the key between, which it reads the key dead at all the same; the line at i itself
+		# being one (a lone key in a one-column plan is a deletion at two columns or more), the key reads dead from there.
+		# Not where the other reader keeps that later line: it stays, and the move would only make the line at i another)
 		if other[0][i]:
 			return other[1].get(i) == line
 		life = other[3][i]
-		return (life >= 0 and other[4][life] >= 0
-				and (other[4][life] == source if source is not None else other[5] > 1))
+		if source is None:
+			return life >= 0 and other[4][life] >= 0 and other[5] > 1
+		end = other[4][life] if life >= 0 else i
+		return end == source or (0 <= end < source and other[3][source] < 0 and other[7][source] < end
+								 and not other[0][source])
 	still = {i for plan in every for i, line in plan[1].items()
 			 if not all(agrees(other, i, line, plan[2].get(i)) for other in every)}
 	if still:
@@ -3190,7 +3205,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 	changed = True
 	while changed:
 		changed = False
-		for own, _, _, lineLife, lifeEnd, _, _ in every:
+		for own, _, _, lineLife, lifeEnd, _, _, _ in every:
 			# (the lines kept for the other readers alone: a byte 1 for each)
 			extra = (int.from_bytes(kept, 'little') & ~int.from_bytes(own, 'little')).to_bytes(len(raw), 'little')
 			i = extra.find(1)
@@ -3198,9 +3213,9 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 				life = lineLife[i]
 				if life >= 0:
 					end = lifeEnd[life]
-					if end >= 0 and not kept[end] and movedFrom.get(i) != end:
+					if end >= 0 and not kept[end] and not (i in movedFrom and lineLife[movedFrom[i]] < 0):
 						kept[end] = 1  # (a row kept for another reader: this one reads the key deleted after it; not when the
-						# line there is that deletion, moved up)
+						# line there is a deletion of it to this reader, moved up: that deletion, or a later one, 5.13)
 						changed = True
 				i = extra.find(1, i + 1)
 	return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]], any(i not in plan[2] for plan in every for i in plan[1])
