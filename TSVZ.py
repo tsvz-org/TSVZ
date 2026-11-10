@@ -3261,10 +3261,11 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	that counts from the place reads the key first there, as it read that line before, and a compaction keeps that line
 	for line 1's readers (_legacyCompact). 5.12 tries it first: any other key comes first to a reader that counts from
 	the place, and can so take another key's place in its order (5.10 and 5.11 tried it last). The first row is looked for
-	past defaults lines that hold a value (5.14): such a line only adds values to a reader's defaults, so a reader that took
-	line 1 takes a line as wide after it, as it did; a line without a value resets them, and the search stops there (a
-	strict reader given wider defaults with a value takes line 1 and not a line as wide after a reset, and would lose the
-	key). Else (5.14), after a line 1 of two cells or more, where the place has one cell (a reader that counts from it
+	past defaults lines whose first value is in their second cell, or in their third where line 1 has two cells (5.14,
+	keepsAValue): a reader that took line 1 takes a line as wide after such a line, as it did. A line without a value resets
+	a reader's defaults, and the search stops there (a strict reader given wider defaults with a value takes line 1 and not a
+	line as wide after a reset, and would lose the key), and so does a line whose first value comes later (3.39 cuts a
+	defaults line to its count, and given a count below that cell it loses the key). Else (5.14), after a line 1 of two cells or more, where the place has one cell (a reader that counts from it
 	reads at one column), that first row's key when the row holds a value: those readers read the key first there, as they
 	read that row first before, and line 1's readers, at two columns or more, read the stand-in as the deletion of a key not
 	yet read (3.39's strict reader given a count of one, which takes only one-cell lines, gains it, as it gains line 1's
@@ -3288,6 +3289,17 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	def valued(i):  # (a row that holds a value: a row, not a deletion, at two columns)
 		return _legacyLineKind(texts[i], 2, False, delimiter)[0] == 'row'
 
+	def keepsAValue(i):
+		# (a defaults line that holds a value, past which every reader that took line 1 takes a line as wide: 5.5 and later
+		# read it whole, but 3.39 cuts it to its count and fills it from its defaults' cells below that count. Given a count
+		# below the cell of the line's first value, and defaults whose values lie beyond the count (so that it read line 1),
+		# 3.39 holds no value after the line, reads strictly and drops a line not as wide as its count: line 1's key's next
+		# row, unless line 1 is that wide. So the first value is in the line's second cell, or in its third where line 1 has
+		# two; at a count of one a stand-in is a row, and loses nothing. d\tX\tW\nd\n#_defaults_#\t\tQ\nd\t1\t2\n
+		# loses d for 3.39's strict reader given a count of two and the defaults [#_defaults_#, '', 'Q'].)
+		first = next(n for n, cell in enumerate(_legacyCells(_legacyLineBody(texts[i]), delimiter)) if n and cell)
+		return first == 1 or first == 2 == kinds[0][2]
+
 	def keyed(start):
 		return next((i for i in range(start, len(raw)) if kinds[i][0] != 'skip'), None)
 
@@ -3308,10 +3320,10 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		later = [j for j in range(i + 1, len(raw)) if kinds[j][0] == 'row' and not goes(j)]
 		# (named: the keys a row with a value before the place names, which is line 1's key alone, and none at line 1's place)
 		named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
-		# (the first row after the place, past defaults lines that hold a value, 5.14: no reader's defaults lose a value at
-		# one, so a reader that took line 1 takes a line as wide after them; a reset stops the search)
+		# (the first row after the place, past defaults lines that hold a value where 3.39 keeps one, 5.14: a reader that took
+		# line 1 takes a line as wide after them; a reset, or another defaults line, stops the search)
 		row = nxt
-		while row is not None and row not in stand and kinds[row][0] == 'defaults':
+		while row is not None and row not in stand and kinds[row][0] == 'defaults' and keepsAValue(row):
 			row = after(row)
 		key = kinds[row][1].rstrip() if row is not None and row not in stand and valued(row) else None
 		if key in named and kinds[row][2] == kinds[0][2]:

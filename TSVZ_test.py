@@ -17626,3 +17626,23 @@ def test_without_a_line_1_of_two_cells_the_first_row_after_the_place_does_not_st
 	p = str(tmp_path / 'f.tsv')
 	assert _deleted_by_a_store(p, b'c\nb\t1\t2\na\n', '', 'c') == b'a\nb\t1\t2\na\n'
 	assert _deleted_by_a_store(p, b'id\nc\nb\t1\t2\na\n', 'id\tv', 'c') == b'id\na\nb\t1\t2\n'  # (the commit compacts a\na)
+
+
+
+
+def test_line_1s_key_does_not_stand_in_past_a_defaults_line_3_39_turns_strict_at(tmp_path):
+	# 3.39 cuts a defaults line to its count. Given a count below the cell of the line's first value, and defaults whose
+	# values all lie beyond that count (so it reads leniently and takes line 1), it holds no value after the line, turns
+	# strict and drops a row of line 1's key that is not as wide as its count: a stand-in of d would lose d for it.
+	p = str(tmp_path / 'f.tsv')
+	for text, count, defaults in ((b'd\tX\tW\nc\n#_defaults_#\t\t\tR\nd\t1\t2\n', 2, [D_, '', 'Q']),
+								  (b'd\tX\tW\nc\n#_defaults_#\t\tQ\nd\t1\t2\n', 2, [D_, '', 'Q']),
+								  (b'd\tX\nc\n#_defaults_#\t\t\tR\nd\t1\na\n', 3, [D_, '', '', 'R'])):
+		def read(p, count=count, defaults=defaults):  # (3.39 changes the defaults list it is given: a new one each read)
+			return TSVZ_old.readTabularFile(p, strict=True, verbose=False, correctColumnNum=count, defaults=list(defaults))
+		_touch(p, text)
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			assert 'd' in read(p)
+		assert _run('--x-header', 'q', 'delete', p, 'c')[0] == 0
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			assert 'd' in read(p), _bytes(p)
