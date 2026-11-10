@@ -302,6 +302,79 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
+## Upgrading to 5.14 from 5.13
+
+The file formats are unchanged. An upgrade needs nothing: no file has to be rewritten, and the API is the same.
+
+Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what changes is the bytes some of them write.
+5.13 writes the same bytes as 5.12 in each of these.
+
+- **A delete under a header keeps the key order where another key's row comes first after the deleted line.** Under a
+  header that line 1 is not, after a line 1 of two cells or more, a reader given the header counts from the first
+  keyed line after line 1, and when a delete takes that line out, a stand-in keeps its place ("Upgrading to 5.8").
+  Where that line had one cell and another key's row with a value came next, 5.11 to 5.13 took a key whose later line
+  holds no value, which comes first to those readers: `d\tX\nc\nb\t1\t2\na\n`, delete `c` under `q`
+  (`tsvz --x-header`, a handler, a `TSVZed` delete and commit, `TSVZedLite(strict=False)`), wrote
+  `d\tX\na\nb\t1\t2\na\n`, and a reopened store and every loose reader given the header listed `a, b` where memory
+  lists `b, a`. That row's key stands in now: `d\tX\nb\nb\t1\t2\na\n`, and every reader lists `b, a`; the readers that
+  count from line 1 read the stand-in as the deletion of a key not yet read. No row or cell changes for any reader
+  given no header, the header, or line 1 for its header. One reader given a count sees the stand-in: 3.39's strict
+  `readTabularFile(correctColumnNum=1)` given no header (or a header and `verifyHeader=False`), which takes only the
+  one-cell lines of such a file, shows `b` as `[b]`, as it shows line 1's key where that stands in ("Upgrading to
+  5.12", first bullet). It gains a key the store has and loses none; in a few files it lists its keys in the store's
+  order instead of its own. With no header, or after a line 1 of one cell, where the readers that count from line 1
+  would read the stand-in as a row, the stand-in is chosen as in 5.13. A store's rewrite after such a delete can
+  refuse to widen line 1 where 5.13 widened: where the stand-in's key has a later row wider than the header
+  (`d\tX\nc\nb\t1\t2\t3\na\na\t1\n`, delete `c` under `d\tX\tz`, then `hardMapToFile()`), Q-C refuses the widening,
+  warns once and leaves line 1 as the delete wrote it, and every reader but the one given a count reads the file as
+  before the delete (5.13 widened, and readers given no header saw what a widening shows them). A later compaction can
+  also keep a line 5.13 dropped, where 5.13's stand-in key had collapsed with that key's own later line (2 of 6,000
+  random files through a delete and a rewrite).
+
+- **Line 1's key stands in past defaults lines that hold a value.** 5.12 and 5.13 let line 1's key stand in only where
+  its row came first after the place: with a defaults line between, a key whose later line holds no value stood in,
+  and came first to the readers given the header: `d\tX\nc\n#_defaults_#\t\tQ\nd\t1\na\n`, delete `c` under `q`, wrote
+  `d\tX\na\n#_defaults_#\t\tQ\nd\t1\na\n`, and a reopened store listed `a, d` where memory lists `d, a`. The first row
+  after the place is now looked for past defaults lines that hold a value (such a line only adds values to a reader's
+  defaults, so a reader that took line 1 takes a line as wide after it): `d\tX\nd\n#_defaults_#\t\tQ\nd\t1\na\n`, and
+  every reader lists `d, a` (3.39's strict reader given a count of one shows `d`, as from 5.12 where line 1's key
+  stands in). The bullet above looks past them the same way. A defaults line without a value stops the search, and
+  5.13's stand-in stays there: it resets a reader's defaults, and a strict reader given wider defaults with a value,
+  which takes line 1, would not take a line as wide after it and would lose the key
+  (`d\tX\nc\n#_defaults_#\t\nd\t1\na\n` still reorders). This also narrows the approved "After a line 1 of one cell, a
+  delete under a header can change a cell for readers given it" (shape 2): `d\tX\na\n#_defaults_#\tP\nd\tY\n`, delete
+  `a` under `q`, wrote `d\tX\n#_defaults_#\tP\nd\tY\n`, and 3.39's loose reader given `q` read `d` as `[d, Y]` where
+  it read `[d]`; 5.14 writes `d\tX\nd\n#_defaults_#\tP\nd\tY\n`, and it reads `[d]`.
+
+- **A compaction moves a key's last line up past a later deletion of it.** A scrub, a `TSVZed` rewrite and a delete's
+  commit move a key's last line into its first line's place where every reader the compaction plans reads the same;
+  where a reader at two columns or more reads the key deleted in between (a lone key is a row at one column and a
+  deletion at two), 5.13 took the move only when the deletion that ends that reader's life of the key was the line
+  moved. A later deletion of the key, with no row of it between, reads the same to that reader, and the move is taken
+  now (not where that reader keeps the later line, which would stay):
+  `id\nb\tX\nb\t\nb\t\na\t1\t\tX\na\t2\t\t2\n#_defaults_#\n` scrubbed with header `a`, defaults `[#_defaults_#, P, Q]`
+  and count 2 writes `id\nb\t\na\t2\t\t2\n#_defaults_#\n` (5.12 and 5.13 kept `b\tX` and both `b\t` lines), and a
+  `TSVZed` given `q` that deletes `c` from `d\tX\nc\nd\t1\na\na\n` and commits writes `d\tX\nd\nd\t1\na\n` (5.13:
+  `d\tX\nd\nd\t1\na\na\n`). Every reader reads both alike. What shows: such files come out of a compaction smaller
+  than 5.13 left them: 15,708 of 1,638,000 scrubs and rewrites of an exhaustive set of small files, and 800 of 36,000
+  random ones, none larger and no reader's view changed; compacting the output again never grows it.
+
+- **A one-column compaction given a count equal to the defaults' count plans that reader once.** A scrub or a `TSVZed`
+  rewrite of a file read as one column, given defaults of two cells or more and a count equal to theirs, planned the
+  reader at that count twice (the one-column rule and the counts given each listed it). The bytes are the same; the
+  second plan's time goes: a scrub of a 200,000-line one-column file given `[#_defaults_#, P]` and a count of two
+  takes 0.88 of 5.13's time, a `TSVZed` rewrite 0.85 (the median of five alternating runs).
+
+- The cost of a compaction and of a delete is otherwise unchanged within measurement: a scrub or a `TSVZed` rewrite of
+  200,000 rows took 0.99 to 1.04 of 5.13's time in the 5.12 review's shapes, a `TSVZed` delete and commit 0.98, with
+  the same bytes but for the stand-in; `tsvz --x-header q delete` where line 1's key now stands in past a defaults
+  line, 0.75 (it no longer looks through the later lines for a key without a value).
+
+- Deferred to 5.15: a compaction can keep a strict reader's first line of a key where no other key competes for its
+  place, once (`a\na\tX\na\t2\t\na\t\t2\n` scrubbed with header `id\tv`, defaults `[#_defaults_#, '', '']` and count 2
+  keeps all four lines). Every reader reads it alike. See
+  [docs/limitations.md](docs/limitations.md#a-compaction-can-keep-a-strict-readers-first-line-of-a-key-where-no-other-key-competes-for-its-place).
+
 ## Upgrading to 5.12 from 5.11
 
 The file formats are unchanged. An upgrade needs nothing: no file has to be rewritten, and the API is the same. What
@@ -326,11 +399,11 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
   file sees a new row when its last lone key is deleted"
   ([docs/limitations.md](docs/limitations.md#339s-strict-reader-of-a-one-column-file-sees-a-new-row-when-its-last-lone-key-is-deleted)).
   Where another line comes first after the place, the stand-in is chosen as in 5.11 and can still come first to the
-  readers given the header. Another key's row first is deferred to 5.13
-  ([docs/limitations.md](docs/limitations.md#after-a-line-1-of-two-or-more-cells-a-delete-before-another-keys-row-reorders-keys-for-readers-given-the-header)):
+  readers given the header. Another key's row first was deferred to 5.13; 5.14 builds it
+  ([Upgrading to 5.14 from 5.13](#upgrading-to-514-from-513)):
   `d\tX\nc\nb\t1\t2\na\n`, delete `c` under `q`, writes `d\tX\na\nb\t1\t2\na\n`, and a reopened store lists `a, b` where
-  memory lists `b, a`. A defaults line first is deferred to 5.13 too
-  ([docs/limitations.md](docs/limitations.md#after-a-line-1-of-two-or-more-cells-a-delete-before-a-defaults-line-reorders-keys-for-readers-given-the-header)).
+  memory lists `b, a`. A defaults line first was deferred to 5.13 too; 5.14 builds it where the defaults line holds a
+  value.
   Line 1's key next at another width (`d\tX\nc\nd\t1\t2\na\n`, `d\tX\tW\nc\nd\t1\na\n`) is a known limitation:
   [docs/limitations.md](docs/limitations.md#after-a-line-1-of-two-or-more-cells-a-delete-under-a-header-can-reorder-keys-for-readers-given-it).
 
@@ -381,7 +454,7 @@ changes is the bytes some deletes and compactions write, in loose files only (`.
 - Deferred to 5.13: a compaction can keep a line no reader needs where it moves a key's last line up into its first
   line's place only from the deletion that ends the other reader's life of the key. A `TSVZed` delete and commit of `c`
   in `d\tX\nc\nd\t1\na\na\n`, given `q`, writes `d\tX\nd\nd\t1\na\na\n` (5.11: `d\tX\na\nd\t1\na\n`), and every reader reads both
-  alike. See [docs/limitations.md](docs/limitations.md#a-compaction-keeps-a-moved-up-line-only-from-the-deletion-that-ends-the-other-readers-life-of-the-key).
+  alike. 5.14 builds it ([Upgrading to 5.14 from 5.13](#upgrading-to-514-from-513)).
 
 - Known, as in 5.11 (no layout serves both readers): after a line 1 of one cell, `tsvz --x-header H delete` followed by a
   rewrite of a `TSVZed` given H can change a cell for every reader, and a delete under a header whose line 1 already names

@@ -3126,7 +3126,7 @@ def _legacyCompactReaders(raw, width, consumed, defaults, delimiter, encoding, m
 		readers.append((len(defaults), False, False, defaults))
 	for count in given:
 		if count != width and (count, consumed, matched, defaults) not in readers:
-			# (not again where the one-column rule listed it at the defaults' count: a second plan of the same reader, 5.13)
+			# (not again where the one-column rule listed it at the defaults' count: a second plan of the same reader, 5.14)
 			readers.append((count, consumed, matched, defaults))
 		if (valued and (count, consumed, matched, ()) not in readers
 				and not (counts.get(True, set()) <= {count} and (consumed or counts.get(False, set()) <= {count}))):
@@ -3147,7 +3147,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 	deletion as wide) a reader at two columns or more keeps no line of that key's life there, or (a moved line) the
 	other reader keeps no line there and reads the line it came from as a deletion of a key it already reads dead: the
 	deletion that ends the life the line moved to is in (5.11), or one before it with no row of the key between, or the
-	line moved to is itself one (5.13); else no plan moves or empties it, and each keeps those lines as they are. A line
+	line moved to is itself one (5.14); else no plan moves or empties it, and each keeps those lines as they are. A line
 	one plan keeps is then another's to read as well: where it is a row of a key that reader reads as deleted after it,
 	the deletion stays. (No line stays for a reader that moved
 	a key's last line into its first line's place: a move survives only when every plan moves the same bytes there, and
@@ -3175,7 +3175,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 		# (the same bytes there; or an emptied line (``source`` None), which reads as a deletion as wide, where the other
 		# reader keeps no line of that key's life: it reads the key deleted after it all the same; or (5.11) a line moved
 		# from ``source``, the deletion that ends that life to the other reader: it reads the key deleted there instead,
-		# and a line of the life kept for another reader gets that deletion back after it. 5.13: or a later deletion of
+		# and a line of the life kept for another reader gets that deletion back after it. 5.14: or a later deletion of
 		# the key to it, with no row of the key between, which it reads the key dead at all the same; the line at i itself
 		# being one (a lone key in a one-column plan is a deletion at two columns or more), the key reads dead from there.
 		# Not where the other reader keeps that later line: it stays, and the move would only make the line at i another)
@@ -3213,7 +3213,7 @@ def _legacyCompactOnce(raw, width, consumed, defaults, delimiter, encoding, matc
 					end = lifeEnd[life]
 					if end >= 0 and not kept[end] and not (i in movedFrom and lineLife[movedFrom[i]] < 0):
 						kept[end] = 1  # (a row kept for another reader: this one reads the key deleted after it; not when the
-						# line there is a deletion of it to this reader, moved up: that deletion, or a later one, 5.13)
+						# line there is a deletion of it to this reader, moved up: that deletion, or a later one, 5.14)
 						changed = True
 				i = extra.find(1, i + 1)
 	return [content.get(i, raw[i]) for i in range(len(raw)) if kept[i]], any(i not in plan[2] for plan in every for i in plan[1])
@@ -3261,10 +3261,10 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 	that counts from the place reads the key first there, as it read that line before, and a compaction keeps that line
 	for line 1's readers (_legacyCompact). 5.12 tries it first: any other key comes first to a reader that counts from
 	the place, and can so take another key's place in its order (5.10 and 5.11 tried it last). The first row is looked for
-	past defaults lines that hold a value (5.13): such a line only adds values to a reader's defaults, so a reader that took
+	past defaults lines that hold a value (5.14): such a line only adds values to a reader's defaults, so a reader that took
 	line 1 takes a line as wide after it, as it did; a line without a value resets them, and the search stops there (a
 	strict reader given wider defaults with a value takes line 1 and not a line as wide after a reset, and would lose the
-	key). Else (5.13), after a line 1 of two cells or more, where the place has one cell (a reader that counts from it
+	key). Else (5.14), after a line 1 of two cells or more, where the place has one cell (a reader that counts from it
 	reads at one column), that first row's key when the row holds a value: those readers read the key first there, as they
 	read that row first before, and line 1's readers, at two columns or more, read the stand-in as the deletion of a key not
 	yet read (3.39's strict reader given a count of one, which takes only one-cell lines, gains it, as it gains line 1's
@@ -3308,7 +3308,7 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		later = [j for j in range(i + 1, len(raw)) if kinds[j][0] == 'row' and not goes(j)]
 		# (named: the keys a row with a value before the place names, which is line 1's key alone, and none at line 1's place)
 		named = {kinds[j][1].rstrip() for j in range(i) if valued(j)}
-		# (the first row after the place, past defaults lines that hold a value, 5.13: no reader's defaults lose a value at
+		# (the first row after the place, past defaults lines that hold a value, 5.14: no reader's defaults lose a value at
 		# one, so a reader that took line 1 takes a line as wide after them; a reset stops the search)
 		row = nxt
 		while row is not None and row not in stand and kinds[row][0] == 'defaults':
@@ -3317,7 +3317,7 @@ def _legacyDropLines(raw, dropAt, skipFirst, widthFromLines, delimiter, encoding
 		if key in named and kinds[row][2] == kinds[0][2]:
 			pick = [row]  # (line 1's key: its first row after the place, as wide as line 1; 5.12: tried first)
 		elif key is not None and key not in named and i > 0 and kinds[0][0] != 'skip' and kinds[0][2] > 1 and kinds[i][2] == 1:
-			pick = [row]  # (5.13: another key's first row after the place, after a line 1 of two cells or more, at one cell)
+			pick = [row]  # (5.14: another key's first row after the place, after a line 1 of two cells or more, at one cell)
 		else:
 			pick = [j for j in later if not valued(j)]
 			if not pick and not (both and i > 0 and kinds[0][0] != 'skip' and kinds[0][2] == 1):

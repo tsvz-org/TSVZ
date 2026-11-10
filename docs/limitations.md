@@ -427,8 +427,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     every key that could stand in is already named by a valued row before the gap (line 1's own `d\tX`), so no stand-in
     goes there, and 3.39's loose reader given `q`, which counts from the gap's place, goes from `[d]` to `[d, Y, Z]`. From
     5.10 line 1's key stands in when the first keyed line after the gap is a row of it as wide as line 1
-    (`d\tX\na\nd\tY\n` becomes `d\tX\nd\nd\tY\n`); left are that line wider or narrower than line 1 (as here), another
-    key's line or a defaults line first.
+    (`d\tX\na\nd\tY\n` becomes `d\tX\nd\nd\tY\n`), and from 5.14 also past defaults lines that hold a value
+    (`d\tX\na\n#_defaults_#\tP\nd\tY\n` becomes `d\tX\nd\n#_defaults_#\tP\nd\tY\n`); left are that line wider or
+    narrower than line 1 (as here), another key's line, or a defaults line without a value first.
   - No row is lost to any reader in these shapes but the old line-1 row that the widening by a rewrite asked for takes
     (README, "Upgrading to 5.8", item 3).
 - Why: no layout serves both readers. A reader given H counts from the line after line 1, so only a one-cell line keeps
@@ -459,7 +460,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   as in 5.11 and comes first to the readers given the header: `d\tX\nc\nd\t1\t2\na\n` (wider) and `d\tX\tW\nc\nd\t1\na\n`
   (narrower), delete `c`, write `d\tX\na\nd\t1\t2\na\n` and `d\tX\tW\na\nd\t1\na\n`. The store's memory lists `d, a`; a
   reopened store, `TSVZedLite` and every loose `readTabularFile` given the header list `a, d`. No row or cell changes, and
-  5.11 writes the same bytes. Another key's row first, and a defaults line first, are deferred (the next two entries).
+  5.11 writes the same bytes. From 5.14 another key's row first stands in where the deleted line had one cell, and line 1's
+  key is looked for past defaults lines that hold a value (README, "Upgrading to 5.14 from 5.13").
 - Why: a one-cell line of line 1's key is a deletion of that key to every reader that counts from line 1, so it can stand
   in only where the key's next line is one they all take. At another width a strict reader given no header drops that line
   and loses the key: `d\tX\nd\nd\t1\t2\na\n` loses `d` for 3.39's, `d\tX\tW\nd\nd\t1\na\n` for every version's. Any other
@@ -468,77 +470,25 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-11-09, the user chose "Approve (Recommended)". Not asked for by the user: it remains from the 5.11
   deferral "A stand-in after a line 1 of two or more cells can reorder keys for readers given the header", which 5.12
   fixes where line 1's key comes next as wide as line 1. The question also named a defaults line first; that shape was
-  then found fixable and moved to a deferral (below), which narrows this entry.
+  then found fixable and moved to a deferral, which narrows this entry (5.14 builds it).
 
-### After a line 1 of two or more cells, a delete before a defaults line reorders keys for readers given the header
+### A compaction can keep a strict reader's first line of a key where no other key competes for its place
 - Kind: deferred
-- What the operator sees: `d\tX\nc\n#_defaults_#\t\tQ\nd\t1\na\n` under header `q` (or `d\tX\tz`), delete `c` through a
-  `TSVZed` delete and commit, `tsvz --x-header` or `TSVZedLite(strict=False)`: 5.11 and 5.12 write
-  `d\tX\na\n#_defaults_#\t\tQ\nd\t1\na\n`. The store's memory lists `d, a`; a reopened store, `TSVZedLite` and every loose
-  `readTabularFile` given the header list `a, d`. No row or cell changes.
-- Why: 5.12 tries line 1's key only where its next line comes first after the place, and does not look past a defaults
-  line. Past one it depends on that line and the reader's defaults: `d\tX\nd\n#_defaults_#\nd\t1\na\n` loses `d` for every
-  strict reader given no header and defaults such as `[#_defaults_#, P, Q]` (the bare line resets them, so `d\t1` is too
-  narrow there). In the example file the defaults line keeps `d\t1` read: by hand, `d\tX\nd\n#_defaults_#\t\tQ\nd\t1\na\n`
-  serves every reader the 5.12 docs round ran (eight defaults sets, and four- and five-cell defaults), except that 3.39's
-  strict `readTabularFile(correctColumnNum=1)` given no header gains `d`, which the widened 3.39 entry covers.
-- Plan (5.13): let line 1's key stand in past defaults lines when its next line is as wide as line 1 and every planned
-  reader still takes that line after them; then run the exhaustive delete-door shapes again, with defaults lines.
-- Revisit when: 5.13.
-- Noted: 2026-11-09, found in the 5.12 docs round (5.11 writes the same bytes); a deferral, not asked.
-
-### After a line 1 of two or more cells, a delete before another key's row reorders keys for readers given the header
-- Kind: deferred
-- What the operator sees: `d\tX\nc\nb\t1\t2\na\n` under header `q` (or `d\tX\tz`), delete `c` through a `TSVZed` delete and
-  commit, `tsvz --x-header` or `TSVZedLite(strict=False)`: 5.11 and 5.12 write `d\tX\na\nb\t1\t2\na\n`. The store's memory
-  lists `b, a`; a reopened store, `TSVZedLite` and every loose `readTabularFile` given the header list `a, b`, and the
-  readers given a count of one but 3.39's strict one list `d, a, b` where they listed `d, b, a`. No row or cell changes.
-- Why: where another key's row comes first after the place, the stand-in is a key whose later line holds no value (`a`),
-  as in 5.11, and it comes first to the readers that count from the place.
-- Plan (5.13): in the header doors, let the first row after the place stand in before a later key without a value. By
-  hand, `d\tX\nb\nb\t1\t2\na\n` keeps the order for every reader the 5.12 docs round ran (headers `q`, `d\tX\tz` and
-  `id\tv`, eight defaults sets): `b` comes first to the readers given the header anyway, and a reader that counts from line
-  1 reads it as the deletion of a key not yet read. It costs 3.39's strict `readTabularFile(correctColumnNum=1)` given no
-  header a row (`b` as `[b]`, where 5.11's `a` gave it nothing new), the kind "3.39's strict reader of a one-column file
-  sees a new row when its last lone key is deleted" covers since its 5.12 widening. Then run the exhaustive delete-door
-  shapes again.
-- Revisit when: 5.13.
-- Noted: 2026-11-09, found in the 5.12 final review (5.11 writes the same bytes); a deferral, not asked.
-
-### A compaction keeps a moved-up line only from the deletion that ends the other reader's life of the key
-- Kind: deferred
-- What the operator sees: a scrub, a `TSVZed` rewrite or a delete's commit can keep a line that no reader needs, once.
-  `id\nb\tX\nb\t\nb\t\na\t1\t\tX\na\t2\t\t2\n#_defaults_#\n` scrubbed with header `a`, defaults `[#_defaults_#, P, Q]` and count 2
-  keeps `b\tX` (`id\nb\tX\nb\t\nb\t\na\t2\t\t2\n#_defaults_#\n`; 5.11 wrote `id\nb\t\na\t2\t\t2\n#_defaults_#\n`). A reader's plan can also
-  keep a strict reader's first line of a key where no other key competes for its place. The delete door is the same
-  family: `d\tX\nc\nd\t1\na\na\n` under header `q` (or `d\tX\tz`, `id\tv`), a `TSVZed` delete of `c` and its commit write `d\tX\nd\nd\t1\na\na\n` (5.11
-  wrote `d\tX\na\nd\t1\na\n`): it keeps the `a\na` pair, since `agrees()` rejects moving the last `a` up for a reader given no
-  header, which reads both lines as deletions of a key it never had. Every reader reads both files alike. The file is a
-  line or two larger, and compacting a scrub's output again never grows it (5.12 review: in the delete doors 405 of
-  123,480 files' outputs were larger than 5.11's and 355 smaller, no reader worse).
-- Why: `agrees()` in `_legacyCompactOnce` accepts a line moved up into another line's place only when the deletion that
-  ends the other reader's life of the key is the one the line came from. A later deletion of the same key with no row of
-  it between would do as well: that reader reads the key deleted at the moved line, and read it dead from the first
-  deletion on. A move it rejects only keeps lines in their places, so it never loses a row.
-- Plan (5.13): accept that later deletion in `agrees()`, then measure it on the exhaustive planned-reader and delete-door
-  shapes again (the 5.12 review's relaxed variant made 408 of 1.31M outputs smaller and no reader worse; on the first
-  trace above it writes one line more than 5.11, so the build needs its own measurement).
-- Revisit when: 5.13.
-- Noted: 2026-11-09, found in the 5.12 review; a deferral, not asked.
-
-### A one-column compaction given a count equal to the defaults' count plans the same reader twice
-- Kind: deferred
-- What the operator sees: a scrub or a `TSVZed` rewrite of a file the one-column rule reads as one column, given defaults
-  of two cells or more and a count (`correctColumnNum`, a store's given column count) equal to the defaults' count, plans
-  the reader at that count twice: once from the one-column rule's branch and again from the loop over the counts given.
-  `_legacyCompactReaders([b'a', b'c'], 1, True, [D, 'P'], '\t', 'utf8', False, (2,))` returns `(2, True, False, [D, 'P'])`
-  twice. The bytes and every reader's view are the same; the cost is the second plan's time. 3,600 of 97,200 argument
-  sets of the 5.12 review's fuzz do it, in 5.11 and 5.12 alike.
-- Why: the two branches each add the reader, and neither looks at the other's.
-- Plan (5.13): in `_legacyCompactReaders`, do not add a reader the list already holds (the loop over the counts given does
-  that already for the readers given no defaults); one line, then the argument sets again.
-- Revisit when: 5.13.
-- Noted: 2026-11-09, found in the 5.12 review (pre-existing in 5.11); a deferral, not asked.
+- What the operator sees: a scrub, a `TSVZed` rewrite or a delete's commit can keep a line that no reader needs, once:
+  `a\na\tX\na\t2\t\na\t\t2\n` scrubbed with header `id\tv`, defaults `[#_defaults_#, '', '']` and count 2 keeps all four
+  lines; 5.11 wrote `a\na\tX\na\t\t2\n`, which every reader (5.14's, 5.5's and 3.39's, strict and loose, given no header,
+  the header or line 1, with and without the defaults and the count, a `TSVZed`, `TSVZedLite`, the command) reads as it
+  reads the file. The reader planned at the defaults' three columns (5.12) keeps `a\t2\t`, the first line of `a` its
+  strict variant takes, as that reader's place, though no other key's row comes after it before `a\t\t2`. Compacting the
+  output again never grows it.
+- Why: a plan keeps a strict reader's first line of a key it takes as the key's place among the keys that reader reads,
+  without asking whether another key's row it takes comes before it. Keeping it only keeps lines in their places, so it
+  never loses a row.
+- Plan (5.15): keep that line only where the strict reader takes a row of another key between it and the key's next line
+  that stays, as `inOrder()` asks of a moved line; then measure it on the exhaustive planned-reader shapes again.
+- Revisit when: 5.15.
+- Noted: 2026-11-09, found in the 5.12 review (the second half of 5.12's deferral "A compaction keeps a moved-up line only
+  from the deletion that ends the other reader's life of the key", whose first half 5.14 builds); a deferral, not asked.
 
 ### A TSVZedLite delete looks at the file's first lines every time
 - Kind: deferred

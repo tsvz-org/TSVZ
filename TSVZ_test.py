@@ -14715,7 +14715,7 @@ def test_a_delete_commit_compacts_for_every_count_the_files_readers_read_at(tmp_
 	(b'd\tX\na\nd\tY\n', b'd\tX\nd\nd\tY\n', None),
 	# (d's next line wider than line 1: 3.39's strict reader at two columns would not take it back; nothing stands in)
 	(b'd\tX\na\nd\tY\tZ\n', b'd\tX\nd\tY\tZ\n', {'339-loose-H': 'cell'}),
-	# (a defaults line first: 5.10 to 5.12 let nothing stand in; from 5.13 d stands in past a defaults line that holds a value)
+	# (a defaults line first: 5.10 to 5.12 let nothing stand in; from 5.14 d stands in past a defaults line that holds a value)
 	(b'd\tX\na\n#_defaults_#\tP\nd\tY\n', b'd\tX\nd\n#_defaults_#\tP\nd\tY\n', None),
 ])
 def test_line_1s_key_stands_in_when_its_next_line_is_as_wide_as_line_1(tmp_path, door, text, written, differ):
@@ -17508,7 +17508,7 @@ def test_after_line_1s_key_stands_in_a_rewrite_widens_and_keeps_the_order_where_
 
 
 # --------------------------------------------------------------------------
-# 5.13: the compaction entries deferred from 5.12 (docs/limitations.md)
+# 5.14: the compaction entries deferred from 5.12 (docs/limitations.md)
 # --------------------------------------------------------------------------
 def test_a_one_column_compaction_given_the_defaults_count_plans_that_reader_once():
 	# The one-column rule's branch and the loop over the counts given each listed the reader at the defaults' count.
