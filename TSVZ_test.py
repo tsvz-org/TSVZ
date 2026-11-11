@@ -17422,7 +17422,7 @@ def _sweep(tmp_path, kind, op, at, start=1, stop=0):
 #: on 3.14: in 7 parts of 1,300, so -n spreads them.
 _INTERRUPT_SWEPT = ([(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (
 	'set', 'set-existing', 'del', 'pop', 'popitem', 'setdefaults', 'commit', 'reload', 'rewrite', 'close')]
-	+ [('tsvz', 'move', 1, 0), ('tsv', 'closed-commit', 1, 0), ('tsvz', 'closed-rewrite', 1, 0)]
+	+ [('tsvz', 'move', 1, 0), ('tsv', 'closed-commit', 1, 0), ('tsvz', 'closed-commit', 1, 0), ('tsvz', 'closed-rewrite', 1, 0)]
 	+ [(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (  # (a TSVZClient with no handler; one-shot calls)
 		'client-set', 'client-del', 'client-get', 'client-pop', 'oneshot-append', 'oneshot-create', 'oneshot-scrub', 'oneshot-clear')]
 	+ [('tsv', 'closed-rewrite', start, start + 1299 if start < 7801 else 0) for start in range(1, 9100, 1300)])
@@ -17828,6 +17828,28 @@ def test_tsvz_serve_stops_on_a_sigterm_that_lands_as_a_connection_starts(tmp_pat
 			proc.kill()
 		proc.communicate()
 	assert not os.path.exists(p + '.serve')
+def test_a_tsvz_commit_lists_writes_and_pops_only_the_rows_it_listed(tmp_path, monkeypatch):
+	# 5.15: a .tsvz commit lists the queue, writes, then takes out only what it listed, as a loose store's does, so a Ctrl-C
+	# anywhere in it drops no row (5.14 took them out first: 559 of 954 steps of a commit after close() lost the row, on
+	# 3.14; the step sweep's closed-commit case). A row queued while the write runs stays queued, for the next commit.
+	p = str(tmp_path / 's.tsvz')
+	t = TSVZ.TSVZed(p, verbose=False, append_check_delay=60)
+	t.close()  # (the commit runs in this thread)
+	t['r1'] = ['r1', '1']
+	t['r2'] = ['r2', '2']
+	real = TSVZ._specAppendPayload
+
+	def append(*args, **kwargs):
+		t['r3'] = ['r3', '3']  # (set while the write runs)
+		return real(*args, **kwargs)
+	monkeypatch.setattr(TSVZ, '_specAppendPayload', append)
+	t.commitAppendToFile()
+	monkeypatch.undo()
+	rows = TSVZ.readTabularFile(p, verbose=False)
+	assert rows['r1'] == ['r1', '1'] and rows['r2'] == ['r2', '2'] and 'r3' not in rows
+	assert len(t.appendQueue) == 1
+	t.commitAppendToFile()
+	assert TSVZ.readTabularFile(p, verbose=False)['r3'] == ['r3', '3'] and not t.appendQueue
 
 
 # --------------------------------------------------------------------------

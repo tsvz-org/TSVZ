@@ -215,8 +215,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     or rewrite of that store then waits for ever. With an interrupt at each bytecode of one such commit or rewrite:
     `writeLock` left held at 6 to 13 steps of about 1,000 to 9,400 (3.14 and 3.11; none at 3.6's line steps). 5.12 did
     the same in these two cases, and in every `.tsvz` commit of a running store, which ran in the caller's thread
-    there. What the cut write leaves in the file is the entry above; the rows a cut `.tsvz` commit drops, the
-    deferral below.
+    there. What the cut write leaves in the file is the entry above. (A cut `.tsvz` commit drops no row from 5.15: its
+    rows stay queued until they are on disk.)
 - Why: `writeLock` is held for the caller across calls by `get_file_obj()`, so a thread that finds itself holding
   it cannot take that for a Ctrl-C's leftover; whatever lets go of a lock is itself code a second Ctrl-C can land in;
   calls after `close()` and writes from forked children are rare.
@@ -226,24 +226,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   or a write after close() or in a forked child, can still leave a store's lock held, and another thread then waits
   for ever (as in 5.12)." The wording is the 5.13 final review's, which adds the `writeLock` case: its hang hits the
   program's own next commit, not only another thread.
-
-### A .tsvz commit after close() or in a forked child that a Ctrl-C cuts can drop the rows it took from the queue
-- Kind: deferred
-- What the operator sees: after `close()`, or in a child that `fork()` made, a `.tsvz` store's `commitAppendToFile()`
-  runs in the caller's thread. A Ctrl-C that lands after it took the queued rows from the queue and before it wrote
-  them drops them: memory holds them, the file does not, and no later commit writes them. With an interrupt at each
-  bytecode of one such commit (5.13 final review): the queued row dropped at 582 of 996 steps. 5.12 did the same
-  there, and in every `.tsvz` commit of a running store, which ran in the caller's thread: a Ctrl-C that ended a loop
-  of sets and commits lost rows the program had set in 21 of 320 runs on 3.14 and 15 of 320 on 3.6 (5.13: none in
-  1,280, as such a commit now runs on the writer thread).
-- Why: `_specCommitLocked` puts the rows back on the queue only for an `Exception`; a KeyboardInterrupt goes up past
-  it.
-- Plan (5.15): an `except BaseException` in `_specCommitLocked` that puts the rows back and raises. A Ctrl-C that
-  lands after the write, before the commit returns, then has them written again at the next commit: a line written
-  twice (the last wins), which costs a few bytes where the drop costs the rows. Then a test: an interrupt
-  at each step of a `.tsvz` commit after `close()`, and the row in the file after the next commit.
-- Revisit when: 5.15.
-- Noted: 2026-11-10, found in the 5.13 final review; a deferral, not asked.
 
 ### A forked child's rows on an inherited store reach the file only through its own commit
 - Kind: deferred

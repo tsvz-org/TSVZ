@@ -6635,20 +6635,30 @@ class TSVZed(OrderedDict):
 			return self
 		try:
 			with self.writeLock:
-				return self._specCommitLocked()
+				self._specCommitLocked()
+				return self
 		finally:
 			self._endWrite()
 
-	def _specCommitLocked(self):
-		# The caller holds self.writeLock (a non-reentrant lock).
-		if not self.appendQueue:
-			return self
+	def _specCommitLocked(self, items=None):
+		"""Append ``items``, the queue's first len(items) records (None: the whole queue), to the active part; the caller
+		holds self.writeLock (a non-reentrant lock). True when they are on disk, or there were none.
+
+		They stay queued until they are on disk, as a loose store's rows do (5.15): a Ctrl-C anywhere here (after close()
+		or in a forked child this runs in the caller's thread) drops none, where 5.14 took them out first and lost them;
+		one after the write and before they leave the queue has them written again by the next commit (the last copy
+		wins). The first len(items) are those listed: whatever else takes from the queue holds writeLock (a reload's
+		replay, a clear), and a set only appends."""
+		if items is None and not self.appendQueue:
+			return True  # (nothing queued, as most ticks find it: no section taken; a row queued meanwhile waits for the next)
 		if self.memoryOnly:
 			self.appendQueue.clear()
-			return self
-		items = []
-		while self.appendQueue:
-			items.append(self.appendQueue.popleft())
+			return True
+		if items is None:
+			with self._memLock:  # (a set queues under it: not while the queue is listed)
+				items = list(self.appendQueue)
+		if not items:
+			return True
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		try:
 			payload = _encodeText(''.join(item + '\n' for item in items), 'utf-8', self.errors)  # checked when set
@@ -6656,9 +6666,11 @@ class TSVZed(OrderedDict):
 			written = _specAppendPayload(self._activePath, payload, reporter, fsync=True,
 										 memberSize=self._specState.memberSize, proceed=lambda: not self._unattended())
 			if written is None:
-				self.appendQueue.extendleft(reversed(items))
 				reporter.flush()
-				return self
+				return False
+			with self._memLock:
+				for _ in range(len(items)):
+					self.appendQueue.popleft()  # (only those listed: rows queued since stay)
 			_, before, after = written
 			if before == self._specSeen:
 				self._specNoteSeen(after)  # else another writer changed the part first: the next check reloads
@@ -6666,21 +6678,21 @@ class TSVZed(OrderedDict):
 				self._writeFailing = False
 				_warn(f'TSVZ warning: {self._fileName}: writes recovered', self.teeLogger)
 		except Exception as e:
-			self.appendQueue.extendleft(reversed(items))
 			if not self._writeFailing:
 				self._writeFailing = True
 				self.__teePrintOrNot(f"Failed to write at commitAppendToFile to {self._activePath}: {e}; will retry",'error')
 				import traceback
 				self.__teePrintOrNot(traceback.format_exc(),'error')
+			reporter.flush()
+			return False
 		reporter.flush()
-		return self
+		return True
 
 	def _specClearFile(self):
 		"""clear_file for .tsvz (design §5.8): commit queued markers, then clear in place."""
 		try:
 			with self.writeLock:
-				self._specCommitLocked()
-				if self.appendQueue:
+				if not self._specCommitLocked():  # (rows set since may be queued: the return says whether it wrote)
 					self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: queued records could not be committed; not clearing",'error')
 					self.deSynced = True
 					return self
