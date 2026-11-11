@@ -17762,6 +17762,74 @@ def test_a_ctrl_c_that_leaves_a_clients_lock_held_is_let_go_of(tmp_path, ext, wh
 		c.close()
 
 
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_a_served_client_answers_each_request_after_a_caught_ctrl_c(tmp_path):
+	# A Ctrl-C that landed while a client waited for a handler's reply left the reply unread on the connection, and the
+	# next request read it: c['b'] gave a's row, len() raised ValueError, and every later answer was one request behind
+	# (5.12 to 5.14). A request a Ctrl-C cut now drops the connection, and the next one connects again first.
+	p = str(tmp_path / 'd.tsvz')
+	TSVZ.appendTabularFile(p, ['a', '1'], verbose=False, createIfNotExist=True)
+	TSVZ.appendTabularFile(p, ['b', '2'], verbose=False)
+	proc = _serve_process(p)
+	try:
+		c = TSVZ.TSVZClient(p)
+		connection = c._backend
+		assert isinstance(connection, TSVZ._ServeConnection)
+		readline = connection.rfile.readline
+
+		def cut(*args):
+			connection.rfile.readline = readline
+			time.sleep(0.2)  # (the reply comes meanwhile: a local socket's round trip takes microseconds)
+			raise KeyboardInterrupt
+		connection.rfile.readline = cut
+		with pytest.raises(KeyboardInterrupt):
+			c['a']
+		assert c['b'] == ['b', '2']
+		assert len(c) == 2
+		assert 'zz' not in c
+		c.close()
+	finally:
+		proc.terminate()
+		proc.communicate(timeout=10)
+
+
+#: ARGV: TSVZ's directory, the store. ``tsvz serve STORE``, with a SIGTERM that it gets as it starts each connection's thread.
+_SIGTERM_AS_A_CONNECTION_STARTS = r"""
+import os, signal, socketserver, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+real = socketserver.ThreadingMixIn.process_request
+def process_request(self, request, address):
+	os.kill(os.getpid(), signal.SIGTERM)  # (handled here, as a SIGTERM that comes while a connection's thread starts)
+	return real(self, request, address)
+socketserver.ThreadingMixIn.process_request = process_request
+sys.exit(TSVZ._cliMain(['serve', sys.argv[2]]))
+"""
+
+
+@pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
+def test_tsvz_serve_stops_on_a_sigterm_that_lands_as_a_connection_starts(tmp_path):
+	# socketserver takes an Exception raised while it starts a connection's thread for that request's failure, and goes
+	# on: a SIGTERM there (_ServeSignal, an Exception) was swallowed, and the handler served on, until a service manager's
+	# SIGKILL skipped its last writes (found under load by the test above: 9 to 11 of 64 runs). Now it goes up, as a Ctrl-C.
+	p = str(tmp_path / 's.tsvz')
+	script = tmp_path / 'serve.py'
+	script.write_text(_SIGTERM_AS_A_CONNECTION_STARTS)
+	proc = subprocess.Popen([sys.executable, str(script), HERE, p], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	try:
+		deadline = time.time() + 10
+		while TSVZ._serveFind(p) is None:
+			assert proc.poll() is None and time.time() < deadline, proc.communicate()[1]
+			time.sleep(0.02)
+		TSVZ._ServeConnection(TSVZ._serveFind(p)).close()  # (the handler starts its thread: the SIGTERM lands there)
+		assert proc.wait(10) == 0  # (a handler stops in milliseconds; 5.14 served on for ever)
+	finally:
+		if proc.poll() is None:
+			proc.kill()
+		proc.communicate()
+	assert not os.path.exists(p + '.serve')
+
+
 # --------------------------------------------------------------------------
 # 5.08 release review, round 1
 # --------------------------------------------------------------------------

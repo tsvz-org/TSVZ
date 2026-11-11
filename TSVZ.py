@@ -9886,8 +9886,10 @@ class _ServeUnreachable(Exception):
 		self.quiet = quiet
 
 
-class _ServeSignal(Exception):
-	"""SIGTERM arrived while ``tsvz serve`` was serving."""
+class _ServeSignal(BaseException):
+	"""SIGTERM arrived while ``tsvz serve`` was serving. A BaseException, as KeyboardInterrupt is (5.15): socketserver takes
+	an Exception raised while it starts a connection's thread for that request's failure and goes on, so one that
+	landed there was swallowed and the handler served on."""
 
 
 def _servePointerPath(store):
@@ -10396,6 +10398,7 @@ class TSVZClient(MutableMapping):
 		self.delimiter = get_delimiter(..., file_name=fileName)
 		self._backend = None
 		self._lock = _SectionLock()  # (never nested: a hold found at a request's start is a Ctrl-C's, see _SectionLock)
+		self._cut = False  # a Ctrl-C cut the last request on the connection: its reply may still come (_request)
 		self._connect()
 
 	def _connect(self):
@@ -10424,15 +10427,26 @@ class TSVZClient(MutableMapping):
 		line = '\t'.join(options + fields)
 		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
 			with self._lock:  # one request at a time on the shared connection
-				try:
-					lines, diagnostics, status, message = self._backend.request(line, bulk)
-				except _ServeLost as e:
+				if self._cut:  # a Ctrl-C cut the last request: its reply may still come, and would answer this one
 					self._backend.close()
 					self._connect()
-					if not retry:
-						raise ConnectionError('the tsvz handler of {} went away ({}); {} may or may not have been '
-											  'applied'.format(self._fileName, e, fields[0]))
-					lines, diagnostics, status, message = self._backend.request(line, bulk)
+					self._cut = False  # (after the connect: one that fails leaves the next request to try again)
+				try:
+					try:
+						lines, diagnostics, status, message = self._backend.request(line, bulk)
+					except _ServeLost as e:
+						self._backend.close()
+						self._connect()
+						if not retry:
+							raise ConnectionError('the tsvz handler of {} went away ({}); {} may or may not have been '
+												  'applied'.format(self._fileName, e, fields[0]))
+						lines, diagnostics, status, message = self._backend.request(line, bulk)
+				except Exception:
+					raise  # (a lost connection or a refused text: no reply is left unread)
+				except BaseException:
+					# Cut part way (a Ctrl-C): the reply, or the rest of a bulk request, is left on the connection.
+					self._cut = isinstance(self._backend, _ServeConnection)  # (a local engine has no reply to lose)
+					raise
 		except BaseException:
 			self._lock.letGo()
 			raise
