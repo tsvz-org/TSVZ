@@ -240,11 +240,36 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   of 824 when the handler changes the keys while the move lists them (a set of a new key, a delete, a move, a clear or
   a sync; 3 of 120 line steps on 3.6; counted at the 5.15 final review's fixes, as in the build before them). (A
   delete, pop or move whose key a handler's `clear()` took raises `KeyError`, as for a missing key: that is right.)
-- Why: found by the 5.15 plan's sweep (the move to the beginning's, by the fix round's); the change is small but in
-  two hot methods, and wants its own tests.
+  - Two handler calls, the second landing inside the redo the first one caused (`_again`; the 5.15 re-review's
+    probes, Python 3.14 and 3.9, one case per instruction of the redo):
+    - a flush, `clear()` or `reload()` between `queue and` and `queue[-1]` (`_moveAgain`, and `_requeue` for sets and
+      deletes) raises `IndexError: deque index out of range` out of the move, set, delete or pop, at 2 to 5 of 89 to
+      617 instructions: a kind 5.14 never raised there;
+    - a delete of the moved key, or `clear()`, between `dict.__contains__` and `dict.get` in `_moveAgain`'s listing
+      for a move to the end hands `_moveLines` a `None` row: `TypeError` in a two-column store (7 of 252
+      instructions), a `None` queued after the drop item in a one-column store (7 of 174), which the drop item's
+      rewrite skips;
+    - a `clear()` inside a move to the beginning's redo, after the first handler set a new key `y`, can leave memory
+      empty and the file holding `y` (the interrupted pass queued `y`'s lines; the next pass deletes only the keys the
+      section captured), and a flush there can leave memory's order apart from the file's.
+
+    After every exception memory and the file agree. Over every pair of handler calls 2, 10, 50 or 200 instructions
+    apart (7 handler pairs, 4 operations, 3.14), memory and the file end apart at 220 of 53,873 pairs, against 5.14's
+    19,094 of 52,102: 140 are the deferred "set of a new key" order, 37 the `y` case (5.14: 381), 43 order only (5.14:
+    418). Exceptions: `IndexError` in 24 pairs (5.14: none), `TypeError` in 196 (5.14: 120), `RuntimeError` in 782
+    (5.14: 628).
+- Why: found by the 5.15 plan's sweep (the move to the beginning's, by the fix round's; the two-handler cases by the
+  5.15 re-review); the change is small but in two hot methods, and wants its own tests. The two-handler cases need two
+  handler calls microseconds apart, and are far rarer than in 5.14.
 - Plan (5.16): `popitem` looks for its key again when the store changed between its look and its take, and raises
   `KeyError('dictionary is empty')` when the store went empty; `move_to_end` raises `KeyError(key)` when its key went
-  inside it, and a move to the beginning lists the other keys again when the store changed while it listed them.
+  inside it, and a move to the beginning lists the other keys again when the store changed while it listed them. For
+  two handlers: `_again` runs a change again when it raised while its lock was let go of (a handler ran inside it), as
+  it does one that ended without the lock, which covers a redo's `IndexError`, `TypeError` and `RuntimeError`;
+  `_moveAgain` counts the keys a pass queued lines for as captured by the next pass (`moved` extended before its
+  `extend`), so a key an interrupted pass re-added and a handler then took gets its deletion line; and a two-handler
+  sweep goes in the suite (the re-review's `pair.py` shape: two handler calls a few instructions apart, against 5.14's
+  counts).
 - Revisit when: 5.16.
 - Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked.
 
