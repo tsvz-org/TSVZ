@@ -16931,7 +16931,7 @@ def test_the_exit_waits_for_the_writer_thread_through_waited(tmp_path, monkeypat
 #: (written twice: docs/limitations.md, "A line can be written twice"). A case that has not ended in 25 s is a hang (its stacks printed), and the parent goes on after
 #: it: every hang the sweeps met was a wait for ever, while a case takes 1 to 20 ms. The parent prints the failures and the counts, and exits 1 on any failure or hang.
 _STEP_SWEEP = r"""
-import dis, faulthandler, os, shutil, subprocess, sys, threading
+import dis, faulthandler, os, shutil, subprocess, sys, threading, time
 HERE, BASE, KIND, OP, AT = sys.argv[1:6]
 START, STOP = int(sys.argv[6]), int(sys.argv[7])
 sys.path.insert(0, HERE)
@@ -17312,6 +17312,16 @@ def ownLines(d):
 _serialRuns = []
 
 
+def idle(t):
+	'''Wait until the store's writer thread waits for work (in _wake: its tick after the last job it ran is over). A serial
+	history's step starts there, so no commit of the writer thread's own lands in it: such a commit is a history of its own
+	('c'), and a history without it then has one outcome. (After the set-up's commit, its tick wrote the operation's lines
+	before another process's line in about 1 run in 5, and the sweep's one run of that history missed the other outcome.)'''
+	end = time.time() + 10
+	while not t._wake._waiters and time.time() < end:
+		time.sleep(0.001)
+
+
 def serials(d):
 	'''The file's rows, in its order, after each serial history of the operation and the handler (then a commit and close()):
 	the operation lands before the handler or after it, or between the steps of one of several steps (a sync: another
@@ -17335,6 +17345,7 @@ def serials(d):
 				p = os.path.join(d, 'serial%d.%s' % (count, KIND))
 				t = opened(p)
 				for step in history:
+					idle(t)
 					try:
 						if step == 'o':
 							HANDLED_OPS[OP](t)
