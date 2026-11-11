@@ -433,3 +433,24 @@ entries go last, in the same commit as the change:
   `NOT_TAKEN` and `NOP`, are skipped: no signal is raised there, and a raise there skipped both the `with` statement's
   exit and the `except` clause, holds a real Ctrl-C never makes. And the sweep keeps no exception object: its traceback
   kept the cut write's open file, whose lock the next write then waited for, a hang no real program meets.
+
+## 2026-11-10 TSVZ 5.15: a job whose waiter left is taken back if it has not begun, and a load stops
+- Changed: when a Ctrl-C ends a thread's wait for the store's writer thread, a job the writer thread has not begun
+  is taken back (it never runs; the rows it would have written stay queued for the next commit), a load under way
+  stops at its next read and changes nothing, and a write under way still runs to its end. At exit nothing is taken
+  back. A loose load stops because the waiter swaps the file its reader reads for a stand-in whose every read stops
+  it; a `.tsvz` load checks a flag once a 1 MiB chunk. A `.tsvz` `clear()` empties memory inside its job, as it
+  lists the queue, where it emptied memory in the calling thread before handing over the file's clear.
+- Why we had to change: 5.13's rule was "a KeyboardInterrupt stops the wait, never the write". A `clear()` whose wait
+  a Ctrl-C ended ran later all the same, after the rows the program set once it caught the Ctrl-C, and took them out
+  of the file (a loose store's memory too; a `.tsvz` store's memory kept them): 63 of 199 steps of a loose `clear()`
+  and 153 of 219 of a `.tsvz` one, on 3.14, left the program's next rows apart or gone. And a load nobody waited for
+  any more kept the writer thread reading, sharing the interpreter with the main thread's shutdown: a Ctrl-C during a
+  1.5M-row load took up to a second or two to end the program.
+- Original design was wrong because: it treated two rules as one. "Do not cut a write part way" is about the file:
+  a write begun is finished. "Do the write the caller gave up on" is a promise nobody asked for: the caller has
+  already gone on, and anything it does next comes before the job, which then runs out of order. And a read whose
+  only product is a copy for that caller is work for nobody once the caller left.
+- Lesson: when a caller stops waiting, finish only what has begun; take back what has not, and stop work whose only
+  product was for that caller (a read into a copy that is swapped in at its end). Stop it from the caller's side, by
+  swapping what the work reads, not by a test in its inner loop, which every run pays for.

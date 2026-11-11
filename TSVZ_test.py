@@ -17423,6 +17423,7 @@ def _sweep(tmp_path, kind, op, at, start=1, stop=0):
 _INTERRUPT_SWEPT = ([(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (
 	'set', 'set-existing', 'del', 'pop', 'popitem', 'setdefaults', 'commit', 'reload', 'rewrite', 'close')]
 	+ [('tsvz', 'move', 1, 0), ('tsv', 'closed-commit', 1, 0), ('tsvz', 'closed-commit', 1, 0), ('tsvz', 'closed-rewrite', 1, 0)]
+	+ [(kind, 'clear', 1, 0) for kind in ('tsv', 'tsvz')]
 	+ [(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (  # (a TSVZClient with no handler; one-shot calls)
 		'client-set', 'client-del', 'client-get', 'client-pop', 'oneshot-append', 'oneshot-create', 'oneshot-scrub', 'oneshot-clear')]
 	+ [('tsv', 'closed-rewrite', start, start + 1299 if start < 7801 else 0) for start in range(1, 9100, 1300)])
@@ -17850,6 +17851,196 @@ def test_a_tsvz_commit_lists_writes_and_pops_only_the_rows_it_listed(tmp_path, m
 	assert len(t.appendQueue) == 1
 	t.commitAppendToFile()
 	assert TSVZ.readTabularFile(p, verbose=False)['r3'] == ['r3', '3'] and not t.appendQueue
+
+
+def _a_store_of_rows(path, rows):
+	if path.endswith('.tsv'):
+		with open(path, 'wb') as f:
+			f.write(b'id\tv\n' + b''.join(b'k%d\t%d\n' % (i, i) for i in range(rows)))
+	else:
+		TSVZ.appendTabularFile(path, ['id', 'v'], verbose=False, createIfNotExist=True)
+		with open(path, 'ab') as f:
+			f.write(b''.join(b'k%d\t%d\n' % (i, i) for i in range(rows)))
+	return TSVZ.TSVZed(path, header='id\tv', verbose=False, rewrite_on_load=False, append_check_delay=60)
+
+
+@pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
+def test_a_load_whose_waiter_a_ctrl_c_took_away_stops_and_changes_nothing(tmp_path, monkeypatch, ext):
+	# The load runs on the writer thread, which went on reading after a Ctrl-C ended the wait, while the main thread
+	# printed the traceback and shut down: a 1.5M-row store took up to a second or two more to end (5.13, 5.14). The read
+	# now stops at its next read (a loose file: its reader's file swapped; .tsvz: once a chunk) and memory stays as it was.
+	p = str(tmp_path / ('s.' + ext))
+	t = _a_store_of_rows(p, 20000)
+	OrderedDict.__setitem__(t, 'mem', ['mem', '1'])  # (in memory only: a finished reload drops it)
+	held = len(t)
+	inside, interrupted = threading.Event(), threading.Event()
+
+	def entered():  # (the writer thread, in the reload's read: it goes on once the Ctrl-C has stopped the wait)
+		inside.set()
+		interrupted.wait(10)  # (the wait is microseconds; 10 s only ends a broken test)
+
+	if ext == 'tsv':
+		real = TSVZ._legacyReadLoop
+
+		def readLoop(*args, **kwargs):
+			entered()
+			return real(*args, **kwargs)
+		monkeypatch.setattr(TSVZ, '_legacyReadLoop', readLoop)
+	else:
+		real = TSVZ._iterPartLines
+
+		def partLines(*args, **kwargs):
+			entered()
+			for item in real(*args, **kwargs):
+				yield item
+		monkeypatch.setattr(TSVZ, '_iterPartLines', partLines)
+
+	def waited(flag, timeout):
+		inside.wait(10)
+		raise KeyboardInterrupt
+	monkeypatch.setattr(TSVZ, '_waited', waited)
+	with pytest.raises(KeyboardInterrupt):
+		t.reload()
+	monkeypatch.undo()
+	interrupted.set()
+	t['b'] = ['b', '2']
+	t.commitAppendToFile()  # (behind the stopped load: the thread runs on)
+	assert t['mem'] == ['mem', '1'] and len(t) == held + 1 and t._workerRuns()
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False)['b'] == ['b', '2']
+	t.reload()
+	assert 'mem' not in t and t['b'] == ['b', '2'] and len(t) == held
+	t.close()
+
+
+def _a_ctrl_c_in_this_threads_waits(monkeypatch):
+	"""Each wait of this thread for the writer thread raises KeyboardInterrupt at once; other threads wait as before."""
+	me, real = threading.current_thread(), TSVZ._waited
+
+	def waited(flag, timeout):
+		if threading.current_thread() is me:
+			raise KeyboardInterrupt
+		return real(flag, timeout)
+	monkeypatch.setattr(TSVZ, '_waited', waited)
+
+
+def _the_writer_thread_held_off(t):
+	"""Hold ``t.writeLock`` in another thread and hand the writer thread a write that waits for it (a commit with
+	nothing queued would not); return the function that lets go (the write then ends)."""
+	held, done = threading.Event(), threading.Event()
+
+	def hold():
+		with t.writeLock:
+			held.set()
+			done.wait(10)  # (the test lets go within milliseconds; 10 s only ends a broken one)
+	holder = threading.Thread(target=hold, daemon=True)
+	holder.start()
+	held.wait(10)
+	def write():
+		with t.writeLock:
+			pass
+	committer = threading.Thread(target=t._call, args=(write,), daemon=True)
+	committer.start()
+	deadline = time.time() + 10
+	while not t._writing and time.time() < deadline:  # (the writer thread took the write, and waits for the lock)
+		time.sleep(0.001)
+
+	def letGo():
+		done.set()
+		holder.join(10)
+		committer.join(10)
+	return letGo
+
+
+@pytest.mark.parametrize('exiting', [False, True], ids=['running', 'at exit'])
+@pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
+def test_a_job_whose_waiter_a_ctrl_c_took_away_is_taken_back_unless_at_exit(tmp_path, monkeypatch, ext, exiting):
+	# A Ctrl-C that ended the wait for a clear() not yet begun left it to run later, after whatever the program set once it
+	# caught the Ctrl-C: those rows went from a loose store's memory and file, and from a .tsvz store's file while its
+	# memory kept them (5.13 final review: 45 of 227 steps of a .tsvz clear). Now it is taken back, but at exit.
+	p = str(tmp_path / ('s.' + ext))
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, rewrite_on_load=False, append_check_delay=60)
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '2']
+	t.commitAppendToFile()
+	t._exiting = exiting
+	letGo = _the_writer_thread_held_off(t)
+	_a_ctrl_c_in_this_threads_waits(monkeypatch)
+	with pytest.raises(KeyboardInterrupt):
+		t.clear()
+	monkeypatch.undo()
+	t['c'] = ['c', '3']
+	t['d'] = ['d', '4']
+	letGo()
+	t.commitAppendToFile()
+	memory = dict(t)
+	t._exiting = False
+	t.close()
+	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
+	assert memory == rows
+	assert sorted(rows) == ([] if exiting else ['a', 'b', 'c', 'd'])  # (at exit the clear ran, after c and d were set)
+
+
+def test_a_tsvz_clear_keeps_memory_and_file_together_for_a_row_set_while_it_runs(tmp_path):
+	# 5.14 emptied memory in the calling thread, then the job committed and cleared the file: a row set in between was
+	# committed, then cleared from the file, while memory kept it. Memory is now emptied as the queue is listed, in the job.
+	p = str(tmp_path / 's.tsvz')
+	t = TSVZ.TSVZed(p, verbose=False, append_check_delay=60)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	t['q'] = ['q', '1']  # (queued at the clear)
+	real = t._specCommitLocked
+	setting = [True]
+
+	def commit(*args):  # (the writer thread, inside the clear's job; not its tick's commit of q, which may come first)
+		if setting and sys._getframe(1).f_code.co_name == '_specClearFile':
+			setting.pop()
+			t['n'] = ['n', '1']
+		return real(*args)
+	t._specCommitLocked = commit
+	t.clear()
+	del t._specCommitLocked
+	t.commitAppendToFile()
+	rows = TSVZ.readTabularFile(p, verbose=False)
+	assert dict(t) == rows == {'n': ['n', '1']}
+	t.close()
+
+
+def test_a_tsvz_clear_that_cannot_clear_drops_no_row(tmp_path, monkeypatch):
+	# The clear empties memory in its job: when the file cannot be cleared the store reloads (at its next tick, or at
+	# close), and memory is the file again, the rows queued before the clear written.
+	p = str(tmp_path / 's.tsvz')
+	t = TSVZ.TSVZed(p, verbose=False, append_check_delay=60)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	t['q'] = ['q', '1']
+
+	def refused(*args, **kwargs):
+		raise OSError(errno.EIO, 'no clear')
+	monkeypatch.setattr(TSVZ, '_specClear', refused)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		t.clear()
+	monkeypatch.undo()
+	t.close()
+	assert dict(t) == TSVZ.readTabularFile(p, verbose=False) == {'a': ['a', '1'], 'q': ['q', '1']}
+
+
+def test_a_tsvz_clear_cut_before_its_job_starts_leaves_memory_as_the_file(tmp_path, monkeypatch):
+	# 5.14 emptied memory in the calling thread before it handed the file's clear to the writer thread: a Ctrl-C in the
+	# wait left memory empty and the file full (104 of 218 steps of a .tsvz clear() on 3.14).
+	p = str(tmp_path / 's.tsvz')
+	t = TSVZ.TSVZed(p, verbose=False, append_check_delay=60)
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '2']
+	t.commitAppendToFile()
+	letGo = _the_writer_thread_held_off(t)
+	_a_ctrl_c_in_this_threads_waits(monkeypatch)
+	with pytest.raises(KeyboardInterrupt):
+		t.clear()
+	monkeypatch.undo()
+	assert dict(t) == {'a': ['a', '1'], 'b': ['b', '2']}
+	letGo()
+	t.close()
+	assert dict(t) == TSVZ.readTabularFile(p, verbose=False)
 
 
 # --------------------------------------------------------------------------

@@ -244,8 +244,10 @@ exits 1 with the message.
 A `TSVZed` writes a `.tsv`, `.csv`, `.nsv` or `.psv` file (compressed or not) from
 its background thread only: `rewrite()`, `mapToFile()`, `hardMapToFile()`,
 `commitAppendToFile()`, `clear()`, `clear_file()`, `reload()`, `close()` and the
-constructor's load hand it the job and wait, so a Ctrl-C stops the wait, never the
-write (the call still raises `KeyboardInterrupt`). At exit a write in progress is
+constructor's load hand it the job and wait, so a Ctrl-C stops the wait: a write the
+thread has begun is finished, one it has not begun is not made (its rows stay queued
+for the next commit), and a load stops, leaving memory as it was (the call still
+raises `KeyboardInterrupt`). At exit a write in progress is
 finished: a Ctrl-C then says so and keeps waiting, and a second one abandons it. A
 closed store is freed. (`get_file_obj()` and `release_file_obj()`, kept from 3.39,
 hand the locked file to the calling thread; while it holds it, that thread must not wait

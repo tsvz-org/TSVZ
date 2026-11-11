@@ -164,31 +164,22 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   line, or memory and file can differ until the next reload." This entry is the duplicate line; memory and the file
   differing is the deferral above, which is wider (a loose store's next rewrite can lose the set or undo the delete).
 
-### A Ctrl-C during a long load takes a second or so to end the program
+### A Ctrl-C while the writer thread reloads after another process's change waits for that reload
 - Kind: deferred
-- What the operator sees: a program whose store is still loading when a Ctrl-C ends it (the constructor's load, or
-  `reload()`) ends up to a second or two later, however big the store, once its load takes that long. A 1.5M-row store
-  (6.5 s to load on 3.14, 8 s on 3.6) and one Ctrl-C a second in: `.tsvz` 0.7 to 1.7 s on 3.14 (ten runs at host loads of
-  12 to 170: the idler the host, the slower) and 0.2 to 0.9 s on 3.6 (three runs); `.tsv` 0.8 to 1.3 s on 3.14 in 5.13
-  and 1.5 to 1.9 s in 5.12, and 0.16 s on 3.6 in 5.12. 5.12's `.tsvz` ended in 0.1 s on 3.14 and 0.06 s on 3.6, as its
-  load ran in the main thread. 5.13 before its exit let go of an idle `.tsvz` store waited for the rest of the load: 5.4 s
-  on 3.14, 8.1 s on 3.6.
-- Why: the load runs on the store's writer thread, which goes on running Python code while the main thread prints the
-  Ctrl-C's traceback and shuts down. They share the GIL, and each file read by the main thread waits up to the 5 ms
-  switch interval for it. On 3.14 the traceback took 0.92 s to print at the default interval and 0.06 s at 0.2 ms, and the
-  process ended 1.3 s after the Ctrl-C against 0.28 s.
-- Plan (5.15): stop a load when a Ctrl-C ended the wait for it: a flag the part reader polls once per chunk (it reads in
-  chunks already), set by `_call` for a load job, so the load changes nothing in memory and the writer thread stops
-  taking the GIL; the loose store's `_readFrom` the same. Check that the worker thread survives the cancel.
-  With it: a job whose wait a Ctrl-C ended and that has not started is taken back. Today it still runs later, and for
-  `clear()` that is after whatever the program set once it caught the Ctrl-C: those rows go from a loose store's
-  memory and file (5.12 the same), and from a `.tsvz` store's file while its memory keeps them (new in 5.13: 5.12's
-  `.tsvz` clear ran in the calling thread and was cut where the Ctrl-C landed). In the final review's sweep, 45 of the
-  227 steps of a `.tsvz` `clear()` (those of its wait) lost the two rows set after the caught interrupt.
-- Revisit when: 5.15.
-- Noted: 2026-11-09, found when the fix for the `.tsvz` load's wait was measured in the 5.13 fix round; a deferral, not
-  asked. 2026-11-10: the interrupted `clear()` added (5.13 final review); moved to 5.15, as the compaction release
-  comes first.
+- What the operator sees: a program with a big store open ends up to a second or two after its Ctrl-C when the Ctrl-C
+  comes while the store's writer thread reads the file again after another process changed it: a `.tsvz` store's
+  sync after another process's append, or a loose store's read of a file another process replaced. 5.15 stops a load
+  a Ctrl-C took the waiter from (the constructor's, `reload()`), but this read is the thread's own tick, which no one
+  waits for, so it does not stop. A 1.5M-row store, SIGINT 0.3 s after the change, medians of 7 runs (5.14, then
+  5.15): on Python 3.14, a `.tsvz` store's sync 1.47 and 1.22 s and a loose store's read of a replaced file 0.97 and
+  0.97 s, where one with no read under way ends in 0.41 to 0.57 s; on 3.6, 0.46 to 0.97 s against 0.46 to 0.52 s.
+- Why: the tick's reads run inside its sync, which also serves its commits and rewrites; a stop there needs its own
+  flag set at exit and its own sweep of the write path, more than this release's load stop.
+- Plan (5.16): the tick's reload, both kinds, runs with a stop of its own that `_atExit` sets when it lets go of the
+  store (for a loose store, the same swap of its reader's file), and `_appendWork` ends on `_LoadStopped`; with a
+  sweep of the tick's write path.
+- Revisit when: 5.16.
+- Noted: 2026-11-10, found by the 5.15 plan's measurement; a deferral, not asked.
 
 ### A write after close(), or in a forked child, can be cut by a Ctrl-C
 - Kind: known limitation

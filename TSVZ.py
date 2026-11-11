@@ -593,6 +593,25 @@ def _fileIdentity(st):
 _KNOWN_NOTHING = ((None, None), 0, hashlib.sha256())
 
 
+class _LoadStopped(BaseException):
+	"""A load whose waiter a Ctrl-C took away stops (TSVZed._call): raised on the writer thread, where _runRequests keeps
+	it, and never seen elsewhere. A BaseException, so no ``except Exception`` on the way reports it as a failure."""
+
+
+class _Stopped(object):
+	"""Stands in for the file a load job reads once its waiter left (TSVZed._call): each read stops the load. Its methods
+	are named, not a __getattr__, which would raise out of a hasattr() that tools make on the module's globals."""
+	__slots__ = ()
+
+	def read(self, *args):
+		raise _LoadStopped
+
+	readline = seek = tell = read  # (what _HashingReader asks of its file)
+
+
+_STOPPED = _Stopped()
+
+
 class _HashingReader(object):
 	"""The open binary file ``f``, read through it: what is read is hashed (``digest``) and counted (``size``), so
 	that what a read parsed is what the store then knows the file holds, byte for byte, even when another writer
@@ -1269,6 +1288,7 @@ class _Reporter(object):
 		self.path = path
 		self.teeLogger = teeLogger
 		self._events = OrderedDict()
+		self.stop = None  # a load job (TSVZed._specReload): its reads stop once the job's waiter left (TSVZed._call)
 
 	def note(self, kind, where, detail):
 		event = self._events.get(kind)
@@ -4298,6 +4318,8 @@ def _iterPartLines(info, reporter, label=''):
 		offset = 0
 		try:
 			for chunk in chunks:
+				if reporter.stop is not None and reporter.stop[5]:
+					raise _LoadStopped  # (once a chunk: the load's waiter left, TSVZed._call)
 				if chunk is None:  # a damaged member ended: the unfinished line before the next member is dropped
 					rest = b''
 					atStart = False  # the part's bytes began before this point (spec §4.7)
@@ -5987,7 +6009,8 @@ class TSVZed(OrderedDict):
 	- Thread-safe for concurrent access from multiple threads.
 	- A legacy file (.tsv, .csv, .nsv, .psv, compressed or not) is written by the store's background thread
 	  only: rewrite(), mapToFile(), hardMapToFile(), commitAppendToFile(), clear(), reload() and close() hand
-	  it the job and wait for it, so a KeyboardInterrupt stops the wait, never the write. At exit, a write in
+	  it the job and wait for it, so a KeyboardInterrupt stops the wait: a write the thread has begun is finished,
+	  one it has not begun is taken back (its rows stay queued), and a load stops (5.15). At exit, a write in
 	  progress is finished (a second Ctrl-C abandons it); a store with nothing to write is not waited for. A
 	  .tsvz-family store's commitAppendToFile(), clear() and reload() are handed to it the same way (5.13; they
 	  ran in the calling thread, whose Ctrl-C could leave writeLock held, and the writer thread waited for it).
@@ -6185,6 +6208,7 @@ class TSVZed(OrderedDict):
 		if self.verbose:
 			self.__teePrintOrNot(f"Loading {self._fileName}")
 		reporter = _Reporter(self._fileName, self.teeLogger)
+		reporter.stop = self._loadJob  # (reload()'s job: the read stops once its waiter left)
 		load = None
 		with self.writeLock:
 			dirMtime = _dirMtimeNs(self._fileName)  # before the read: a part created during it is a change
@@ -6688,11 +6712,21 @@ class TSVZed(OrderedDict):
 		reporter.flush()
 		return True
 
-	def _specClearFile(self):
-		"""clear_file for .tsvz (design §5.8): commit queued markers, then clear in place."""
+	def _specClearFile(self, dropRows=False):
+		"""clear_file for .tsvz (design §5.8): commit queued markers, then clear in place. ``dropRows`` (clear()): memory is
+		emptied as the queue is listed, in one section of this job (5.15; before, clear() emptied memory in its own thread
+		first, and a Ctrl-C before the job ran left memory empty and the file full). A row set before it is listed,
+		written, then cleared from the file: in neither. One set after it is queued behind the listed rows and written
+		after the clear: in both. When the listed rows cannot be written or the file cleared, the next tick reloads
+		(deSynced): memory becomes the file with every queued row replayed, so none is dropped."""
 		try:
 			with self.writeLock:
-				if not self._specCommitLocked():  # (rows set since may be queued: the return says whether it wrote)
+				items = None
+				if dropRows:
+					with self._memLock:
+						OrderedDict.clear(self)
+						items = list(self.appendQueue)
+				if not self._specCommitLocked(items):  # (the rows queued before the clear: their markers outlive it)
 					self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: queued records could not be committed; not clearing",'error')
 					self.deSynced = True
 					return self
@@ -6717,11 +6751,11 @@ class TSVZed(OrderedDict):
 		# clear the dictionary and update the file
 		if self.verbose:
 			self.__teePrintOrNot(f"Clearing {self._fileName}")
-		if self.memoryOnly or self._spec:
+		if self.memoryOnly:
 			super().clear()
-			if self.memoryOnly:
-				return self
-			self.clear_file()
+			return self
+		if self._spec:
+			self._call(self._specClearFile, True)  # (memory too, in the job: _specClearFile)
 		else:
 			self._call(self._clearFile, True)
 		self._accepted()  # nothing is left to refuse: a later refusal is reported again
@@ -7021,6 +7055,8 @@ memoryOnly:{self.memoryOnly}
 	_writing = 0  # write jobs and writes under way on the writer thread (_startWrite): the exit lets go of none of them
 	_letGo = False  # the exit let go of the store (_atExit), or abandoned it: its writer thread starts no write
 	_exiting = False  # _stopLiveStores stops it at exit: a Ctrl-C there finishes the store, which does not run on
+	_loadJob = None  # the load job (reload()'s) the writer thread runs: it stops once its waiter left (_call)
+	_loadReader = None  # that load's reader of a loose file, whose file _call swaps for _STOPPED
 
 	def _refuse(self, where, error, explicit=False):
 		"""Remember that a rewrite was refused with ``error``; raise it for an ``explicit`` call, else report it once.
@@ -7566,6 +7602,11 @@ memoryOnly:{self.memoryOnly}
 		if f is not None:
 			codec = _fileCodec(self._fileName)
 			reader = _HashingReader(f)
+			job = self._loadJob
+			if job is not None:  # (reload()'s job: _call swaps the reader's file for _STOPPED once its waiter left)
+				self._loadReader = reader
+				if job[5]:
+					raise _LoadStopped
 			reporter = _Reporter(self._fileName, self.teeLogger)
 			try:
 				f.seek(0)
@@ -7727,21 +7768,38 @@ memoryOnly:{self.memoryOnly}
 				self.__teePrintOrNot(f"Time anomalies detected in {self._fileName}, resetting externalFileUpdateTime")
 
 	def _call(self, fn, *args):
-		"""``fn(*args)``, run on the store's writer thread while this one waits: a KeyboardInterrupt stops the wait, never
-		the write. Run here on that thread itself, or when it is not running (after close, in a forked child)."""
+		"""``fn(*args)``, run on the store's writer thread while this one waits. A KeyboardInterrupt stops the wait: a
+		write the thread has begun is finished, one it has not begun is taken back (its rows stay queued), and a load
+		stops (5.15). Run here on that thread itself, or when it is not running (after close, in a forked child)."""
 		if self.appendThread is threading.current_thread() or not self._workerRuns():
 			return fn(*args)
 		self._memLock.letGo()  # (no section waits for the writer thread, which may need the lock: a hold is a Ctrl-C's)
-		job = [fn, args, _Flag(), None, None]
-		self._requests.append(job)
-		self._wake.set()
-		while not _waited(job[2], 0.1):  # in steps: a Ctrl-C stops the wait on every platform
-			if not self._workerRuns():  # it stopped before it took the job
+		job = [fn, args, _Flag(), None, None, False]  # fn, args, done, result, error, stop (its waiter left: a load stops)
+		try:  # (from before the job is queued: a Ctrl-C between the two would leave it to run)
+			self._requests.append(job)
+			self._wake.set()
+			while not _waited(job[2], 0.1):  # in steps: a Ctrl-C stops the wait on every platform
+				if not self._workerRuns():  # it stopped before it took the job
+					try:
+						self._requests.remove(job)
+					except ValueError:
+						continue
+					return fn(*args)
+		except BaseException:
+			# A Ctrl-C ended the wait. A job not started is taken back: it never runs, so a clear() cannot come after rows
+			# the program sets once it caught the Ctrl-C (5.14 ran it later). Not at exit, where queued and running writes
+			# are finished. A load under way stops at its next read and changes nothing (_LoadStopped), so the writer
+			# thread lets go of the interpreter and the program ends.
+			job[5] = True
+			if not self._exiting:
 				try:
 					self._requests.remove(job)
 				except ValueError:
-					continue
-				return fn(*args)
+					pass  # started (a write runs to its end; a load stops), or never queued
+			reader = self._loadReader
+			if reader is not None and self._loadJob is job:
+				reader.f = _STOPPED  # (a loose load: its next read stops it; nothing is tested per line)
+			raise
 		if job[4] is not None:
 			raise job[4]
 		return job[3]
@@ -7787,8 +7845,10 @@ memoryOnly:{self.memoryOnly}
 					job[3] = None
 				else:
 					try:
+						self._loadJob = job if job[0] in (self._reload, self._specReload) else None  # (only a load stops)
 						job[3] = job[0](*job[1])
 					finally:
+						self._loadJob = self._loadReader = None
 						if writes:
 							self._endWrite()
 			except BaseException as e:
