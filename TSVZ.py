@@ -6557,7 +6557,7 @@ class TSVZed(OrderedDict):
 		self._readWhole = True
 		self.defaults = defaults
 
-	def _specAgain(self, record, requeue=True):
+	def _specAgain(self, record):
 		"""(.tsvz) Memory as ``record`` makes it, replayed as a read replays a queued record (_specReplayQueued)."""
 		quiet = _Reporter('')  # (never flushed: reported when it was queued)
 		for line in record.split('\n'):
@@ -6573,8 +6573,7 @@ class TSVZed(OrderedDict):
 				OrderedDict.__setitem__(self, key, row)
 		self.defaults = list(self._specState.defaults)
 		self.dirty = True
-		if requeue:
-			self._requeue(record)
+		self._requeue(record)
 
 	def _shapeRow(self, key, value, columns, defaults, load=False):
 		"""The row ``__setitem__`` keeps for ``key`` (stripped, not empty) and the column count after it; None when strict refuses it.
