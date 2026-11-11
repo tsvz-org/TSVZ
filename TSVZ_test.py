@@ -267,9 +267,9 @@ def test_basic_roundtrip():
 
 
 def test_version():
-	# (the scripts report the full form; pip and PyPI show it as 5.12)
-	assert TSVZ.version == '5.13'
-	assert TSVZ.__version__ == '5.13'
+	# (the scripts report the full form; pip and PyPI show it as 5.14)
+	assert TSVZ.version == '5.14'
+	assert TSVZ.__version__ == '5.14'
 	assert not hasattr(TSVZ, 'WalStore')
 
 
@@ -14732,8 +14732,8 @@ def test_a_delete_commit_compacts_for_every_count_the_files_readers_read_at(tmp_
 	(b'd\tX\na\nd\tY\n', b'd\tX\nd\nd\tY\n', None),
 	# (d's next line wider than line 1: 3.39's strict reader at two columns would not take it back; nothing stands in)
 	(b'd\tX\na\nd\tY\tZ\n', b'd\tX\nd\tY\tZ\n', {'339-loose-H': 'cell'}),
-	# (a defaults line first: nothing stands in, as before)
-	(b'd\tX\na\n#_defaults_#\tP\nd\tY\n', b'd\tX\n#_defaults_#\tP\nd\tY\n', {'339-loose-H': 'cell'}),
+	# (a defaults line first: 5.10 to 5.12 let nothing stand in; from 5.14 d stands in past a defaults line that holds a value)
+	(b'd\tX\na\n#_defaults_#\tP\nd\tY\n', b'd\tX\nd\n#_defaults_#\tP\nd\tY\n', None),
 ])
 def test_line_1s_key_stands_in_when_its_next_line_is_as_wide_as_line_1(tmp_path, door, text, written, differ):
 	kwargs = {'strict': False} if door == 'lite' else {}
@@ -17872,3 +17872,210 @@ def test_after_line_1s_key_stands_in_a_rewrite_widens_and_keeps_the_order_where_
 	assert _bytes(p) == b'd\tX\tz\nd\t1\t\na\t1\t2\t3\n'
 	for mod in (TSVZ, TSVZ_old):
 		assert list(mod.readTabularFile(p, header=H, strict=False, verbose=False)) == ['d', 'a']
+
+
+# --------------------------------------------------------------------------
+# 5.14: the compaction entries deferred from 5.12 (docs/limitations.md)
+# --------------------------------------------------------------------------
+def test_a_one_column_compaction_given_the_defaults_count_plans_that_reader_once():
+	# The one-column rule's branch and the loop over the counts given each listed the reader at the defaults' count.
+	for consumed in (True, False):
+		readers = TSVZ._legacyCompactReaders([b'a', b'c'], 1, consumed, [D_, 'P'], '\t', 'utf8', False, (2,))
+		assert readers.count((2, consumed, False, [D_, 'P'])) == 1, readers
+		assert len(readers) == len({(w, c, m, tuple(d)) for w, c, m, d in readers}), readers
+
+
+def test_a_compaction_moves_a_line_up_where_a_later_deletion_ends_the_other_readers_life_of_the_key(tmp_path):
+	# 5.12's agrees() took a key's last line moved up into its first line's place only where the deletion that ends the
+	# other reader's life of the key was that line itself. Here the one-column plans move the second b\t up into b\tX's
+	# place, and the reader given no header and the defaults (three columns) reads b deleted at the first b\t: the move was
+	# refused and every line kept. A later deletion of the key, with no row of it between, reads the same to that reader.
+	p = str(tmp_path / 'f.tsv')
+	text = b'id\nb\tX\nb\t\nb\t\na\t1\t\tX\na\t2\t\t2\n#_defaults_#\n'
+	defaults = [D_, 'P', 'Q']
+	_touch(p, text)
+	before = _planned_views(p, 'id', 'a', defaults)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		TSVZ.scrubTabularFile(p, header='a', defaults=list(defaults), correctColumnNum=2)
+	assert _bytes(p) == b'id\nb\t\na\t2\t\t2\n#_defaults_#\n'  # (5.11's bytes; 5.12 kept b\tX and both b\t lines)
+	assert _planned_views(p, 'id', 'a', defaults) == before
+
+
+def test_a_delete_commit_moves_a_lone_key_up_past_its_later_deletion(tmp_path):
+	# (the delete door: the store given q reads a\na as a row and its value, and the readers that count from line 1 read
+	# both as deletions of a key they never had; 5.12 kept the pair)
+	p = str(tmp_path / 'f.tsv')
+	mem = _delete_reads_as_before(p, b'd\tX\nc\nd\t1\na\na\n', 'c', b'd\tX\nd\nd\t1\na\n', 'q', 'zed')
+	assert list(mem) == ['d', 'a']
+
+
+def _store_order_after_delete(p, text, H, key):
+	"""(memory's keys after a TSVZed given ``H`` deletes ``key`` and commits, a reopened store's keys)."""
+	_touch(p, text)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		t = TSVZ.TSVZed(p, header=H, verbose=False, append_check_delay=60, rewrite_on_load=False)
+		del t[key]
+		t.commitAppendToFile()
+		mem = list(t)
+		t.close()
+		t = TSVZ.TSVZed(p, header=H, verbose=False, append_check_delay=60, rewrite_on_load=False)
+		again = list(t)
+		t.close()
+	return mem, again
+
+
+def _counted_one(p):
+	"""3.39's strict readTabularFile given a count of one and no header: it takes only the one-cell lines of a file."""
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		return list(TSVZ_old.readTabularFile(p, strict=True, verbose=False, correctColumnNum=1))
+
+
+def _deleted_by_a_store(p, text, H, key):
+	_touch(p, text)
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		t = TSVZ.TSVZed(p, header=H, verbose=False, append_check_delay=60, rewrite_on_load=False)
+		del t[key]
+		t.commitAppendToFile()
+		t.close()
+	return _bytes(p)
+
+
+@pytest.mark.parametrize('door', ['zed', 'cli', 'lite'])
+@pytest.mark.parametrize('H', ['q', 'd\tX\tz'])
+@pytest.mark.parametrize('defaults_line', [b'#_defaults_#\t\tQ', b'#_defaults_#\tP', b'#_defaults_#\tP\nnote\n#_defaults_#\t\tQ'])
+def test_line_1s_key_stands_in_past_a_defaults_line_that_holds_a_value(tmp_path, door, H, defaults_line):
+	# 5.12 tried line 1's key only where its next line came first after the place, so with a defaults line between, a stood
+	# in (d\tX\na\n#_defaults_#\t\tQ\nd\t1\na\n), and a reopened store and the loose readers given the header listed a, d.
+	# Past a defaults line whose first value is in its second cell, or in its third after a line 1 of two cells, every reader
+	# that took line 1 takes a line as wide (3.39 cuts a defaults line to its count and keeps that value), so line 1's key
+	# stands in (a first value that comes later: test_line_1s_key_does_not_stand_in_past_a_defaults_line_3_39_turns_strict_at).
+	p = str(tmp_path / 'f.tsv')
+	text = b'd\tX\nc\n' + defaults_line.replace(b'note', b'# note') + b'\nd\t1\na\n'
+	kwargs = {'strict': False} if door == 'lite' else {}
+	written = text.replace(b'\nc\n', b'\nd\n', 1)
+	_delete_reads_as_before(p, text, 'c', written.replace(b'# note\n', b'') if door == 'zed' else written, H, door, None, **kwargs)
+	assert _store_order_after_delete(p, text, H, 'c') == (['d', 'a'], ['d', 'a'])
+	assert _counted_one(p) == ['d', 'a']  # (the approved 3.39 entry: that reader shows line 1's key)
+
+
+def test_a_reset_between_the_place_and_line_1s_key_keeps_5_12s_stand_in(tmp_path):
+	# A defaults line with no value resets a reader's defaults: a strict reader given no header and defaults of three cells
+	# with a value takes d\tX (they fill it) and not d\t1 after the reset, so a stand-in of d would lose d for it.
+	p = str(tmp_path / 'f.tsv')
+	text = b'd\tX\nc\n#_defaults_#\t\nd\t1\na\n'
+	strict = [functools.partial(mod.readTabularFile, strict=True, verbose=False, defaults=[D_, 'P', 'Q']) for mod in (TSVZ, TSVZ_old)]
+	_touch(p, text)
+	assert all('d' in read(p) for read in strict)
+	assert _run('--x-header', 'q', 'delete', p, 'c')[0] == 0
+	assert _bytes(p) == b'd\tX\na\n#_defaults_#\t\nd\t1\na\n'
+	assert all('d' in read(p) for read in strict)
+
+
+@pytest.mark.parametrize('door', ['zed', 'cli', 'lite'])
+@pytest.mark.parametrize('H', ['q', 'd\tX\tz'])
+def test_the_first_row_after_the_place_stands_in_so_readers_given_the_header_keep_the_order(tmp_path, door, H):
+	# 5.11 and 5.12 let a stand in for c (a key whose later line holds no value): d\tX\na\nb\t1\t2\na\n, and a reopened store
+	# and every loose reader given the header, which count from the place, listed a, b where memory lists b, a. The first
+	# row after the place stands in now, before a later key without a value: those readers read b there first, as they
+	# read b\t1\t2 first before, and the readers that count from line 1 read it as the deletion of a key not yet read.
+	p = str(tmp_path / 'f.tsv')
+	text = b'd\tX\nc\nb\t1\t2\na\n'
+	kwargs = {'strict': False} if door == 'lite' else {}
+	_delete_reads_as_before(p, text, 'c', b'd\tX\nb\nb\t1\t2\na\n', H, door, None, **kwargs)
+	assert _store_order_after_delete(p, text, H, 'c') == (['b', 'a'], ['b', 'a'])
+	# (what it costs: 3.39's strict reader given a count of one, which takes only one-cell lines, shows b, as it shows line
+	# 1's key where that stands in: the approved 3.39 entry's kind)
+	assert _counted_one(p) == ['b', 'a']
+
+
+def test_without_a_line_1_of_two_cells_the_first_row_after_the_place_does_not_stand_in(tmp_path):
+	# (no header: the place is line 1, and 3.39's strict reader given none counts from it at one column and would gain b;
+	# a line 1 of one cell: its readers read the stand-in as a row too. 5.12's stand-in stays in both.)
+	p = str(tmp_path / 'f.tsv')
+	assert _deleted_by_a_store(p, b'c\nb\t1\t2\na\n', '', 'c') == b'a\nb\t1\t2\na\n'
+	assert _deleted_by_a_store(p, b'id\nc\nb\t1\t2\na\n', 'id\tv', 'c') == b'id\na\nb\t1\t2\n'  # (the commit compacts a\na)
+
+
+
+
+def test_line_1s_key_does_not_stand_in_past_a_defaults_line_3_39_turns_strict_at(tmp_path):
+	# 3.39 cuts a defaults line to its count. Given a count below the cell of the line's first value, and defaults whose
+	# values all lie beyond that count (so it reads leniently and takes line 1), it holds no value after the line, turns
+	# strict and drops a row of line 1's key that is not as wide as its count: a stand-in of d would lose d for it.
+	p = str(tmp_path / 'f.tsv')
+	for text, count, defaults in ((b'd\tX\tW\nc\n#_defaults_#\t\t\tR\nd\t1\t2\n', 2, [D_, '', 'Q']),
+								  (b'd\tX\tW\nc\n#_defaults_#\t\tQ\nd\t1\t2\n', 2, [D_, '', 'Q']),
+								  (b'd\tX\nc\n#_defaults_#\t\t\tR\nd\t1\na\n', 3, [D_, '', '', 'R'])):
+		def read(p, count=count, defaults=defaults):  # (3.39 changes the defaults list it is given: a new one each read)
+			return TSVZ_old.readTabularFile(p, strict=True, verbose=False, correctColumnNum=count, defaults=list(defaults))
+		_touch(p, text)
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			assert 'd' in read(p)
+		assert _run('--x-header', 'q', 'delete', p, 'c')[0] == 0
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			assert 'd' in read(p), _bytes(p)
+
+
+@pytest.mark.parametrize('reset', [b'#_defaults_#\t', b'#_defaults_#\t\t'])
+def test_the_first_row_of_another_key_stands_in_past_a_reset(tmp_path, reset):
+	# (a reset stops line 1's key's search, not another key's: its stand-in deletes a key no reader that counts from line 1
+	# has read, whatever its defaults)
+	p = str(tmp_path / 'f.tsv')
+	text = b'd\tX\nc\n' + reset + b'\nb\t1\t2\na\n'
+	_delete_reads_as_before(p, text, 'c', text.replace(b'\nc\n', b'\nb\n', 1), 'q', 'cli', None)
+	assert _store_order_after_delete(p, text, 'q', 'c') == (['b', 'a'], ['b', 'a'])
+
+
+@pytest.mark.parametrize('text, header, defaults, once', [
+	(b'b\nc\nc\t2\nc\n', '', [D_, 'P'], b'b\nc\n'),
+	(b'c\na\na\tX\t2\na\n', '', [D_, ''], b'c\na\n'),
+	(b'id\tv\na\na\tX\na\n', 'id\tv\tw', None, b'id\tv\na\n'),
+	(b'id\na\nb\tX\na\nb\t\n', '', [D_, 'P'], b'id\na\nb\t\n'),
+	(b'id\na\t1\t1\nb\t\nd\tX\nb\tX\nd\tX\nb\t\nd\t\n', 'id\tz', [D_, 'P'], b'id\na\t1\t1\nb\t\nd\t\n'),
+])
+def test_a_scrub_leaves_nothing_for_a_second_scrub_where_it_weighed_a_later_deletion(tmp_path, text, header, defaults, once):
+	# 5.14's agrees() takes a lone key's last line up into its first line's place past a later deletion of the key, where
+	# the other reader reads no row of the key between them. Either way that goes, a second scrub then dropped more, where
+	# 5.13 wrote the first scrub's bytes and stayed there. Refused (the first three: the other reader reads c\t2 between):
+	# the pass drops that row, dead to both readers, and only the next finds the move free (b\nc\nc\n, then b\nc\n).
+	# Taken (the fourth): the second a goes, which lay between b's lines, and only the next pass moves b's last line up
+	# (id\na\nb\tX\nb\t\n, then id\na\nb\t\n). The fifth is both, one after the other. The compaction runs the pass
+	# again itself.
+	p = str(tmp_path / 'f.tsv')
+	kwargs = dict(header=header, strict=False)
+	if defaults:
+		kwargs['defaults'] = list(defaults)
+	line1 = text.split(b'\n')[0].decode()
+	_touch(p, text)
+	before = _planned_views(p, line1, header, defaults)
+	for _ in range(2):  # (the second scrub changes nothing)
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			TSVZ.scrubTabularFile(p, **kwargs)
+		assert _bytes(p) == once
+		assert _planned_views(p, line1, header, defaults) == before
+
+
+def test_a_pass_that_weighed_a_later_deletion_asks_for_another():
+	# (the pass itself: refusing the move, then taking it, it says another pass can drop more; the third weighs nothing)
+	args = (1, False, [D_, 'P'], '\t', 'utf8', False)
+	lines, again = TSVZ._legacyCompactOnce([b'b', b'c', b'c\t2', b'c'], *args)
+	assert (lines, again) == ([b'b', b'c', b'c'], True)
+	assert TSVZ._legacyCompactOnce(lines, *args) == ([b'b', b'c'], True)
+	assert TSVZ._legacyCompactOnce([b'b', b'c'], *args) == ([b'b', b'c'], False)
+	assert TSVZ._legacyCompact([b'b', b'c', b'c\t2', b'c'], *args) == [b'b', b'c']
+
+
+def test_a_rewrite_leaves_nothing_for_a_second_rewrite_where_it_weighed_a_later_deletion(tmp_path):
+	# (the same through a TSVZed rewrite: 5.14 before this wrote id\tv\na\na\n, and id\tv\na\n at the next rewrite)
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, b'id\tv\na\na\tX\na\n')
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		t = TSVZ.TSVZed(p, header='id\tv\tw', strict=False, verbose=False, append_check_delay=60, rewrite_on_load=False)
+		try:
+			t.hardMapToFile()
+			first = _bytes(p)
+			t.hardMapToFile()
+			second = _bytes(p)
+		finally:
+			t.close()
+	assert first == second == b'id\tv\na\n'
