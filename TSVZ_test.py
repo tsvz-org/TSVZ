@@ -18269,7 +18269,8 @@ import multiprocessing, os, signal, sys, threading, time
 sys.path.insert(0, sys.argv[1])
 import TSVZ
 case, p = sys.argv[2], sys.argv[3]
-t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)  # (no tick writes)
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60,  # (no tick writes)
+				rewrite_on_exit=case == 'file-rewrite')
 t['a'] = ['a', '1']
 t.commitAppendToFile()
 
@@ -18314,9 +18315,12 @@ elif case in ('held', 'nohook'):  # a parent thread holds writeLock at the fork 
 		status(forked(lambda: t.__setitem__('c', ['c', '1'])))
 	else:
 		status(forked(lambda: (t.__setitem__('c', ['c', '1']), t.close())))
-elif case == 'file':  # the parent holds get_file_obj() across the fork, and waits for the child before it lets go
+elif case.startswith('file'):  # the parent holds get_file_obj() across the fork, and waits for the child before it lets go
 	f = t.get_file_obj('ab')
-	status(forked(lambda: t.__setitem__('c', ['c', '1'])))
+	def body():  # ('file-desynced': another process changed the file, and the parent's writer thread has not followed yet)
+		t['c'] = ['c', '1']
+		t.deSynced = case == 'file-desynced'
+	status(forked(body))
 	t.release_file_obj(f)
 elif case in ('mp', 'mpclose'):  # multiprocessing's fork child ends by os._exit
 	def body():
@@ -18332,16 +18336,20 @@ t.close()
 
 
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
-@pytest.mark.parametrize('case', ['exit', 'close', 'queued', 'held', 'file', 'mp', 'mpclose', 'nohook'])
+@pytest.mark.parametrize('case', ['exit', 'close', 'queued', 'held', 'file', 'file-rewrite', 'file-desynced', 'mp', 'mpclose', 'nohook'])
 @pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
 def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(tmp_path, ext, case):
 	# 5.14: a child that fork() made wrote nothing at its close or exit, and its commit wrote the rows its parent had
 	# queued too, so they were written twice, and an older row could land after the parent's newer one. At the fork the
 	# child's copy now drops the parent's queue and takes new locks (a parent thread may have held one); its close and
 	# normal exit write what it set, but where its parent held the file through get_file_obj() (it may be waiting for the
-	# child) or no fork hook ran: there it writes nothing, as 5.14 did, and says so.
+	# child) or no fork hook ran: there it writes nothing, as 5.14 did, and says so. It does not rewrite or sync either, which
+	# wait for the lock the parent holds: with rewrite_on_exit, or a store another process's change left to follow
+	# (deSynced), 5.14 and 5.15's first build waited for ever there, as a child that sets a row (5.15 review).
 	if case == 'nohook' and sys.version_info >= (3, 7):
 		pytest.skip('3.6: the fork hook is a wrapper of threading._after_fork')
+	if case == 'file-rewrite' and ext == 'tsvz':
+		pytest.skip('rewrite_on_exit is ignored for .tsvz')
 	p = str(tmp_path / ('s.' + ext))
 	script = tmp_path / 'forked.py'
 	script.write_text(_FORKED)
@@ -18356,8 +18364,8 @@ def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(t
 	assert ('c' in rows) == written and lines.count(b'c') == int(written), (rows, done.stderr)
 	if case == 'queued':
 		assert rows['p1'] == ['p1', 'new'] and lines.count(b'p1') == 2  # (the parent's two: the child dropped its copy)
-	if case in ('file', 'nohook'):
-		said = 'its parent held the file (get_file_obj) at the fork' if case == 'file' else 'no fork hook ran in it'
+	if case.startswith('file') or case == 'nohook':
+		said = 'its parent held the file (get_file_obj) at the fork' if case.startswith('file') else 'no fork hook ran in it'
 		assert done.stderr.count(said) == 1, done.stderr
 
 

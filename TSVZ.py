@@ -8286,7 +8286,9 @@ memoryOnly:{self.memoryOnly}
 		try:
 			# Once the exit let go of the store, a close() (another exit handler's) still writes what is queued, here.
 			if not self.shutdownEvent.is_set() or self._letGo:
-				if self._spec:
+				if not (self._workerRuns() or self._commitsAtClose()):
+					pass  # (a forked child that writes nothing at its close: no rewrite or sync either, which wait for the file's lock)
+				elif self._spec:
 					self._specSync()
 					if not self._workerRuns() and self._commitsAtClose():
 						self._specCommit()  # (no writer thread: a forked child's, or the exit let go of the store)
@@ -8330,11 +8332,12 @@ memoryOnly:{self.memoryOnly}
 		self._forkReset = os.getpid()
 
 	def _commitsAtClose(self):
-		"""True where a store with no writer thread writes its queue at close (stopAppendThread): in the process that made
-		it (the exit let go of it), or in a forked child that the fork hook reset and whose parent did not hold the file
-		through get_file_obj() at the fork. Elsewhere it writes nothing there, as 5.14's child did (one forked while a
-		parent thread held writeLock would wait for ever on its copy; one whose parent holds the file while it waits for
-		the child would wait for the parent), and says so once."""
+		"""True where a store with no writer thread writes at close (stopAppendThread: its queue, and the rewrite or sync
+		it makes first): in the process that made it (the exit let go of it), or in a forked child that the fork hook reset
+		and whose parent did not hold the file through get_file_obj() at the fork. Elsewhere it writes nothing there, as
+		5.14's child did, rewrite_on_exit and a pending sync included (one forked while a parent thread held writeLock
+		would wait for ever on its copy; one whose parent holds the file while it waits for the child would wait for the
+		parent), and says so once."""
 		if self._workerPid == os.getpid() or (self._forkReset == os.getpid() and not self._parentHeldFile):
 			return True
 		if self.appendQueue:
