@@ -16944,6 +16944,12 @@ def tracer(frame, event, arg):
 		return None
 	if opcodes:
 		frame.f_trace_opcodes = True
+		if event != 'opcode' and sys.version_info < (3, 12):
+			# counted and raised at opcode events only, up to 3.11: on 3.9 an opcode event right after a line event overwrites
+			# the line event's error, and the next C call then fails with SystemError ('returned a result with an error
+			# set'). 3.12+ (settrace over sys.monitoring) sends no opcode event to a frame that turns them on at its call
+			# event, so there every event is a step, as before.
+			return tracer
 	left[0] -= 1
 	if not left[0]:
 		raise KeyboardInterrupt
