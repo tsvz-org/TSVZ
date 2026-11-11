@@ -6525,14 +6525,32 @@ class TSVZed(OrderedDict):
 		if item is not None:
 			self._requeue(item)
 
-	def _moveAgain(self, moved, lines):  # (move_to_end: its moved rows, then its lines in one step, unless still last)
+	def _moveAgain(self, moved, key, last):  # (move_to_end: its order again, from the rows memory holds now)
+		"""move_to_end's order, made again from the rows memory holds now, never the rows the section captured: a signal
+		handler's own change of a row (a set, a delete, a reload) is kept, and only the order is restored. The keys
+		the move sends to the end (``key`` for a move to the end, every other key for one to the beginning) go there in
+		memory as the section sent them, the keys memory holds that the section did not capture (a handler's) after them,
+		and fresh lines (_queueMove) send them there in the file. A key of ``moved`` that memory no longer holds gets its
+		deletion line: the section's own lines may have come after the handler's."""
+		if dict.__contains__(self, key):
+			OrderedDict.move_to_end(self, key, last)
+		ends = []  # (the keys that go to the end, in order)
 		for k, row in moved:
-			if not k.startswith('#'):
-				OrderedDict.__setitem__(self, k, row)
-				OrderedDict.move_to_end(self, k)
-		queue = self.appendQueue
-		if lines and not (queue and queue[-1] is lines[-1]):
-			queue.extend(lines)
+			if k.startswith('#'):
+				pass  # (memory only: its place in memory stays)
+			elif dict.__contains__(self, k):
+				ends.append(k)
+			else:
+				self._deleteLine(k, row)
+		if not last:
+			held = set(ends)
+			held.add(key)
+			for k in OrderedDict.keys(self):
+				if k not in held and not k.startswith('#'):
+					ends.append(k)
+		for k in ends:
+			OrderedDict.move_to_end(self, k)
+			self._queueMove(k, dict.get(self, k))
 
 	def _setDefaultsAgain(self, defaults):  # (setDefaults: no line; a read meanwhile can leave _readWhole False)
 		self._givenDefaults = list(defaults)
@@ -7089,11 +7107,11 @@ memoryOnly:{self.memoryOnly}
 				OrderedDict.move_to_end(self, key, last)
 				if self.memoryOnly:
 					return self
-				lines = self._queueMoves(moved)
+				self._queueMoves(moved)
 				self.lastUpdateTime = get_time_ns()
 				lost = not lock._is_owned()
 			if lost:
-				self._again(self._moveAgain, moved, lines)
+				self._again(self._moveAgain, moved, key, last)
 		except BaseException:
 			self._memLock.letGo()
 			raise
@@ -7114,11 +7132,9 @@ memoryOnly:{self.memoryOnly}
 		return moved
 
 	def _queueMoves(self, moved):
-		"""Queue the lines that move each of ``moved`` (_queueMove), the caller holding _memLock; the lines."""
-		lines = []
+		"""Queue the lines that move each of ``moved`` (_queueMove), the caller holding _memLock."""
 		for k, row in moved:
-			lines += self._queueMove(k, row)
-		return lines
+			self._queueMove(k, row)
 
 	def _queueMove(self, key, row):
 		"""Queue what moves ``key`` to the end of the legacy file for every reader, the caller holding _memLock: its
@@ -7127,7 +7143,7 @@ memoryOnly:{self.memoryOnly}
 		cell read, right-stripped) is not a line the format can write: their lines stay where they are."""
 		one = self._oneColumn(row)
 		if key.startswith('#') or not (one or any(row[1:])):
-			return ()
+			return
 		self.dirty = True
 		if one:
 			lines = [_DropKey([key])]
@@ -7139,7 +7155,6 @@ memoryOnly:{self.memoryOnly}
 		else:
 			lines.append(row)
 		self.appendQueue.extend(lines)  # (one step: a read the writer thread makes never replays half of it)
-		return lines
 
 	def __sizeof__(self):
 		sizeof = sys.getsizeof

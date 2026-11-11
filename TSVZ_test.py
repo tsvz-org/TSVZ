@@ -16925,8 +16925,9 @@ def test_the_exit_waits_for_the_writer_thread_through_waited(tmp_path, monkeypat
 #: and (a TSVZed) after one more write, a commit and close(), memory and the file agree but on the operation's own key
 #: (deferred: a Ctrl-C between a section's change of memory and its line). A handler's name: that signal handler run at
 #: the step, as a real signal's runs inside whatever the main thread was doing; then after a commit and close() memory
-#: and the file agree on every key, and the operation's own line is counted (written twice: docs/limitations.md, "A line
-#: can be written twice"). A case that has not ended in 25 s is a hang (its stacks printed), and the parent goes on after
+#: and the file agree on every key, the file's rows (their values and their order) are those of one of the two serial runs
+#: (the operation and then the handler, or the handler and then the operation), and the operation's own line is counted
+#: (written twice: docs/limitations.md, "A line can be written twice"). A case that has not ended in 25 s is a hang (its stacks printed), and the parent goes on after
 #: it: every hang the sweeps met was a wait for ever, while a case takes 1 to 20 ms. The parent prints the failures and the counts, and exits 1 on any failure or hang.
 _STEP_SWEEP = r"""
 import dis, faulthandler, os, shutil, subprocess, sys, threading
@@ -17069,6 +17070,7 @@ STORE_OPS = {
 	'pop': lambda t: t.pop('a'),
 	'popitem': lambda t: t.popitem(),
 	'move': lambda t: t.move_to_end('a'),
+	'move-first': lambda t: t.move_to_end('c', last=False),  # (every other key goes to the end)
 	'setdefaults': lambda t: t.setDefaults(['', 'D']),
 	'commit': lambda t: t.commitAppendToFile(),
 	'reload': lambda t: t.reload(),
@@ -17079,7 +17081,7 @@ STORE_OPS = {
 	'closed-rewrite': lambda t: t.rewrite(force=True),
 	'exit': None,
 }
-OPKEY = {'set': 'x', 'set-existing': 'a', 'del': 'a', 'pop': 'a', 'popitem': 'c', 'move': 'a'}
+OPKEY = {'set': 'x', 'set-existing': 'a', 'del': 'a', 'pop': 'a', 'popitem': 'c', 'move': 'a', 'move-first': 'c'}
 
 
 def theExit(t):
@@ -17221,12 +17223,14 @@ HANDLED_OPS = {
 	'pop': lambda t: t.pop('a'),
 	'popitem': lambda t: t.popitem(),
 	'move': lambda t: t.move_to_end('a'),
+	'move-first': lambda t: t.move_to_end('c', last=False),
 	'set-defaults-row': lambda t: t.__setitem__(T.DEFAULTS_INDICATOR_KEY, [T.DEFAULTS_INDICATOR_KEY, 'D']),
 	'del-defaults-row': lambda t: t.__delitem__(T.DEFAULTS_INDICATOR_KEY),
 	'setdefaults': lambda t: t.setDefaults(['', 'D']),
 	'set-marker': lambda t: t.__setitem__(T.DEFAULTS_INDICATOR_KEY, [T.DEFAULTS_INDICATOR_KEY, 'D']),
 }
 DEFAULTS_OPS = ('set-defaults-row', 'del-defaults-row', 'setdefaults', 'set-marker')
+MOVE_OPS = ('move', 'move-first')
 
 
 def own(t):
@@ -17252,6 +17256,7 @@ HANDLERS = {
 	'own': lambda t, p: own(t),
 	'commit': lambda t, p: t.commitAppendToFile(),  # (a flush on SIGUSR1)
 	'set': lambda t, p: t.__setitem__('z', ['z', '1']),
+	'set-b': lambda t, p: t.__setitem__('b', ['b', 'H']),  # (a row the operation may have captured)
 	'del': lambda t, p: t.__delitem__('b'),
 }
 # What a signal handler's clear() can make the operation it lands in raise, memory and the file agreeing: deferred to
@@ -17294,6 +17299,31 @@ def ownLines(d):
 	return _ownLines
 
 
+_serialRuns = []
+
+
+def serials(d):
+	'''The file's rows, in its order, after each of the serial runs of the operation and the handler (a commit and close()
+	after them): the operation, then the handler; the operation, a flush (the writer thread's tick can write its lines at any
+	time, and another process's line lands before or after them), then the handler; the handler, then the operation. An
+	operation that raises ran nowhere (a clear() took its key). A signal handler that lands inside the operation can leave any.'''
+	if not _serialRuns:
+		for order in ('oh', 'och', 'ho'):
+			p = os.path.join(d, 'serial.' + KIND)
+			t = opened(p)
+			runs = {'o': lambda: HANDLED_OPS[OP](t), 'c': t.commitAppendToFile, 'h': lambda: HANDLERS[AT](t, p)}
+			for run in order:
+				try:
+					runs[run]()
+				except Exception:
+					pass
+			t.commitAppendToFile()
+			t.close()
+			_serialRuns.append(list(fileRows(p).items()))
+			os.remove(p)
+	return _serialRuns
+
+
 def handlerCase(d, n):
 	'''A signal handler that uses the store, run at the n-th step of the operation, as a real signal's runs inside
 	whatever the main thread was doing: after a commit and close(), memory and the file agree on every key (and on the
@@ -17317,6 +17347,8 @@ def handlerCase(d, n):
 	keys, mem, rows = apart(t, p)
 	if keys:
 		notes.append('fail:apart:%s mem=%r file=%r' % (','.join(keys), [mem.get(k) for k in keys], [rows.get(k) for k in keys]))
+	elif not notes and list(rows.items()) not in serials(d):  # (memory and the file agree: a serial order of the two?)
+		notes.append('fail:serial:file=%r serial=%r' % (list(rows.items()), serials(d)))
 	if OP in DEFAULTS_OPS:
 		if OP == 'setdefaults':  # (no line: memory holds the defaults the program set, or the handler's own)
 			want = [defaults] + ([T._normalizeDefaults(['', 'H'], t.delimiter)] if AT == 'own' else [])
@@ -17329,8 +17361,9 @@ def handlerCase(d, n):
 	with open(p, 'rb') as f:
 		copies = f.read().split(b'\n').count(lines[0]) if lines else 0
 	if copies > 1:  # (KL-b; a clear drops a row's line or writes it before it clears, so the redo's copy is the only one,
-		# but it keeps the defaults: a defaults line or marker it wrote or kept can be queued again by the redo)
-		notes.append(('fail' if AT == 'clear' and OP not in DEFAULTS_OPS else 'allow') + ':twice')
+		# but it keeps the defaults: a defaults line or marker it wrote or kept can be queued again by the redo. A move's
+		# lines the clear came before (stale rows, which the redo's deletion lines take out again) are written twice.)
+		notes.append(('fail' if AT == 'clear' and OP not in DEFAULTS_OPS + MOVE_OPS else 'allow') + ':twice')
 	return notes
 
 
@@ -17424,7 +17457,7 @@ def _sweep(tmp_path, kind, op, at, start=1, stop=0):
 #: on 3.14: in 7 parts of 1,300, so -n spreads them.
 _INTERRUPT_SWEPT = ([(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (
 	'set', 'set-existing', 'del', 'pop', 'popitem', 'setdefaults', 'commit', 'reload', 'rewrite', 'close')]
-	+ [(kind, 'move', 1, 0) for kind in ('tsv', 'tsvz')]
+	+ [(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in ('move', 'move-first')]
 	+ [('tsv', 'closed-commit', 1, 0), ('tsvz', 'closed-commit', 1, 0), ('tsvz', 'closed-rewrite', 1, 0)]
 	+ [(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in ('clear', 'exit')]  # (exit: _stopLiveStores, a row queued)
 	+ [(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (  # (a TSVZClient with no handler; one-shot calls)
@@ -17443,9 +17476,9 @@ def test_a_ctrl_c_caught_at_any_step_of_an_operation_leaves_no_lock_held_and_mem
 #: The (kind, op, handler) a signal handler is swept through: every operation that changes memory in a section, with every
 #: kind of handler (a .tsvz move is memory only).
 _HANDLER_SWEPT = [(kind, op, handler) for kind, ops in (
-	('tsv', ('set', 'set-existing', 'del', 'pop', 'popitem', 'move', 'set-defaults-row', 'del-defaults-row', 'setdefaults')),
+	('tsv', ('set', 'set-existing', 'del', 'pop', 'popitem', 'move', 'move-first', 'set-defaults-row', 'del-defaults-row', 'setdefaults')),
 	('tsvz', ('set', 'set-existing', 'del', 'pop', 'popitem', 'set-marker')))
-	for op in ops for handler in ('reload', 'clear', 'sync', 'own', 'commit', 'set', 'del')]
+	for op in ops for handler in ('reload', 'clear', 'sync', 'own', 'commit', 'set', 'set-b', 'del')]
 
 
 @pytest.mark.parametrize('kind, op, handler', _HANDLER_SWEPT, ids=['-'.join(case) for case in _HANDLER_SWEPT])
@@ -17532,6 +17565,48 @@ def test_a_sigterm_handler_that_closes_the_store_and_exits_inside_a_set_exits_wi
 	with pytest.raises(SystemExit) as stopped:
 		t['a'] = ['a', '1']  # (the handler runs inside this set's section)
 	assert stopped.value.code == 0 and not t._memLock._is_owned()
+
+
+@pytest.mark.parametrize('when', ['before', 'after'])
+@pytest.mark.parametrize('how', ['set', 'delete'])
+@pytest.mark.parametrize('last', [False, True])
+def test_a_signal_handlers_change_of_a_row_survives_a_move_it_lands_in(tmp_path, monkeypatch, last, how, when):
+	# move_to_end has no value of its own, so a signal handler's set or delete of a row, landing inside it, must stay: 5.15's
+	# redo set the rows the move had captured before the handler ran, and put them back over its change (a set lost, a
+	# deleted row back; a move to the end lost its own key's change); 5.14 kept it when the handler landed after the move's lines
+	# were queued. The redo restores the order only, from the rows memory holds now.
+	p = str(tmp_path / 'm.tsv')
+	_touch(p, b'id\tv\na\t1\nb\t1\nc\t1\n')
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, rewrite_on_load=False, append_check_delay=60)
+	target = 'a' if last else 'b'  # (a move to the end queues the key's own row, one to the beginning every other key's)
+	real = TSVZ.TSVZed._queueMoves
+	ran = []
+
+	def handler():
+		ran.append(1)
+		if how == 'set':
+			t[target] = [target, 'H']
+		else:
+			del t[target]
+
+	def queueMoves(self, moved):  # (the section's own queueing, where the signal lands: just before it, or just after)
+		if when == 'before':
+			handler()
+		queued = real(self, moved)
+		if when == 'after':
+			handler()
+		return queued
+
+	monkeypatch.setattr(TSVZ.TSVZed, '_queueMoves', queueMoves)
+	t.move_to_end('a' if last else 'c', last=last)
+	assert ran == [1] and not t._memLock._is_owned()
+	t.commitAppendToFile()
+	memory = [(k, list(v)) for k, v in t.items()]
+	t.close()
+	rows = [(k, list(v)) for k, v in TSVZ.readTabularFile(p, header='id\tv', verbose=False).items()]
+	order = ['b', 'c', 'a'] if last else ['c', 'a', 'b']
+	want = [(k, [k, 'H' if how == 'set' and k == target else '1']) for k in order if how == 'set' or k != target]
+	assert memory == want and rows == want
 
 
 #: ARGV: TSVZ's directory, 'commit', 'set' or 'reload', the file. A SIGALRM handler that uses the store while the main
