@@ -8322,7 +8322,14 @@ memoryOnly:{self.memoryOnly}
 		dropped from this copy: the parent writes them, and written here too an older row could land last. What the
 		child sets from now on is written by its commitAppendToFile(), and by its close() and normal exit where nothing
 		can wait for ever there (_commitsAtClose); a child that ends by os._exit (multiprocessing's do) writes only what
-		it commits or closes."""
+		it commits or closes.
+
+		The file's state is the parent's to mend, as its writes are its to finish: the child takes no _damaged, which a
+		rewrite of the parent's under way at the fork sets (or one that failed left), and follows the file as another
+		process's store does. Taken, it made the child's close or exit write its fork-time memory over the file (the
+		merge rule's "memory is the only good copy", _syncFrom): the parent's later rows lost and its deleted rows back,
+		in the file and then in the parent's memory (5.15 final review; 5.14's child waited for ever on its copy of
+		writeLock there). The parent holds every row the child's copy does, and its own later ones."""
 		self._parentHeldFile = self._fileObjHeld
 		self._fileObjHeld = False
 		self.writeLock = threading.Lock()
@@ -8331,6 +8338,7 @@ memoryOnly:{self.memoryOnly}
 		self._requests.clear()
 		self._loadJob = self._loadReader = None  # (the parent's writer thread's load, not here: its stop is for it)
 		self._writing = 0
+		self._damaged = False
 		self._forkReset = os.getpid()
 
 	def _commitsAtClose(self):

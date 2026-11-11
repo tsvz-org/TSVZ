@@ -18398,12 +18398,39 @@ elif case in ('mp', 'mpclose'):  # multiprocessing's fork child ends by os._exit
 	child.start()
 	child.join(10)
 	print('child', child.exitcode, flush=True)
+elif case in ('writing', 'writing-set'):  # the parent's writer thread is inside a rewrite's write at the fork
+	for value in '01':
+		t['b'] = ['b', value]
+		t.commitAppendToFile()  # (b's first line is superseded: the rewrite takes it out, so the file is not what it was)
+	inside, go = threading.Event(), threading.Event()
+	write, parent = TSVZ._writeLines, os.getpid()
+	def held(*args, **kwargs):  # (the parent's rewrite waits here, its write begun, until the child is forked)
+		if os.getpid() == parent and not inside.is_set():
+			inside.set()
+			go.wait(10)
+		return write(*args, **kwargs)
+	TSVZ._writeLines = held
+	threading.Thread(target=lambda: t.rewrite(force=True), daemon=True).start()
+	inside.wait(10)
+	ready, ended = os.pipe()
+	def body():
+		os.read(ready, 1)  # (the parent's rewrite is over, and its set of p2 and its delete of b are in the file)
+		if case == 'writing-set':
+			t['c'] = ['c', '1']
+	pid = forked(body)
+	go.set()
+	t['p2'] = ['p2', '1']
+	del t['b']
+	t.commitAppendToFile()  # (behind the rewrite)
+	os.write(ended, b'x')
+	status(pid)
 t.close()
 """
 
 
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
-@pytest.mark.parametrize('case', ['exit', 'close', 'queued', 'held', 'file', 'file-rewrite', 'file-desynced', 'load', 'mp', 'mpclose', 'nohook'])
+@pytest.mark.parametrize('case', ['exit', 'close', 'queued', 'held', 'file', 'file-rewrite', 'file-desynced', 'load', 'mp', 'mpclose', 'nohook',
+								  'writing', 'writing-set'])
 @pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
 def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(tmp_path, ext, case):
 	# 5.14: a child that fork() made wrote nothing at its close or exit, and its commit wrote the rows its parent had
@@ -18414,11 +18441,14 @@ def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(t
 	# wait for the lock the parent holds: with rewrite_on_exit, or a store another process's change left to follow
 	# (deSynced), 5.14 and 5.15's first build waited for ever there, as a child that sets a row (5.15 review). A child forked
 	# while its parent's writer thread runs a load whose waiter a Ctrl-C took away does not inherit the stop (_loadJob): its
-	# own reload() ran inline and raised _LoadStopped, which is meant never to leave the writer thread.
+	# own reload() ran inline and raised _LoadStopped, which is meant never to leave the writer thread. A child forked while
+	# its parent's writer thread was inside a rewrite took the parent's mark of a write under way (_damaged), and at its exit
+	# wrote its fork-time memory over the parent's later rows: the parent's new row lost and its deleted row back, in the
+	# file and then in the parent's memory (5.15 final review; 5.14's child waited for ever there).
 	if case == 'nohook' and sys.version_info >= (3, 7):
 		pytest.skip('3.6: the fork hook is a wrapper of threading._after_fork')
-	if case == 'file-rewrite' and ext == 'tsvz':
-		pytest.skip('rewrite_on_exit is ignored for .tsvz')
+	if case in ('file-rewrite', 'writing', 'writing-set') and ext == 'tsvz':
+		pytest.skip('a .tsvz store is never rewritten (rewrite_on_exit and rewrite() are ignored)')
 	p = str(tmp_path / ('s.' + ext))
 	script = tmp_path / 'forked.py'
 	script.write_text(_FORKED)
@@ -18429,10 +18459,12 @@ def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(t
 	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
 	with open(p, 'rb') as f:
 		lines = [line.split(b'\t')[0] for line in f.read().split(b'\n')]
-	written = case in ('exit', 'close', 'queued', 'held', 'mpclose')
+	written = case in ('exit', 'close', 'queued', 'held', 'mpclose', 'writing-set')
 	assert ('c' in rows) == written and lines.count(b'c') == int(written), (rows, done.stderr)
 	if case == 'queued':
 		assert rows['p1'] == ['p1', 'new'] and lines.count(b'p1') == 2  # (the parent's two: the child dropped its copy)
+	if case.startswith('writing'):
+		assert 'p2' in rows and 'b' not in rows and 'a' in rows, (rows, done.stderr)  # (the parent's later set and delete)
 	if case.startswith('file') or case == 'nohook':
 		said = 'its parent held the file (get_file_obj) at the fork' if case.startswith('file') else 'no fork hook ran in it'
 		assert done.stderr.count(said) == 1, done.stderr
