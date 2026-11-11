@@ -436,6 +436,26 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-11-10, the user chose "Approve as KL (Recommended)": a parent that forks and ends by `os._exit`
   loses the rows it queued last; the README says to commit before forking.
 
+### A forked child's row is lost when its parent's failed rewrite has left the file damaged
+- Kind: deferred
+- What the operator sees: a loose store's rewrite fails part way (a full disk, an I/O error), leaving the file damaged
+  and memory "the only good copy", and the program then forks a child that sets and commits a row. The row reaches the
+  file: the child's write makes the file again from its memory, which followed the file. When the still-damaged
+  parent's next rewrite gets through (its retry, or its close), it finds the file no longer begins with the bytes it
+  held when its rewrite stopped, warns "Overwriting external changes ... memory is written over them", and writes its
+  own memory over the file: the child's row is lost, while the parent's own rows, those it appended after the fork
+  included, stay. 5.14, 5.15 before its final review's fixes, and 5.15 the same (the 5.15 re-review's
+  `s/forkdamaged.py`, Python 3.14: an ENOSPC injected part way into the parent's rewrite, with and without
+  `rewrite_on_exit`, the child ending by `close()` or its normal exit).
+- Why: the merge rule takes in only what another writer appended after the bytes the damaged file held, since any
+  other change may be the damage itself; a child that writes the file again is such a change, and the parent cannot
+  tell its rows from damage. Found by the 5.15 re-review; not this release's change, and rare (a rewrite that failed,
+  then a fork before the parent made the file again).
+- Revisit when: 5.16, or someone loses a forked child's rows this way. A first look: whether a forked child only
+  appends while the file may still be damaged (it cannot know its parent's state after the fork), so the parent's
+  merge rule takes its rows in as another writer's appends.
+- Noted: 2026-11-11, from the 5.15 re-review; a deferral, not asked.
+
 ### A TSVZClient with no server, used in a forked child, waits for ever at its first write
 - Kind: deferred
 - What the operator sees: a program opens a `TSVZClient` on a file no `tsvz serve` handler serves (the client then
