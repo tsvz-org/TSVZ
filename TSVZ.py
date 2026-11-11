@@ -44,10 +44,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.14'
+version = '5.15'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-11-10'
+COMMIT_DATE = '2026-11-11'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -591,6 +591,25 @@ def _fileIdentity(st):
 
 #: What a legacy store knows its file holds (TSVZed._known) when it knows the file holds nothing, whichever file it is.
 _KNOWN_NOTHING = ((None, None), 0, hashlib.sha256())
+
+
+class _LoadStopped(BaseException):
+	"""A load whose waiter a Ctrl-C took away stops (TSVZed._call): raised on the writer thread, where _runRequests keeps
+	it, and never seen elsewhere. A BaseException, so no ``except Exception`` on the way reports it as a failure."""
+
+
+class _Stopped(object):
+	"""Stands in for the file a load job reads once its waiter left (TSVZed._call): each read stops the load. Its methods
+	are named, not a __getattr__, which would raise out of a hasattr() that tools make on the module's globals."""
+	__slots__ = ()
+
+	def read(self, *args):
+		raise _LoadStopped
+
+	readline = seek = tell = read  # (what _HashingReader asks of its file)
+
+
+_STOPPED = _Stopped()
 
 
 class _HashingReader(object):
@@ -1269,6 +1288,7 @@ class _Reporter(object):
 		self.path = path
 		self.teeLogger = teeLogger
 		self._events = OrderedDict()
+		self.stop = None  # a load job (TSVZed._specReload): its reads stop once the job's waiter left (TSVZed._call)
 
 	def note(self, kind, where, detail):
 		event = self._events.get(kind)
@@ -1330,10 +1350,15 @@ def _pathLock(path):
 	refused, excludes no thread of the process, and Windows' ``msvcrt`` gives
 	up after 10 s. A TSVZed's own writes, which its writeLock serialises, and
 	readers do not take it.
+
+	A _SectionLock (5.15): TSVZ's code never takes it inside another hold of it (the whole suite run with a lock that
+	logs every re-entry found none but a test's stand-in for another program), so a thread that finds itself holding it
+	at a section's start holds it from a Ctrl-C, and each site lets go of it on the way out of one
+	(``except BaseException: lock.letGo(); raise``).
 	"""
 	key = os.path.realpath(path)
 	# (setdefault: one step, where a guard lock could be left held by a Ctrl-C and stop every thread's writes, see _Flag)
-	return _PATH_LOCKS.get(key) or _PATH_LOCKS.setdefault(key, threading.RLock())
+	return _PATH_LOCKS.get(key) or _PATH_LOCKS.setdefault(key, _SectionLock())
 
 
 #: The lock modes of ``_lockFile`` (spec §18.6): READ, taken by readers that make state out of the file, shared, for the
@@ -1402,10 +1427,6 @@ def _locksAfterFork():
 				os.dup2(null, fd)
 		finally:
 			os.close(null)
-
-
-if hasattr(os, 'register_at_fork'):  # Python 3.7+
-	os.register_at_fork(after_in_child=_locksAfterFork)
 
 
 def _lockFile(f, mode=_REWRITE):
@@ -1686,13 +1707,18 @@ def _lockedAppend(path, payload, tailPolicy, reporter, fsync=False, header=None,
 	"""Append ``payload`` (whole records ending in b'\\n') to the file ``path`` (_appendOpen), compressed in
 	``codec`` when given, under its locks: ``_pathLock`` and the file lock (``_lockFile``), so that no other writer
 	that takes them writes between the look at what the file holds and the write. A missing file is created."""
-	with _pathLock(path):
-		with open(path, 'a+b') as f:
-			_lockFile(f, mode=_APPEND)
-			try:
-				_appendOpen(f, payload, codec, header, tailPolicy, reporter, fsync, memberSize)
-			finally:
-				_unlockFile(f)
+	lock = _pathLock(path)
+	try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+		with lock:
+			with open(path, 'a+b') as f:
+				_lockFile(f, mode=_APPEND)
+				try:
+					_appendOpen(f, payload, codec, header, tailPolicy, reporter, fsync, memberSize)
+				finally:
+					_unlockFile(f)
+	except BaseException:
+		lock.letGo()
+		raise
 
 
 _CODEC_SUPPORT = {}
@@ -2174,12 +2200,13 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 											 teeLogger=teeLogger,
 											 delimiter=delimiter,
 											 ),delimiter=delimiter),delimiter,encoding,errors,what='header')
-			try:
+			lock = _pathLock(fileName)
+			try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
 				codec = _fileCodec(fileName)
 				data = _compressBytes(codec, headerBytes + b'\n') if codec else headerBytes + b'\n'  # before: no gap
 				# Not over a file another writer made since it was looked for ('xb'), nor a link (its target is made),
 				# and under the lock, as every writer writes: an append that took it first has written the header.
-				with _pathLock(fileName), open(os.path.realpath(fileName), 'xb') as file:  # lockf excludes no thread
+				with lock, open(os.path.realpath(fileName), 'xb') as file:  # lockf excludes no thread
 					_lockFile(file, mode=_APPEND)
 					try:
 						if not os.fstat(file.fileno()).st_size:
@@ -2195,6 +2222,9 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 					return True  # another writer made it meanwhile (not a directory, nor a link that leads nowhere)
 			except Exception:
 				pass
+			except BaseException:
+				lock.letGo()
+				raise
 			__teePrintOrNot('Failed to create '+fileName,'error',teeLogger=teeLogger)
 			if strict:
 				raise FileNotFoundError("Failed to create file")
@@ -4284,6 +4314,8 @@ def _iterPartLines(info, reporter, label=''):
 		offset = 0
 		try:
 			for chunk in chunks:
+				if reporter.stop is not None and reporter.stop[5]:
+					raise _LoadStopped  # (once a chunk: the load's waiter left, TSVZed._call)
 				if chunk is None:  # a damaged member ended: the unfinished line before the next member is dropped
 					rest = b''
 					atStart = False  # the part's bytes began before this point (spec §4.7)
@@ -4912,37 +4944,42 @@ def _specBackupPart(path, reporter):
 	For a rewrite that drops damaged members (spec §16.6). Raises OSError when
 	the copy cannot be made; a partial copy is removed.
 	"""
-	with _pathLock(path):
-		with open(path, 'r+b') as f:
-			_lockFile(f, mode=_REWRITE)
-			try:
-				first = backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
-				# Readable by whoever could read the part, writable by its owner only, never setuid,
-				# setgid, sticky or executable (the umask still applies on top).
-				st = os.fstat(f.fileno())
-				mode = st.st_mode & 0o644
-				suffix = 0
-				while True:
-					try:
-						# never overwrite an earlier backup; O_BINARY: no newline translation on Windows
-						flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
-						copy = os.fdopen(os.open(backup, flags, mode), 'wb')
-						break
-					except FileExistsError:
-						suffix += 1
-						backup = '{}.{}'.format(first, suffix)
+	lock = _pathLock(path)
+	try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+		with lock:
+			with open(path, 'r+b') as f:
+				_lockFile(f, mode=_REWRITE)
 				try:
-					with copy:
-						_matchOwner(copy.fileno(), st)
-						shutil.copyfileobj(f, copy)
-						copy.flush()
-						os.fsync(copy.fileno())
-				except BaseException:
-					os.remove(backup)  # a partial copy is no backup
-					raise
-				_fsyncDirectory(backup)  # the new name is durable before the part is rewritten
-			finally:
-				_unlockFile(f)
+					first = backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
+					# Readable by whoever could read the part, writable by its owner only, never setuid,
+					# setgid, sticky or executable (the umask still applies on top).
+					st = os.fstat(f.fileno())
+					mode = st.st_mode & 0o644
+					suffix = 0
+					while True:
+						try:
+							# never overwrite an earlier backup; O_BINARY: no newline translation on Windows
+							flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
+							copy = os.fdopen(os.open(backup, flags, mode), 'wb')
+							break
+						except FileExistsError:
+							suffix += 1
+							backup = '{}.{}'.format(first, suffix)
+					try:
+						with copy:
+							_matchOwner(copy.fileno(), st)
+							shutil.copyfileobj(f, copy)
+							copy.flush()
+							os.fsync(copy.fileno())
+					except BaseException:
+						os.remove(backup)  # a partial copy is no backup
+						raise
+					_fsyncDirectory(backup)  # the new name is durable before the part is rewritten
+				finally:
+					_unlockFile(f)
+	except BaseException:
+		lock.letGo()
+		raise
 	reporter.note('backup', None, 'kept the bytes of {}, whose damaged members are not rewritten, in {}'.format(path, backup))
 	return backup
 
@@ -4958,21 +4995,26 @@ def _specAppendTo(f, path, payload, reporter, fsync=False, memberSize=None, proc
 	both taken under the lock, so no other locked writer's append falls between.
 	``proceed``: called once the lock is taken; False writes nothing and returns None.
 	"""
-	with _pathLock(path):
-		_seekRawStart(f)  # msvcrt locks from the raw position: lock and unlock the same range
-		_lockFile(f, mode=_APPEND)
-		try:
-			if proceed is not None and not proceed():
-				return None
-			before = _specStamp(os.fstat(f.fileno()))
-			offset = _appendOpen(f, payload, _parsePartName(path).codec, None, 'truncate', reporter, fsync, memberSize)
-			return offset, before, _specStamp(os.fstat(f.fileno()))
-		finally:
+	lock = _pathLock(path)
+	try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+		with lock:
+			_seekRawStart(f)  # msvcrt locks from the raw position: lock and unlock the same range
+			_lockFile(f, mode=_APPEND)
 			try:
-				_seekRawStart(f)
-			except OSError:
-				pass  # a failed write is already propagating; the lock must still be released
-			_unlockFile(f)
+				if proceed is not None and not proceed():
+					return None
+				before = _specStamp(os.fstat(f.fileno()))
+				offset = _appendOpen(f, payload, _parsePartName(path).codec, None, 'truncate', reporter, fsync, memberSize)
+				return offset, before, _specStamp(os.fstat(f.fileno()))
+			finally:
+				try:
+					_seekRawStart(f)
+				except OSError:
+					pass  # a failed write is already propagating; the lock must still be released
+				_unlockFile(f)
+	except BaseException:
+		lock.letGo()
+		raise
 
 
 def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None, proceed=None):
@@ -5040,58 +5082,63 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None, build=None)
 	codec = _parsePartName(path).codec
 	_requireCodec(codec)
 	raw = None if build else _compressBytes(codec, content, memberSize=memberSize) if codec else content  # (nothing: one empty member)
-	with _pathLock(path):
-		with open(path, 'r+b') as f:
-			_lockFile(f, mode=_REWRITE)
-			try:
-				st = os.fstat(f.fileno())
-				if expect is not None and _specStamp(st) != expect:
-					return None
-				if build:
-					content = build(f)
-					if content is None:
+	lock = _pathLock(path)
+	try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+		with lock:
+			with open(path, 'r+b') as f:
+				_lockFile(f, mode=_REWRITE)
+				try:
+					st = os.fstat(f.fileno())
+					if expect is not None and _specStamp(st) != expect:
+						return None
+					if build:
+						content = build(f)
+						if content is None:
+							return False, _specStamp(st)
+						raw = _compressBytes(codec, content, memberSize=memberSize) if codec else content
+					fd = f.fileno()
+					# Read unbuffered, as the file is written below: a read-ahead in f would leave it a stale position to
+					# close at. What a failed rewrite puts back is kept: the bytes the write overwrites (from the start to
+					# the shorter end) and the old size to cut back to. A clear of a huge file reads none of it.
+					size = st.st_size
+					old = _readFrom0(fd, min(size, len(raw)))
+					if size == len(raw) and old == raw:
 						return False, _specStamp(st)
-					raw = _compressBytes(codec, content, memberSize=memberSize) if codec else content
-				fd = f.fileno()
-				# Read unbuffered, as the file is written below: a read-ahead in f would leave it a stale position to
-				# close at. What a failed rewrite puts back is kept: the bytes the write overwrites (from the start to
-				# the shorter end) and the old size to cut back to. A clear of a huge file reads none of it.
-				size = st.st_size
-				old = _readFrom0(fd, min(size, len(raw)))
-				if size == len(raw) and old == raw:
-					return False, _specStamp(st)
-				try:
-					_reserveSpace(fd, len(raw))  # spec §19.8: a full disk refuses the rewrite before any byte changes
-					_writeFrom0(fd, raw)
-				except BaseException as e:
-					# Once the cut is made the rewrite is done: only the cut makes the file shorter, and it follows the
-					# whole write, so the new bytes are complete (what was cut off is not kept to put back).
-					if os.fstat(fd).st_size < size:
-						raise
-					# Put the old bytes back rather than leave a half-rewritten part (or one a failed
-					# reservation lengthened): the write left what it did not overwrite as it was.
 					try:
-						os.lseek(fd, 0, os.SEEK_SET)
-						view = memoryview(old)
-						while view:
-							view = view[os.write(fd, view):]
-						os.ftruncate(fd, size)
-						os.fsync(fd)
-					except OSError as undo:
-						damaged = '{}: the rewrite failed ({!r}) and the old bytes could not be put back ({}): the part is damaged'.format(
-							path, e, undo)
-						if isinstance(e, OSError):
-							raise OSError(e.errno, damaged)
-						_warn('TSVZ warning: ' + damaged)  # an interrupt stays an interrupt
-					raise
-				os.fsync(fd)
-				return True, _specStamp(os.fstat(fd))
-			finally:
-				try:
-					_seekRawStart(f)  # msvcrt unlocks from the raw position: the range it locked
-				except OSError:
-					pass
-				_unlockFile(f)
+						_reserveSpace(fd, len(raw))  # spec §19.8: a full disk refuses the rewrite before any byte changes
+						_writeFrom0(fd, raw)
+					except BaseException as e:
+						# Once the cut is made the rewrite is done: only the cut makes the file shorter, and it follows the
+						# whole write, so the new bytes are complete (what was cut off is not kept to put back).
+						if os.fstat(fd).st_size < size:
+							raise
+						# Put the old bytes back rather than leave a half-rewritten part (or one a failed
+						# reservation lengthened): the write left what it did not overwrite as it was.
+						try:
+							os.lseek(fd, 0, os.SEEK_SET)
+							view = memoryview(old)
+							while view:
+								view = view[os.write(fd, view):]
+							os.ftruncate(fd, size)
+							os.fsync(fd)
+						except OSError as undo:
+							damaged = '{}: the rewrite failed ({!r}) and the old bytes could not be put back ({}): the part is damaged'.format(
+								path, e, undo)
+							if isinstance(e, OSError):
+								raise OSError(e.errno, damaged)
+							_warn('TSVZ warning: ' + damaged)  # an interrupt stays an interrupt
+						raise
+					os.fsync(fd)
+					return True, _specStamp(os.fstat(fd))
+				finally:
+					try:
+						_seekRawStart(f)  # msvcrt unlocks from the raw position: the range it locked
+					except OSError:
+						pass
+					_unlockFile(f)
+	except BaseException:
+		lock.letGo()
+		raise
 
 
 def _reserveSpace(fd, length):
@@ -5607,9 +5654,20 @@ class _Flag(object):
 			self._waiters.remove(bell)
 
 
-class _SectionLock(_thread.RLock):
+class _RLock(_thread.RLock):
+	"""An RLock its holder can let go of whole, at a door where it holds none: _ServeStore.lock, which a read nests, is let
+	go of where a Ctrl-C leaves _serveRespond (5.15)."""
+	__slots__ = ()
+
+	def letGo(self):
+		"""Let go of what a Ctrl-C left this thread holding; the caller is in no section."""
+		while self._is_owned():
+			self.release()
+
+
+class _SectionLock(_RLock):
 	"""A lock for sections that TSVZ's own code never nests, which a Ctrl-C cannot leave held for good: a TSVZed's _memLock
-	(5.13).
+	(5.13), a path's lock (_pathLock) and a TSVZClient's (5.15).
 
 	A KeyboardInterrupt can land just after a ``with`` statement takes its lock and before the block is set up (seen on
 	3.14), or where the block's exit never runs (3.6's end of a block; CPython bpo-29988). A plain lock was then held for
@@ -5627,20 +5685,19 @@ class _SectionLock(_thread.RLock):
 	A signal handler that uses the store is not TSVZ's code: it runs inside the section it interrupted, and its own section
 	(or its wait for the writer thread) lets go of the interrupted one's hold. The exit of the interrupted section then
 	finds the lock not held, and ignores that (__exit__; a check of the hold before the release leaves a gap that a handler
-	lands in). The rest of that section runs without the lock. When the writer thread rewrites meanwhile, a line is written
-	twice (the last wins). When it reads the file into memory meanwhile (the handler's own reload() or clear(), another
-	thread's reload, the sync with another process's write that follows a commit: the handler's whole wait for the writer
-	thread, not microseconds), a change the section made in memory and had not yet queued is undone in memory and written
-	all the same: memory and the file differ on that key until the next reload, a delete of a row set so does nothing, and
-	a loose store's next rewrite writes memory's side (measured: README, "Upgrading to 5.13"; docs/limitations.md). A
-	handler that sets the section's own key does the same: memory keeps its row, the file ends with the section's line.
+	lands in). The rest of that section runs without the lock, and the writer thread may have read the file into memory
+	or cleared it meanwhile (the handler's own reload() or clear(), another thread's reload, the sync with another
+	process's write that follows a commit: the handler's whole wait for the writer thread, not microseconds), which
+	undid in memory a change the section went on to queue. So each section of a TSVZed ends with a test of its hold: one
+	that finds it let go of makes its change again under the lock (TSVZed._again), and queues its line again unless that
+	line is still the last one queued (_requeue). Memory and the file then agree (5.12 to 5.14 left them apart on that
+	key, and a loose store's next rewrite wrote memory's side). The line is written twice where the handler committed,
+	rewrote or queued another line after the section's; the last copy wins (docs/limitations.md). A move_to_end has no
+	value of its own: its redo (_moveAgain) makes the move again with the rows and in the order memory holds now, so a
+	handler's change of a row, or its own move of another key, stays; it writes the move's lines again unless the
+	section's are still the last queued and are what memory makes now.
 	(Its exit is a Python method, about 0.1 microsecond a section dearer than the RLock's own on 3.6, 0.04 on 3.14.)"""
 	__slots__ = ()
-
-	def letGo(self):
-		"""Let go of what a Ctrl-C left this thread holding; the caller is in no section."""
-		while self._is_owned():
-			self.release()
 
 	def __enter__(self):
 		if self._is_owned():
@@ -5666,31 +5723,85 @@ def _waited(flag, timeout):
 _LIVE_STORES = weakref.WeakValueDictionary()
 
 
-def _stopLiveStores():
+def _storesAfterFork():
+	"""In a child that fork() made, before any of its code runs: the in-process and file locks it inherits
+	(_locksAfterFork), and each live store (_afterFork)."""
+	_locksAfterFork()
+	for store in list(_LIVE_STORES.values()):
+		store._afterFork()
+
+
+if hasattr(os, 'register_at_fork'):  # Python 3.7+
+	os.register_at_fork(after_in_child=_storesAfterFork)
+elif hasattr(threading, '_after_fork'):
+	# Python 3.6 has no os.register_at_fork, but os.fork() runs threading._after_fork() in every child (PyOS_AfterFork):
+	# the hook goes there (the user's pick, 2026-11-10). 3.6 is frozen, so this private name cannot change under it. A
+	# library that later replaces it without calling it turns this off: such a child writes nothing at its close and
+	# exit, and says so (TSVZed._commitsAtClose).
+	_threadingAfterFork = threading._after_fork
+
+	def _afterFork36():
+		try:
+			_threadingAfterFork()
+		finally:
+			_storesAfterFork()
+	threading._after_fork = _afterFork36
+
+
+_exitArmed = False  # _stopLiveStores reached its inner try: from there on it takes a first Ctrl-C as the first
+
+
+def _stopLiveStores(interrupted=False, cut=None, abandoned=True):
 	"""At exit, stop every store still running (_atExit: a TSVZed's last rewrite and appends), letting a write in
-	progress finish: a first Ctrl-C meanwhile keeps waiting for it, and says so; a second abandons it."""
-	interrupted = abandoned = False
+	progress finish. A first Ctrl-C anywhere before every store is stopped keeps waiting for what is under way, and says
+	so; a second abandons it. One in the last step (_closeStreamsToDaemons, which waits up to _DAEMON_PRINT_WAIT for a
+	writer thread's print) comes after every row is written, and ends the exit with a traceback. The locals are default
+	arguments, so nothing runs before the try (atexit calls it with none); a first Ctrl-C before its inner try leaves
+	_exitArmed unset, and _stopLiveStoresAgain, which atexit runs next, stops the stores (5.15)."""
+	global _exitArmed
 	try:
-		for store in reversed(list(_LIVE_STORES.values())):  # the last made first, as atexit runs its own
+		while True:  # (once more after a first Ctrl-C, through the stores still live: a stopped one has left _LIVE_STORES)
 			try:
-				store._atExit()
+				_exitArmed = True
+				for store in reversed(list(_LIVE_STORES.values())):  # the last made first, as atexit runs its own
+					if store is cut:
+						store._finish()  # (the store whose stop the first Ctrl-C cut: what is queued and under way, finished)
+					else:
+						cut = store
+						store._atExit()
+				abandoned = False
+				return
 			except KeyboardInterrupt:
 				if interrupted:
 					raise
 				interrupted = True
-				eprint(f"TSVZ: the write to {store._fileName} is being finished; Ctrl-C again to abandon it")
-				store._finish()
-	except BaseException:
-		abandoned = True
-		for store in list(_LIVE_STORES.values()):
-			store._letGo = True  # abandoned: no writer thread starts a write the interpreter's end would cut short
-		raise
+				if cut is not None and id(cut) in _LIVE_STORES:
+					eprint(f"TSVZ: the write to {cut._fileName} is being finished; Ctrl-C again to abandon it")
+				elif _LIVE_STORES:
+					eprint("TSVZ: the writes still to make are being finished; Ctrl-C again to abandon them")
 	finally:
-		# (after the stores: what a last write of theirs reports is still printed; an abandon ends the program at once, so the
-		# door shuts without waiting for a print under way)
-		_closeStreamsToDaemons(0 if abandoned else None)
+		if abandoned and _exitArmed:  # (a second Ctrl-C, or an error; unarmed, _stopLiveStoresAgain follows)
+			for store in list(_LIVE_STORES.values()):
+				store._letGo = True  # abandoned: no writer thread starts a write the interpreter's end would cut short
+		if _exitArmed:
+			# (after the stores: what a last write of theirs reports is still printed; an abandon ends the program at once, so the
+			# door shuts without waiting for a print under way)
+			_closeStreamsToDaemons(0 if abandoned else None)
 
 
+def _stopLiveStoresAgain():
+	"""Runs at exit right after _stopLiveStores (atexit runs the last registered first, and goes on to the next callback
+	after one that raised). When a first Ctrl-C came before that one's inner try, the stores are stopped here, as after
+	a first Ctrl-C; a second abandons them. CPython takes a signal at a function's first instruction (RESUME, 3.11+),
+	before any try is set up, and 3.6 at the two set-up steps after the outer try's: a first Ctrl-C there skipped the
+	whole stop, the queued rows were not written, and nothing stopped the writer threads."""
+	if not _exitArmed:
+		if _LIVE_STORES:
+			eprint("TSVZ: the writes still to make are being finished; Ctrl-C again to abandon them")
+		_stopLiveStores(True)
+
+
+atexit.register(_stopLiveStoresAgain)
 atexit.register(_stopLiveStores)
 
 
@@ -5952,7 +6063,8 @@ class TSVZed(OrderedDict):
 	- Thread-safe for concurrent access from multiple threads.
 	- A legacy file (.tsv, .csv, .nsv, .psv, compressed or not) is written by the store's background thread
 	  only: rewrite(), mapToFile(), hardMapToFile(), commitAppendToFile(), clear(), reload() and close() hand
-	  it the job and wait for it, so a KeyboardInterrupt stops the wait, never the write. At exit, a write in
+	  it the job and wait for it, so a KeyboardInterrupt stops the wait: a write the thread has begun is finished,
+	  one it has not begun is taken back (its rows stay queued), and a load stops (5.15). At exit, a write in
 	  progress is finished (a second Ctrl-C abandons it); a store with nothing to write is not waited for. A
 	  .tsvz-family store's commitAppendToFile(), clear() and reload() are handed to it the same way (5.13; they
 	  ran in the calling thread, whose Ctrl-C could leave writeLock held, and the writer thread waited for it).
@@ -6090,10 +6202,14 @@ class TSVZed(OrderedDict):
 			self.defaults = defaults
 			return
 		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
-			with self._memLock:  # (a read's swap sees either both of these or neither)
+			lock = self._memLock
+			with lock:  # (a read's swap sees either both of these or neither)
 				self._givenDefaults = list(defaults)  # (the defaults a whole read starts from)
 				self._readWhole = True  # memory's defaults now differ from the file's: another process's change is read whole
 				self.defaults = defaults
+				lost = not lock._is_owned()
+			if lost:
+				self._again(self._setDefaultsAgain, defaults)
 		except BaseException:
 			self._memLock.letGo()
 			raise
@@ -6150,6 +6266,7 @@ class TSVZed(OrderedDict):
 		if self.verbose:
 			self.__teePrintOrNot(f"Loading {self._fileName}")
 		reporter = _Reporter(self._fileName, self.teeLogger)
+		reporter.stop = self._loadJob  # (reload()'s job: the read stops once its waiter left)
 		load = None
 		with self.writeLock:
 			dirMtime = _dirMtimeNs(self._fileName)  # before the read: a part created during it is a change
@@ -6307,16 +6424,21 @@ class TSVZed(OrderedDict):
 			self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
 		if key == DEFAULTS_INDICATOR_KEY:
 			try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
-				with self._memLock:  # with memory and the queue: a reload sets the column count under it too
+				lock = self._memLock
+				with lock:  # with memory and the queue: a reload sets the column count under it too
 					self.correctColumnNum = newColumnNum
 					self.defaults = value
 					if self.verbose:
 						self.__teePrintOrNot(f"Defaults set to {value}")
-					if not self.memoryOnly:
-						self.appendQueue.append(value)
-						self.lastUpdateTime = get_time_ns()
-						if self.verbose:
-							self.__teePrintOrNot(f"Appending Defaults {key} to the appendQueue")
+					if self.memoryOnly:
+						return
+					self.appendQueue.append(value)
+					self.lastUpdateTime = get_time_ns()
+					if self.verbose:
+						self.__teePrintOrNot(f"Appending Defaults {key} to the appendQueue")
+					lost = not lock._is_owned()
+				if lost:
+					self._again(self._defaultsAgain, value, newColumnNum)
 			except BaseException:
 				self._memLock.letGo()
 				raise
@@ -6324,10 +6446,12 @@ class TSVZed(OrderedDict):
 		if self.verbose:
 			self.__teePrintOrNot(f"Setting {key} to {value}")
 		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
-			with self._memLock:  # memory and the queue change together: see reload()
+			lock = self._memLock
+			with lock:  # memory and the queue change together: see reload()
 				self.correctColumnNum = newColumnNum
-				if key in self:
-					if self[key] == value:
+				held = dict.get(self, key, _NO_ROW)  # (one lookup: a signal handler's clear between two raised KeyError)
+				if held is not _NO_ROW:
+					if held == value:
 						if self.verbose:
 							self.__teePrintOrNot(f"Key {key} already exists with the same value")
 						return
@@ -6346,6 +6470,9 @@ class TSVZed(OrderedDict):
 					self.__teePrintOrNot(f"Appending {key} to the appendQueue")
 				self.appendQueue.append(value)
 				self.lastUpdateTime = get_time_ns()
+				lost = not lock._is_owned()
+			if lost:
+				self._again(self._setAgain, key, value, newColumnNum)
 		except BaseException:
 			self._memLock.letGo()
 			raise
@@ -6353,6 +6480,101 @@ class TSVZed(OrderedDict):
 		#     self.commitAppendToFile()
 		# else:
 		#     self.appendEvent.set()
+
+	def _again(self, change, *args):
+		"""A signal handler that used the store let go of a section's lock inside it (_SectionLock): the writer thread
+		may have read the file into memory or cleared it meanwhile. change(*args) makes memory what the section's lines
+		make it and queues them again (_requeue), under the lock, until a round runs with it held."""
+		lock = self._memLock
+		try:
+			while True:
+				with lock:
+					change(*args)
+					if lock._is_owned():
+						return
+		except BaseException:
+			lock.letGo()
+			raise
+
+	def _requeue(self, item):
+		"""Queue ``item`` again (the caller holds _memLock), unless it is still the last line queued (the identity of
+		the object the section queued): then it is written after everything before it, as the section left it."""
+		queue = self.appendQueue
+		if not (queue and queue[-1] is item):
+			queue.append(item)
+
+	# The redos (_again): each makes memory what its section's lines make it, with all the state the section set (a reload
+	# resets the column count from the file), and queues the lines again. Methods called with arguments, not closures: a
+	# nested function makes the names it uses cells of the whole method, read through a cell at every set (7 to 9%).
+	def _setAgain(self, key, value, columns):  # (the legacy set of a row)
+		self.correctColumnNum = columns
+		OrderedDict.__setitem__(self, key, value)
+		self.dirty = True
+		self._requeue(value)
+
+	def _defaultsAgain(self, value, columns):  # (the legacy set of #_defaults_#)
+		self.correctColumnNum = columns
+		self.defaults = value
+		self._requeue(value)
+
+	def _defaultsDelAgain(self, item):  # (the legacy delete of #_defaults_#)
+		self.defaults = [DEFAULTS_INDICATOR_KEY]
+		self._requeue(item)
+
+	def _delAgain(self, key, item):  # (the legacy delete, pop and popitem)
+		if dict.__contains__(self, key):
+			OrderedDict.__delitem__(self, key)
+		self.dirty = True
+		if item is not None:
+			self._requeue(item)
+
+	def _moveAgain(self, moved, key, last, lines):  # (move_to_end: its move again, in the order memory holds now)
+		"""move_to_end's move made again, with the rows and in the order memory holds now, never the section's captured
+		ones: a signal handler's own change (a set, a delete, a reload, a move of another key) stays, and only the
+		section's move is made again. ``key`` goes to its end of memory again; for a move to the beginning, every other
+		key follows it in the order memory holds now (a '#' key, memory only, keeps its place among them). In the file,
+		a key of ``moved`` that memory no longer holds gets its deletion line (the section's own lines may have come
+		after the handler's), and the keys the move sends to the end get fresh lines (_moveLines), in one step. Neither
+		when the section's lines (``lines``) are still the last ones queued and are the lines memory makes now: they are
+		then written after everything queued before them, as the section left them."""
+		if dict.__contains__(self, key):
+			OrderedDict.move_to_end(self, key, last)
+		gone = [(k, row) for k, row in moved if not k.startswith('#') and not dict.__contains__(self, k)]
+		if last:
+			ends = [(k, dict.get(self, k)) for k, row in moved if dict.__contains__(self, k)]
+		else:
+			ends = [(k, row) for k, row in OrderedDict.items(self) if k != key]
+		fresh = self._moveLines(ends)
+		queue = self.appendQueue
+		if gone or not (lines and queue and queue[-1] is lines[-1] and fresh == lines):
+			for k, row in gone:
+				self._deleteLine(k, row)
+			if fresh:
+				self.dirty = True
+				queue.extend(fresh)
+
+	def _setDefaultsAgain(self, defaults):  # (setDefaults: no line; a read meanwhile can leave _readWhole False)
+		self._givenDefaults = list(defaults)
+		self._readWhole = True
+		self.defaults = defaults
+
+	def _specAgain(self, record):
+		"""(.tsvz) Memory as ``record`` makes it, replayed as a read replays a queued record (_specReplayQueued)."""
+		quiet = _Reporter('')  # (never flushed: reported when it was queued)
+		for line in record.split('\n'):
+			replayed = _specProcessRecord(line, self._specState, self.delimiter, quiet, None)
+			if replayed is None:
+				continue
+			key, row = replayed
+			if row is None:
+				if dict.__contains__(self, key):
+					OrderedDict.__delitem__(self, key)
+			else:
+				self.correctColumnNum = _specPadRow(row, self._specState, self.correctColumnNum if self.correctColumnNum > 0 else -1)
+				OrderedDict.__setitem__(self, key, row)
+		self.defaults = list(self._specState.defaults)
+		self.dirty = True
+		self._requeue(record)
 
 	def _shapeRow(self, key, value, columns, defaults, load=False):
 		"""The row ``__setitem__`` keeps for ``key`` (stripped, not empty) and the column count after it; None when strict refuses it.
@@ -6441,21 +6663,27 @@ class TSVZed(OrderedDict):
 		key = self._nameKey(key)
 		if key == DEFAULTS_INDICATOR_KEY:
 			try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
-				with self._memLock:
+				lock = self._memLock
+				with lock:
 					self.defaults = [DEFAULTS_INDICATOR_KEY]
 					if self.verbose:
 						self.__teePrintOrNot("Defaults cleared")
-					if not self.memoryOnly:
-						self.__appendEmptyLine(key)
-						if self.verbose:
-							self.__teePrintOrNot(f"Appending empty default line {key}")
+					if self.memoryOnly:
+						return
+					item = self.__appendEmptyLine(key)
+					if self.verbose:
+						self.__teePrintOrNot(f"Appending empty default line {key}")
+					lost = not lock._is_owned()
+				if lost:
+					self._again(self._defaultsDelAgain, item)
 			except BaseException:
 				self._memLock.letGo()
 				raise
 			return
 		# delete the key from the dictionary and update the file
 		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
-			with self._memLock:  # memory and the queue change together: see reload()
+			lock = self._memLock
+			with lock:  # memory and the queue change together: see reload()
 				if key not in self:
 					if self.verbose:
 						self.__teePrintOrNot(f"Key {key} not found")
@@ -6467,10 +6695,13 @@ class TSVZed(OrderedDict):
 					if self.verbose:
 						self.__teePrintOrNot(f"Key {key} deleted in memory")
 					return
-				self._deleteLine(key, row)
+				item = self._deleteLine(key, row)
 				if self.verbose:
 					self.__teePrintOrNot(f"Appending empty line {key}")
 				self.lastUpdateTime = get_time_ns()
+				lost = not lock._is_owned()
+			if lost:
+				self._again(self._delAgain, key, item)
 		except BaseException:
 			self._memLock.letGo()
 			raise
@@ -6486,8 +6717,9 @@ class TSVZed(OrderedDict):
 		legacy store where that would read as a row, a drop item (_DropKey)."""
 		if not self._spec and self._oneColumn(row):
 			self.dirty = True
-			self.appendQueue.append(_DropKey([key]))
-			return self
+			item = _DropKey([key])
+			self.appendQueue.append(item)
+			return item
 		return self.__appendEmptyLine(key)
 
 	def __appendEmptyLine(self,key):
@@ -6500,8 +6732,9 @@ class TSVZed(OrderedDict):
 		self.dirty = True
 		if self._spec:
 			# Spec §9.2: a tombstone is the lone key, never padded. One queue item, so it is committed whole.
-			self.appendQueue.append(_specTombstoneLines(key, self.delimiter, self._specState.strip))
-			return self
+			item = _specTombstoneLines(key, self.delimiter, self._specState.strip)
+			self.appendQueue.append(item)
+			return item
 		if self.correctColumnNum > 1:
 			emptyLine = [key]+['']*(self.correctColumnNum-1)  # (not padded to _appendWidth: only a row with a value is)
 		else:
@@ -6509,7 +6742,7 @@ class TSVZed(OrderedDict):
 		if self.verbose:
 			self.__teePrintOrNot(f"Appending {emptyLine} to the appendQueue")
 		self.appendQueue.append(emptyLine)
-		return self
+		return emptyLine
 
 	def _specSetItem(self, key, value):
 		"""__setitem__ for .tsvz (design §5.2): write the given cells, keep the padded row in memory."""
@@ -6525,7 +6758,8 @@ class TSVZed(OrderedDict):
 			return
 		self._checkWritable(value)
 		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
-			with self._memLock:  # memory and the queue change together: see _specReload
+			lock = self._memLock
+			with lock:  # memory and the queue change together: see _specReload
 				if self.strict and self.correctColumnNum > 0 and len(value) != self.correctColumnNum:
 					self.__teePrintOrNot(f"Value {value} does not have the correct number of columns: {self.correctColumnNum}. Refuse adding key...",'error')
 					return
@@ -6541,6 +6775,9 @@ class TSVZed(OrderedDict):
 					return
 				self.appendQueue.append(record)
 				self.lastUpdateTime = get_time_ns()
+				lost = not lock._is_owned()
+			if lost:
+				self._again(self._specAgain, record)
 		except BaseException:
 			self._memLock.letGo()
 			raise
@@ -6550,7 +6787,8 @@ class TSVZed(OrderedDict):
 		self._checkWritable(value, 'defaults' if key == DEFAULTS_INDICATOR_KEY else 'row')
 		keyLower = key.lower()
 		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
-			with self._memLock:  # the reader state and the queue change together: see _specReload
+			lock = self._memLock
+			with lock:  # the reader state and the queue change together: see _specReload
 				if keyLower in _SPEC_MARKER_KEYS:
 					reporter = _Reporter(self._fileName, self.teeLogger)
 					applied = _specApplyMarker(self._specState, keyLower, value[1:], reporter, None)
@@ -6562,8 +6800,12 @@ class TSVZed(OrderedDict):
 					self.__teePrintOrNot(f"Marker {key} set to {value[1:]}")
 				if self.memoryOnly:
 					return
-				self.appendQueue.append(_specFormatRecord(value, self.delimiter, marker=True))
+				record = _specFormatRecord(value, self.delimiter, marker=True)
+				self.appendQueue.append(record)
 				self.lastUpdateTime = get_time_ns()
+				lost = not lock._is_owned()
+			if lost:
+				self._again(self._specAgain, record)
 		except BaseException:
 			self._memLock.letGo()
 			raise
@@ -6575,7 +6817,8 @@ class TSVZed(OrderedDict):
 			self._specSetMarker(key, [key])
 			return
 		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
-			with self._memLock:  # memory and the queue change together: see _specReload
+			lock = self._memLock
+			with lock:  # memory and the queue change together: see _specReload
 				if key not in self:
 					if self.verbose:
 						self.__teePrintOrNot(f"Key {key} not found")
@@ -6584,8 +6827,11 @@ class TSVZed(OrderedDict):
 				OrderedDict.__delitem__(self, key)
 				if self.memoryOnly:
 					return
-				self.__appendEmptyLine(key)
+				item = self.__appendEmptyLine(key)
 				self.lastUpdateTime = get_time_ns()
+				lost = not lock._is_owned()
+			if lost:
+				self._again(self._specAgain, item)
 		except BaseException:
 			self._memLock.letGo()
 			raise
@@ -6600,20 +6846,30 @@ class TSVZed(OrderedDict):
 			return self
 		try:
 			with self.writeLock:
-				return self._specCommitLocked()
+				self._specCommitLocked()
+				return self
 		finally:
 			self._endWrite()
 
-	def _specCommitLocked(self):
-		# The caller holds self.writeLock (a non-reentrant lock).
-		if not self.appendQueue:
-			return self
+	def _specCommitLocked(self, items=None):
+		"""Append ``items``, the queue's first len(items) records (None: the whole queue), to the active part; the caller
+		holds self.writeLock (a non-reentrant lock). True when they are on disk, or there were none.
+
+		They stay queued until they are on disk, as a loose store's rows do (5.15): a Ctrl-C anywhere here (after close()
+		or in a forked child this runs in the caller's thread) drops none, where 5.14 took them out first and lost them;
+		one after the write and before they leave the queue has them written again by the next commit (the last copy
+		wins). The first len(items) are those listed: whatever else takes from the queue holds writeLock (a reload's
+		replay, a clear), and a set only appends."""
+		if items is None and not self.appendQueue:
+			return True  # (nothing queued, as most ticks find it: no section taken; a row queued meanwhile waits for the next)
 		if self.memoryOnly:
 			self.appendQueue.clear()
-			return self
-		items = []
-		while self.appendQueue:
-			items.append(self.appendQueue.popleft())
+			return True
+		if items is None:
+			with self._memLock:  # (a set queues under it: not while the queue is listed)
+				items = list(self.appendQueue)
+		if not items:
+			return True
 		reporter = _Reporter(self._fileName, self.teeLogger)
 		try:
 			payload = _encodeText(''.join(item + '\n' for item in items), 'utf-8', self.errors)  # checked when set
@@ -6621,9 +6877,11 @@ class TSVZed(OrderedDict):
 			written = _specAppendPayload(self._activePath, payload, reporter, fsync=True,
 										 memberSize=self._specState.memberSize, proceed=lambda: not self._unattended())
 			if written is None:
-				self.appendQueue.extendleft(reversed(items))
 				reporter.flush()
-				return self
+				return False
+			with self._memLock:
+				for _ in range(len(items)):
+					self.appendQueue.popleft()  # (only those listed: rows queued since stay)
 			_, before, after = written
 			if before == self._specSeen:
 				self._specNoteSeen(after)  # else another writer changed the part first: the next check reloads
@@ -6631,21 +6889,31 @@ class TSVZed(OrderedDict):
 				self._writeFailing = False
 				_warn(f'TSVZ warning: {self._fileName}: writes recovered', self.teeLogger)
 		except Exception as e:
-			self.appendQueue.extendleft(reversed(items))
 			if not self._writeFailing:
 				self._writeFailing = True
 				self.__teePrintOrNot(f"Failed to write at commitAppendToFile to {self._activePath}: {e}; will retry",'error')
 				import traceback
 				self.__teePrintOrNot(traceback.format_exc(),'error')
+			reporter.flush()
+			return False
 		reporter.flush()
-		return self
+		return True
 
-	def _specClearFile(self):
-		"""clear_file for .tsvz (design §5.8): commit queued markers, then clear in place."""
+	def _specClearFile(self, dropRows=False):
+		"""clear_file for .tsvz (design §5.8): commit queued markers, then clear in place. ``dropRows`` (clear()): memory is
+		emptied as the queue is listed, in one section of this job (5.15; before, clear() emptied memory in its own thread
+		first, and a Ctrl-C before the job ran left memory empty and the file full). A row set before it is listed,
+		written, then cleared from the file: in neither. One set after it is queued behind the listed rows and written
+		after the clear: in both. When the listed rows cannot be written or the file cleared, the next tick reloads
+		(deSynced): memory becomes the file with every queued row replayed, so none is dropped."""
 		try:
 			with self.writeLock:
-				self._specCommitLocked()
-				if self.appendQueue:
+				items = None
+				if dropRows:
+					with self._memLock:
+						OrderedDict.clear(self)
+						items = list(self.appendQueue)
+				if not self._specCommitLocked(items):  # (the rows queued before the clear: their markers outlive it)
 					self.__teePrintOrNot(f"Failed to write at clear_file() to {self._fileName}: queued records could not be committed; not clearing",'error')
 					self.deSynced = True
 					return self
@@ -6670,11 +6938,11 @@ class TSVZed(OrderedDict):
 		# clear the dictionary and update the file
 		if self.verbose:
 			self.__teePrintOrNot(f"Clearing {self._fileName}")
-		if self.memoryOnly or self._spec:
+		if self.memoryOnly:
 			super().clear()
-			if self.memoryOnly:
-				return self
-			self.clear_file()
+			return self
+		if self._spec:
+			self._call(self._specClearFile, True)  # (memory too, in the job: _specClearFile)
 		else:
 			self._call(self._clearFile, True)
 		self._accepted()  # nothing is left to refuse: a later refusal is reported again
@@ -6752,16 +7020,24 @@ memoryOnly:{self.memoryOnly}
 	def popitem(self, last=True):
 		# Not OrderedDict.popitem: before Python 3.11 it goes through self[key] and del self[key], which strip the key.
 		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
-			with self._memLock:  # memory and the queue change together: see reload()
+			lock = self._memLock
+			with lock:  # memory and the queue change together: see reload()
 				if not OrderedDict.__len__(self):
 					raise KeyError('dictionary is empty')
 				key = next(OrderedDict.__reversed__(self)) if last else next(OrderedDict.__iter__(self))
 				self._checkDelete(key)
 				value = OrderedDict.__getitem__(self, key)
 				OrderedDict.__delitem__(self, key)
+				item = None
 				if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
-					self._deleteLine(key, value)
+					item = self._deleteLine(key, value)
 				self.lastUpdateTime = get_time_ns()
+				lost = not lock._is_owned()
+			if lost and item is not None:
+				if self._spec:
+					self._again(self._specAgain, item)
+				else:
+					self._again(self._delAgain, key, item)
 		except BaseException:
 			self._memLock.letGo()
 			raise
@@ -6777,7 +7053,8 @@ memoryOnly:{self.memoryOnly}
 		'''
 		key = self._nameKey(key)
 		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
-			with self._memLock:  # memory and the queue change together: see reload()
+			lock = self._memLock
+			with lock:  # memory and the queue change together: see reload()
 				if not OrderedDict.__contains__(self, key):
 					if default is self.__marker:
 						raise KeyError(key)
@@ -6786,9 +7063,16 @@ memoryOnly:{self.memoryOnly}
 				self._checkDelete(key)
 				value = OrderedDict.__getitem__(self, key)
 				OrderedDict.__delitem__(self, key)
+				item = None
 				if not self.memoryOnly and (self._spec or not key.startswith('#')):  # a legacy '#' key is memory only
-					self._deleteLine(key, value)
+					item = self._deleteLine(key, value)
 				self.lastUpdateTime = get_time_ns()
+				lost = not lock._is_owned()
+			if lost and item is not None:
+				if self._spec:
+					self._again(self._specAgain, item)
+				else:
+					self._again(self._delAgain, key, item)
 		except BaseException:
 			self._memLock.letGo()
 			raise
@@ -6815,39 +7099,68 @@ memoryOnly:{self.memoryOnly}
 			self.checkExternalChanges()
 			self._call(self._rewrite, False, None, True)
 		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
-			with self._memLock:
+			lock = self._memLock
+			with lock:
 				if not dict.__contains__(self, key):
 					raise KeyError(key)
-				moved = [(k, row) for k, row in OrderedDict.items(self) if k != key] if not last else [(key, dict.get(self, key))]
-				if not self.memoryOnly:  # refused before memory or the queue change, as a set or a delete is
-					for k, row in moved:
-						if not k.startswith('#'):
-							self._checkDelete(k)
-							self._checkWritable(row)
+				moved = self._movedRows(key, last)  # (refused before memory or the queue change, as a set or a delete is)
 				OrderedDict.move_to_end(self, key, last)
-				if not self.memoryOnly:
-					for k, row in moved:
-						self._queueMove(k, row)
-					self.lastUpdateTime = get_time_ns()
+				if self.memoryOnly:
+					return self
+				lines = self._queueMoves(moved)
+				self.lastUpdateTime = get_time_ns()
+				lost = not lock._is_owned()
+			if lost:
+				self._again(self._moveAgain, moved, key, last, lines)
 		except BaseException:
 			self._memLock.letGo()
 			raise
 		return self
 
-	def _queueMove(self, key, row):
-		"""Queue what moves ``key`` to the end of the legacy file for every reader, the caller holding _memLock: its
-		deletion, then its row. A row with an empty cell the defaults in effect would fill (one read before them) goes
-		between a reset and the same defaults again. A '#' key is memory only, and a row with no value (a whitespace-only
-		cell read, right-stripped) is not a line the format can write: their lines stay where they are."""
-		one = self._oneColumn(row)
-		if key.startswith('#') or not (one or any(row[1:])):
-			return
-		self._deleteLine(key, row)
-		defaults = self.defaults
-		if not one and any(i < len(defaults) and defaults[i] and not row[i] for i in range(1, len(row))):
-			self.appendQueue.extend(([DEFAULTS_INDICATOR_KEY], row, _fitRow(defaults, self.correctColumnNum)))
-		else:
-			self.appendQueue.append(row)
+	# move_to_end's loops are methods of their own: Python 3.14 leaves a loop's back jump and test inside a try block out
+	# of the exception table, so a Ctrl-C there (a real signal lands at the back jump) skipped the section's exit and its
+	# clean-up, and the lock stayed held. A call is covered: the KeyboardInterrupt goes up through it as anywhere else.
+	def _movedRows(self, key, last):
+		"""The rows move_to_end queues again (the caller holds _memLock): every other key's for a move to the beginning,
+		else the key's own; each checked as a set or a delete is (_checkDelete, _checkWritable)."""
+		moved = [(k, row) for k, row in OrderedDict.items(self) if k != key] if not last else [(key, dict.get(self, key))]
+		if not self.memoryOnly:
+			for k, row in moved:
+				if not k.startswith('#'):
+					self._checkDelete(k)
+					self._checkWritable(row)
+		return moved
+
+	def _queueMoves(self, moved):
+		"""Queue the lines that move each of ``moved`` (_moveLines) in one step, the caller holding _memLock: a read the
+		writer thread makes replays all of the move or none of it, never part of a move to the beginning. Returns them."""
+		lines = self._moveLines(moved)
+		if lines:
+			self.dirty = True
+			self.appendQueue.extend(lines)
+		return lines
+
+	def _moveLines(self, moved):
+		"""The lines that move each (key, row) of ``moved`` to the end of the legacy file for every reader, in order (the
+		caller holds _memLock): a key's deletion, then its row. A row with an empty cell the defaults in effect would fill
+		(one read before them) goes between a reset and the same defaults again. A '#' key is memory only, and a row with
+		no value (a whitespace-only cell read, right-stripped) is not a line the format can write: their lines stay where
+		they are."""
+		lines = []
+		for key, row in moved:
+			one = self._oneColumn(row)
+			if key.startswith('#') or not (one or any(row[1:])):
+				continue
+			if one:
+				lines.append(_DropKey([key]))
+			else:
+				lines.append([key] + [''] * (self.correctColumnNum - 1) if self.correctColumnNum > 1 else [key])
+			defaults = self.defaults
+			if not one and any(i < len(defaults) and defaults[i] and not row[i] for i in range(1, len(row))):
+				lines += [[DEFAULTS_INDICATOR_KEY], row, _fitRow(defaults, self.correctColumnNum)]
+			else:
+				lines.append(row)
+		return lines
 
 	def __sizeof__(self):
 		sizeof = sys.getsizeof
@@ -6974,6 +7287,11 @@ memoryOnly:{self.memoryOnly}
 	_writing = 0  # write jobs and writes under way on the writer thread (_startWrite): the exit lets go of none of them
 	_letGo = False  # the exit let go of the store (_atExit), or abandoned it: its writer thread starts no write
 	_exiting = False  # _stopLiveStores stops it at exit: a Ctrl-C there finishes the store, which does not run on
+	_loadJob = None  # the load job (reload()'s) the writer thread runs: it stops once its waiter left (_call)
+	_forkReset = None  # the pid of the forked child whose fork hook reset the store (_afterFork)
+	_fileObjHeld = False  # get_file_obj() holds the file (writeLock and the file lock) until release_file_obj()
+	_parentHeldFile = False  # in a forked child: the parent held the file through get_file_obj() at the fork
+	_loadReader = None  # that load's reader of a loose file, whose file _call swaps for _STOPPED
 
 	def _refuse(self, where, error, explicit=False):
 		"""Remember that a rewrite was refused with ``error``; raise it for an ``explicit`` call, else report it once.
@@ -7519,6 +7837,11 @@ memoryOnly:{self.memoryOnly}
 		if f is not None:
 			codec = _fileCodec(self._fileName)
 			reader = _HashingReader(f)
+			job = self._loadJob
+			if job is not None:  # (reload()'s job: _call swaps the reader's file for _STOPPED once its waiter left)
+				self._loadReader = reader
+				if job[5]:
+					raise _LoadStopped
 			reporter = _Reporter(self._fileName, self.teeLogger)
 			try:
 				f.seek(0)
@@ -7680,24 +8003,55 @@ memoryOnly:{self.memoryOnly}
 				self.__teePrintOrNot(f"Time anomalies detected in {self._fileName}, resetting externalFileUpdateTime")
 
 	def _call(self, fn, *args):
-		"""``fn(*args)``, run on the store's writer thread while this one waits: a KeyboardInterrupt stops the wait, never
-		the write. Run here on that thread itself, or when it is not running (after close, in a forked child)."""
+		"""``fn(*args)``, run on the store's writer thread while this one waits. A KeyboardInterrupt stops the wait: a
+		write the thread has begun is finished, one it has not begun is taken back (its rows stay queued), and a load
+		stops (5.15). Run here on that thread itself, or when it is not running (after close, in a forked child)."""
 		if self.appendThread is threading.current_thread() or not self._workerRuns():
 			return fn(*args)
 		self._memLock.letGo()  # (no section waits for the writer thread, which may need the lock: a hold is a Ctrl-C's)
-		job = [fn, args, _Flag(), None, None]
-		self._requests.append(job)
-		self._wake.set()
-		while not _waited(job[2], 0.1):  # in steps: a Ctrl-C stops the wait on every platform
-			if not self._workerRuns():  # it stopped before it took the job
+		job = [fn, args, _Flag(), None, None, False]  # fn, args, done, result, error, stop (its waiter left: a load stops)
+		try:  # (from before the job is queued: a Ctrl-C between the two would leave it to run)
+			self._requests.append(job)
+			self._wake.set()
+			if self._waitFor(job):
+				return fn(*args)  # (the thread stopped before it took the job)
+		except BaseException:
+			# A Ctrl-C ended the wait. A job not started is taken back: it never runs, so a clear() cannot come after rows
+			# the program sets once it caught the Ctrl-C (5.14 ran it later). Not at exit, where queued and running writes
+			# are finished. A load under way stops at its next read and changes nothing (_LoadStopped), so the writer
+			# thread lets go of the interpreter and the program ends.
+			job[5] = True
+			if not self._exiting:
 				try:
 					self._requests.remove(job)
 				except ValueError:
-					continue
-				return fn(*args)
+					pass  # started (a write runs to its end; a load stops), or never queued
+			reader = self._loadReader
+			if reader is not None and self._loadJob is job:
+				reader.f = _STOPPED  # (a loose load: its next read stops it; nothing is tested per line)
+			raise
 		if job[4] is not None:
 			raise job[4]
 		return job[3]
+
+	# The wait's loop is a method of its own: Python 3.12 to 3.14 leave a loop's back jump inside a try block out of the
+	# exception table, so a Ctrl-C there (a real signal lands at the back jump, in the few instructions after a step of
+	# the wait timed out) skipped _call's take-back of the job. A call is covered: the KeyboardInterrupt goes up through
+	# it as anywhere else (as move_to_end's loops, _movedRows).
+	def _waitFor(self, job):
+		"""Wait for the writer thread to finish ``job``, in steps: a Ctrl-C stops the wait on every platform. True when the
+		thread stopped before it took the job, which is then taken back for the caller to run itself; and in a child that
+		a signal handler forked inside this wait, where no writer thread will ever take it (the fork hook dropped the
+		parent's jobs, _afterFork): 5.14's child ran it itself; until the 5.15 final review, it waited for ever."""
+		while not _waited(job[2], 0.1):
+			if not self._workerRuns():
+				try:
+					self._requests.remove(job)
+				except ValueError:
+					if self._workerPid == os.getpid():
+						continue  # (the writer thread took it, and sets its flag however it ends)
+				return True
+		return False
 
 	def _workerRuns(self):
 		"""True while the writer thread runs and takes jobs: until the end of _appendWorker, not Thread.is_alive() (on
@@ -7740,8 +8094,10 @@ memoryOnly:{self.memoryOnly}
 					job[3] = None
 				else:
 					try:
+						self._loadJob = job if job[0] in (self._reload, self._specReload) else None  # (only a load stops)
 						job[3] = job[0](*job[1])
 					finally:
+						self._loadJob = self._loadReader = None
 						if writes:
 							self._endWrite()
 			except BaseException as e:
@@ -7939,8 +8295,12 @@ memoryOnly:{self.memoryOnly}
 		try:
 			# Once the exit let go of the store, a close() (another exit handler's) still writes what is queued, here.
 			if not self.shutdownEvent.is_set() or self._letGo:
-				if self._spec:
+				if not (self._workerRuns() or self._commitsAtClose()):
+					pass  # (a forked child that writes nothing at its close: no rewrite or sync either, which wait for the file's lock)
+				elif self._spec:
 					self._specSync()
+					if not self._workerRuns() and self._commitsAtClose():
+						self._specCommit()  # (no writer thread: a forked child's, or the exit let go of the store)
 				else:
 					self._closing = True
 					self._reported = {}  # a failure that lasts to the end is reported once more: nothing tries after it
@@ -7950,8 +8310,8 @@ memoryOnly:{self.memoryOnly}
 						# here either): memory holds the only good copy, and goes with the store. Over damage no row went
 						# after, only an explicit call rewrites: the bytes past it hold rows no read reached.
 						self.rewrite(force=self.rewrite_on_exit and not self._remake)  # Ensure any final sync operations are performed
-						if self._letGo:
-							self._commit()  # (the writer thread appends nothing more: the queued rows, here)
+						if not self._workerRuns() and self._commitsAtClose():
+							self._commit()  # (no writer thread: a forked child's, or the exit let go of the store)
 					except BaseException:
 						self._closing = self._exiting  # a Ctrl-C stopped the wait: the store runs on, but not at exit
 						raise
@@ -7962,6 +8322,47 @@ memoryOnly:{self.memoryOnly}
 			self.__teePrintOrNot(f"Failed to stop append thread for {self._fileName}: {e}",'error')
 			import traceback
 			self.__teePrintOrNot(traceback.format_exc(),'error')
+
+	def _afterFork(self):
+		"""In a child that fork() made (_storesAfterFork): the store goes on with no writer thread (_workerRuns: the pid).
+		Its locks are new, as a thread of the parent's may have held one at the fork and is not here to let go of it
+		(its writer thread holds writeLock through each commit's write and fsync). The rows the parent had queued are
+		dropped from this copy: the parent writes them, and written here too an older row could land last. What the
+		child sets from now on is written by its commitAppendToFile(), and by its close() and normal exit where nothing
+		can wait for ever there (_commitsAtClose); a child that ends by os._exit (multiprocessing's do) writes only what
+		it commits or closes.
+
+		The file's state is the parent's to mend, as its writes are its to finish: the child takes no _damaged, which a
+		rewrite of the parent's under way at the fork sets (or one that failed left), and follows the file as another
+		process's store does. Taken, it made the child's close or exit write its fork-time memory over the file (the
+		merge rule's "memory is the only good copy", _syncFrom): the parent's later rows lost and its deleted rows back,
+		in the file and then in the parent's memory (5.15 final review; 5.14's child waited for ever on its copy of
+		writeLock there). The parent holds every row the child's copy does, and its own later ones."""
+		self._parentHeldFile = self._fileObjHeld
+		self._fileObjHeld = False
+		self.writeLock = threading.Lock()
+		self._memLock = _SectionLock()
+		self.appendQueue.clear()
+		self._requests.clear()
+		self._loadJob = self._loadReader = None  # (the parent's writer thread's load, not here: its stop is for it)
+		self._writing = 0
+		self._damaged = False
+		self._forkReset = os.getpid()
+
+	def _commitsAtClose(self):
+		"""True where a store with no writer thread writes at close (stopAppendThread: its queue, and the rewrite or sync
+		it makes first): in the process that made it (the exit let go of it), or in a forked child that the fork hook reset
+		and whose parent did not hold the file through get_file_obj() at the fork. Elsewhere it writes nothing there, as
+		5.14's child did, rewrite_on_exit and a pending sync included (one forked while a parent thread held writeLock
+		would wait for ever on its copy; one whose parent holds the file while it waits for the child would wait for the
+		parent), and says so once."""
+		if self._workerPid == os.getpid() or (self._forkReset == os.getpid() and not self._parentHeldFile):
+			return True
+		if self.appendQueue:
+			_warnOnce(self, 'fork-close', self._fileName, 'the rows this forked child set are not written at its close or '
+					  'exit: ' + ('its parent held the file (get_file_obj) at the fork' if self._parentHeldFile else
+					  'no fork hook ran in it') + '; commitAppendToFile() writes them', self.teeLogger)
+		return False
 
 	def _finish(self):
 		"""Stop the writer thread once it has done its jobs and appended the queue; forget the store (_LIVE_STORES)."""
@@ -8003,6 +8404,7 @@ memoryOnly:{self.memoryOnly}
 		waiting for its own lock, but must not wait on another store of the same file (its reload(), close() or a
 		write) while it holds it: that store's thread waits for this lock, for ever."""
 		self.writeLock.acquire()
+		self._fileObjHeld = True  # (a child forked while it is held writes nothing at its close: _commitsAtClose)
 		file = locked = None
 		try:
 			if 'w' in modes:
@@ -8037,6 +8439,7 @@ memoryOnly:{self.memoryOnly}
 					file.close()  # an unlocked file is never handed out
 				except Exception:
 					pass
+			self._fileObjHeld = False
 			self.writeLock.release()
 			if not isinstance(e, Exception):
 				raise
@@ -8063,6 +8466,7 @@ memoryOnly:{self.memoryOnly}
 			try:
 				_closeUnflushed(raw)
 			finally:
+				self._fileObjHeld = False
 				self.writeLock.release()
 		if self.verbose:
 			self.__teePrintOrNot(f"File {self._fileName} unlocked / released")
@@ -8881,6 +9285,9 @@ file_descriptor:{self.fileObj.fileno() if self.fileObj is not None else None}
 
 	_atExit = _finish = close  # what _stopLiveStores does with a store left open at exit
 
+	def _afterFork(self):
+		pass  # (no queue and no thread: nothing a forked child inherits needs a reset, _storesAfterFork)
+
 	def __exit__(self,exc_type,exc_value,traceback):
 		return self.close()
 
@@ -9071,7 +9478,7 @@ class _ServeStore(object):
 		self.strict = strict
 		self.teeLogger = teeLogger
 		self.verbose = verbose
-		self.lock = threading.RLock()
+		self.lock = _RLock()  # (reentrant: a read takes it and syncs; a Ctrl-C's hold is let go of in _serveRespond)
 		self.mapping = dict if lazy else OrderedDict  # a one-shot read fills a dict faster; popitem reverses either
 		self.data = self.mapping()
 		self.unreadable = False
@@ -9792,6 +10199,9 @@ def _serveRespond(store, line, bulk=None, logger=None):
 		status, rows, message = 1, [], str(e) or type(e).__name__
 		if logger is not None:
 			logger.teelog('tsvz: {}: request {!r} failed: {}'.format(store.path, line[:80], message), 'error')
+	except BaseException:
+		store.lock.letGo()  # (none held on entry: what a Ctrl-C left, bpo-29988; see _SectionLock)
+		raise
 	failing = store.writer.failing
 	if failing:
 		log.lines.append('TSVZ warning: {}: writes are failing ({}); writes acknowledged before they were written '
@@ -9848,8 +10258,10 @@ class _ServeUnreachable(Exception):
 		self.quiet = quiet
 
 
-class _ServeSignal(Exception):
-	"""SIGTERM arrived while ``tsvz serve`` was serving."""
+class _ServeSignal(BaseException):
+	"""SIGTERM arrived while ``tsvz serve`` was serving. A BaseException, as KeyboardInterrupt is (5.15): socketserver takes
+	an Exception raised while it starts a connection's thread for that request's failure and goes on, so one that
+	landed there was swallowed and the handler served on."""
 
 
 def _servePointerPath(store):
@@ -10357,7 +10769,8 @@ class TSVZClient(MutableMapping):
 		self._spec = _isSpecPath(fileName)
 		self.delimiter = get_delimiter(..., file_name=fileName)
 		self._backend = None
-		self._lock = threading.RLock()
+		self._lock = _SectionLock()  # (never nested: a hold found at a request's start is a Ctrl-C's, see _SectionLock)
+		self._cut = False  # a Ctrl-C cut the last request on the connection: its reply may still come (_request)
 		self._connect()
 
 	def _connect(self):
@@ -10384,16 +10797,31 @@ class TSVZClient(MutableMapping):
 				bulk = None if bulk is None else [self._encoded(text) for text in bulk]
 		options = (['--sync'] if write and self._sync else []) + (['--x-written'] if write else [])
 		line = '\t'.join(options + fields)
-		with self._lock:  # one request at a time on the shared connection
-			try:
-				lines, diagnostics, status, message = self._backend.request(line, bulk)
-			except _ServeLost as e:
-				self._backend.close()
-				self._connect()
-				if not retry:
-					raise ConnectionError('the tsvz handler of {} went away ({}); {} may or may not have been '
-										  'applied'.format(self._fileName, e, fields[0]))
-				lines, diagnostics, status, message = self._backend.request(line, bulk)
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._lock:  # one request at a time on the shared connection
+				if self._cut:  # a Ctrl-C cut the last request: its reply may still come, and would answer this one
+					self._backend.close()
+					self._connect()
+					self._cut = False  # (after the connect: one that fails leaves the next request to try again)
+				try:
+					try:
+						lines, diagnostics, status, message = self._backend.request(line, bulk)
+					except _ServeLost as e:
+						self._backend.close()
+						self._connect()
+						if not retry:
+							raise ConnectionError('the tsvz handler of {} went away ({}); {} may or may not have been '
+												  'applied'.format(self._fileName, e, fields[0]))
+						lines, diagnostics, status, message = self._backend.request(line, bulk)
+				except Exception:
+					raise  # (a lost connection or a refused text: no reply is left unread)
+				except BaseException:
+					# Cut part way (a Ctrl-C): the reply, or the rest of a bulk request, is left on the connection.
+					self._cut = isinstance(self._backend, _ServeConnection)  # (a local engine has no reply to lose)
+					raise
+		except BaseException:
+			self._lock.letGo()
+			raise
 		for text in diagnostics:
 			_warn(text, self.teeLogger)
 		if status == 2:
@@ -10591,10 +11019,14 @@ class TSVZClient(MutableMapping):
 	mapToFile = hardMapToFile = rewrite
 
 	def close(self):
-		with self._lock:
-			if self._backend is not None:
-				self._backend.close()
-				self._backend = None
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._lock:
+				if self._backend is not None:
+					self._backend.close()
+					self._backend = None
+		except BaseException:
+			self._lock.letGo()
+			raise
 
 	def __del__(self):
 		try:

@@ -424,6 +424,56 @@ entries go last, in the same commit as the change:
   that a signal handler inside it dropped it first (a check of the hold before the release is not enough: the handler
   lands between the check and the release). Work moved to a thread that the exit waits for makes the exit wait for it:
   the exit has to tell a read, which it can leave, from a write, which it finishes. Find such places by raising the
-  interrupt at every step of the code in turn (`sys.settrace`, every bytecode with `f_trace_opcodes`), and test the
-  operator's cases too (a Ctrl-C that ends a loop of writes, caught and not; one during a big load; a signal handler that
-  uses the store), where the rates are highest.
+  interrupt at every step of the code in turn, and test the operator's cases too (a Ctrl-C that ends a loop of writes, caught and not; one during a big load; a signal handler that
+  uses the store), where the rates are highest. Sharpened in 5.15, when the step sweep went into the suite: step as a
+  real signal can land. On 3.12+ that is `sys.monitoring`'s instruction events, which start at a frame's first
+  instruction, where settrace's opcode events start late. Up to 3.11 it is settrace's `opcode` events, and only those:
+  on 3.9 an opcode event right after a `line` event overwrote the line event's raise, the interrupt ran on, and the next
+  C call failed with `SystemError` (CI's 3.9 job, red since 5.13). On 3.11+ the steps the exception table leaves out,
+  `NOT_TAKEN` and `NOP`, are skipped: no signal is raised there, and a raise there skipped both the `with` statement's
+  exit and the `except` clause, holds a real Ctrl-C never makes. And the sweep keeps no exception object: its traceback
+  kept the cut write's open file, whose lock the next write then waited for, a hang no real program meets.
+
+## 2026-11-10 TSVZ 5.15: a job whose waiter left is taken back if it has not begun, and a load stops
+- Changed: when a Ctrl-C ends a thread's wait for the store's writer thread, a job the writer thread has not begun
+  is taken back (it never runs; the rows it would have written stay queued for the next commit), a load under way
+  stops at its next read and changes nothing, and a write under way still runs to its end. At exit nothing is taken
+  back. A loose load stops because the waiter swaps the file its reader reads for a stand-in whose every read stops
+  it; a `.tsvz` load checks a flag once a 1 MiB chunk. A `.tsvz` `clear()` empties memory inside its job, as it
+  lists the queue, where it emptied memory in the calling thread before handing over the file's clear.
+- Why we had to change: 5.13's rule was "a KeyboardInterrupt stops the wait, never the write". A `clear()` whose wait
+  a Ctrl-C ended ran later all the same, after the rows the program set once it caught the Ctrl-C, and took them out
+  of the file (a loose store's memory too; a `.tsvz` store's memory kept them): 63 of 199 steps of a loose `clear()`
+  and 153 of 219 of a `.tsvz` one, on 3.14, left the program's next rows apart or gone. And a load nobody waited for
+  any more kept the writer thread reading, sharing the interpreter with the main thread's shutdown: a Ctrl-C during a
+  1.5M-row load took up to a second or two to end the program.
+- Original design was wrong because: it treated two rules as one. "Do not cut a write part way" is about the file:
+  a write begun is finished. "Do the write the caller gave up on" is a promise nobody asked for: the caller has
+  already gone on, and anything it does next comes before the job, which then runs out of order. And a read whose
+  only product is a copy for that caller is work for nobody once the caller left.
+- Lesson: when a caller stops waiting, finish only what has begun; take back what has not, and stop work whose only
+  product was for that caller (a read into a copy that is swapped in at its end). Stop it from the caller's side, by
+  swapping what the work reads, not by a test in its inner loop, which every run pays for.
+
+## 2026-11-10 TSVZ 5.15: a forked child's copy of a store is reset at the fork, by a hook
+- Changed: in a child that `fork()` made, each open `TSVZed` drops the rows its parent had queued and gets new locks,
+  in an at-fork hook that runs before any of the child's code (`os.register_at_fork` on 3.7+, a wrapper of
+  `threading._after_fork` on 3.6). The child's `close()` and normal exit now write the rows it set, except where its
+  parent held the file through `get_file_obj()` at the fork, or (3.6) no hook ran; there they write nothing and say so.
+- Why we had to change: the child's commit wrote the parent's queued rows too, so they were written twice, and an
+  older row could land after the parent's newer one, winning in the file while the parent's memory held the newer.
+  Its close and exit wrote nothing at all. And a lock a parent's thread held at the fork (the writer thread holds
+  `writeLock` through each commit's write and fsync) stays held in the child, where no thread will let go of it: a
+  close or exit that writes would wait for ever on it.
+- Original design was wrong because: it treated the child's copy as the store. The queue and the locks belong to the
+  parent's threads, which go on in the parent and are not in the child. The first plan for the fix checked the pid at
+  every write; that costs a system call per set on every program, for the rare one that forks, and still cannot free
+  a lock a dead thread holds.
+- Lesson: state a forked child copies from a parent that still owns it (queued work, locks, threads) is reset once,
+  before the child's code runs, by the platform's at-fork hook, not by a check at every call. Where the child cannot
+  know whether the parent waits for it (a parent holding the file while it waits for the child), it does nothing
+  that could wait for the parent, and says what it left undone.
+- Missed at first (the 5.15 final review): the mark of a rewrite under way (`_damaged`, set from the write's start until
+  the file is on disk). A child forked inside a parent's rewrite took it, and its close wrote its fork-time memory over
+  the parent's later rows, as memory "the only good copy". The file's state is the parent's too: list every field a
+  write in progress sets, not only the queue and the locks.

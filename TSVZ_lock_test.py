@@ -23,7 +23,7 @@ LINUX = sys.platform.startswith('linux')
 KINDS = ['ofd', 'flock'] if LINUX else ['flock']
 NATIVE = getattr(TSVZ, '_LOCK_KIND', None)
 linux_only = pytest.mark.skipif(not LINUX, reason='open file description locks are Linux-only')
-needs_fork_hook = pytest.mark.skipif(not hasattr(os, 'register_at_fork'), reason='os.register_at_fork (Python 3.7+)')
+needs_fork_hook = pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')  # (TSVZ hooks every fork: os.register_at_fork, or 3.6's wrapper)
 
 
 def _tsv(tmp_path, n=1000, name='f.tsv'):
