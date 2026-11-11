@@ -371,9 +371,10 @@ can land in, and checks the locks, memory and the file after each.
   runs inside the set or delete it lands in and lets go of its lock (5.13); the writer thread could then read the file
   into memory or clear it, undoing the change in memory while its line was still written, and a loose store's next
   rewrite lost the set or brought the deleted row back. A set or delete that finds its lock was let go of makes its
-  change again under the lock now, and queues its line again unless it is still the last one queued. (A
-  `move_to_end` has no value of its own: it restores only the order, from the rows memory holds then, so a handler's
-  change of a row stays.) With the
+  change again under the lock now, and queues its line again unless it is still the last one queued. When the handler
+  writes the key the set or delete is writing, the set or delete runs after it, and its value is kept (the handler's
+  write came first, as if the handler had run before the set). (A `move_to_end` has no value of its own: it restores
+  only the order, from the rows memory holds then, so a handler's change of a row stays.) With the
   handler (a `reload()`, `clear()`, a commit, a sync with another process's line, a set or delete) at each step of each
   set, delete, pop, popitem, move and defaults change: 5.14 left memory and the file apart at 3,650 of 33,054 landings
   on 3.14 and 570 of 5,810 line steps on 3.6; 5.15 at none. The line is written twice where the handler wrote or
