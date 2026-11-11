@@ -360,14 +360,20 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   sets rows on that store. Its `close()` and its normal exit leave them unwritten, and say so once: "the rows this
   forked child set are not written at its close or exit: its parent held the file (get_file_obj) at the fork;
   commitAppendToFile() writes them". That holds even when both have let go of the file since: the close makes no
-  rewrite or sync either, which wait for the file's lock. Its own `commitAppendToFile()` writes them once the parent
-  lets go of the file. So commit before forking, or commit in the child.
+  rewrite or sync either, which wait for the file's lock. So let go of the file (`release_file_obj()`) before forking;
+  or commit in the child, which writes once the parent lets go of the file (and waits for ever if the parent holds it
+  while it waits for that child). A commit in the parent before the fork writes none of the child's rows. (The 5.15
+  re-review's probe, Python 3.14 and 3.6, `.tsv` with `rewrite_on_exit` and `.tsvz`: a release before the fork wrote
+  the child's row in every case; a commit before it, never.)
   - A store with neither `rewrite_on_exit` nor a sync pending at the close: 5.14 the same, without the message.
   - A store with `rewrite_on_exit` (`.tsv`), or with a sync pending at the close (another process's change not yet
     followed, both kinds): 5.14's close wrote the rows by that rewrite or sync once both had let go of the file; where
     the parent still held it and waited for the child, it waited for ever on 3.14 and wrote through the lock it
     inherited on 3.6. 5.15 writes nothing there and ends (the 5.15 final review's probe, run again on its fixes, on
     Python 3.14 and 3.6).
+  - A child that calls `commitAppendToFile()` itself while its parent holds the file and waits for it: on Python 3.6
+    5.14's child wrote, through the copy of the parent's lock it inherited; 5.15's waits for ever, as 5.14's already did
+    on 3.7 and later, since 5.15's fork hook drops the inherited locks on 3.6 too.
   - On Python 3.6 the same holds for a child in which TSVZ's fork hook did not run, because a library replaced
     `threading._after_fork` without calling the one it replaced: that child also keeps 5.14's other behaviour (its
     commit writes the rows the parent had queued too, and it keeps the locks the parent's threads held), and its
@@ -383,7 +389,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   2026-11-11; the user chose "Widen KL-c (Recommended)": a child whose parent held the file at the fork writes nothing
   at its close, even when both have let go of it since, for the stores with `rewrite_on_exit` or a pending sync, where
   5.14 wrote the row. (The question's advice was "write before forking, or close the store in the child explicitly";
-  a `close()` in such a child writes nothing, so the advice here is to commit.)
+  a `close()` in such a child writes nothing, and a commit before the fork writes none of the child's rows, so the
+  advice here is the 5.15 re-review's: let go of the file before forking, or commit in the child once the parent has
+  let go.) The Python 3.6 child whose explicit commit now waits for ever while the parent holds the file and waits for
+  it: the user chose "Ship it (Recommended)", 2026-11-11.
 
 ### A parent that forks and ends by os._exit does not write the rows it queued last
 - Kind: known limitation

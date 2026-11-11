@@ -262,7 +262,9 @@ only what it commits or closes. A parent that ends by `os._exit` (a daemon's for
 not write what it had queued, so commit before forking a child that outlives its parent.
 A child forked while its parent holds `get_file_obj()` writes nothing at its close or
 exit, since the parent may be waiting for it, and says so, even once both have let go of
-the file; its `commitAppendToFile()` writes once the parent lets go.
+the file; its `commitAppendToFile()` writes once the parent lets go, so a child that
+commits while its parent holds the file and waits for it waits for ever. Let go of the
+file before forking, and the child's close and exit write.
 
 A file another process removed is made
 again from memory by the store's next write, an append included (a removal in the
@@ -405,8 +407,10 @@ can land in, and checks the locks, memory and the file after each.
   - A forked child writes nothing at its close or exit where its parent held `get_file_obj()` at the fork (the parent
     may be waiting for it), and says so, even once both have let go of the file: where the store has `rewrite_on_exit`
     or a sync pending, 5.14 wrote the rows there once both had let go (and on 3.14 waited for ever while the parent
-    held the file). Commit before forking, or commit in the child: its `commitAppendToFile()` writes once the parent
-    lets go.
+    held the file). Let go of the file (`release_file_obj()`) before forking; or commit in the child, which writes
+    once the parent lets go of the file (and waits for ever if the parent holds it while it waits for that child; on
+    Python 3.6, 5.14's child wrote there through a copy of the parent's lock). A commit before forking writes none of
+    the child's rows.
   - A parent that forks and ends by `os._exit` does not write the rows it queued last: commit before forking.
 - **Planned for 5.16** ([docs/limitations.md](docs/limitations.md)): a Ctrl-C caught inside a set, delete, pop or move
   still leaves that one key apart (memory changed, the line not queued; a move to the beginning, several keys' order),
