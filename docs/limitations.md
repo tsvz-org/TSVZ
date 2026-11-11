@@ -15,10 +15,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     again under the lock; a plain one does not);
   - the reader is TSVZ 5.2 or older, or tsvz-rs: it takes no lock and can see a 5.3 rewrite part way, as before.
     Restarting the program on 5.3 ends it;
-  - Python 3.6: a child that `fork()` made while a thread held a TSVZ lock keeps that lock until it exits, so the
-    parent's later writes of the file wait for the child (an inherited read lock holds off only rewrites, and on
-    `flock` systems appends too; an inherited write lock holds off reads as well). 3.7 and later drop it in the
-    child;
   - where only `lockf` works (on Linux, a kernel or file system that refuses open file description locks: a kernel
     before 3.15, or a RHEL/CentOS 7 kernel older than 3.10.0-704, i.e. 7.0 to 7.4's own: the backport is in
     3.10.0-704, and 7.9's 3.10.0-1160 has them, checked on CentOS 7.9; elsewhere, a file
@@ -27,15 +23,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     lock, and two threads' writes do not exclude each other (a new file's header can be written twice), as in 5.2;
   - Windows is unchanged: readers take no lock.
 - Why: TSVZ cannot change older programs or other tools, and a writer that empties the file first or ignores the
-  lock gives a reader nothing to wait on. Python 3.6 has no at-fork hook. On `lockf`-only hosts `lockf` is kept so
-  that 3.39 to 5.2 writers stay excluded; `flock` would not exclude them on Linux.
+  lock gives a reader nothing to wait on. On `lockf`-only hosts `lockf` is kept so that 3.39 to 5.2 writers stay
+  excluded; `flock` would not exclude them on Linux.
 - Revisit when: an operator loses a delete with only 5.3 or later programs on a file, still runs 3.39 to 5.0
   writers beside 5.3, or runs on hosts without open file description locks.
 - Approved: 2026-11-02, the user chose "One known limitation (Recommended)" for older writers that empty the file
   before or without the lock, readers from 5.1 and earlier, and Python 3.6 forks, and "Keep lockf (Recommended)"
   for Linux without open file description locks; 2026-11-04, "Accept the wider entry (Recommended)" for this
   wording (readers from 5.2 and earlier, `lockf`-only hosts and Windows folded in); 2026-11-04, "Correct the wording
-  (Recommended)" for the RHEL/CentOS 7 kernel range found on the EL7 test VM.
+  (Recommended)" for the RHEL/CentOS 7 kernel range found on the EL7 test VM. Narrowed in 5.15: a Python 3.6 child
+  that `fork()` made drops the locks it inherits too, since TSVZ's fork hook runs there (the user chose "Wrap it on
+  3.6 (Recommended)", 2026-11-10).
 
 ### A running TSVZed of 3.39 to 5.2 cuts rows to its header's count when it reads its file again
 - Kind: known limitation
@@ -218,25 +216,53 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   for ever (as in 5.12)." The wording is the 5.13 final review's, which adds the `writeLock` case: its hang hits the
   program's own next commit, not only another thread.
 
-### A forked child's rows on an inherited store reach the file only through its own commit
+### A forked child writes nothing at its close or exit when its parent held get_file_obj() at the fork
+- Kind: known limitation
+- What the operator sees: a child that `fork()` made while its parent held the store's file through `get_file_obj()`
+  sets rows on that store. Its `close()` and its normal exit leave them unwritten, and say so once: "the rows this
+  forked child set are not written at its close or exit: its parent held the file (get_file_obj) at the fork;
+  commitAppendToFile() writes them". Its own `commitAppendToFile()` writes them once the parent lets go of the file.
+  5.14 the same, without the message. On Python 3.6 the same holds for a child in which TSVZ's fork hook did not run,
+  because a library replaced `threading._after_fork` without calling the one it replaced: that child also keeps
+  5.14's other behaviour (its commit writes the rows the parent had queued too, and it keeps the locks the parent's
+  threads held), and its message ends "no fork hook ran in it".
+- Why: the child cannot tell whether its parent waits for it while holding the file. A write there waits for the
+  parent's lock, and a parent that waits for the child (`waitpid`) would then never let go: the 5.15 plan's first
+  design hung there (measured). A child with no fork hook may hold a copy of a lock a parent's thread held, and its
+  close would wait for ever on it.
+- Revisit when: someone needs those rows written and cannot commit.
+- Approved: 2026-11-10, the user chose "Approve as KL (Recommended)": a forked child writes nothing at close or exit
+  when its parent held `get_file_obj()` at the fork, and warns once. The Python 3.6 child with no hook is the case the
+  user's pick "Wrap it on 3.6 (Recommended)" named: that child keeps 5.14's behaviour and says so once.
+
+### A parent that forks and ends by os._exit does not write the rows it queued last
+- Kind: known limitation
+- What the operator sees: a program sets rows, forks a child that outlives it, and ends by `os._exit`, as a
+  daemonizing double fork does. The rows it queued in its last `append_check_delay` before the fork (0.01 s by
+  default) are written by neither: the child drops them at the fork, since a parent normally writes them. In 5.14 the
+  child's explicit `commitAppendToFile()` wrote them (twice where the parent wrote them too), and its close and exit
+  wrote nothing, its own rows included; 5.15 writes the child's own rows there. The README says: commit before
+  forking a child that outlives its parent.
+- Why: the child cannot tell a parent that will write them from one that will not. Committing in a hook before every
+  fork would cost a write and an fsync per `os.fork()`, and would wait for ever where the forking thread holds the
+  store's lock or its file (`get_file_obj()`).
+- Revisit when: someone loses rows this way.
+- Approved: 2026-11-10, the user chose "Approve as KL (Recommended)": a parent that forks and ends by `os._exit`
+  loses the rows it queued last; the README says to commit before forking.
+
+### A TSVZClient with no server, used in a forked child, waits for ever at its first write
 - Kind: deferred
-- What the operator sees: a child that `fork()` made from a program with an open `TSVZed` sets rows on that store.
-  They reach the file only through the child's own `commitAppendToFile()`: its `close()` and its exit write nothing
-  (5.13 final review, `.tsv` and `.tsvz`; 5.12 the same). Found by reading, not run: that commit also writes the queue
-  the child inherited, the rows the parent had queued and not yet written at the fork, which the parent writes as
-  well, so they are written twice; and when the parent changed such a key after the fork and committed first, the
-  child's commit writes the older value last, so it wins in the file while the parent's memory holds the newer one.
-- Why: the child has no writer thread (`_workerRuns()` compares the store's `_workerPid` with `os.getpid()`), and its
-  queue is a copy of the parent's at the fork.
-- Plan (5.15): the store notes its pid (`_workerPid`). In a forked child, the first write or commit drops the
-  inherited queue, since the parent writes those rows, so the queue holds only what the child sets; the child's
-  `close()` and a normal exit write those. The check is at the write, not at the fork: Python 3.6 has no
-  `os.register_at_fork`. `multiprocessing`'s fork children end by `os._exit`, which skips exit handlers, so there only
-  an explicit `close()` or commit writes; a README line says so. Then a test: a child's set and exit, set and
-  `close()`, and set and commit with rows the parent had queued at the fork, each row once in the file and the
-  parent's later value last.
-- Revisit when: 5.15.
-- Noted: 2026-11-10, found in the 5.13 final review; the user chose "Fix in 5.15 (Recommended)".
+- What the operator sees: a program opens a `TSVZClient` on a file no `tsvz serve` handler serves (the client then
+  works on the file in its own process, through a local engine) and forks; in the child, the first write through that
+  client (`c['x'] = ...`) never returns. The engine's writer thread (`_ServeWriter`) is not in the child. Checked on
+  5.14 and 5.15, Python 3.14 and 3.6, `.tsv` and `.tsvz` (the 5.15 plan's `probe/forkclient.py`: no return in 10 s).
+- Why: 5.15's fork hook resets each `TSVZed`; the client's engine is another object with its own thread, and its
+  reset needs its own design and tests.
+- Plan (5.16): built on 5.15's fork hook (`_storesAfterFork`): each live `_ServeWriter` (`_SERVE_OPEN_WRITERS`)
+  drops its inherited queue in the child and starts its thread again, either at its first `submit` there (a pid check
+  once a request) or in the hook; measured to settle which.
+- Revisit when: 5.16.
+- Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked.
 
 ### The suite's interrupt sweep covers a set and a commit only
 - Kind: deferred

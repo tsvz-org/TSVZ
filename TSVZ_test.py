@@ -1518,7 +1518,7 @@ def test_lock_survives_another_descriptor_of_the_part_closing(tmp_path):
 	assert code == 3
 
 
-@pytest.mark.skipif(not hasattr(os, 'register_at_fork'), reason='os.register_at_fork (Python 3.7+)')
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')  # (TSVZ's fork hook: os.register_at_fork, or 3.6's wrapper)
 @pytest.mark.filterwarnings('ignore::DeprecationWarning')  # fork() in a process with threads: here on purpose
 def test_a_forked_child_does_not_wait_for_a_path_lock_its_parent_held(tmp_path, monkeypatch):
 	# A parent thread waits for another process's lock, holding the in-process lock of the path:
@@ -18095,6 +18095,105 @@ def test_a_first_ctrl_c_before_the_exits_stop_begins_still_writes_the_rows(tmp_p
 	done = subprocess.run([sys.executable, str(script), HERE, p, str(step)], stdout=subprocess.PIPE,
 						  stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
 	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False).get('q') == ['q', '1'], done.stderr
+
+
+#: ARGV: TSVZ's directory, CASE, the file. A store with the row a, then fork() (CASE says how), the child's status
+#: printed. Each child has 10 s (an alarm): a close or exit takes well under 0.1 s, and the failure is a wait for ever.
+_FORKED = r"""
+import multiprocessing, os, signal, sys, threading, time
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+case, p = sys.argv[2], sys.argv[3]
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)  # (no tick writes)
+t['a'] = ['a', '1']
+t.commitAppendToFile()
+
+def forked(body):
+	pid = os.fork()
+	if pid == 0:
+		signal.alarm(10)
+		body()
+		sys.exit(0)  # (the normal exit: atexit runs)
+	return pid
+
+def status(pid):
+	_, code = os.waitpid(pid, 0)
+	print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+
+if case == 'exit':  # the child sets c and exits
+	status(forked(lambda: t.__setitem__('c', ['c', '1'])))
+elif case == 'close':  # ... closes, then exits
+	status(forked(lambda: (t.__setitem__('c', ['c', '1']), t.close())))
+elif case == 'queued':  # p1 queued in the parent at the fork; the child commits after the parent's newer p1
+	t['p1'] = ['p1', 'old']
+	go, wait = os.pipe()
+	def body():
+		os.read(go, 1)
+		t['c'] = ['c', '1']
+		t.commitAppendToFile()
+	pid = forked(body)
+	t['p1'] = ['p1', 'new']
+	t.commitAppendToFile()
+	os.write(wait, b'x')
+	status(pid)
+elif case in ('held', 'nohook'):  # a parent thread holds writeLock at the fork (a commit's write and fsync), 0.5 s
+	held = threading.Event()
+	def hold():
+		with t.writeLock:
+			held.set()
+			time.sleep(0.5)  # (the child reaches its close milliseconds after the fork)
+	threading.Thread(target=hold, daemon=True).start()  # (daemon: with no fork hook, the child's exit would join it)
+	held.wait(10)
+	if case == 'nohook':  # (3.6: a library replaced threading._after_fork without calling it; the child exits)
+		threading._after_fork = lambda: None
+		status(forked(lambda: t.__setitem__('c', ['c', '1'])))
+	else:
+		status(forked(lambda: (t.__setitem__('c', ['c', '1']), t.close())))
+elif case == 'file':  # the parent holds get_file_obj() across the fork, and waits for the child before it lets go
+	f = t.get_file_obj('ab')
+	status(forked(lambda: t.__setitem__('c', ['c', '1'])))
+	t.release_file_obj(f)
+elif case in ('mp', 'mpclose'):  # multiprocessing's fork child ends by os._exit
+	def body():
+		t['c'] = ['c', '1']
+		if case == 'mpclose':
+			t.close()
+	child = multiprocessing.get_context('fork').Process(target=body)
+	child.start()
+	child.join(10)
+	print('child', child.exitcode, flush=True)
+t.close()
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
+@pytest.mark.parametrize('case', ['exit', 'close', 'queued', 'held', 'file', 'mp', 'mpclose', 'nohook'])
+@pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
+def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(tmp_path, ext, case):
+	# 5.14: a child that fork() made wrote nothing at its close or exit, and its commit wrote the rows its parent had
+	# queued too, so they were written twice, and an older row could land after the parent's newer one. At the fork the
+	# child's copy now drops the parent's queue and takes new locks (a parent thread may have held one); its close and
+	# normal exit write what it set, but where its parent held the file through get_file_obj() (it may be waiting for the
+	# child) or no fork hook ran: there it writes nothing, as 5.14 did, and says so.
+	if case == 'nohook' and sys.version_info >= (3, 7):
+		pytest.skip('3.6: the fork hook is a wrapper of threading._after_fork')
+	p = str(tmp_path / ('s.' + ext))
+	script = tmp_path / 'forked.py'
+	script.write_text(_FORKED)
+	# 60 s: the run takes a second; only a wait for ever takes this long, on a machine the suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, case, p], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+						  universal_newlines=True, timeout=60)
+	assert done.returncode == 0 and 'child 0' in done.stdout, done.stdout + done.stderr
+	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
+	with open(p, 'rb') as f:
+		lines = [line.split(b'\t')[0] for line in f.read().split(b'\n')]
+	written = case in ('exit', 'close', 'queued', 'held', 'mpclose')
+	assert ('c' in rows) == written and lines.count(b'c') == int(written), (rows, done.stderr)
+	if case == 'queued':
+		assert rows['p1'] == ['p1', 'new'] and lines.count(b'p1') == 2  # (the parent's two: the child dropped its copy)
+	if case in ('file', 'nohook'):
+		said = 'its parent held the file (get_file_obj) at the fork' if case == 'file' else 'no fork hook ran in it'
+		assert done.stderr.count(said) == 1, done.stderr
 
 
 # --------------------------------------------------------------------------

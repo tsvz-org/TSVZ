@@ -251,7 +251,20 @@ raises `KeyboardInterrupt`). At exit a write in progress is
 finished: a Ctrl-C then says so and keeps waiting, and a second one abandons it. A
 closed store is freed. (`get_file_obj()` and `release_file_obj()`, kept from 3.39,
 hand the locked file to the calling thread; while it holds it, that thread must not wait
-on another store of the same file, whose thread waits for this lock.) A file another process removed is made
+on another store of the same file, whose thread waits for this lock.)
+
+A child that `fork()` made (`os.fork()`, or `multiprocessing`'s fork children, which its
+`fork` start method makes; Python 3.14's default on Linux, `forkserver`, makes children
+that inherit no store) drops the rows its parent had queued, which the parent writes,
+and writes the rows it sets itself at its `commitAppendToFile()`, its `close()` and its
+normal exit. One that ends by `os._exit`, as `multiprocessing`'s children do, writes
+only what it commits or closes. A parent that ends by `os._exit` (a daemon's fork) does
+not write what it had queued, so commit before forking a child that outlives its parent.
+A child forked while its parent holds `get_file_obj()` writes nothing at its close or
+exit, since the parent may be waiting for it, and says so; its `commitAppendToFile()`
+writes once the parent lets go.
+
+A file another process removed is made
 again from memory by the store's next write, an append included (a removal in the
 microseconds as a write starts is followed as a rotation instead); while that rewrite
 fails or is refused, the rows are appended to a new file there, and memory keeps all of

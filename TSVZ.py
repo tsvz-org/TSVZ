@@ -1429,10 +1429,6 @@ def _locksAfterFork():
 			os.close(null)
 
 
-if hasattr(os, 'register_at_fork'):  # Python 3.7+
-	os.register_at_fork(after_in_child=_locksAfterFork)
-
-
 def _lockFile(f, mode=_REWRITE):
 	"""Lock the open file ``f`` for ``mode`` (_READ, _APPEND, _REWRITE), waiting for it; True when it is locked.
 
@@ -5723,6 +5719,31 @@ def _waited(flag, timeout):
 _LIVE_STORES = weakref.WeakValueDictionary()
 
 
+def _storesAfterFork():
+	"""In a child that fork() made, before any of its code runs: the in-process and file locks it inherits
+	(_locksAfterFork), and each live store (_afterFork)."""
+	_locksAfterFork()
+	for store in list(_LIVE_STORES.values()):
+		store._afterFork()
+
+
+if hasattr(os, 'register_at_fork'):  # Python 3.7+
+	os.register_at_fork(after_in_child=_storesAfterFork)
+elif hasattr(threading, '_after_fork'):
+	# Python 3.6 has no os.register_at_fork, but os.fork() runs threading._after_fork() in every child (PyOS_AfterFork):
+	# the hook goes there (the user's pick, 2026-11-10). 3.6 is frozen, so this private name cannot change under it. A
+	# library that later replaces it without calling it turns this off: such a child writes nothing at its close and
+	# exit, and says so (TSVZed._commitsAtClose).
+	_threadingAfterFork = threading._after_fork
+
+	def _afterFork36():
+		try:
+			_threadingAfterFork()
+		finally:
+			_storesAfterFork()
+	threading._after_fork = _afterFork36
+
+
 _exitArmed = False  # _stopLiveStores reached its inner try: from there on it takes a first Ctrl-C as the first
 
 
@@ -7085,6 +7106,9 @@ memoryOnly:{self.memoryOnly}
 	_letGo = False  # the exit let go of the store (_atExit), or abandoned it: its writer thread starts no write
 	_exiting = False  # _stopLiveStores stops it at exit: a Ctrl-C there finishes the store, which does not run on
 	_loadJob = None  # the load job (reload()'s) the writer thread runs: it stops once its waiter left (_call)
+	_forkReset = None  # the pid of the forked child whose fork hook reset the store (_afterFork)
+	_fileObjHeld = False  # get_file_obj() holds the file (writeLock and the file lock) until release_file_obj()
+	_parentHeldFile = False  # in a forked child: the parent held the file through get_file_obj() at the fork
 	_loadReader = None  # that load's reader of a loose file, whose file _call swaps for _STOPPED
 
 	def _refuse(self, where, error, explicit=False):
@@ -8077,6 +8101,8 @@ memoryOnly:{self.memoryOnly}
 			if not self.shutdownEvent.is_set() or self._letGo:
 				if self._spec:
 					self._specSync()
+					if not self._workerRuns() and self._commitsAtClose():
+						self._specCommit()  # (no writer thread: a forked child's, or the exit let go of the store)
 				else:
 					self._closing = True
 					self._reported = {}  # a failure that lasts to the end is reported once more: nothing tries after it
@@ -8086,8 +8112,8 @@ memoryOnly:{self.memoryOnly}
 						# here either): memory holds the only good copy, and goes with the store. Over damage no row went
 						# after, only an explicit call rewrites: the bytes past it hold rows no read reached.
 						self.rewrite(force=self.rewrite_on_exit and not self._remake)  # Ensure any final sync operations are performed
-						if self._letGo:
-							self._commit()  # (the writer thread appends nothing more: the queued rows, here)
+						if not self._workerRuns() and self._commitsAtClose():
+							self._commit()  # (no writer thread: a forked child's, or the exit let go of the store)
 					except BaseException:
 						self._closing = self._exiting  # a Ctrl-C stopped the wait: the store runs on, but not at exit
 						raise
@@ -8098,6 +8124,37 @@ memoryOnly:{self.memoryOnly}
 			self.__teePrintOrNot(f"Failed to stop append thread for {self._fileName}: {e}",'error')
 			import traceback
 			self.__teePrintOrNot(traceback.format_exc(),'error')
+
+	def _afterFork(self):
+		"""In a child that fork() made (_storesAfterFork): the store goes on with no writer thread (_workerRuns: the pid).
+		Its locks are new, as a thread of the parent's may have held one at the fork and is not here to let go of it
+		(its writer thread holds writeLock through each commit's write and fsync). The rows the parent had queued are
+		dropped from this copy: the parent writes them, and written here too an older row could land last. What the
+		child sets from now on is written by its commitAppendToFile(), and by its close() and normal exit where nothing
+		can wait for ever there (_commitsAtClose); a child that ends by os._exit (multiprocessing's do) writes only what
+		it commits or closes."""
+		self._parentHeldFile = self._fileObjHeld
+		self._fileObjHeld = False
+		self.writeLock = threading.Lock()
+		self._memLock = _SectionLock()
+		self.appendQueue.clear()
+		self._requests.clear()
+		self._writing = 0
+		self._forkReset = os.getpid()
+
+	def _commitsAtClose(self):
+		"""True where a store with no writer thread writes its queue at close (stopAppendThread): in the process that made
+		it (the exit let go of it), or in a forked child that the fork hook reset and whose parent did not hold the file
+		through get_file_obj() at the fork. Elsewhere it writes nothing there, as 5.14's child did (one forked while a
+		parent thread held writeLock would wait for ever on its copy; one whose parent holds the file while it waits for
+		the child would wait for the parent), and says so once."""
+		if self._workerPid == os.getpid() or (self._forkReset == os.getpid() and not self._parentHeldFile):
+			return True
+		if self.appendQueue:
+			_warnOnce(self, 'fork-close', self._fileName, 'the rows this forked child set are not written at its close or '
+					  'exit: ' + ('its parent held the file (get_file_obj) at the fork' if self._parentHeldFile else
+					  'no fork hook ran in it') + '; commitAppendToFile() writes them', self.teeLogger)
+		return False
 
 	def _finish(self):
 		"""Stop the writer thread once it has done its jobs and appended the queue; forget the store (_LIVE_STORES)."""
@@ -8139,6 +8196,7 @@ memoryOnly:{self.memoryOnly}
 		waiting for its own lock, but must not wait on another store of the same file (its reload(), close() or a
 		write) while it holds it: that store's thread waits for this lock, for ever."""
 		self.writeLock.acquire()
+		self._fileObjHeld = True  # (a child forked while it is held writes nothing at its close: _commitsAtClose)
 		file = locked = None
 		try:
 			if 'w' in modes:
@@ -8173,6 +8231,7 @@ memoryOnly:{self.memoryOnly}
 					file.close()  # an unlocked file is never handed out
 				except Exception:
 					pass
+			self._fileObjHeld = False
 			self.writeLock.release()
 			if not isinstance(e, Exception):
 				raise
@@ -8199,6 +8258,7 @@ memoryOnly:{self.memoryOnly}
 			try:
 				_closeUnflushed(raw)
 			finally:
+				self._fileObjHeld = False
 				self.writeLock.release()
 		if self.verbose:
 			self.__teePrintOrNot(f"File {self._fileName} unlocked / released")
@@ -9016,6 +9076,9 @@ file_descriptor:{self.fileObj.fileno() if self.fileObj is not None else None}
 		return self
 
 	_atExit = _finish = close  # what _stopLiveStores does with a store left open at exit
+
+	def _afterFork(self):
+		pass  # (no queue and no thread: nothing a forked child inherits needs a reset, _storesAfterFork)
 
 	def __exit__(self,exc_type,exc_value,traceback):
 		return self.close()

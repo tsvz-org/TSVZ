@@ -454,3 +454,22 @@ entries go last, in the same commit as the change:
 - Lesson: when a caller stops waiting, finish only what has begun; take back what has not, and stop work whose only
   product was for that caller (a read into a copy that is swapped in at its end). Stop it from the caller's side, by
   swapping what the work reads, not by a test in its inner loop, which every run pays for.
+
+## 2026-11-10 TSVZ 5.15: a forked child's copy of a store is reset at the fork, by a hook
+- Changed: in a child that `fork()` made, each open `TSVZed` drops the rows its parent had queued and gets new locks,
+  in an at-fork hook that runs before any of the child's code (`os.register_at_fork` on 3.7+, a wrapper of
+  `threading._after_fork` on 3.6). The child's `close()` and normal exit now write the rows it set, except where its
+  parent held the file through `get_file_obj()` at the fork, or (3.6) no hook ran; there they write nothing and say so.
+- Why we had to change: the child's commit wrote the parent's queued rows too, so they were written twice, and an
+  older row could land after the parent's newer one, winning in the file while the parent's memory held the newer.
+  Its close and exit wrote nothing at all. And a lock a parent's thread held at the fork (the writer thread holds
+  `writeLock` through each commit's write and fsync) stays held in the child, where no thread will let go of it: a
+  close or exit that writes would wait for ever on it.
+- Original design was wrong because: it treated the child's copy as the store. The queue and the locks belong to the
+  parent's threads, which go on in the parent and are not in the child. The first plan for the fix checked the pid at
+  every write; that costs a system call per set on every program, for the rare one that forks, and still cannot free
+  a lock a dead thread holds.
+- Lesson: state a forked child copies from a parent that still owns it (queued work, locks, threads) is reset once,
+  before the child's code runs, by the platform's at-fork hook, not by a check at every call. Where the child cannot
+  know whether the parent waits for it (a parent holding the file while it waits for the child), it does nothing
+  that could wait for the parent, and says what it left undone.
