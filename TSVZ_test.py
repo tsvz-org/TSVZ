@@ -17967,6 +17967,38 @@ def test_a_tsvz_commit_lists_writes_and_pops_only_the_rows_it_listed(tmp_path, m
 	assert TSVZ.readTabularFile(p, verbose=False)['r3'] == ['r3', '3'] and not t.appendQueue
 
 
+@pytest.mark.parametrize('where', ['before', 'after'])
+def test_a_tsvz_commit_a_ctrl_c_cuts_in_its_write_drops_no_row(tmp_path, monkeypatch, where):
+	# A .tsvz commit after close() (or in a forked child) runs in the caller's thread. 5.14 took the rows out of the queue
+	# before it wrote them and put them back only for an Exception, so a Ctrl-C in the write dropped them: in memory, not in
+	# the file, and no later commit wrote them (5.13 final review: 582 of 996 steps). Now they leave the queue once they are on
+	# disk: a Ctrl-C before the write leaves them queued, one after it has them written again by the next commit.
+	p = str(tmp_path / 's.tsvz')
+	t = TSVZ.TSVZed(p, verbose=False, append_check_delay=60)
+	t.close()  # (the commit runs in this thread)
+	t['r1'] = ['r1', '1']
+	t['r2'] = ['r2', '2']
+	real = TSVZ._specAppendPayload
+
+	def append(*args, **kwargs):
+		if where == 'before':
+			raise KeyboardInterrupt
+		real(*args, **kwargs)
+		raise KeyboardInterrupt  # (the rows are on disk, and not yet out of the queue)
+	monkeypatch.setattr(TSVZ, '_specAppendPayload', append)
+	with pytest.raises(KeyboardInterrupt):
+		t.commitAppendToFile()
+	monkeypatch.undo()
+	assert len(t.appendQueue) == 2
+	t.commitAppendToFile()  # (the program caught the Ctrl-C and goes on)
+	assert not t.appendQueue
+	rows = TSVZ.readTabularFile(p, verbose=False)
+	assert rows['r1'] == ['r1', '1'] and rows['r2'] == ['r2', '2']
+	with open(p, 'rb') as f:
+		copies = [line.split(b'\t')[0] for line in f.read().split(b'\n')].count(b'r1')
+	assert copies == (1 if where == 'before' else 2)  # (written again: the last copy wins)
+
+
 def _a_store_of_rows(path, rows):
 	if path.endswith('.tsv'):
 		with open(path, 'wb') as f:
