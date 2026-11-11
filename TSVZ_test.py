@@ -277,6 +277,7 @@ def test_version():
 # Shared helpers for the 4.1 tests
 # ==========================================================================
 import contextlib
+import dis
 import functools
 import gzip
 import zlib
@@ -18091,6 +18092,57 @@ def test_a_job_whose_waiter_a_ctrl_c_took_away_is_taken_back_unless_at_exit(tmp_
 	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
 	assert memory == rows
 	assert sorted(rows) == ([] if exiting else ['a', 'b', 'c', 'd'])  # (at exit the clear ran, after c and d were set)
+
+
+@pytest.mark.skipif(not hasattr(sys, 'monitoring'), reason='sys.monitoring (3.12+), where the exception table has the hole')
+@pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
+def test_a_ctrl_c_at_the_back_jump_of_the_wait_for_the_writer_thread_takes_the_job_back(tmp_path, monkeypatch, ext):
+	# Python 3.12 to 3.14 leave a loop's back jump inside a try block out of the exception table, so a KeyboardInterrupt
+	# raised there skipped _call's take-back of the job (a real signal lands at a back jump, in the few instructions after
+	# a step of the wait timed out): the clear() stayed queued, to run after the rows the program set once it caught the
+	# Ctrl-C (5.15 review). The wait's loop is a method of its own, whose call the table covers.
+	p = str(tmp_path / ('s.' + ext))
+	t = TSVZ.TSVZed(p, header='id\tv', verbose=False, rewrite_on_load=False, append_check_delay=60)
+	t['a'] = ['a', '1']
+	t['b'] = ['b', '2']
+	t.commitAppendToFile()
+	letGo = _the_writer_thread_held_off(t)
+	me, real = threading.current_thread(), TSVZ._waited
+	stepped, fired = [], []
+
+	def waited(flag, timeout):
+		if threading.current_thread() is not me:
+			return real(flag, timeout)
+		stepped.append(1)
+		return False  # (a step of the wait that ended with the job not done: the loop goes round)
+	monkeypatch.setattr(TSVZ, '_waited', waited)
+	backward = dis.opmap['JUMP_BACKWARD']
+
+	def jump(code, offset):  # (the first back jump TSVZ's code makes in this thread after a step of its wait)
+		if stepped and not fired and threading.current_thread() is me and code.co_filename == TSVZ.__file__ \
+				and code.co_code[offset] == backward:
+			fired.append(offset)
+			raise KeyboardInterrupt
+	monitoring = sys.monitoring
+	monitoring.use_tool_id(4, 'test')
+	monitoring.register_callback(4, monitoring.events.INSTRUCTION, jump)
+	monitoring.set_events(4, monitoring.events.INSTRUCTION)
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			t.clear()
+	finally:
+		monitoring.set_events(4, 0)
+		monitoring.register_callback(4, monitoring.events.INSTRUCTION, None)
+		monitoring.free_tool_id(4)
+	monkeypatch.undo()
+	assert fired, 'the loop made no back jump'
+	t['c'] = ['c', '3']
+	letGo()
+	t.commitAppendToFile()
+	memory = dict(t)
+	t.close()
+	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
+	assert memory == rows and sorted(rows) == ['a', 'b', 'c']  # (the clear never ran)
 
 
 def test_a_tsvz_clear_keeps_memory_and_file_together_for_a_row_set_while_it_runs(tmp_path):

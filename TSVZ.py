@@ -8007,13 +8007,8 @@ memoryOnly:{self.memoryOnly}
 		try:  # (from before the job is queued: a Ctrl-C between the two would leave it to run)
 			self._requests.append(job)
 			self._wake.set()
-			while not _waited(job[2], 0.1):  # in steps: a Ctrl-C stops the wait on every platform
-				if not self._workerRuns():  # it stopped before it took the job
-					try:
-						self._requests.remove(job)
-					except ValueError:
-						continue
-					return fn(*args)
+			if self._waitFor(job):
+				return fn(*args)  # (the thread stopped before it took the job)
 		except BaseException:
 			# A Ctrl-C ended the wait. A job not started is taken back: it never runs, so a clear() cannot come after rows
 			# the program sets once it caught the Ctrl-C (5.14 ran it later). Not at exit, where queued and running writes
@@ -8032,6 +8027,22 @@ memoryOnly:{self.memoryOnly}
 		if job[4] is not None:
 			raise job[4]
 		return job[3]
+
+	# The wait's loop is a method of its own: Python 3.12 to 3.14 leave a loop's back jump inside a try block out of the
+	# exception table, so a Ctrl-C there (a real signal lands at the back jump, in the few instructions after a step of
+	# the wait timed out) skipped _call's take-back of the job. A call is covered: the KeyboardInterrupt goes up through
+	# it as anywhere else (as move_to_end's loops, _movedRows).
+	def _waitFor(self, job):
+		"""Wait for the writer thread to finish ``job``, in steps: a Ctrl-C stops the wait on every platform. True when the
+		thread stopped before it took the job, which is then taken back for the caller to run itself."""
+		while not _waited(job[2], 0.1):
+			if not self._workerRuns():
+				try:
+					self._requests.remove(job)
+				except ValueError:
+					continue
+				return True
+		return False
 
 	def _workerRuns(self):
 		"""True while the writer thread runs and takes jobs: until the end of _appendWorker, not Thread.is_alive() (on
