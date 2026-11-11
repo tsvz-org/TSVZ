@@ -381,9 +381,10 @@ can land in, and checks the locks, memory and the file after each.
   queued something after it (known, below). A loose set looks its key up once, so a handler's `clear()` between two
   lookups no longer raises KeyError out of it. The check of the lock costs a `.tsvz` set, delete or pop 1.1 to 2.4%
   (30 to 50 ns of a 2 µs set, on Python 3.14 and 3.6); a loose set is 4 to 7% faster, from its single lookup.
-- **A Ctrl-C at a loop in `move_to_end` no longer leaves the store's lock held** (Python 3.12 to 3.14, which leave a
-  loop's back jump in a `with` block inside a `try` out of the exception table, so a signal landing there skipped the
-  block's exit).
+- **A Ctrl-C at a loop in `move_to_end` no longer leaves the store's lock held, and one in the wait for the writer
+  thread no longer skips taking its job back** (Python 3.12 to 3.14, which leave a loop's back jump inside a `try` or
+  `with` block out of the exception table, so a signal landing there skipped the block's exit and its clean-up). Other
+  loops of that shape are left (planned for 5.16, below).
 - Compactions are unchanged: the plan to drop a strict reader's first line of a key where it takes no row between it
   and its last moved the view of readers given other arguments than the writer's in the random differential (4 of
   20,000 `.tsv` argument sets), so it is deferred again
@@ -400,7 +401,11 @@ can land in, and checks the locks, memory and the file after each.
     may be waiting for it), and says so; its `commitAppendToFile()` writes once the parent lets go.
   - A parent that forks and ends by `os._exit` does not write the rows it queued last: commit before forking.
 - **Planned for 5.16** ([docs/limitations.md](docs/limitations.md)): a Ctrl-C caught inside a set, delete, pop or move
-  still leaves that one key apart (memory changed, the line not queued); a handler's change of the store inside
+  still leaves that one key apart (memory changed, the line not queued; a move to the beginning, several keys' order),
+  and so does one that follows a signal handler's `reload()` inside the set; a Ctrl-C at the back jump of other loops
+  inside a `try` or `with` block can skip their clean-up on Python 3.12 to 3.14 (a static check comes first); a
+  `.tsvz` `clear()` after `close()` or in a forked child that a Ctrl-C cuts can leave memory empty and the file full;
+  a handler's change of the store inside
   `popitem()` or `move_to_end()` can make it raise `StopIteration`, `RuntimeError` or `TypeError`; a `TSVZClient` with
   no server, used in a forked child, waits for ever at its first write; a Ctrl-C while the writer thread itself reloads
   after another process's change waits for that reload; and the compaction above.

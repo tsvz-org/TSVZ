@@ -165,13 +165,48 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   the file follows; a `.tsvz` store keeps them apart until a reload. Counted by the suite's step sweep (`allow:opkey`),
   5.15 on Python 3.14: `.tsv` set 20 of 325 steps, delete 78 of 263, pop and popitem 84 of about 250; `.tsvz` set 10
   of 399, delete 184 of 365, pop and popitem 198 of about 360 (5.12 to 5.14 the same).
+  - `move_to_end(key, last=False)` moves every other key to the end, queueing the lines of one key after another, so a
+    Ctrl-C inside it can leave several keys' order apart (memory has the whole move, the file part of it), not one key;
+    the rows themselves agree (by reading: the step sweep compares rows, not their order).
+  - Two signals: a signal handler's `reload()` landing inside a set or delete (it undoes the change in memory), then a
+    caught Ctrl-C between the section's end and its redo (`_again`, which 5.15 added for the handler alone), leaves the
+    key apart the same way: memory without the row and the file with it (a delete, by reading: the row back in memory).
+    A loose store's next rewrite then drops the row from the file, the loss the redo prevents for the handler alone.
+    Checked on Python 3.14 for a set, both kinds (the 5.15 review's probe, with the handler alone as the control).
 - Why: a fix finishes the operation in the section's `except BaseException` clause, which changes what a cut set
   means (it completes) and needs its own sweep; 5.15's work on these sections was the signal handler's case.
 - Plan (5.16): the clause the sections already have calls the section's redo (`_setAgain`, `_delAgain` and the others
-  5.15 added for signal handlers) with its own arguments, under the lock, when the section had begun changing memory:
-  a set cut by a Ctrl-C completes, and the KeyboardInterrupt still goes up. With its own sweep.
+  5.15 added for signal handlers) with its own arguments, under the lock, when the section had begun changing memory
+  or found its hold let go of (the two-signal case): a set cut by a Ctrl-C completes, and the KeyboardInterrupt still
+  goes up. With its own sweep.
 - Revisit when: 5.16.
-- Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked.
+- Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked. The two-signal case and the move to the
+  beginning's several keys were added 2026-11-11, from the 5.15 review.
+
+### A Ctrl-C at a loop's back jump inside a try or with block can skip its clean-up on Python 3.12 to 3.14, in loops 5.15 did not move
+- Kind: deferred
+- What the operator sees: Python 3.12 to 3.14 leave a loop's back jump (and the test before it) inside a `try` or `with`
+  body out of the exception table, so a KeyboardInterrupt raised there skips the block's exit and every `except` clause
+  around it. A real signal lands at a back jump. 5.15 moved the two loops that held a lock or a take-back there
+  (`move_to_end`'s, and `_call`'s wait for the writer thread) into methods of their own, whose calls the table covers.
+  A static scan of TSVZ.py (the 5.15 review's, an exception-table check: each back jump, call and resume inside a
+  `try` or `with` body of a function that the table does not cover) lists 32 more such back jumps on Python 3.12.15 and
+  36 on 3.14.8 (and 6 `JUMP_BACKWARD_NO_INTERRUPT` in a `with` statement's own exit on 3.14, where no signal is taken).
+  By the review's reading, those a main thread of an open store reaches are:
+  - `_appendOpen`'s `while view:` (3.12 and 3.13): a partial append's truncate is skipped;
+  - `_specRewriteInPlace`'s put-back loop, on a second Ctrl-C;
+  - `_iterPartLines`: the file stays open until the traceback goes;
+  - `_ServeConnection.request`'s reply loop (3.14): harmless now, since a cut request drops the connection.
+
+  The rest run on the writer thread, or after `close()` (the Ctrl-C there is "A second Ctrl-C inside a set's clean-up"
+  above). None is worse than 5.14. A step sweep cannot reach a loop that iterates only in rare conditions, which is
+  why 5.15's sweep missed `_call`'s.
+- Why: each loop has its own clean-up, and its own test, so moving them all is a release's work; a check that finds the
+  new ones as they are written has to come first.
+- Plan (5.16): a static exception-table check in the suite (Python 3.12+), listing the uncovered back jumps in
+  functions the main thread of an open store runs; move each loop of those into a method, and write down the rest.
+- Revisit when: 5.16.
+- Noted: 2026-11-11, found by the 5.15 review; a deferral, not asked.
 
 ### A signal handler's change of the store inside popitem or move_to_end can make it raise the wrong exception
 - Kind: deferred
@@ -195,10 +230,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   a `rewrite()`, `mapToFile()` or `hardMapToFile()` called there runs in the caller's thread, as in 4.9. A Ctrl-C
   during it can leave a `.tsv`-family file damaged, a compressed one unreadable; if the program goes on, the next
   rewrite makes it again from memory under the merge rule.
+  - Also a `.tsvz` store's `clear()` there (the 5.15 review, 2026-11-11, deferred): it empties memory, then clears the
+    file in the caller's thread, and a Ctrl-C between the two leaves memory empty and the file full. `deSynced` is set
+    only for an Exception, and after `close()` no tick reloads, so nothing brings the rows back into memory (checked on
+    Python 3.14 and 3.6 by raising in `_specClear`). 5.14 had the window in every `.tsvz` `clear()`; 5.15 closes it for a
+    running store (the clear runs in its writer thread's job) and narrows it to these two cases.
 - Why: calls after `close()` and writes from forked children are rare, and covering them means starting a writer
   thread again in both cases, with its lifetime to get right.
-- Revisit when: someone writes through a closed store or from a forked child and hits it.
-- Approved: 2026-10-29, the user chose "Known limitation (Recommended)".
+- Revisit when: someone writes through a closed store or from a forked child and hits it. For the `.tsvz` `clear()`:
+  5.16, which sets `deSynced` before memory is emptied; a closed store would still need a reload.
+- Approved: 2026-10-29, the user chose "Known limitation (Recommended)". (The `.tsvz` `clear()` is deferred, not
+  approved.)
 
 ### A second Ctrl-C inside a set's clean-up, or a Ctrl-C in a write made after close() or in a forked child, can leave a lock held
 - Kind: known limitation
