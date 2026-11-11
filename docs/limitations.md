@@ -682,12 +682,22 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   output again never grows it.
 - Why: a plan keeps a strict reader's first line of a key it takes as the key's place among the keys that reader reads,
   without asking whether another key's row it takes comes before it. Keeping it only keeps lines in their places, so it
-  never loses a row.
-- Plan (5.15): keep that line only where the strict reader takes a row of another key between it and the key's next line
-  that stays, as `inOrder()` asks of a moved line; then measure it on the exhaustive planned-reader shapes again.
-- Revisit when: 5.15.
+  never loses a row. The 5.15 plan's rule (keep that line only where the planned strict reader takes a row between it
+  and its last line of the key) passed the exhaustive differential of its planned readers (0 of 1,310,400 compactions
+  read otherwise), but the random differential of the writers (5,000 `.tsv` and 1,500 `.csv` files, 4 argument sets
+  each) found readers given other arguments than the writer's that it moved, where 5.14 kept the line, in 4 `.tsv` and
+  1 `.csv` argument sets: a reader given line 1 for its header where the writer was given none read `a, d` as `d, a`
+  (`a\t1\na\t\t1\nd\t1\n\na\t1\t2\n`, defaults `[#_defaults_#, '', '']`), a strict reader given a count of 3 that the
+  writer was not given lost a cell (`c` from `[c, 2, X]` to `[c, 2, '']`), and tsvz-rs read `c, b` as `b, c`. So 5.15
+  keeps 5.14's compaction; the suite holds the first two files as a test.
+- Plan (5.16): drop that line only where no reader that can read the file otherwise takes a line between: a reader
+  given line 1 for its header (also where the writer has no header) and a reader given a count the writer was not
+  given, as the random differential lists them; then the exhaustive differential with an empty header and count readers
+  for a rewrite, and the random one.
+- Revisit when: 5.16.
 - Noted: 2026-11-09, found in the 5.12 review (the second half of 5.12's deferral "A compaction keeps a moved-up line only
   from the deletion that ends the other reader's life of the key", whose first half 5.14 builds); a deferral, not asked.
+  2026-11-10: the 5.15 plan's rule was built and taken back, as above.
 
 ### A TSVZedLite delete looks at the file's first lines every time
 - Kind: deferred

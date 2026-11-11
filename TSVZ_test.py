@@ -18908,6 +18908,45 @@ def test_a_compaction_keeps_what_a_strict_reader_given_no_header_and_its_default
 		assert dict(mod.readTabularFile(p, defaults=list(defaults), strict=True, verbose=False)) == before[mod.__name__]
 
 
+@pytest.mark.parametrize('door', ['scrub', 'rewrite'])
+@pytest.mark.parametrize('text, H, defaults, strict, readers', [
+	(b'a\t1\na\t\t1\nd\t1\n\na\t1\t2\n', '', [D_, '', ''], False,
+	 [dict(header='a\t1', strict=s, defaults=d) for s in (True, False) for d in (None, [D_, '', ''])]),
+	(b'a\t1\nb\t1\nc\t2\t\n#_defaults_#\tP\nd\t\nc\t2\tX\n#_defaults_#\nc\t1\n', 'a\t1', [D_, ''], True,
+	 [dict(strict=True, correctColumnNum=3, header=h, defaults=d) for h in (None, 'a\t1') for d in (None, [D_, ''])])],
+						 ids=['line 1 for a header', 'a count of 3'])
+def test_a_compaction_keeps_a_strict_readers_first_line_of_a_key_that_a_reader_given_other_arguments_needs(
+		tmp_path, door, text, H, defaults, strict, readers):
+	# The 5.15 plan's item 8 kept a strict reader's first line of a key only where that reader takes a row between it and
+	# its last. The random differential found readers given other arguments than the writer's that the rule moved: one
+	# given line 1 for its header where the writer was given none (a, d became d, a), and one given a count of 3 that the
+	# writer was not given (c lost its X). 5.14 kept the line; so does 5.15 (docs/limitations.md: the deferral).
+	p = str(tmp_path / 'f.tsv')
+	_touch(p, text)
+
+	def views():
+		out = []
+		for mod in (TSVZ, TSVZ_old):
+			for k in readers:
+				k = {name: value for name, value in k.items() if value is not None}
+				try:
+					with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+						out.append(list(mod.readTabularFile(p, verbose=False, **k).items()))
+				except Exception as e:
+					out.append(type(e).__name__)
+		return out
+	before = views()
+	with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+		if door == 'scrub':
+			TSVZ.scrubTabularFile(p, header=H, defaults=list(defaults), strict=strict)
+		else:
+			t = TSVZ.TSVZed(p, header=H, defaults=list(defaults), strict=strict, verbose=False, append_check_delay=60,
+							createIfNotExist=False, rewrite_on_load=False)
+			t._call(t.hardMapToFile)
+			t.close()
+	assert views() == before
+
+
 def test_after_line_1s_key_stands_in_a_rewrite_widens_and_keeps_the_order_where_5_11_refused(tmp_path):
 	# (5.11: a stood in, and its later line is wider than the header, so a store's rewrite refused the widening (Q-C) and
 	# the order a, d stayed for every reader given the header. With d standing in, the rewrite widens line 1.)
