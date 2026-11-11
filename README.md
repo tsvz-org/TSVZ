@@ -261,8 +261,8 @@ normal exit. One that ends by `os._exit`, as `multiprocessing`'s children do, wr
 only what it commits or closes. A parent that ends by `os._exit` (a daemon's fork) does
 not write what it had queued, so commit before forking a child that outlives its parent.
 A child forked while its parent holds `get_file_obj()` writes nothing at its close or
-exit, since the parent may be waiting for it, and says so; its `commitAppendToFile()`
-writes once the parent lets go.
+exit, since the parent may be waiting for it, and says so, even once both have let go of
+the file; its `commitAppendToFile()` writes once the parent lets go.
 
 A file another process removed is made
 again from memory by the store's next write, an append included (a removal in the
@@ -373,8 +373,9 @@ can land in, and checks the locks, memory and the file after each.
   rewrite lost the set or brought the deleted row back. A set or delete that finds its lock was let go of makes its
   change again under the lock now, and queues its line again unless it is still the last one queued. When the handler
   writes the key the set or delete is writing, the set or delete runs after it, and its value is kept (the handler's
-  write came first, as if the handler had run before the set). (A `move_to_end` has no value of its own: it restores
-  only the order, from the rows memory holds then, so a handler's change of a row stays.) With the
+  write came first, as if the handler had run before the set). (A `move_to_end` has no value of its own: it makes its
+  move again with the rows and in the order memory holds then, so a handler's change of a row, or its own move of
+  another key, stays.) With the
   handler (a `reload()`, `clear()`, a commit, a sync with another process's line, a set or delete) at each step of each
   set, delete, pop, popitem, move and defaults change: 5.14 left memory and the file apart at 3,650 of 33,054 landings
   on 3.14 and 570 of 5,810 line steps on 3.6; 5.15 at none. The line is written twice where the handler wrote or
@@ -390,15 +391,22 @@ can land in, and checks the locks, memory and the file after each.
   20,000 `.tsv` argument sets), so it is deferred again
   ([docs/limitations.md](docs/limitations.md#a-compaction-can-keep-a-strict-readers-first-line-of-a-key-where-no-other-key-competes-for-its-place)).
 - **Everything else runs at 5.14's speed.** Commits, empty commits (most of the writer thread's ticks), loads,
-  reloads, clears, one-shot calls, threads, opens and reads each landed within 5.14's own run-to-run spread on Python
-  3.14 and 3.6.
+  reloads, clears, one-shot calls, threads, opens, reads and moves each landed within 5.14's own run-to-run spread on
+  Python 3.14 and 3.6, but for an explicit `commitAppendToFile()` of a `.tsvz` store with nothing queued, up to about
+  5% (0.5 µs) slower in one of two runs of 61 rounds, from its job's bookkeeping (the writer thread's own ticks do not
+  take that path).
 - **Known** ([docs/limitations.md](docs/limitations.md)):
-  - A line can be written twice: by a signal handler that uses the store inside a set or delete and wrote or queued
-    something after its line (35 to 45 per 1,000 landings on 3.14), and by a commit after `close()` or in a forked child
-    that a Ctrl-C cuts just after its write. The last copy wins; where another process writes the same key between the
-    two copies, the older lands last.
+  - A line can be written twice: by a signal handler that uses the store inside a set, delete or move and wrote or
+    queued something after its lines (35 to 46 per 1,000 landings of a set or delete on 3.14, about 30 of a move to
+    the end), and by a commit after `close()` or in a forked child that a Ctrl-C cuts just after its write. A handler's
+    set or delete of another key inside a move to the beginning has every other key's lines written again, so the file
+    can double until its next rewrite, and a handler's `clear()` inside a move writes its deletion lines twice. The
+    last copy wins; where another process writes one of those keys between the two copies, the older lands last.
   - A forked child writes nothing at its close or exit where its parent held `get_file_obj()` at the fork (the parent
-    may be waiting for it), and says so; its `commitAppendToFile()` writes once the parent lets go.
+    may be waiting for it), and says so, even once both have let go of the file: where the store has `rewrite_on_exit`
+    or a sync pending, 5.14 wrote the rows there once both had let go (and on 3.14 waited for ever while the parent
+    held the file). Commit before forking, or commit in the child: its `commitAppendToFile()` writes once the parent
+    lets go.
   - A parent that forks and ends by `os._exit` does not write the rows it queued last: commit before forking.
 - **Planned for 5.16** ([docs/limitations.md](docs/limitations.md)): a Ctrl-C caught inside a set, delete, pop or move
   still leaves that one key apart (memory changed, the line not queued; a move to the beginning, several keys' order),
@@ -406,9 +414,13 @@ can land in, and checks the locks, memory and the file after each.
   inside a `try` or `with` block can skip their clean-up on Python 3.12 to 3.14 (a static check comes first); a
   `.tsvz` `clear()` after `close()` or in a forked child that a Ctrl-C cuts can leave memory empty and the file full;
   a handler's change of the store inside
-  `popitem()` or `move_to_end()` can make it raise `StopIteration`, `RuntimeError` or `TypeError`; a `TSVZClient` with
-  no server, used in a forked child, waits for ever at its first write; a Ctrl-C while the writer thread itself reloads
-  after another process's change waits for that reload; and the compaction above.
+  `popitem()` or `move_to_end()` can make it raise `StopIteration`, `RuntimeError` or `TypeError`; a handler's new key,
+  move or followed line inside a set of a new key can leave that key's place in memory apart from the file's; a
+  handler's `clear()` inside a delete, pop or move of a store with no header can leave the key in the file as a row of
+  the key alone; a `#` key can leave memory when the store follows another process's change while rows are queued (all
+  three as in 5.14); a `TSVZClient` with no server, used in a forked child, waits for ever at its first write; a Ctrl-C
+  while the writer thread itself reloads after another process's change waits for that reload; and the compaction
+  above.
 
 ## Upgrading to 5.14 from 5.13
 

@@ -107,30 +107,47 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-10-24, the user chose "One writer thread (Recommended)", whose description said "At exit the
   program finishes a write in progress, and a second Ctrl-C abandons it."
 
-### A line can be written twice, by a signal handler that uses a store inside a set or delete or by a commit a Ctrl-C cuts
+### A line can be written twice, by a signal handler that uses a store inside a set, delete or move, or by a commit a Ctrl-C cuts
 - Kind: known limitation
 - What the operator sees:
-  - A program's signal handler uses a store (a commit, `reload()`, `clear()`, a rewrite, a set or a delete) while its
-    main thread sets and deletes rows in it. When the signal lands inside a set or delete, its rest runs without the
-    store's lock (5.12 waited for ever there), and the writer thread may read the file into memory or clear it
-    meanwhile. From 5.15 the set or delete then makes its change again under the lock, so memory and the file agree,
-    and queues its line again unless that line is still the last one queued. So the row or deletion is written twice
-    where the handler wrote or queued something after the section's line, on `.tsvz` stores too: with the handler run
-    at each step of each set, delete, pop, popitem, move and defaults change, 35 (a `reload()`) to 45 (a commit, a set
-    or delete of another key, a sync with another process's line, a set of the same key) per 1,000 landings on Python
-    3.14, 87 to 104 on 3.6's line steps; 5.14 wrote none twice there, but left memory and the file apart in 3,650 of
-    33,054 landings. A `clear()` writes no row twice; it keeps the defaults, so a `#_defaults_#` line or a `.tsvz`
-    marker it wrote or kept can be (29 of 856 landings on 3.14).
+  - A program's signal handler uses a store (a commit, `reload()`, `clear()`, a rewrite, a set, a delete or a
+    `move_to_end`) while its main thread sets, deletes or moves rows in it. When the signal lands inside a set, delete
+    or move, its rest runs without the store's lock (5.12 waited for ever there), and the writer thread may read the
+    file into memory or clear it meanwhile. From 5.15 a set or delete then makes its change again under the lock, so
+    memory and the file agree, and queues its line again unless that line is still the last one queued. A
+    `move_to_end` makes its move again with the rows and in the order memory holds then, and queues its lines again
+    unless the move's own are still the last ones queued and are the lines memory makes then. So a line is written
+    twice where the handler wrote or queued something after the section's, on `.tsvz` stores too. With the handler
+    run at each step (the suite's sweep and the 5.15 final review's, at its fixes, Python 3.14; 3.6's line steps in
+    brackets; ranges over two runs):
+    - a set, delete, pop, popitem or defaults change: 35 (a `reload()`) to 46 (a commit, a set or delete of another
+      key, a sync with another process's line, a set of the same key) per 1,000 landings (68 to 104);
+    - `move_to_end(key)`: a flush, a `reload()`, a sync, or a set or delete of another key, 11 to 16 of 524 landings,
+      about 30 per 1,000 (4 to 7 of 81); a set of the moved key itself, 333 of 524 (55 of 81);
+    - `move_to_end(key, last=False)`, which sends every other key to the end: a flush or a `reload()`, 9 to 16 of 824
+      (5 to 7 of 120); a set or delete of another key, or another process's line followed, 606 to 616 of 824 (91 to 92
+      of 120): every other key's lines are written again, as their order must follow the handler's change, so the
+      file can double until its next rewrite.
+
+    5.14 wrote none twice there, but left memory and the file apart in 3,650 of 33,054 landings. A `clear()` writes no
+    row twice inside a set, delete, pop or popitem; it keeps the defaults, so a `#_defaults_#` line or a `.tsvz` marker
+    it wrote or kept can be (20 of 1,028 landings of the defaults changes on 3.14, 8 of 194 on 3.6). Inside a move it
+    writes the move's deletion lines twice (159 of 524 and 284 of 824 landings on 3.14, 20 of 81 and 31 of 120 on
+    3.6): the move's lines can come after the clear, and the redo deletes the keys again.
   - A commit after `close()` or in a forked child that a Ctrl-C cuts just after its write writes its rows again at the
     next commit: 195 of 1,037 steps of such a `.tsvz` commit on 3.14 (from 5.15, which keeps them queued until they
     are on disk), 170 of 1,175 of a loose one (as in 5.14).
-  - The last copy wins, so every reader reads the same rows, and the file is a line longer until its next rewrite (a
-    `.tsvz` file until a scrub). The exception is a stale copy: when another process writes the same key between the
-    two copies (while the handler runs), the older copy lands last and the file says it. In 5.14 a handler that only
-    committed wrote the line once, so this case is new.
+  - The last copy wins, so every reader reads the same rows, and the file is longer until its next rewrite (a `.tsvz`
+    file until a scrub): a line for each copy, or up to two lines for each row after a move to the beginning. The
+    exception is a stale copy: when another process writes one of those keys between the two copies (while the
+    handler runs), the older copy lands last and the file says it. For a set or delete that is the key it writes; for
+    a move to the beginning, any key it moves, since every other key's lines are written again (the kind "A write by
+    another process between a move_to_end and its commit can be lost" names). In 5.14 a handler that only committed
+    wrote the line once, so this case is new.
 - Why: knowing whether the first copy is already on disk, not only whether it is still the last line queued, needs an
   identity check across the queue and a rewrite's snapshot, or a counter on every queued line: more state on every
-  write, for a few bytes and a race that needs another writer of the same key while the handler runs.
+  write, for a few bytes and a race that needs another writer of the same key while the handler runs. A move to the
+  beginning that a handler changed the keys inside can say the new order only by lines after the handler's.
 - Revisit when: someone sees a file grow this way, or another process's write lost behind a repeated older copy.
 - Approved: 2026-11-10, the user chose "Approve as KL (Recommended)" on the question: "a program's own signal handler
   that writes to a store while the main thread is part way through writing to the same store. 5.12 deadlocked here
@@ -138,7 +155,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   line, or memory and file can differ until the next reload." This entry is the duplicate line; memory and the file
   differing was a deferral, which 5.15 fixed (a loose store's next rewrite could lose the set or undo the delete).
   Widened 2026-11-10 to `.tsvz` stores, item 4's cut commit, and the stale-copy case; the user chose "Build it, skip
-  extra copy (Recommended)". (Item 4: the 5.15 plan's fix that keeps a cut `.tsvz` commit's rows queued.)
+  extra copy (Recommended)". (Item 4: the 5.15 plan's fix that keeps a cut `.tsvz` commit's rows queued.) Widened
+  2026-11-11 to moves; the user chose "Approve the widening (Recommended)": a handler landing inside a move can leave a
+  second copy of the moved lines (a move to the front can double the file) until the next rewrite, and a `clear()`
+  handler there can write a deletion line twice; no data or order is wrong.
 
 ### A Ctrl-C while the writer thread reloads after another process's change waits for that reload
 - Kind: deferred
@@ -165,9 +185,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   the file follows; a `.tsvz` store keeps them apart until a reload. Counted by the suite's step sweep (`allow:opkey`),
   5.15 on Python 3.14: `.tsv` set 20 of 325 steps, delete 78 of 263, pop and popitem 84 of about 250; `.tsvz` set 10
   of 399, delete 184 of 365, pop and popitem 198 of about 360 (5.12 to 5.14 the same).
-  - `move_to_end(key, last=False)` moves every other key to the end, queueing the lines of one key after another, so a
-    Ctrl-C inside it can leave several keys' order apart (memory has the whole move, the file part of it), not one key;
-    the rows themselves agree (by reading: the step sweep compares rows, not their order).
+  - `move_to_end(key, last=False)` moves every other key to the end, so a Ctrl-C between its change of memory and its
+    queueing of the lines (one step, from the 5.15 final review's fixes) leaves several keys' order apart (memory has
+    the whole move, the file none of it), not one key; the rows themselves agree (by reading: the Ctrl-C sweep compares
+    rows, not their order).
   - Two signals: a signal handler's `reload()` landing inside a set or delete (it undoes the change in memory), then a
     caught Ctrl-C between the section's end and its redo (`_again`, which 5.15 added for the handler alone), leaves the
     key apart the same way: memory without the row and the file with it (a delete, by reading: the row back in memory).
@@ -215,14 +236,79 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   exception that says nothing of what happened, memory and the file agreeing. With the handler run at each step
   (5.15, Python 3.14): `popitem` raises `StopIteration` at 11 of about 245 steps when the handler clears the store, and
   `RuntimeError` ("OrderedDict mutated during iteration") at 1 when it clears, sets, deletes or syncs; `move_to_end`
-  raises `TypeError` at 10 of 502 when it clears. (A delete, pop or move whose key a handler's `clear()` took raises
-  `KeyError`, as for a missing key: that is right.)
-- Why: found by the 5.15 plan's sweep; the change is small but in two hot methods, and wants its own tests.
+  raises `TypeError` at 14 of 524 when it clears, and `move_to_end(key, last=False)` raises that `RuntimeError` at 26
+  of 824 when the handler changes the keys while the move lists them (a set of a new key, a delete, a move, a clear or
+  a sync; 3 of 120 line steps on 3.6; counted at the 5.15 final review's fixes, as in the build before them). (A
+  delete, pop or move whose key a handler's `clear()` took raises `KeyError`, as for a missing key: that is right.)
+- Why: found by the 5.15 plan's sweep (the move to the beginning's, by the fix round's); the change is small but in
+  two hot methods, and wants its own tests.
 - Plan (5.16): `popitem` looks for its key again when the store changed between its look and its take, and raises
   `KeyError('dictionary is empty')` when the store went empty; `move_to_end` raises `KeyError(key)` when its key went
-  inside it.
+  inside it, and a move to the beginning lists the other keys again when the store changed while it listed them.
 - Revisit when: 5.16.
 - Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked.
+
+### A set of a new key can leave its place in memory apart from the file's
+- Kind: deferred
+- What the operator sees: a program's signal handler sets another new key, moves a key, or follows another process's
+  line, while its main thread sets a new key (`t['x'] = ...`). When the handler lands between the set's change of
+  memory and its queued line, memory holds x before the handler's change and the file after it: the rows agree, and
+  the order differs until a reload (a loose store's next rewrite writes memory's order). The set's redo sets the row
+  again and leaves it where it was. Counted by the suite's handler sweep (`allow:new-key-order`) at the 5.15 final
+  review's fixes: 20 of 325 landings on Python 3.14 for each such handler, with or without a header (4 of 59 line
+  steps on 3.6), and a `.tsvz` store's 10 of 399 for a set of another key (2 of 72); 5.14 the same 20.
+- Why: found by the 5.15 final review's wider sweep; not worse than 5.14, and the fix is in the redo of every set.
+- Plan (5.16): `_setAgain` and `_specAgain` move a key that was new to the end when its line is still the last one
+  queued; the sweep's allowance goes.
+- Revisit when: 5.16.
+- Noted: 2026-11-11, found by the 5.15 final review; a deferral, not asked.
+
+### A signal handler's clear() in a store with no header can leave a deleted key as a row of the key alone
+- Kind: deferred
+- What the operator sees: a store whose file has no header line, and a signal handler that calls `clear()` while the
+  main thread deletes, pops or moves a row. After the clear the store has no column count, so the deletion line
+  written after it (the delete's own, or a move's redo's) is the lone key, which the emptied file reads as a row:
+  the key is in the file, as a row of the key alone, and not in memory. Counted by the suite's handler sweep
+  (`allow:lone-key`) at the 5.15 final review's fixes, Python 3.14: a delete 63 of 263 landings, `pop` 69 of 249,
+  `popitem` 69 of 245, `move_to_end` 91 of 524 and to the beginning 91 of 824 (3.6: 9 of 49, 10 of 46, 10 of 44, 17
+  of 81, 17 of 120). 5.14: 63, 67 and 67 for the first three, and for a move the whole row back at 182 of 532. With a
+  header every reader takes the line as a deletion (none in the sweeps with one).
+- Why: found by the 5.15 final review's wider sweep; 5.14 the same or worse.
+- Plan (5.16): the branch of `__appendEmptyLine` for a store with no column count writes what reads as a deletion
+  there (a drop item, as a one-column store's); the sweep's allowance goes.
+- Revisit when: 5.16.
+- Noted: 2026-11-11, found by the 5.15 final review; a deferral, not asked.
+
+### A '#' key can leave memory when the store follows another process's change while rows are queued
+- Kind: deferred
+- What the operator sees: a loose store that holds a `#` key (memory only: it is never written). When it follows
+  another process's change while it has rows queued, it reads the file whole and replays the queue, and the `#` key,
+  which the file does not hold, is gone from memory; with nothing queued it reads only what was appended, and the key
+  stays. So whether a `#` key outlives another process's append depends on the timing: 8 of 10 runs lost it on Python
+  3.14 (a move queued, another process's line, then the follow; 5.14: 6 of 10). `reload()` drops it always.
+- Why: found by the 5.15 final review fixes' sweep of a store with a `#` key; 5.14 the same. Whether a whole read
+  keeps `#` keys is a choice of what `reload()` means, as `_readWidened` keeps them and `reload()` does not.
+- Plan (5.16): decide whether a whole read keeps the `#` keys memory holds (in their place, as `_readWidened` does), and
+  make the follow and `reload()` agree; the sweep's check of a `#` key's place then covers memory without it too.
+- Revisit when: 5.16.
+- Noted: 2026-11-11, found by the 5.15 final review's fixes; a deferral, not asked.
+
+### Test gaps the 5.15 final review's fixes leave
+- Kind: deferred
+- What the operator sees: nothing directly; the suite does not yet look at these, which the 5.15 final review's own
+  wider sweep (and the fixes' run of it) did, and where it found nothing beyond the deferrals above:
+  - the handler sweep runs no one-column store, and not the handlers `rewrite()`, a pop of another key, `popitem()`, a
+    delete of the operation's own key and a move of the operation's own key;
+  - a fork is tested while the parent's writer thread is inside an explicit `rewrite()`, not inside a `clear()`'s, a
+    one-column delete's commit's or the tick's interval rewrite (the review's probe ran the interval rewrite; the
+    others set the same flag, by reading);
+  - the Ctrl-C sweep compares rows, not their order.
+- Why: each handler and store adds sweeps to CI's serial run (each under 3.5 s on 3.14; the whole serial 3.14 run took
+  13 min 7 s here with the 160 sweeps the fixes added, of the job's 40 minutes); the fixes added the ones that guard
+  what they changed.
+- Plan (5.16): add them to the suite, measured against CI's time.
+- Revisit when: 5.16.
+- Noted: 2026-11-11, from the 5.15 final review's test gaps; a deferral, not asked.
 
 ### A write after close(), or in a forked child, can be cut by a Ctrl-C
 - Kind: known limitation
@@ -273,19 +359,31 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: a child that `fork()` made while its parent held the store's file through `get_file_obj()`
   sets rows on that store. Its `close()` and its normal exit leave them unwritten, and say so once: "the rows this
   forked child set are not written at its close or exit: its parent held the file (get_file_obj) at the fork;
-  commitAppendToFile() writes them". Its own `commitAppendToFile()` writes them once the parent lets go of the file.
-  5.14 the same, without the message. On Python 3.6 the same holds for a child in which TSVZ's fork hook did not run,
-  because a library replaced `threading._after_fork` without calling the one it replaced: that child also keeps
-  5.14's other behaviour (its commit writes the rows the parent had queued too, and it keeps the locks the parent's
-  threads held), and its message ends "no fork hook ran in it".
+  commitAppendToFile() writes them". That holds even when both have let go of the file since: the close makes no
+  rewrite or sync either, which wait for the file's lock. Its own `commitAppendToFile()` writes them once the parent
+  lets go of the file. So commit before forking, or commit in the child.
+  - A store with neither `rewrite_on_exit` nor a sync pending at the close: 5.14 the same, without the message.
+  - A store with `rewrite_on_exit` (`.tsv`), or with a sync pending at the close (another process's change not yet
+    followed, both kinds): 5.14's close wrote the rows by that rewrite or sync once both had let go of the file; where
+    the parent still held it and waited for the child, it waited for ever on 3.14 and wrote through the lock it
+    inherited on 3.6. 5.15 writes nothing there and ends (the 5.15 final review's probe, run again on its fixes, on
+    Python 3.14 and 3.6).
+  - On Python 3.6 the same holds for a child in which TSVZ's fork hook did not run, because a library replaced
+    `threading._after_fork` without calling the one it replaced: that child also keeps 5.14's other behaviour (its
+    commit writes the rows the parent had queued too, and it keeps the locks the parent's threads held), and its
+    message ends "no fork hook ran in it".
 - Why: the child cannot tell whether its parent waits for it while holding the file. A write there waits for the
   parent's lock, and a parent that waits for the child (`waitpid`) would then never let go: the 5.15 plan's first
-  design hung there (measured). A child with no fork hook may hold a copy of a lock a parent's thread held, and its
-  close would wait for ever on it.
+  design hung there (measured), as 5.14's close did with `rewrite_on_exit` or a pending sync. A child with no fork
+  hook may hold a copy of a lock a parent's thread held, and its close would wait for ever on it.
 - Revisit when: someone needs those rows written and cannot commit.
 - Approved: 2026-11-10, the user chose "Approve as KL (Recommended)": a forked child writes nothing at close or exit
   when its parent held `get_file_obj()` at the fork, and warns once. The Python 3.6 child with no hook is the case the
-  user's pick "Wrap it on 3.6 (Recommended)" named: that child keeps 5.14's behaviour and says so once.
+  user's pick "Wrap it on 3.6 (Recommended)" named: that child keeps 5.14's behaviour and says so once. Widened
+  2026-11-11; the user chose "Widen KL-c (Recommended)": a child whose parent held the file at the fork writes nothing
+  at its close, even when both have let go of it since, for the stores with `rewrite_on_exit` or a pending sync, where
+  5.14 wrote the row. (The question's advice was "write before forking, or close the store in the child explicitly";
+  a `close()` in such a child writes nothing, so the advice here is to commit.)
 
 ### A parent that forks and ends by os._exit does not write the rows it queued last
 - Kind: known limitation

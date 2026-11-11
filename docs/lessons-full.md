@@ -473,3 +473,7 @@ entries go last, in the same commit as the change:
   before the child's code runs, by the platform's at-fork hook, not by a check at every call. Where the child cannot
   know whether the parent waits for it (a parent holding the file while it waits for the child), it does nothing
   that could wait for the parent, and says what it left undone.
+- Missed at first (the 5.15 final review): the mark of a rewrite under way (`_damaged`, set from the write's start until
+  the file is on disk). A child forked inside a parent's rewrite took it, and its close wrote its fork-time memory over
+  the parent's later rows, as memory "the only good copy". The file's state is the parent's too: list every field a
+  write in progress sets, not only the queue and the locks.
