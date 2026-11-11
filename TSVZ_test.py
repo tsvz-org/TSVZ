@@ -17244,10 +17244,18 @@ def own(t):
 		t[OPKEY[OP]] = [OPKEY[OP], 'H']
 
 
-def sync(t, p):
+def syncAppend(t, p):
 	T.appendTabularFile(p, ['z', '1'], verbose=False)  # (another writer's line, under the lock as the format asks)
+
+
+def syncFollow(t, p):
 	t.checkExternalChanges()
 	t.rewrite()  # (the writer thread reads the file into memory while the handler waits)
+
+
+def sync(t, p):
+	syncAppend(t, p)
+	syncFollow(t, p)
 
 
 HANDLERS = {
@@ -17260,6 +17268,7 @@ HANDLERS = {
 	'set-b': lambda t, p: t.__setitem__('b', ['b', 'H']),  # (a row the operation may have captured)
 	'del': lambda t, p: t.__delitem__('b'),
 }
+HANDLER_PARTS = {'sync': (syncAppend, syncFollow)}  # (a handler of several steps: the writer thread's flush can land between them)
 # What a signal handler's clear() can make the operation it lands in raise, memory and the file agreeing: deferred to
 # 5.16 (popitem's StopIteration and RuntimeError, move_to_end's TypeError), or a delete's KeyError for a key gone.
 CLEARED = ('KeyError', 'StopIteration', 'RuntimeError', 'TypeError')
@@ -17304,24 +17313,43 @@ _serialRuns = []
 
 
 def serials(d):
-	'''The file's rows, in its order, after each of the serial runs of the operation and the handler (a commit and close()
-	after them): the operation, then the handler; the operation, a flush (the writer thread's tick can write its lines at any
-	time, and another process's line lands before or after them), then the handler; the handler, then the operation. An
-	operation that raises ran nowhere (a clear() took its key). A signal handler that lands inside the operation can leave any.'''
+	'''The file's rows, in its order, after each serial history of the operation and the handler (then a commit and close()):
+	the operation lands before the handler or after it, or between the steps of one of several steps (a sync: another
+	process's line, then following it), and the writer thread's flush can write the operation's lines at any time after it,
+	and another process's line lands before or after them. An operation that raises ran nowhere (a clear() took its key).
+	A signal handler that lands inside the operation can leave any of these.'''
 	if not _serialRuns:
-		for order in ('oh', 'och', 'ho'):
-			p = os.path.join(d, 'serial.' + KIND)
-			t = opened(p)
-			runs = {'o': lambda: HANDLED_OPS[OP](t), 'c': t.commitAppendToFile, 'h': lambda: HANDLERS[AT](t, p)}
-			for run in order:
-				try:
-					runs[run]()
-				except Exception:
-					pass
-			t.commitAppendToFile()
-			t.close()
-			_serialRuns.append(list(fileRows(p).items()))
-			os.remove(p)
+		parts = HANDLER_PARTS.get(AT) or (HANDLERS[AT],)
+		count = 0
+		for before in range(len(parts) + 1):  # (the handler's steps that come before the operation)
+			for flush in [None] + list(range(before, len(parts) + 1)):  # (a flush after the operation, before that step)
+				history = []
+				for i in range(len(parts) + 1):
+					if i == before:
+						history.append('o')
+					if i == flush:
+						history.append('c')
+					if i < len(parts):
+						history.append(i)
+				count += 1
+				p = os.path.join(d, 'serial%d.%s' % (count, KIND))
+				t = opened(p)
+				for step in history:
+					try:
+						if step == 'o':
+							HANDLED_OPS[OP](t)
+						elif step == 'c':
+							t.commitAppendToFile()
+						else:
+							parts[step](t, p)
+					except Exception:
+						pass
+				t.commitAppendToFile()
+				t.close()
+				rows = list(fileRows(p).items())
+				if rows not in _serialRuns:
+					_serialRuns.append(rows)
+				os.remove(p)
 	return _serialRuns
 
 
