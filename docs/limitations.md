@@ -37,6 +37,25 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   wording (readers from 5.2 and earlier, `lockf`-only hosts and Windows folded in); 2026-11-04, "Correct the wording
   (Recommended)" for the RHEL/CentOS 7 kernel range found on the EL7 test VM.
 
+### A running TSVZed of 3.39 to 5.2 cuts rows to its header's count when it reads its file again
+- Kind: known limitation
+- What the operator sees: a program on TSVZ 3.39 to 5.2 keeps a `TSVZed` open on a `.tsv`-family file whose line 1 is not
+  the header it was given (it prints "Header mismatch" at the open), and the file holds a row wider than that header:
+  `a\na\t\t1\nb\nb\n` under `id\tv`. Its first load shows the row whole (`[a, '', 1]`). When it reads the file again it
+  cuts the row to the header's count (`[a, '']`), and its next rewrite writes the cut row, so the value is gone from
+  the file. It reads again at its own `reload()` and whenever it follows a change of the file by another process: a
+  rewrite or a scrub by any version (4.9 to 5.2), and also an append or a new modification time alone (3.39, 4.1). A
+  scrub or rewrite by 5.14 is such a change as one by 5.13 is; because 5.14's compaction drops lines in more files, it
+  writes where 5.13 wrote nothing in a few more (44 of 72,000 scrubs in the 5.14 final review's run), and in each the
+  running store read 5.14's bytes exactly as it re-read the file before the scrub. A fresh open reads the row whole,
+  before and after. 5.4 and later read the file again as they first read it.
+- Why: TSVZ cannot change older programs: their reload starts from the column count their last read ended with, where
+  their first load takes it from the file. Any write to the file sets it off, so no writer can avoid it.
+- Revisit when: someone runs a 3.39 to 5.2 store beside newer writers on a file whose line 1 is not its header.
+  Upgrading that program to 5.4 or later ends it.
+- Approved: 2026-11-10, the user chose "KL, release 5.14 (Recommended)". The user did not ask for it explicitly; the 5.14
+  final review found it.
+
 ### Reads by 5.3 programs can hold off a 3.39 to 5.2 writer
 - Kind: known limitation
 - What the operator sees: a rewrite or an append of a `.tsv`-family file by a 3.39 to 5.2 program takes a lock on
@@ -832,7 +851,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   files, each under two headers, 233,352 runs). In that second sweep 5.14's output differs from 5.12's in 20,536 runs, and
   this reader, given no header or a header and `verifyHeader=False`, and any of five defaults sets, gains a key in
   88,112 reader runs (5.14's total, line 1's key past a defaults line included) and lists the store's order in 3,840. It
-  loses no key, and no cell changes for it. Every other TSVZ.py reader reads these files as 5.12 did or better.
+  loses no key, and no cell changes for it. Every reader from 5.5 on reads these files as 5.12 did or better.
+
+  "3.39's strict reader" in this entry stands for every strict reader before 5.5: 4.1 to 5.4 take a line only when it
+  is exactly as wide as their count, as 3.39 does, and given a count of one they gain the same keys in the same files,
+  from 5.12 (line 1's key) and from 5.14 (the stand-in's key). The 5.14 final review ran 3.39's, 4.9's, 5.2's and
+  5.4's on every output of its delete sweep that differs from 5.13's (65,070 files under three headers, seven doors,
+  2.19 million runs): 3.39's, 4.9's and 5.2's each gain a key in 41,088 reader runs and list the store's order in
+  1,080; 5.4's does when given no defaults (25,088 and 1,080; given defaults with a value it takes wider rows and
+  gains nothing). None loses a key or reads a cell otherwise.
 - Why: no layout serves both: 5.5's and later readers keep `[b, 1]` only if the file reads at one column or at two, and
   either needs a keyed line that 3.39's strict read takes as a row of `b`. A bare `#_defaults_#` would keep one column, but
   it is a row named `#_defaults_#` to every reader at one column. For the 5.12 delete: the stand-in must be one cell to
@@ -843,11 +870,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   they read and keeps the store's own order; the only reader that can see it takes a one-cell line as a row. Any other
   one-cell stand-in is a key that comes first to the store's readers (5.13's order change, which only a stand-in of this
   kind avoids).
-- Revisit when: nothing in the format can fix it; upgrading the reader from 3.39 cures it.
+- Revisit when: nothing in the format can fix it; upgrading the reader to 5.5 or later cures it.
 - Approved: 2026-11-07, the user chose "Known limitation (Recommended)". The store's own delete: 2026-11-08, Q-A, the user
   chose "A: stand-in in the store's own delete (Recommended)". The delete under a header after a line 1 of two cells or
   more (5.12): 2026-11-09, the user chose "Keep, widen the KL (Recommended)". The stand-in of another key's row (5.14):
-  2026-11-09, the user chose "Widen it, keep the fix (Recommended)".
+  2026-11-09, the user chose "Widen it, keep the fix (Recommended)". Every strict reader before 5.5 (4.1 to 5.4) named in
+  this entry: 2026-11-10, the user chose "Name them in the entry (Recommended)".
 
 ### pip 9 cannot upgrade from or uninstall 5.5 and earlier
 - Kind: known limitation

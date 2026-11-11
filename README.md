@@ -321,7 +321,8 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
   given no header, the header, or line 1 for its header. One reader given a count sees the stand-in: 3.39's strict
   `readTabularFile(correctColumnNum=1)` given no header (or a header and `verifyHeader=False`), which takes only the
   one-cell lines of such a file, shows `b` as `[b]`, as it shows line 1's key where that stands in ("Upgrading to
-  5.12", first bullet). It gains a key the store has and loses none; in a few files it lists its keys in the store's
+  5.12", first bullet). So do the strict readers of 4.1 to 5.4 given a count of one, which take lines as 3.39's does;
+  5.5 and later take a wider line and read these files as before. It gains a key the store has and loses none; in a few files it lists its keys in the store's
   order instead of its own. This widens the approved "3.39's strict reader of a one-column file sees a new row when its
   last lone key is deleted", from line 1's key to the stand-in's
   ([docs/limitations.md](docs/limitations.md#339s-strict-reader-of-a-one-column-file-sees-a-new-row-when-its-last-lone-key-is-deleted)).
@@ -392,6 +393,12 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
   place, once (`a\na\tX\na\t2\t\na\t\t2\n` scrubbed with header `id\tv`, defaults `[#_defaults_#, '', '']` and count 2
   keeps all four lines). Every reader reads it alike. See
   [docs/limitations.md](docs/limitations.md#a-compaction-can-keep-a-strict-readers-first-line-of-a-key-where-no-other-key-competes-for-its-place).
+
+- **Known: a program still running 3.39 to 5.2 can cut a wide row when another writer changes its file.** A `TSVZed` of
+  3.39 to 5.2 open on a file whose line 1 is not its header reads the file again after another process writes it, cuts a
+  row wider than its header to the header's count, and its next rewrite drops the extra cell. Any writer sets it off, 5.13
+  too; 5.14's compaction writes in a few more files than 5.13's did. Upgrading that program to 5.4 or later ends it
+  ([docs/limitations.md](docs/limitations.md#a-running-tsvzed-of-339-to-52-cuts-rows-to-its-headers-count-when-it-reads-its-file-again)).
 
 ## Upgrading to 5.13 from 5.12
 
