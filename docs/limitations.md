@@ -136,7 +136,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   that writes to a store while the main thread is part way through writing to the same store. 5.12 deadlocked here
   for ever. 5.13 goes on, but the rest of the interrupted write runs without its lock: the file can get a duplicate
   line, or memory and file can differ until the next reload." This entry is the duplicate line; memory and the file
-  differing was a deferral, which 5.15 fixed (a loose store's next rewrite could lose the set or undo the delete). Widened 2026-11-10 to `.tsvz` stores, item 4's cut commit, and the stale-copy case; the user chose "Build it, skip
+  differing was a deferral, which 5.15 fixed (a loose store's next rewrite could lose the set or undo the delete).
+  Widened 2026-11-10 to `.tsvz` stores, item 4's cut commit, and the stale-copy case; the user chose "Build it, skip
   extra copy (Recommended)". (Item 4: the 5.15 plan's fix that keeps a cut `.tsvz` commit's rows queued.)
 
 ### A Ctrl-C while the writer thread reloads after another process's change waits for that reload

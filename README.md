@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.14**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.15**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -317,6 +317,90 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
+## Upgrading to 5.15 from 5.14
+
+The file formats are unchanged. An upgrade needs nothing: no file has to be rewritten, and the API is the same.
+
+What changes is what a Ctrl-C, a signal handler that uses a store, and `fork()` do to a running program. The suite now
+raises a KeyboardInterrupt at every step of every operation a Ctrl-C can land in (stepped as a real signal lands: by
+`sys.monitoring` on Python 3.12 and later), and at every step of each operation a signal handler that uses the store
+can land in, and checks the locks, memory and the file after each.
+
+- **A caught Ctrl-C no longer leaves a client's, its engine's or a path's lock to the program's other threads.** A
+  program that catches a Ctrl-C and goes on: one that landed where a `TSVZClient` (served, or working on the file in
+  its own process), a `tsvz serve` handler's store or a one-shot call (`appendTabularFile`, `scrubTabularFile`,
+  `clearTabularFile`) held its lock could leave it held, and another thread that used the same client, store or path
+  then waited for ever. Each lets go of it on the way up now, as a store's sections have since 5.13: with a Ctrl-C at
+  each step of each client and one-shot call on Python 3.14, 5.14 left a lock held at 164 steps, 5.15 at none.
+- **A served client answers each request after a caught Ctrl-C.** A Ctrl-C that cut a served `TSVZClient`'s request
+  while its reply was on the way left that reply to answer the client's next request: `c['b']` could return `a`'s row.
+  The client now drops a cut connection and connects again. And `tsvz serve` stops on every SIGTERM: one that landed
+  as a connection began was taken for that connection's error, and the handler ran on.
+- **A `.tsvz` commit after `close()` or in a forked child that a Ctrl-C cuts drops no row.** It took the rows from the
+  queue before it wrote them, and a Ctrl-C between lost them (559 of 954 steps of such a commit on 3.14, 97 of 164 line
+  steps on 3.6). They stay queued until they are on disk now, as a loose store's do; a commit cut just after its write
+  writes them again at the next commit (known, below).
+- **A Ctrl-C during a load ends the program sooner.** A Ctrl-C ends the wait for the store's writer thread, as before;
+  a load under way there (the constructor's, or `reload()`) now stops at its next read and changes nothing, so the
+  program ends about as soon as one with no load under way: with a 1.5M-row store and a Ctrl-C 1 s into the
+  constructor's load or `reload()`, it ended 0.06 to 1.02 s after the Ctrl-C (medians of 7, two runs each on Python
+  3.14 and 3.6; 1.37 s at most), where 5.14 took 0.06 to 1.17 s (2.32 s at most), and the same store with no load
+  under way ends in 0.41 to 1.12 s on that machine. A write the thread has not begun when a Ctrl-C ends the wait
+  for it is taken back (its rows stay queued for the next commit), so a `clear()` no longer runs after the rows the
+  program sets once it caught the Ctrl-C; one the thread has begun is still finished. A `.tsvz` `clear()` empties
+  memory in its job, as it lists the queue, so a Ctrl-C can no longer leave memory empty and the file full. With a
+  Ctrl-C at each step of a `clear()` and rows set after it, 5.14 left memory and the file apart at 63 of 199 steps of a
+  loose store's and 153 of 219 of a `.tsvz` one (3.14); 5.15 at none.
+- **A first Ctrl-C anywhere in the exit's stop of the stores waits for their writes.** 5.14 waited only for one that
+  landed inside a store's own stop; one in the steps around it abandoned every store, and the rows still queued were
+  not written (10 of 519 steps of the `.tsv` exit and 13 of 337 of the `.tsvz` one on 3.14; 3 of 82 and 2 of 57 line
+  steps on 3.6). 5.15 writes them at every step, says "TSVZ: the writes still to make are being finished; Ctrl-C again
+  to abandon them" where the cut was not in a store's own write, and also catches a first Ctrl-C that lands in the
+  instant before that stop begins. A second Ctrl-C abandons the writes, as before.
+- **A child that `fork()` made writes its own rows, not its parent's.** At the fork its copy of each store drops the
+  rows the parent had queued (the parent writes them) and takes new locks (a parent's thread may have held one), and
+  its `close()` and normal exit write the rows it set. In 5.14 those wrote nothing, and its `commitAppendToFile()`
+  also wrote the parent's queued rows: twice, and an older row could land after the parent's newer one. A child that
+  ends by `os._exit`, as `multiprocessing`'s fork children do, writes only what it commits or closes. Commit before
+  forking a child that outlives its parent: a parent that ends by `os._exit` (a daemon's fork) does not write the rows
+  it queued last (known, below). On Python 3.6 children now drop the TSVZ locks they inherit too, as on 3.7 and later
+  since 5.3, so a child's copy of a `get_file_obj()` handle fails its writes with EBADF there as well; in 5.14 a 3.6
+  child wrote through it into the file its parent held locked.
+- **A signal handler that uses the store inside a set or delete leaves memory and the file agreeing.** The handler
+  runs inside the set or delete it lands in and lets go of its lock (5.13); the writer thread could then read the file
+  into memory or clear it, undoing the change in memory while its line was still written, and a loose store's next
+  rewrite lost the set or brought the deleted row back. A set or delete that finds its lock was let go of makes its
+  change again under the lock now, and queues its line again unless it is still the last one queued. With the
+  handler (a `reload()`, `clear()`, a commit, a sync with another process's line, a set or delete) at each step of each
+  set, delete, pop, popitem, move and defaults change: 5.14 left memory and the file apart at 3,650 of 33,054 landings
+  on 3.14 and 570 of 5,810 line steps on 3.6; 5.15 at none. The line is written twice where the handler wrote or
+  queued something after it (known, below). A loose set looks its key up once, so a handler's `clear()` between two
+  lookups no longer raises KeyError out of it. The check of the lock costs a `.tsvz` set, delete or pop 1.1 to 2.4%
+  (30 to 50 ns of a 2 µs set, on Python 3.14 and 3.6); a loose set is 4 to 7% faster, from its single lookup.
+- **A Ctrl-C at a loop in `move_to_end` no longer leaves the store's lock held** (Python 3.12 to 3.14, which leave a
+  loop's back jump in a `with` block inside a `try` out of the exception table, so a signal landing there skipped the
+  block's exit).
+- Compactions are unchanged: the plan to drop a strict reader's first line of a key where it takes no row between it
+  and its last moved the view of readers given other arguments than the writer's in the random differential (4 of
+  20,000 `.tsv` argument sets), so it is deferred again
+  ([docs/limitations.md](docs/limitations.md#a-compaction-can-keep-a-strict-readers-first-line-of-a-key-where-no-other-key-competes-for-its-place)).
+- **Everything else runs at 5.14's speed.** Commits, empty commits (most of the writer thread's ticks), loads,
+  reloads, clears, one-shot calls, threads, opens and reads each landed within 5.14's own run-to-run spread on Python
+  3.14 and 3.6.
+- **Known** ([docs/limitations.md](docs/limitations.md)):
+  - A line can be written twice: by a signal handler that uses the store inside a set or delete and wrote or queued
+    something after its line (35 to 45 per 1,000 landings on 3.14), and by a commit after `close()` or in a forked child
+    that a Ctrl-C cuts just after its write. The last copy wins; where another process writes the same key between the
+    two copies, the older lands last.
+  - A forked child writes nothing at its close or exit where its parent held `get_file_obj()` at the fork (the parent
+    may be waiting for it), and says so; its `commitAppendToFile()` writes once the parent lets go.
+  - A parent that forks and ends by `os._exit` does not write the rows it queued last: commit before forking.
+- **Planned for 5.16** ([docs/limitations.md](docs/limitations.md)): a Ctrl-C caught inside a set, delete, pop or move
+  still leaves that one key apart (memory changed, the line not queued); a handler's change of the store inside
+  `popitem()` or `move_to_end()` can make it raise `StopIteration`, `RuntimeError` or `TypeError`; a `TSVZClient` with
+  no server, used in a forked child, waits for ever at its first write; a Ctrl-C while the writer thread itself reloads
+  after another process's change waits for that reload; and the compaction above.
+
 ## Upgrading to 5.14 from 5.13
 
 The file formats are unchanged. An upgrade needs nothing: no file has to be rewritten, and the API is the same.
@@ -406,7 +490,7 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
 
 - Deferred to 5.15: a compaction can keep a strict reader's first line of a key where no other key competes for its
   place, once (`a\na\tX\na\t2\t\na\t\t2\n` scrubbed with header `id\tv`, defaults `[#_defaults_#, '', '']` and count 2
-  keeps all four lines). Every reader reads it alike. See
+  keeps all four lines). Every reader reads it alike (deferred again to 5.16: see Upgrading to 5.15). See
   [docs/limitations.md](docs/limitations.md#a-compaction-can-keep-a-strict-readers-first-line-of-a-key-where-no-other-key-competes-for-its-place).
 
 - **Known: a program still running 3.39 to 5.2 can cut a wide row when another writer changes its file.** A `TSVZed` of
@@ -441,8 +525,8 @@ The file formats are unchanged, and no file has to be rewritten.
   left in a section that runs in the caller's thread after `close()` or in a forked child, can leave it. There a Ctrl-C
   can also leave the store's `writeLock` held, which nothing lets go of, and the program's next commit or rewrite of
   that store then waits for ever (a known limitation; 5.12 the same, and in every `.tsvz` commit), and a `.tsvz`
-  commit cut there can drop the rows it had taken from the queue (5.12 the same; planned for 5.15). See
-  docs/limitations.md.
+  commit cut there can drop the rows it had taken from the queue (5.12 the same; planned for 5.15; fixed in 5.15: see
+  Upgrading to 5.15). See docs/limitations.md.
 - **A signal handler that uses the store no longer hangs a set.** A handler that commits (flush on `SIGUSR1`) or sets a row,
   or one that calls `close()` and exits (`SIGTERM`), runs inside whatever the main thread was doing, a set included. In
   5.12 the program waited for ever in 5 to 11 of 40 runs on 3.14 and in 19 to 40 of 40 on 3.6, whichever of the three the
@@ -458,16 +542,19 @@ The file formats are unchanged, and no file has to be rewritten.
   1,400 to 2,100 commits while another process appended to the file (3.14), and 1 to 8 in 120 to 430 `reload()`s by the
   handler. A handler that sets the very key the set or delete was changing does the same: memory keeps the handler's
   row, and the file ends with the section's line. A handler that only sets rows of other keys, or sets a flag the main
-  loop acts on, is not affected. Planned for 5.15 (docs/limitations.md). When the writer thread rewrites a loose store's
-  file meanwhile instead, the change is written twice, by the rewrite and by the line queued after it: the last wins, so
-  readers read the same rows, and the next rewrite drops the extra line (a known limitation).
+  loop acts on, is not affected. Planned for 5.15 (docs/limitations.md; fixed in 5.15: see Upgrading to 5.15). When
+  the writer thread rewrites a loose store's file meanwhile instead, the change is written twice, by the rewrite and by
+  the line queued after it: the last wins, so readers read the same rows, and the next rewrite drops the extra line (a
+  known limitation).
 - **Not covered yet:** a `TSVZClient`'s lock, a `tsvz serve` store's and the lock a one-shot call takes on a path
   (`appendTabularFile`, `scrubTabularFile`, `clearTabularFile`) are not let go of the same way: a caught Ctrl-C that
   left one held can make another thread of the program that uses the same client, store or path wait for ever (not
-  the exit, except of a path's writer thread). Planned for 5.15 (docs/limitations.md).
+  the exit, except of a path's writer thread). Planned for 5.15 (docs/limitations.md; fixed in 5.15: see Upgrading
+  to 5.15).
 - **Not covered yet either:** rows that a child `fork()` made sets on a store it inherited reach the file only through
   its own `commitAppendToFile()`: its `close()` and its exit write nothing, and that commit also writes the rows the
-  parent had queued at the fork (5.12 the same). Planned for 5.15 (docs/limitations.md).
+  parent had queued at the fork (5.12 the same). Planned for 5.15 (docs/limitations.md; fixed in 5.15: see Upgrading
+  to 5.15).
 - **`TSVZed.shutdownEvent` is no longer a `threading.Event`.** It has the same `is_set()` (and `isSet()`), `set()`,
   `clear()` and `wait()`, which behave as an Event's, but `isinstance(store.shutdownEvent, threading.Event)` is now
   false, and an Event's internals (`_cond`, `_flag`) are not there. An Event holds its lock across Python code, which a
@@ -478,7 +565,8 @@ The file formats are unchanged, and no file has to be rewritten.
   queued, no write under way: a load is no write) is let go of at once, as a loose store is, so a Ctrl-C during a long
   load ends the program, where it first waited for the whole load (6.45 s after one Ctrl-C on a 1.5M-row store). It
   still takes up to a second or two on a big store, while the load thread keeps the interpreter busy (a loose
-  store's does too; 5.12's `.tsvz` load, in the main thread, ended in 0.1 s): planned for 5.15 (docs/limitations.md).
+  store's does too; 5.12's `.tsvz` load, in the main thread, ended in 0.1 s): planned for 5.15 (docs/limitations.md;
+  fixed in 5.15: see Upgrading to 5.15).
 - A set costs a little more: a loop of 200,000 `store[k] = v` (15 alternating runs each, medians, a host at a load of 80
   to 115) took 1.53 s in 5.12 and 1.63 s in 5.13 on 3.6 (7% more), 0.96 s and 0.97 s on 3.14 (2% more); the noise between
   runs is about 4%.
@@ -1302,8 +1390,8 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   Where only `lockf` works (a
   Linux kernel without open file description locks, a file system that refuses them and
   `flock`), writers use it and readers take no lock, as in 5.2.
-- A child that `fork()` made drops the TSVZ locks it inherits (Python 3.7 and later): a
-  copy of a `get_file_obj()` holder gets EBADF on its writes.
+- A child that `fork()` made drops the TSVZ locks it inherits (Python 3.7 and later; every
+  Python from 5.15): a copy of a `get_file_obj()` holder gets EBADF on its writes.
 - A thread holding `get_file_obj()` reads that file (`readTabularFile`) without waiting.
   One that waits on another TSVZ store of the same file (its `reload()`, `close()` or a
   write) can wait for ever: that store's thread waits for this thread's lock
@@ -1319,8 +1407,8 @@ The file formats are unchanged, and a 3.39 host still reads every `.tsv`-family 
   abandons the write, on every Python.
 - Still not covered: writers that empty the file before or without the lock (3.39's and
   4.9's compressed rewrites and `clear()`, 3.39 to 5.0 scrub and clear, other tools),
-  readers from 5.2 and earlier and tsvz-rs, Python 3.6 forks, `lockf`-only hosts and
-  Windows
+  readers from 5.2 and earlier and tsvz-rs, Python 3.6 forks (covered from 5.15), `lockf`-only
+  hosts and Windows
   ([limitations](docs/limitations.md#some-writers-and-readers-still-meet-another-processs-rewrite-part-way)).
 
 ## Upgrading to 5.2 from 5.1
