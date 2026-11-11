@@ -418,14 +418,15 @@ can land in, and checks the locks, memory and the file after each.
   and so does one that follows a signal handler's `reload()` inside the set; a Ctrl-C at the back jump of other loops
   inside a `try` or `with` block can skip their clean-up on Python 3.12 to 3.14 (a static check comes first); a
   `.tsvz` `clear()` after `close()` or in a forked child that a Ctrl-C cuts can leave memory empty and the file full;
-  a handler's change of the store inside
-  `popitem()` or `move_to_end()` can make it raise `StopIteration`, `RuntimeError` or `TypeError`; a handler's new key,
-  move or followed line inside a set of a new key can leave that key's place in memory apart from the file's; a
-  handler's `clear()` inside a delete, pop or move of a store with no header can leave the key in the file as a row of
-  the key alone; a `#` key can leave memory when the store follows another process's change while rows are queued (all
-  three as in 5.14); a `TSVZClient` with no server, used in a forked child, waits for ever at its first write; a Ctrl-C
-  while the writer thread itself reloads after another process's change waits for that reload; and the compaction
-  above.
+  a handler's change of the store inside `popitem()` or `move_to_end()` can make it raise `StopIteration`,
+  `RuntimeError` or `TypeError`, and two handler calls, the second inside the first one's redo, can make a set, delete,
+  pop or move raise `IndexError` or, rarely, leave a key apart (220 of 53,873 pairs; 5.14: 19,094 of 52,102); a
+  handler's new key, move or followed line inside a set of a new key can leave that key's place in memory apart from
+  the file's; a handler's `clear()` inside a delete, pop or move of a store with no header can leave the key in the
+  file as a row of the key alone; a `#` key can leave memory when the store follows another process's change while
+  rows are queued; a forked child's row is lost when its parent's failed rewrite has left the file damaged (these four
+  as in 5.14); a `TSVZClient` with no server, used in a forked child, waits for ever at its first write; a Ctrl-C while
+  the writer thread itself reloads after another process's change waits for that reload; and the compaction above.
 
 ## Upgrading to 5.14 from 5.13
 
