@@ -119,15 +119,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     unless the move's own are still the last ones queued and are the lines memory makes then. So a line is written
     twice where the handler wrote or queued something after the section's, on `.tsvz` stores too. With the handler
     run at each step (the suite's sweep and the 5.15 final review's, at its fixes, Python 3.14; 3.6's line steps in
-    brackets; ranges over two runs):
-    - a set, delete, pop, popitem or defaults change: 35 (a `reload()`) to 46 (a commit, a set or delete of another
-      key, a sync with another process's line, a set of the same key) per 1,000 landings (68 to 104);
-    - `move_to_end(key)`: a flush, a `reload()`, a sync, or a set or delete of another key, 11 to 16 of 524 landings,
-      about 30 per 1,000 (4 to 7 of 81); a set of the moved key itself, 333 of 524 (55 of 81);
+    brackets; ranges over the fixes' runs and the 5.15 re-review's):
+    - a set, delete, pop, popitem or defaults change: 35 (a `reload()`) to 47 (a commit, a set or delete of another
+      key, a sync with another process's line, a set of the same key) per 1,000 landings (68 to 107); a `rewrite()` of
+      a `.tsv` store, 174 per 1,000 (180): 33 of 325 landings of a set, 78 to 84 of about 250 of a delete, pop or
+      popitem, whose deletion line goes again after the rewrite took the key out;
+    - `move_to_end(key)`: a flush, a `reload()`, a sync, or a set or delete of another key, 10 to 16 of 524 landings,
+      about 30 per 1,000 (4 to 7 of 81); a set of the moved key itself, 333 of 524 (55 of 81); a `rewrite()`, none;
     - `move_to_end(key, last=False)`, which sends every other key to the end: a flush or a `reload()`, 9 to 16 of 824
-      (5 to 7 of 120); a set or delete of another key, or another process's line followed, 606 to 616 of 824 (91 to 92
-      of 120): every other key's lines are written again, as their order must follow the handler's change, so the
-      file can double until its next rewrite.
+      (5 to 7 of 120); a `rewrite()`, none; a set or delete of another key, or another process's line followed, 606 to
+      616 of 824 (91 to 92 of 120): every other key's lines are written again, as their order must follow the
+      handler's change, so the file can double until its next rewrite.
 
     5.14 wrote none twice there, but left memory and the file apart in 3,650 of 33,054 landings. A `clear()` writes no
     row twice inside a set, delete, pop or popitem; it keeps the defaults, so a `#_defaults_#` line or a `.tsvz` marker

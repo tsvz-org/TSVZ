@@ -399,11 +399,12 @@ can land in, and checks the locks, memory and the file after each.
   take that path).
 - **Known** ([docs/limitations.md](docs/limitations.md)):
   - A line can be written twice: by a signal handler that uses the store inside a set, delete or move and wrote or
-    queued something after its lines (35 to 46 per 1,000 landings of a set or delete on 3.14, about 30 of a move to
-    the end), and by a commit after `close()` or in a forked child that a Ctrl-C cuts just after its write. A handler's
-    set or delete of another key inside a move to the beginning has every other key's lines written again, so the file
-    can double until its next rewrite, and a handler's `clear()` inside a move writes its deletion lines twice. The
-    last copy wins; where another process writes one of those keys between the two copies, the older lands last.
+    queued something after its lines (35 to 47 per 1,000 landings of a set or delete on 3.14, 174 where the handler
+    rewrites the file, about 30 of a move to the end), and by a commit after `close()` or in a forked child that a
+    Ctrl-C cuts just after its write. A handler's set or delete of another key inside a move to the beginning has
+    every other key's lines written again, so the file can double until its next rewrite, and a handler's `clear()`
+    inside a move writes its deletion lines twice. The last copy wins; where another process writes one of those keys
+    between the two copies, the older lands last.
   - A forked child writes nothing at its close or exit where its parent held `get_file_obj()` at the fork (the parent
     may be waiting for it), and says so, even once both have let go of the file: where the store has `rewrite_on_exit`
     or a sync pending, 5.14 wrote the rows there once both had let go (and on 3.14 waited for ever while the parent
