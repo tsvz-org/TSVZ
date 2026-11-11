@@ -44,7 +44,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.15'
+version = '5.16'
 __version__ = version
 author = 'pan@zopyr.us'
 COMMIT_DATE = '2026-11-11'
@@ -5971,7 +5971,8 @@ class TSVZed(OrderedDict):
 	append_check_delay : float, default=0.01
 		Time delay (in seconds) between checks of the append queue by the worker thread.
 	monitor_external_changes : bool, default=True
-		If True, monitors and detects external file modifications.
+		If True, monitors and detects external file modifications. In a child that fork() made it is True (5.16): the
+		parent writes the file too.
 	verbose : bool, default=False
 		If True, prints detailed operation logs.
 	encoding : str, default='utf8'
@@ -8337,7 +8338,11 @@ memoryOnly:{self.memoryOnly}
 		process's store does. Taken, it made the child's close or exit write its fork-time memory over the file (the
 		merge rule's "memory is the only good copy", _syncFrom): the parent's later rows lost and its deleted rows back,
 		in the file and then in the parent's memory (5.15 final review; 5.14's child waited for ever on its copy of
-		writeLock there). The parent holds every row the child's copy does, and its own later ones."""
+		writeLock there). The parent holds every row the child's copy does, and its own later ones.
+
+		The child follows the file whatever monitor_external_changes was given (5.16): with it off, a rewrite of the
+		child's (a one-column delete's or move's commit, rewrite_on_exit, a due rewrite_interval) wrote its memory over the
+		file without reading it, and the rows the parent set after the fork were lost; 5.15's close and exit reached it."""
 		self._parentHeldFile = self._fileObjHeld
 		self._fileObjHeld = False
 		self.writeLock = threading.Lock()
@@ -8347,6 +8352,7 @@ memoryOnly:{self.memoryOnly}
 		self._loadJob = self._loadReader = None  # (the parent's writer thread's load, not here: its stop is for it)
 		self._writing = 0
 		self._damaged = False
+		self.monitor_external_changes = True  # another process, the parent, writes this file: the child follows it
 		self._forkReset = os.getpid()
 
 	def _commitsAtClose(self):

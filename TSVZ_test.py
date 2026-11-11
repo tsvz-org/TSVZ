@@ -18412,7 +18412,9 @@ sys.path.insert(0, sys.argv[1])
 import TSVZ
 case, p = sys.argv[2], sys.argv[3]
 t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60,  # (no tick writes)
-				rewrite_on_exit=case == 'file-rewrite')
+				rewrite_on_exit=case in ('file-rewrite', 'dirty', 'dirty-set'),
+				rewrite_interval=0.05 if case == 'dirty-interval' else 0,  # (due at the child's exit: it waits 0.2 s)
+				monitor_external_changes=not case.startswith('dirty'))
 t['a'] = ['a', '1']
 t.commitAppendToFile()
 
@@ -18527,13 +18529,28 @@ elif case == 'wait':  # a signal handler forks while this thread waits for the w
 		t.close()
 		os._exit(0)
 	status(pids[0])
+elif case.startswith('dirty'):  # monitoring off, the parent dirty at the fork; p2 set after it, the parent's store closed first
+	t['a'] = ['a', '2']
+	t.commitAppendToFile()  # (a's first line is superseded: dirty)
+	ready, ended = os.pipe()
+	def body():
+		if case == 'dirty-set':
+			t['c'] = ['c', '1']  # (a new key: nothing the child changed is in the file yet)
+		os.read(ready, 1)  # (the parent's p2 is in the file, and its store closed: the child's exit writes last)
+		if case == 'dirty-interval':
+			time.sleep(0.2)  # (the file kept still for four times rewrite_interval: its rewrite is due at the exit)
+	pid = forked(body)
+	t['p2'] = ['p2', '1']
+	t.close()
+	os.write(ended, b'x')
+	status(pid)
 t.close()
 """
 
 
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
 @pytest.mark.parametrize('case', ['exit', 'close', 'queued', 'held', 'file', 'file-rewrite', 'file-desynced', 'load', 'mp', 'mpclose', 'nohook',
-								  'writing', 'writing-set', 'wait'])
+								  'writing', 'writing-set', 'wait', 'dirty', 'dirty-set', 'dirty-interval'])
 @pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
 def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(tmp_path, ext, case):
 	# 5.14: a child that fork() made wrote nothing at its close or exit, and its commit wrote the rows its parent had
@@ -18549,10 +18566,13 @@ def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(t
 	# wrote its fork-time memory over the parent's later rows: the parent's new row lost and its deleted row back, in the
 	# file and then in the parent's memory (5.15 final review; 5.14's child waited for ever there). A child that a signal
 	# handler forked while its thread waited for the writer thread never returned from that call: the job was gone with
-	# the parent's (5.14's child ran it itself).
+	# the parent's (5.14's child ran it itself). A child of a store with monitoring off whose parent was dirty at the fork
+	# (superseded lines in the file) made its rewrite at exit (rewrite_on_exit, a due rewrite_interval) without reading
+	# the file: its fork-time memory over the parent's row set after the fork (5.15 re-review; 5.14 the same). From 5.16
+	# a forked child follows the file whatever monitor_external_changes says.
 	if case == 'nohook' and sys.version_info >= (3, 7):
 		pytest.skip('3.6: the fork hook is a wrapper of threading._after_fork')
-	if case in ('file-rewrite', 'writing', 'writing-set') and ext == 'tsvz':
+	if case in ('file-rewrite', 'writing', 'writing-set', 'dirty', 'dirty-set', 'dirty-interval') and ext == 'tsvz':
 		pytest.skip('a .tsvz store is never rewritten (rewrite_on_exit and rewrite() are ignored)')
 	p = str(tmp_path / ('s.' + ext))
 	script = tmp_path / 'forked.py'
@@ -18564,8 +18584,10 @@ def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(t
 	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
 	with open(p, 'rb') as f:
 		lines = [line.split(b'\t')[0] for line in f.read().split(b'\n')]
-	written = case in ('exit', 'close', 'queued', 'held', 'mpclose', 'writing-set', 'wait')
+	written = case in ('exit', 'close', 'queued', 'held', 'mpclose', 'writing-set', 'wait', 'dirty-set')
 	assert ('c' in rows) == written and lines.count(b'c') == int(written), (rows, done.stderr)
+	if case.startswith('dirty'):
+		assert rows.get('p2') == ['p2', '1'] and rows['a'] == ['a', '2'], (rows, done.stderr)  # (the parent's after the fork)
 	if case == 'queued':
 		assert rows['p1'] == ['p1', 'new'] and lines.count(b'p1') == 2  # (the parent's two: the child dropped its copy)
 	if case.startswith('writing'):
@@ -18575,6 +18597,73 @@ def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(t
 	if case.startswith('file') or case == 'nohook':
 		said = 'its parent held the file (get_file_obj) at the fork' if case.startswith('file') else 'no fork hook ran in it'
 		assert done.stderr.count(said) == 1, done.stderr
+
+
+#: ARGV: TSVZ's directory, the file, CASE, END. A one-column store with monitor_external_changes=False holding a and b,
+#: then fork(): the child makes CASE's change (delete: del b; move: move_to_end a), the parent sets p2 and commits, and
+#: the child then ends by END (exit: its normal exit; close: close(), then os._exit; commit: commitAppendToFile(), then
+#: os._exit), its status printed; the parent closes last. Each child has 10 s (an alarm): it ends in well under a
+#: second, and a failure here is a lost row, not a wait.
+_FORKED_ONE_COLUMN = r"""
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, case, end = sys.argv[2], sys.argv[3], sys.argv[4]
+t = TSVZ.TSVZed(p, header='id', rewrite_on_load=False, verbose=False, append_check_delay=60,  # (no tick writes)
+				monitor_external_changes=False)
+t['a'] = ['a']
+t['b'] = ['b']
+t.commitAppendToFile()
+acted, go = os.pipe(), os.pipe()
+pid = os.fork()
+if pid == 0:
+	signal.alarm(10)
+	if case == 'delete':
+		del t['b']
+	else:
+		t.move_to_end('a')
+	os.write(acted[1], b'x')
+	os.read(go[0], 1)  # (the parent's p2 is in the file)
+	if end == 'commit':
+		t.commitAppendToFile()
+		os._exit(0)
+	if end == 'close':
+		t.close()
+		os._exit(0)
+	sys.exit(0)  # (the normal exit: atexit runs)
+os.read(acted[0], 1)
+t['p2'] = ['p2']
+t.commitAppendToFile()
+os.write(go[1], b'x')
+_, code = os.waitpid(pid, 0)
+print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+t.close()
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
+@pytest.mark.parametrize('end', ['exit', 'close', 'commit'])
+@pytest.mark.parametrize('case', ['delete', 'move'])
+@pytest.mark.parametrize('ext', ['tsv', 'tsv.gz'])
+def test_a_forked_child_of_a_one_column_store_with_monitoring_off_keeps_its_parents_later_rows(tmp_path, ext, case, end):
+	# A one-column delete or move is not a line: its commit rewrites the file. With monitor_external_changes=False that
+	# rewrite did not read the file first, so a forked child that deleted or moved a key wrote its fork-time memory over
+	# the rows its parent set after the fork. 5.14 lost them at the child's explicit commit only; 5.15's close and normal
+	# exit, which write the child's rows, lost them too: the file ended with a alone. From 5.16 the child follows the file
+	# whatever monitor_external_changes says (the parent, another process, writes it).
+	p = str(tmp_path / ('s.' + ext))
+	script = tmp_path / 'forked.py'
+	script.write_text(_FORKED_ONE_COLUMN)
+	# 60 s: the run takes a second; only a wait for ever takes this long, on a machine the suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, case, end], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+						  universal_newlines=True, timeout=60)
+	assert done.returncode == 0 and 'child 0' in done.stdout, done.stdout + done.stderr
+	keys = list(TSVZ.readTabularFile(p, header='id', verbose=False))
+	assert 'p2' in keys, (keys, done.stderr)  # (the parent's, after the fork)
+	if case == 'delete':
+		assert sorted(keys) == ['a', 'p2'], (keys, done.stderr)  # (the child's delete)
+	else:
+		assert sorted(keys) == ['a', 'b', 'p2'] and keys.index('a') > keys.index('b'), (keys, done.stderr)  # (its move)
 
 
 # --------------------------------------------------------------------------
