@@ -16925,9 +16925,9 @@ def test_the_exit_waits_for_the_writer_thread_through_waited(tmp_path, monkeypat
 #: and (a TSVZed) after one more write, a commit and close(), memory and the file agree but on the operation's own key
 #: (deferred: a Ctrl-C between a section's change of memory and its line). A handler's name: that signal handler run at
 #: the step, as a real signal's runs inside whatever the main thread was doing; then after a commit and close() memory
-#: and the file agree on every key, and the operation's own line is counted (written twice: KL2). A case that has not
-#: ended in 25 s is a hang (its stacks printed), and the parent goes on after it: every hang the sweeps met was a wait for
-#: ever, while a case takes 1 to 20 ms. The parent prints the failures and the counts, and exits 1 on any failure or hang.
+#: and the file agree on every key, and the operation's own line is counted (written twice: docs/limitations.md, "A line
+#: can be written twice"). A case that has not ended in 25 s is a hang (its stacks printed), and the parent goes on after
+#: it: every hang the sweeps met was a wait for ever, while a case takes 1 to 20 ms. The parent prints the failures and the counts, and exits 1 on any failure or hang.
 _STEP_SWEEP = r"""
 import dis, faulthandler, os, shutil, subprocess, sys, threading
 HERE, BASE, KIND, OP, AT = sys.argv[1:6]
@@ -17153,7 +17153,7 @@ def storeCase(d, n):
 		with open(p, 'rb') as f:
 			copies = sum(1 for line in f.read().split(b'\n') if line.split(b'\t')[0] == b'q2')
 		if copies > 1:
-			notes.append('allow:twice')  # (cut after its write: written again by the next commit, KL2)
+			notes.append('allow:twice')  # (cut after its write: written again by the next commit: "A line can be written twice")
 	if OP != 'setdefaults' and keys:  # (a setDefaults() changes how every row reads: not compared)
 		if OP in OPKEY and keys == [OPKEY[OP]]:
 			# Deferred (5.16): a Ctrl-C between a section's change of memory and its queued line leaves that key apart.
@@ -17297,7 +17297,8 @@ def ownLines(d):
 def handlerCase(d, n):
 	'''A signal handler that uses the store, run at the n-th step of the operation, as a real signal's runs inside
 	whatever the main thread was doing: after a commit and close(), memory and the file agree on every key (and on the
-	defaults), and the operation's own line is counted (written twice: KL2).'''
+	defaults), and the operation's own line is counted (written twice: docs/limitations.md, "A line can be written
+	twice").'''
 	lines, defaults = ownLines(d)
 	p = os.path.join(d, 'f.' + KIND)
 	t = opened(p)
@@ -17327,8 +17328,9 @@ def handlerCase(d, n):
 			notes.append('fail:defaults mem=%r want=%r' % (t.defaults, want))
 	with open(p, 'rb') as f:
 		copies = f.read().split(b'\n').count(lines[0]) if lines else 0
-	if copies > 1:
-		notes.append(('fail' if AT == 'clear' else 'allow') + ':twice')
+	if copies > 1:  # (KL-b; a clear drops a row's line or writes it before it clears, so the redo's copy is the only one,
+		# but it keeps the defaults: a defaults line or marker it wrote or kept can be queued again by the redo)
+		notes.append(('fail' if AT == 'clear' and OP not in DEFAULTS_OPS else 'allow') + ':twice')
 	return notes
 
 
@@ -17437,14 +17439,12 @@ def test_a_ctrl_c_caught_at_any_step_of_an_operation_leaves_no_lock_held_and_mem
 	_sweep(tmp_path, kind, op, 'raise', start, stop)
 
 
-#: The (kind, op, handler) a signal handler is swept through.
-_HANDLER_SWEPT = ([(kind, op, handler) for kind, ops in (
+#: The (kind, op, handler) a signal handler is swept through: every operation that changes memory in a section, with every
+#: kind of handler (a .tsvz move is memory only).
+_HANDLER_SWEPT = [(kind, op, handler) for kind, ops in (
 	('tsv', ('set', 'set-existing', 'del', 'pop', 'popitem', 'move', 'set-defaults-row', 'del-defaults-row', 'setdefaults')),
-	('tsvz', ('set', 'set-existing', 'del', 'pop', 'popitem', 'set-marker'))) for op in ops for handler in ('commit', 'set', 'del')]
-	+ [('tsv', op, 'sync') for op in ('set', 'set-existing', 'del', 'pop', 'popitem', 'set-defaults-row', 'del-defaults-row', 'setdefaults')]
-	+ [('tsv', op, 'clear') for op in ('del', 'pop', 'popitem', 'del-defaults-row', 'setdefaults')]
-	+ [('tsvz', op, 'clear') for op in ('del', 'pop', 'popitem', 'set-marker')]
-	+ [('tsv', 'setdefaults', handler) for handler in ('reload', 'own')])
+	('tsvz', ('set', 'set-existing', 'del', 'pop', 'popitem', 'set-marker')))
+	for op in ops for handler in ('reload', 'clear', 'sync', 'own', 'commit', 'set', 'del')]
 
 
 @pytest.mark.parametrize('kind, op, handler', _HANDLER_SWEPT, ids=['-'.join(case) for case in _HANDLER_SWEPT])
@@ -17533,48 +17533,87 @@ def test_a_sigterm_handler_that_closes_the_store_and_exits_inside_a_set_exits_wi
 	assert stopped.value.code == 0 and not t._memLock._is_owned()
 
 
-#: ARGV: TSVZ's directory, 'commit' or 'set', the file. A SIGALRM handler that uses the store, every 2 ms, while the main
-#: thread sets rows in a loop; 50 handler calls, then the close. Real signals: the handler lands wherever Python is.
+#: ARGV: TSVZ's directory, 'commit', 'set' or 'reload', the file. A SIGALRM handler that uses the store while the main
+#: thread sets new rows and deletes the one set 20 before, in a loop: every 2 ms, 50 calls (reload: one 2 ms after the last
+#: ends, for 30 s). Real signals: the handler lands wherever Python is. Printed: the sets, the handler's calls, and the
+#: loop's keys whose last value (the program's) memory or the file does not hold. Each key is set once, so a change a
+#: handler undid stays undone (with keys set again, the next set of the key hid it).
 _HANDLER_IN_SETS = r"""
-import signal, sys
+import signal, sys, time
 sys.path.insert(0, sys.argv[1])
 import TSVZ
 how, p = sys.argv[2], sys.argv[3]
 t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False)
 calls = [0]
+stop = []
 def handler(sig, frame):
+	if stop:
+		return
 	calls[0] += 1
 	if how == 'commit':
 		t.commitAppendToFile()
+	elif how == 'reload':
+		t.reload()
+		# (one at a time, 2 ms after the last ends: a reload can take longer than 2 ms, and a handler that lands in
+		# itself goes on landing in itself, to a RecursionError)
+		signal.setitimer(signal.ITIMER_REAL, 0.002)
 	else:
 		t['h%d' % calls[0]] = ['h', str(calls[0])]
 signal.signal(signal.SIGALRM, handler)
-signal.setitimer(signal.ITIMER_REAL, 0.002, 0.002)
+signal.setitimer(signal.ITIMER_REAL, 0.002, 0 if how == 'reload' else 0.002)
+model = {}
 i = 0
-while calls[0] < 50:
-	k = 'k%d' % (i % 500)
+# (reload: in 30 s, 5.14 left 2 to 11 keys apart in each of 8 runs, 3.14 and 3.6, both kinds; the file grows with every
+# set, and each reload reads it whole, so a longer run adds few reloads)
+want, end = (float('inf'), time.time() + 30) if how == 'reload' else (50, float('inf'))
+while calls[0] < want and time.time() < end:
+	k = 'k%d' % i
 	t[k] = [k, str(i)]
+	model[k] = [k, str(i)]
+	if i >= 20:
+		k = 'k%d' % (i - 20)
+		del t[k]
+		del model[k]
 	i += 1
+stop.append(1)
 signal.setitimer(signal.ITIMER_REAL, 0)
+memory = {k: list(v) for k, v in t.items() if k.startswith('k')}
 t.close()
-print(i)
+rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
+written = {k: v for k, v in rows.items() if k.startswith('k')}
+print(i, calls[0], sorted(k for k in set(model) | set(memory) | set(written) if not model.get(k) == memory.get(k) == written.get(k)))
 """
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='SIGALRM')
-@pytest.mark.parametrize('how', ['commit', 'set'])
-def test_a_real_signal_handler_that_uses_the_store_while_the_program_sets_rows_ends_normally(tmp_path, how):
-	p = str(tmp_path / 's.tsv')
+@pytest.mark.parametrize('how, ext', [('commit', 'tsv'), ('set', 'tsv'), ('reload', 'tsv'), ('reload', 'tsvz')])
+def test_a_real_signal_handler_that_uses_the_store_while_the_program_sets_rows_leaves_memory_and_the_file_as_it_set_them(tmp_path, how, ext):
+	# 5.12 waited for ever at the first signal that landed inside a set. 5.13 and 5.14 went on, but a handler's reload()
+	# inside a set or delete undid the change in memory and wrote it all the same: keys whose memory and file differed
+	# (2 to 11 in 30 s of reloads). A section that finds its hold let go of now makes its change again.
+	p = str(tmp_path / ('s.' + ext))
 	script = tmp_path / 'handler.py'
 	script.write_text(_HANDLER_IN_SETS)
 	try:
-		# 120 s: the run takes about a second; only a wait for ever (5.12's) takes this long, on a machine the whole suite keeps busy.
+		# 120 s: the run takes about a second (reload: 30 s by design); only a wait for ever (5.12's) takes this long, on
+		# a machine the whole suite keeps busy.
 		done = subprocess.run([sys.executable, str(script), HERE, how, p], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
 							  universal_newlines=True, timeout=120)
 	except subprocess.TimeoutExpired as e:
 		raise AssertionError('a handler that used the store waited for ever: {}'.format(e.stderr))
 	assert done.returncode == 0 and not done.stderr, done.stderr
-	assert len(TSVZ.readTabularFile(p, header='id\tv', verbose=False)) >= 50
+	sets, calls, apart = done.stdout.strip().split('\n')[-1].split(' ', 2)  # (the last line: TSVZ prints 'Created' first)
+	assert int(calls) >= 50 and apart == '[]', done.stdout
+
+
+def test_the_methods_that_change_memory_hold_no_cell_variables():
+	# A nested function that uses a method's names makes them cell variables of the whole method, read through a cell at
+	# every use: the 5.15 plan's first prototype of the redo did that and cost 7 to 9% of a set. The redos are methods.
+	for name in ('__setitem__', '__delitem__', 'pop', 'popitem', 'move_to_end', 'setDefaults', '_specSetItem',
+				 '_specSetMarker', '_specDelItem'):
+		# (before 3.12 a comprehension is a nested function (PEP 709): move_to_end's makes its key a cell, as in 5.14)
+		allowed = ('key',) if name == 'move_to_end' and sys.version_info < (3, 12) else ()
+		assert getattr(TSVZ.TSVZed, name).__code__.co_cellvars == allowed, name
 
 
 class _LeakyLock(TSVZ._SectionLock):

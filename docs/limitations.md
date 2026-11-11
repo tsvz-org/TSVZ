@@ -107,60 +107,37 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-10-24, the user chose "One writer thread (Recommended)", whose description said "At exit the
   program finishes a write in progress, and a second Ctrl-C abandons it."
 
-### A signal handler that uses a store inside a set or delete can leave memory and the file apart on that key
-- Kind: deferred
-- What the operator sees: a program whose signal handler uses a `TSVZed` (flush on `SIGUSR1`: `commitAppendToFile()`;
-  `reload()` on `SIGHUP`; `clear()`) while its main thread sets and deletes rows. When the signal lands inside a set
-  or delete, between its change of memory and its queueing of the line, and the writer thread reads the file into
-  memory while the handler waits for it (the handler's own `reload()` or `clear()`, another thread's `reload()`, or
-  the sync with another process's write, which follows each commit), the change is undone in memory and written all
-  the same. A row just set is then in the file and not in memory: `store[k]` misses it, a `del store[k]` does nothing
-  (the row stays in the file), and a loose store's next rewrite takes it out of the file. A row just deleted is back
-  in memory while the file has its deletion, and a loose store's next rewrite writes it back. A `.tsvz` store's
-  memory follows the file again at its next reload. Nothing is reported. In a loop of sets and deletes with a handler
-  about every millisecond (5.13 final review): no key in 13,000 sets by the handler on 3.14 and 23,000 on 3.6, nor in
-  17,000 and 73,000 commits by it with nothing else reading the file; 3 to 6 keys in 1,400 to 2,100 commits while
-  another process appended to the file (3.14); 1 to 8 keys in 120 to 430 `reload()`s by the handler (3.14); 8 and 13
-  keys in 790 and 940 commits while another thread called `reload()` in a loop (3.14; 7 and 12 in 3,100 and 4,600 on
-  3.6). 5.12 waited for ever at the first such signal that landed inside a set (18 of 18 runs, within seconds).
-  A handler that sets the very key the interrupted set or delete was changing does the same without the writer thread
-  (found by reading, not run): memory keeps the handler's row, and the file ends with the section's line, queued after
-  the handler's.
-- Why: the handler runs inside the section it interrupted and has to let go of that section's lock before it waits
-  for the writer thread, which needs it; the rest of the section then runs without the lock. A handler that only sets
-  rows of other keys, or sets a flag the main loop acts on, is not affected. When the writer thread rewrites the file
-  instead, the line is written twice: the next entry.
-- Plan (5.15): a section that finds, at its end, that its lock was taken from it makes its change of memory again
-  under the lock (a set puts its row, a delete drops its key), so memory agrees with what it queued; a test with the
-  handler run at each step of a set, a delete, a pop and a move, for `reload()`, `clear()` and a commit beside
-  another process's append, and with a handler that sets the section's own key.
-- Revisit when: 5.15.
-- Noted: 2026-11-10, measured in the 5.13 final review; a deferral, not asked. It is wider than the "memory and file can
-  differ until the next reload" of the question the user approved on 2026-11-10 (the next entry), and plans its fix.
-
-### A signal handler that uses a store inside a set or delete can write that line twice
+### A line can be written twice, by a signal handler that uses a store inside a set or delete or by a commit a Ctrl-C cuts
 - Kind: known limitation
-- What the operator sees: a program whose signal handler uses a loose (`.tsv`-family) `TSVZed` (a commit, a rewrite, a
-  set) while its main thread sets and deletes rows in it. When the signal lands inside a set or delete, between its
-  change of memory and its queueing of the line, the rest of that set or delete runs without the store's lock (5.12
-  waited for ever there).
-  If the writer thread rewrites the file meanwhile (the handler's own `rewrite()`, `mapToFile()` or `hardMapToFile()`,
-  a commit that rewrites, as a one-column delete's does, or a rewrite that thread starts on its own), the rewrite
-  writes memory with the change in it, and the line queued after it writes the change again: the file holds that row,
-  or that deletion, twice. The last wins, so every reader reads the same rows; the file is a line longer until its
-  next rewrite. A `.tsvz` store is never rewritten from memory, so it does not meet this. Not measured; the measured
-  cases of the same window, where memory and the file differ, are the entry above.
-- Why: the handler runs inside the section it interrupted and has to let go of its lock; the section cannot tell that
-  a rewrite ran meanwhile without more state to compare. The line costs the file a few bytes and no reader anything.
-  The fix planned in the entry above does not remove it: the section makes its change of memory again under the lock,
-  and its line is still queued after the rewrite that already wrote the change.
-- Revisit when: someone sees a file grow this way, or the 5.15 work on these sections finds a way to skip the line that
-  costs no more than it saves.
+- What the operator sees:
+  - A program's signal handler uses a store (a commit, `reload()`, `clear()`, a rewrite, a set or a delete) while its
+    main thread sets and deletes rows in it. When the signal lands inside a set or delete, its rest runs without the
+    store's lock (5.12 waited for ever there), and the writer thread may read the file into memory or clear it
+    meanwhile. From 5.15 the set or delete then makes its change again under the lock, so memory and the file agree,
+    and queues its line again unless that line is still the last one queued. So the row or deletion is written twice
+    where the handler wrote or queued something after the section's line, on `.tsvz` stores too: with the handler run
+    at each step of each set, delete, pop, popitem, move and defaults change, 35 (a `reload()`) to 45 (a commit, a set
+    or delete of another key, a sync with another process's line, a set of the same key) per 1,000 landings on Python
+    3.14, 87 to 104 on 3.6's line steps; 5.14 wrote none twice there, but left memory and the file apart in 3,650 of
+    33,054 landings. A `clear()` writes no row twice; it keeps the defaults, so a `#_defaults_#` line or a `.tsvz`
+    marker it wrote or kept can be (29 of 856 landings on 3.14).
+  - A commit after `close()` or in a forked child that a Ctrl-C cuts just after its write writes its rows again at the
+    next commit: 195 of 1,037 steps of such a `.tsvz` commit on 3.14 (from 5.15, which keeps them queued until they
+    are on disk), 170 of 1,175 of a loose one (as in 5.14).
+  - The last copy wins, so every reader reads the same rows, and the file is a line longer until its next rewrite (a
+    `.tsvz` file until a scrub). The exception is a stale copy: when another process writes the same key between the
+    two copies (while the handler runs), the older copy lands last and the file says it. In 5.14 a handler that only
+    committed wrote the line once, so this case is new.
+- Why: knowing whether the first copy is already on disk, not only whether it is still the last line queued, needs an
+  identity check across the queue and a rewrite's snapshot, or a counter on every queued line: more state on every
+  write, for a few bytes and a race that needs another writer of the same key while the handler runs.
+- Revisit when: someone sees a file grow this way, or another process's write lost behind a repeated older copy.
 - Approved: 2026-11-10, the user chose "Approve as KL (Recommended)" on the question: "a program's own signal handler
   that writes to a store while the main thread is part way through writing to the same store. 5.12 deadlocked here
   for ever. 5.13 goes on, but the rest of the interrupted write runs without its lock: the file can get a duplicate
   line, or memory and file can differ until the next reload." This entry is the duplicate line; memory and the file
-  differing is the deferral above, which is wider (a loose store's next rewrite can lose the set or undo the delete).
+  differing was a deferral, which 5.15 fixed (a loose store's next rewrite could lose the set or undo the delete). Widened 2026-11-10 to `.tsvz` stores, item 4's cut commit, and the stale-copy case; the user chose "Build it, skip
+  extra copy (Recommended)". (Item 4: the 5.15 plan's fix that keeps a cut `.tsvz` commit's rows queued.)
 
 ### A Ctrl-C while the writer thread reloads after another process's change waits for that reload
 - Kind: deferred
@@ -178,6 +155,38 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   sweep of the tick's write path.
 - Revisit when: 5.16.
 - Noted: 2026-11-10, found by the 5.15 plan's measurement; a deferral, not asked.
+
+### A Ctrl-C caught inside a set, delete, pop or move can leave that one key apart
+- Kind: deferred
+- What the operator sees: a program that catches a Ctrl-C and goes on. When the Ctrl-C lands inside a set, delete,
+  pop, popitem or `move_to_end`, between its change of memory and its queueing of the line, memory has the change and
+  the file never gets it: the interrupted operation, half made. A loose store's next rewrite writes memory's side, so
+  the file follows; a `.tsvz` store keeps them apart until a reload. Counted by the suite's step sweep (`allow:opkey`),
+  5.15 on Python 3.14: `.tsv` set 20 of 325 steps, delete 78 of 263, pop and popitem 84 of about 250; `.tsvz` set 10
+  of 399, delete 184 of 365, pop and popitem 198 of about 360 (5.12 to 5.14 the same).
+- Why: a fix finishes the operation in the section's `except BaseException` clause, which changes what a cut set
+  means (it completes) and needs its own sweep; 5.15's work on these sections was the signal handler's case.
+- Plan (5.16): the clause the sections already have calls the section's redo (`_setAgain`, `_delAgain` and the others
+  5.15 added for signal handlers) with its own arguments, under the lock, when the section had begun changing memory:
+  a set cut by a Ctrl-C completes, and the KeyboardInterrupt still goes up. With its own sweep.
+- Revisit when: 5.16.
+- Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked.
+
+### A signal handler's change of the store inside popitem or move_to_end can make it raise the wrong exception
+- Kind: deferred
+- What the operator sees: a program whose signal handler changes a store while its main thread calls `popitem()` or
+  `move_to_end()` on it. When the signal lands inside the call, the store changes under it, and the call raises an
+  exception that says nothing of what happened, memory and the file agreeing. With the handler run at each step
+  (5.15, Python 3.14): `popitem` raises `StopIteration` at 11 of about 245 steps when the handler clears the store, and
+  `RuntimeError` ("OrderedDict mutated during iteration") at 1 when it clears, sets, deletes or syncs; `move_to_end`
+  raises `TypeError` at 10 of 502 when it clears. (A delete, pop or move whose key a handler's `clear()` took raises
+  `KeyError`, as for a missing key: that is right.)
+- Why: found by the 5.15 plan's sweep; the change is small but in two hot methods, and wants its own tests.
+- Plan (5.16): `popitem` looks for its key again when the store changed between its look and its take, and raises
+  `KeyError('dictionary is empty')` when the store went empty; `move_to_end` raises `KeyError(key)` when its key went
+  inside it.
+- Revisit when: 5.16.
+- Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked.
 
 ### A write after close(), or in a forked child, can be cut by a Ctrl-C
 - Kind: known limitation
