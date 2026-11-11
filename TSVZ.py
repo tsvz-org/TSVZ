@@ -8328,6 +8328,7 @@ memoryOnly:{self.memoryOnly}
 		self._memLock = _SectionLock()
 		self.appendQueue.clear()
 		self._requests.clear()
+		self._loadJob = self._loadReader = None  # (the parent's writer thread's load, not here: its stop is for it)
 		self._writing = 0
 		self._forkReset = os.getpid()
 

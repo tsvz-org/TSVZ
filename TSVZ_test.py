@@ -18354,6 +18354,13 @@ elif case.startswith('file'):  # the parent holds get_file_obj() across the fork
 		t.deSynced = case == 'file-desynced'
 	status(forked(body))
 	t.release_file_obj(f)
+elif case == 'load':  # the parent's writer thread is in a reload() whose waiter a Ctrl-C took away (TSVZed._call) at the fork
+	t._loadJob = [None, (), None, None, None, True]
+	t._loadReader = object()
+	def body():
+		t.reload()  # (here, in the caller's thread: it must not stop for a load that is not its own)
+		print('reloaded', sorted(t), flush=True)
+	status(forked(body))
 elif case in ('mp', 'mpclose'):  # multiprocessing's fork child ends by os._exit
 	def body():
 		t['c'] = ['c', '1']
@@ -18368,7 +18375,7 @@ t.close()
 
 
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
-@pytest.mark.parametrize('case', ['exit', 'close', 'queued', 'held', 'file', 'file-rewrite', 'file-desynced', 'mp', 'mpclose', 'nohook'])
+@pytest.mark.parametrize('case', ['exit', 'close', 'queued', 'held', 'file', 'file-rewrite', 'file-desynced', 'load', 'mp', 'mpclose', 'nohook'])
 @pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
 def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(tmp_path, ext, case):
 	# 5.14: a child that fork() made wrote nothing at its close or exit, and its commit wrote the rows its parent had
@@ -18377,7 +18384,9 @@ def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(t
 	# normal exit write what it set, but where its parent held the file through get_file_obj() (it may be waiting for the
 	# child) or no fork hook ran: there it writes nothing, as 5.14 did, and says so. It does not rewrite or sync either, which
 	# wait for the lock the parent holds: with rewrite_on_exit, or a store another process's change left to follow
-	# (deSynced), 5.14 and 5.15's first build waited for ever there, as a child that sets a row (5.15 review).
+	# (deSynced), 5.14 and 5.15's first build waited for ever there, as a child that sets a row (5.15 review). A child forked
+	# while its parent's writer thread runs a load whose waiter a Ctrl-C took away does not inherit the stop (_loadJob): its
+	# own reload() ran inline and raised _LoadStopped, which is meant never to leave the writer thread.
 	if case == 'nohook' and sys.version_info >= (3, 7):
 		pytest.skip('3.6: the fork hook is a wrapper of threading._after_fork')
 	if case == 'file-rewrite' and ext == 'tsvz':
