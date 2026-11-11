@@ -238,22 +238,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 5.15.
 - Noted: 2026-11-10, found in the 5.13 final review; the user chose "Fix in 5.15 (Recommended)".
 
-### A first Ctrl-C in the exit's first steps abandons the queued rows
-- Kind: deferred
-- What the operator sees: at exit, `_stopLiveStores()` writes what each store still has queued; a first Ctrl-C
-  meanwhile keeps waiting ("TSVZ: the write to X is being finished; Ctrl-C again to abandon it"), and only a second
-  abandons the write. A first Ctrl-C that lands in the exit's own first steps, before its handling of a store begins
-  (the function's start, the list of stores, the loop), abandons every store at once, as a second would: the rows
-  still queued are not written. With an interrupt at each instruction of `_stopLiveStores()` and a row queued (5.13
-  final review): 11 to 13 steps lost it in 5.13, 12 to 15 in 5.12. The window is the first microseconds of the exit.
-- Why: the first Ctrl-C is caught around each store's `_atExit()`; one outside it reaches the clause that abandons.
-- Plan (5.15): take a first KeyboardInterrupt anywhere in `_stopLiveStores()` as the first: the `try` as the
-  function's first statement, and a loop that on a first one sets `interrupted`, says so, and goes through the stores
-  still live again (a stopped store has left `_LIVE_STORES`), so that only a second abandons. Then the exit sweep as a
-  test: no single interrupt loses the queued row, on `.tsv` and `.tsvz`.
-- Revisit when: 5.15.
-- Noted: 2026-11-10, found in the 5.13 final review; a deferral, not asked.
-
 ### The suite's interrupt sweep covers a set and a commit only
 - Kind: deferred
 - What the operator sees: nothing in the library. `TSVZ_test.py::_INTERRUPTED_WRITES` raises a KeyboardInterrupt at

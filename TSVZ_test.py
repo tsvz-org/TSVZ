@@ -17423,7 +17423,7 @@ def _sweep(tmp_path, kind, op, at, start=1, stop=0):
 _INTERRUPT_SWEPT = ([(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (
 	'set', 'set-existing', 'del', 'pop', 'popitem', 'setdefaults', 'commit', 'reload', 'rewrite', 'close')]
 	+ [('tsvz', 'move', 1, 0), ('tsv', 'closed-commit', 1, 0), ('tsvz', 'closed-commit', 1, 0), ('tsvz', 'closed-rewrite', 1, 0)]
-	+ [(kind, 'clear', 1, 0) for kind in ('tsv', 'tsvz')]
+	+ [(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in ('clear', 'exit')]  # (exit: _stopLiveStores, a row queued)
 	+ [(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (  # (a TSVZClient with no handler; one-shot calls)
 		'client-set', 'client-del', 'client-get', 'client-pop', 'oneshot-append', 'oneshot-create', 'oneshot-scrub', 'oneshot-clear')]
 	+ [('tsv', 'closed-rewrite', start, start + 1299 if start < 7801 else 0) for start in range(1, 9100, 1300)])
@@ -18041,6 +18041,60 @@ def test_a_tsvz_clear_cut_before_its_job_starts_leaves_memory_as_the_file(tmp_pa
 	letGo()
 	t.close()
 	assert dict(t) == TSVZ.readTabularFile(p, verbose=False)
+
+
+#: ARGV: TSVZ's directory, the file, N. A store with a row queued (no tick writes it), then the program's normal exit, with
+#: a KeyboardInterrupt raised in _stopLiveStores before its stop of the stores begins: 3.12+ at its first instruction (a
+#: PY_START event, where CPython takes a signal: RESUME), before 3.12 at its N-th line event.
+_EXIT_CUT_AT_ITS_START = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, n = sys.argv[2], int(sys.argv[3])
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)
+t['a'] = ['a', '1']
+t.commitAppendToFile()
+t['q'] = ['q', '1']
+target = TSVZ._stopLiveStores.__code__
+fired = []
+if hasattr(sys, 'monitoring'):
+	def start(code, offset):
+		if code is target and not fired:
+			fired.append(offset)
+			raise KeyboardInterrupt
+	sys.monitoring.use_tool_id(3, 'exit')
+	sys.monitoring.register_callback(3, sys.monitoring.events.PY_START, start)
+	sys.monitoring.set_events(3, sys.monitoring.events.PY_START)
+else:
+	count = [0]
+	def local(frame, event, arg):
+		if event == 'line' and not fired:
+			count[0] += 1
+			if count[0] == n:
+				fired.append(n)
+				raise KeyboardInterrupt
+		return local
+	def started(frame, event, arg):
+		return local if frame.f_code is target and not fired else None
+	sys.settrace(started)
+"""
+
+
+@pytest.mark.parametrize('step', [1, 2, 3])
+@pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
+def test_a_first_ctrl_c_before_the_exits_stop_begins_still_writes_the_rows(tmp_path, ext, step):
+	# A first Ctrl-C at the exit waits for the queued writes, and only a second abandons them; one that CPython takes
+	# before the stop's try is set up skipped the whole stop (3.11+: its first instruction; 3.6: line steps 2 and 3, the
+	# loop's and the inner try's set-up): the queued row was not written, unless the writer thread's tick wrote it first.
+	if sys.version_info >= (3, 12) and step > 1:
+		pytest.skip('3.12+: the PY_START step only')
+	p = str(tmp_path / ('s.' + ext))
+	script = tmp_path / 'exit.py'
+	script.write_text(_EXIT_CUT_AT_ITS_START)
+	# 60 s: the program ends in a second; only an exit that waits for ever takes this long, on a machine the suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, str(step)], stdout=subprocess.PIPE,
+						  stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False).get('q') == ['q', '1'], done.stderr
 
 
 # --------------------------------------------------------------------------

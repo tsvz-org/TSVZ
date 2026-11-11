@@ -5723,31 +5723,60 @@ def _waited(flag, timeout):
 _LIVE_STORES = weakref.WeakValueDictionary()
 
 
-def _stopLiveStores():
+_exitArmed = False  # _stopLiveStores reached its inner try: from there on it takes a first Ctrl-C as the first
+
+
+def _stopLiveStores(interrupted=False, cut=None, abandoned=True):
 	"""At exit, stop every store still running (_atExit: a TSVZed's last rewrite and appends), letting a write in
-	progress finish: a first Ctrl-C meanwhile keeps waiting for it, and says so; a second abandons it."""
-	interrupted = abandoned = False
+	progress finish. A first Ctrl-C anywhere before every store is stopped keeps waiting for what is under way, and says
+	so; a second abandons it. One in the last step (_closeStreamsToDaemons, which waits up to _DAEMON_PRINT_WAIT for a
+	writer thread's print) comes after every row is written, and ends the exit with a traceback. The locals are default
+	arguments, so nothing runs before the try (atexit calls it with none); a first Ctrl-C before its inner try leaves
+	_exitArmed unset, and _stopLiveStoresAgain, which atexit runs next, stops the stores (5.15)."""
+	global _exitArmed
 	try:
-		for store in reversed(list(_LIVE_STORES.values())):  # the last made first, as atexit runs its own
+		while True:  # (once more after a first Ctrl-C, through the stores still live: a stopped one has left _LIVE_STORES)
 			try:
-				store._atExit()
+				_exitArmed = True
+				for store in reversed(list(_LIVE_STORES.values())):  # the last made first, as atexit runs its own
+					if store is cut:
+						store._finish()  # (the store whose stop the first Ctrl-C cut: what is queued and under way, finished)
+					else:
+						cut = store
+						store._atExit()
+				abandoned = False
+				return
 			except KeyboardInterrupt:
 				if interrupted:
 					raise
 				interrupted = True
-				eprint(f"TSVZ: the write to {store._fileName} is being finished; Ctrl-C again to abandon it")
-				store._finish()
-	except BaseException:
-		abandoned = True
-		for store in list(_LIVE_STORES.values()):
-			store._letGo = True  # abandoned: no writer thread starts a write the interpreter's end would cut short
-		raise
+				if cut is not None and id(cut) in _LIVE_STORES:
+					eprint(f"TSVZ: the write to {cut._fileName} is being finished; Ctrl-C again to abandon it")
+				elif _LIVE_STORES:
+					eprint("TSVZ: the writes still to make are being finished; Ctrl-C again to abandon them")
 	finally:
-		# (after the stores: what a last write of theirs reports is still printed; an abandon ends the program at once, so the
-		# door shuts without waiting for a print under way)
-		_closeStreamsToDaemons(0 if abandoned else None)
+		if abandoned and _exitArmed:  # (a second Ctrl-C, or an error; unarmed, _stopLiveStoresAgain follows)
+			for store in list(_LIVE_STORES.values()):
+				store._letGo = True  # abandoned: no writer thread starts a write the interpreter's end would cut short
+		if _exitArmed:
+			# (after the stores: what a last write of theirs reports is still printed; an abandon ends the program at once, so the
+			# door shuts without waiting for a print under way)
+			_closeStreamsToDaemons(0 if abandoned else None)
 
 
+def _stopLiveStoresAgain():
+	"""Runs at exit right after _stopLiveStores (atexit runs the last registered first, and goes on to the next callback
+	after one that raised). When a first Ctrl-C came before that one's inner try, the stores are stopped here, as after
+	a first Ctrl-C; a second abandons them. CPython takes a signal at a function's first instruction (RESUME, 3.11+),
+	before any try is set up, and 3.6 at the two set-up steps after the outer try's: a first Ctrl-C there skipped the
+	whole stop, the queued rows were not written, and nothing stopped the writer threads."""
+	if not _exitArmed:
+		if _LIVE_STORES:
+			eprint("TSVZ: the writes still to make are being finished; Ctrl-C again to abandon them")
+		_stopLiveStores(True)
+
+
+atexit.register(_stopLiveStoresAgain)
 atexit.register(_stopLiveStores)
 
 
