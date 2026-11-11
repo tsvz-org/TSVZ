@@ -5692,7 +5692,9 @@ class _SectionLock(_RLock):
 	that finds it let go of makes its change again under the lock (TSVZed._again), and queues its line again unless that
 	line is still the last one queued (_requeue). Memory and the file then agree (5.12 to 5.14 left them apart on that
 	key, and a loose store's next rewrite wrote memory's side). The line is written twice where the handler committed,
-	rewrote or queued another line after the section's; the last copy wins (docs/limitations.md).
+	rewrote or queued another line after the section's; the last copy wins (docs/limitations.md). A move_to_end has no
+	value of its own: its redo (_moveAgain) restores the order only, from the rows memory holds, so a handler's change of
+	a row stays.
 	(Its exit is a Python method, about 0.1 microsecond a section dearer than the RLock's own on 3.6, 0.04 on 3.14.)"""
 	__slots__ = ()
 
