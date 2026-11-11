@@ -5693,8 +5693,9 @@ class _SectionLock(_RLock):
 	line is still the last one queued (_requeue). Memory and the file then agree (5.12 to 5.14 left them apart on that
 	key, and a loose store's next rewrite wrote memory's side). The line is written twice where the handler committed,
 	rewrote or queued another line after the section's; the last copy wins (docs/limitations.md). A move_to_end has no
-	value of its own: its redo (_moveAgain) restores the order only, from the rows memory holds, so a handler's change of
-	a row stays.
+	value of its own: its redo (_moveAgain) makes the move again with the rows and in the order memory holds now, so a
+	handler's change of a row, or its own move of another key, stays; it writes the move's lines again unless the
+	section's are still the last queued and are what memory makes now.
 	(Its exit is a Python method, about 0.1 microsecond a section dearer than the RLock's own on 3.6, 0.04 on 3.14.)"""
 	__slots__ = ()
 
@@ -6527,32 +6528,30 @@ class TSVZed(OrderedDict):
 		if item is not None:
 			self._requeue(item)
 
-	def _moveAgain(self, moved, key, last):  # (move_to_end: its order again, from the rows memory holds now)
-		"""move_to_end's order, made again from the rows memory holds now, never the rows the section captured: a signal
-		handler's own change of a row (a set, a delete, a reload) is kept, and only the order is restored. The keys
-		the move sends to the end (``key`` for a move to the end, every other key for one to the beginning) go there in
-		memory as the section sent them, the keys memory holds that the section did not capture (a handler's) after them,
-		and fresh lines (_queueMove) send them there in the file. A key of ``moved`` that memory no longer holds gets its
-		deletion line: the section's own lines may have come after the handler's."""
+	def _moveAgain(self, moved, key, last, lines):  # (move_to_end: its move again, in the order memory holds now)
+		"""move_to_end's move made again, with the rows and in the order memory holds now, never the section's captured
+		ones: a signal handler's own change (a set, a delete, a reload, a move of another key) stays, and only the
+		section's move is made again. ``key`` goes to its end of memory again; for a move to the beginning, every other
+		key follows it in the order memory holds now (a '#' key, memory only, keeps its place among them). In the file,
+		a key of ``moved`` that memory no longer holds gets its deletion line (the section's own lines may have come
+		after the handler's), and the keys the move sends to the end get fresh lines (_moveLines), in one step. Neither
+		when the section's lines (``lines``) are still the last ones queued and are the lines memory makes now: they are
+		then written after everything queued before them, as the section left them."""
 		if dict.__contains__(self, key):
 			OrderedDict.move_to_end(self, key, last)
-		ends = []  # (the keys that go to the end, in order)
-		for k, row in moved:
-			if k.startswith('#'):
-				pass  # (memory only: its place in memory stays)
-			elif dict.__contains__(self, k):
-				ends.append(k)
-			else:
+		gone = [(k, row) for k, row in moved if not k.startswith('#') and not dict.__contains__(self, k)]
+		if last:
+			ends = [(k, dict.get(self, k)) for k, row in moved if dict.__contains__(self, k)]
+		else:
+			ends = [(k, row) for k, row in OrderedDict.items(self) if k != key]
+		fresh = self._moveLines(ends)
+		queue = self.appendQueue
+		if gone or not (lines and queue and queue[-1] is lines[-1] and fresh == lines):
+			for k, row in gone:
 				self._deleteLine(k, row)
-		if not last:
-			held = set(ends)
-			held.add(key)
-			for k in OrderedDict.keys(self):
-				if k not in held and not k.startswith('#'):
-					ends.append(k)
-		for k in ends:
-			OrderedDict.move_to_end(self, k)
-			self._queueMove(k, dict.get(self, k))
+			if fresh:
+				self.dirty = True
+				queue.extend(fresh)
 
 	def _setDefaultsAgain(self, defaults):  # (setDefaults: no line; a read meanwhile can leave _readWhole False)
 		self._givenDefaults = list(defaults)
@@ -7108,11 +7107,11 @@ memoryOnly:{self.memoryOnly}
 				OrderedDict.move_to_end(self, key, last)
 				if self.memoryOnly:
 					return self
-				self._queueMoves(moved)
+				lines = self._queueMoves(moved)
 				self.lastUpdateTime = get_time_ns()
 				lost = not lock._is_owned()
 			if lost:
-				self._again(self._moveAgain, moved, key, last)
+				self._again(self._moveAgain, moved, key, last, lines)
 		except BaseException:
 			self._memLock.letGo()
 			raise
@@ -7133,29 +7132,35 @@ memoryOnly:{self.memoryOnly}
 		return moved
 
 	def _queueMoves(self, moved):
-		"""Queue the lines that move each of ``moved`` (_queueMove), the caller holding _memLock."""
-		for k, row in moved:
-			self._queueMove(k, row)
+		"""Queue the lines that move each of ``moved`` (_moveLines) in one step, the caller holding _memLock: a read the
+		writer thread makes replays all of the move or none of it, never part of a move to the beginning. Returns them."""
+		lines = self._moveLines(moved)
+		if lines:
+			self.dirty = True
+			self.appendQueue.extend(lines)
+		return lines
 
-	def _queueMove(self, key, row):
-		"""Queue what moves ``key`` to the end of the legacy file for every reader, the caller holding _memLock: its
-		deletion, then its row. A row with an empty cell the defaults in effect would fill (one read before them) goes
-		between a reset and the same defaults again. A '#' key is memory only, and a row with no value (a whitespace-only
-		cell read, right-stripped) is not a line the format can write: their lines stay where they are."""
-		one = self._oneColumn(row)
-		if key.startswith('#') or not (one or any(row[1:])):
-			return
-		self.dirty = True
-		if one:
-			lines = [_DropKey([key])]
-		else:
-			lines = [[key] + [''] * (self.correctColumnNum - 1) if self.correctColumnNum > 1 else [key]]
-		defaults = self.defaults
-		if not one and any(i < len(defaults) and defaults[i] and not row[i] for i in range(1, len(row))):
-			lines += [[DEFAULTS_INDICATOR_KEY], row, _fitRow(defaults, self.correctColumnNum)]
-		else:
-			lines.append(row)
-		self.appendQueue.extend(lines)  # (one step: a read the writer thread makes never replays half of it)
+	def _moveLines(self, moved):
+		"""The lines that move each (key, row) of ``moved`` to the end of the legacy file for every reader, in order (the
+		caller holds _memLock): a key's deletion, then its row. A row with an empty cell the defaults in effect would fill
+		(one read before them) goes between a reset and the same defaults again. A '#' key is memory only, and a row with
+		no value (a whitespace-only cell read, right-stripped) is not a line the format can write: their lines stay where
+		they are."""
+		lines = []
+		for key, row in moved:
+			one = self._oneColumn(row)
+			if key.startswith('#') or not (one or any(row[1:])):
+				continue
+			if one:
+				lines.append(_DropKey([key]))
+			else:
+				lines.append([key] + [''] * (self.correctColumnNum - 1) if self.correctColumnNum > 1 else [key])
+			defaults = self.defaults
+			if not one and any(i < len(defaults) and defaults[i] and not row[i] for i in range(1, len(row))):
+				lines += [[DEFAULTS_INDICATOR_KEY], row, _fitRow(defaults, self.correctColumnNum)]
+			else:
+				lines.append(row)
+		return lines
 
 	def __sizeof__(self):
 		sizeof = sys.getsizeof
