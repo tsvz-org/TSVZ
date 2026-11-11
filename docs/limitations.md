@@ -456,6 +456,22 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   merge rule takes its rows in as another writer's appends.
 - Noted: 2026-11-11, from the 5.15 re-review; a deferral, not asked.
 
+### A forked child of a store with monitoring off overwrites the rows its parent set after the fork
+- Kind: deferred
+- What the operator sees: a loose store with `monitor_external_changes=False` has replaced, deleted or moved a row
+  since its last rewrite (it is dirty), and the program forks a child. The parent sets a row after the fork. When the
+  child's store makes its rewrite at exit (`rewrite_on_exit`, or a due `rewrite_interval`), it writes its fork-time
+  memory over the file without reading it, so the parent's new row is lost if the parent closed first, or, for a due
+  `rewrite_interval`, even when the parent closes after the child. The child need not set anything. With monitoring on,
+  or with neither option, no row is lost. 5.14 and 5.15 the same (the fixer's probe on 939b464 and 7f474c3, Python
+  3.14 and 3.6).
+- Why: the child keeps its parent's `dirty` at the fork, though the parent's own rewrite mends what it marks. The fix,
+  clearing `dirty` in the fork hook as the queue and `_damaged` are cleared, is built and tested on the branch
+  `feat/516-fork-dirty`, but it came as a third fix round of 5.15, and that needs a design check of the fork state
+  first. Not this release's change: 5.15 is no worse than 5.14 here.
+- Revisit when: 5.16, after the design check of what a forked child keeps from its parent.
+- Noted: 2026-11-11, from the Haiku second opinion on the 5.15 final review; a deferral, not asked.
+
 ### A TSVZClient with no server, used in a forked child, waits for ever at its first write
 - Kind: deferred
 - What the operator sees: a program opens a `TSVZClient` on a file no `tsvz serve` handler serves (the client then

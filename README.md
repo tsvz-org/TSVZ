@@ -264,7 +264,9 @@ A child forked while its parent holds `get_file_obj()` writes nothing at its clo
 exit, since the parent may be waiting for it, and says so, even once both have let go of
 the file; its `commitAppendToFile()` writes once the parent lets go, so a child that
 commits while its parent holds the file and waits for it waits for ever. Let go of the
-file before forking, and the child's close and exit write.
+file before forking, and the child's close and exit write. A child that a signal handler
+forks inside a `mapToFile()`, `hardMapToFile()` or `rewrite()` finishes that call with
+its own memory, as if it had made the call after the fork.
 
 A file another process removed is made
 again from memory by the store's next write, an append included (a removal in the
@@ -424,7 +426,9 @@ can land in, and checks the locks, memory and the file after each.
   handler's new key, move or followed line inside a set of a new key can leave that key's place in memory apart from
   the file's; a handler's `clear()` inside a delete, pop or move of a store with no header can leave the key in the
   file as a row of the key alone; a `#` key can leave memory when the store follows another process's change while
-  rows are queued; a forked child's row is lost when its parent's failed rewrite has left the file damaged (these four
+  rows are queued; a forked child's row is lost when its parent's failed rewrite has left the file damaged; with
+  `monitor_external_changes=False`, a forked child whose parent had replaced, deleted or moved a row since its last
+  rewrite writes its fork-time memory over the rows its parent set after the fork, at its rewrite at exit (these five
   as in 5.14); a `TSVZClient` with no server, used in a forked child, waits for ever at its first write; a Ctrl-C while
   the writer thread itself reloads after another process's change waits for that reload; and the compaction above.
 
