@@ -1330,10 +1330,15 @@ def _pathLock(path):
 	refused, excludes no thread of the process, and Windows' ``msvcrt`` gives
 	up after 10 s. A TSVZed's own writes, which its writeLock serialises, and
 	readers do not take it.
+
+	A _SectionLock (5.15): TSVZ's code never takes it inside another hold of it (the whole suite run with a lock that
+	logs every re-entry found none but a test's stand-in for another program), so a thread that finds itself holding it
+	at a section's start holds it from a Ctrl-C, and each site lets go of it on the way out of one
+	(``except BaseException: lock.letGo(); raise``).
 	"""
 	key = os.path.realpath(path)
 	# (setdefault: one step, where a guard lock could be left held by a Ctrl-C and stop every thread's writes, see _Flag)
-	return _PATH_LOCKS.get(key) or _PATH_LOCKS.setdefault(key, threading.RLock())
+	return _PATH_LOCKS.get(key) or _PATH_LOCKS.setdefault(key, _SectionLock())
 
 
 #: The lock modes of ``_lockFile`` (spec §18.6): READ, taken by readers that make state out of the file, shared, for the
@@ -1686,13 +1691,18 @@ def _lockedAppend(path, payload, tailPolicy, reporter, fsync=False, header=None,
 	"""Append ``payload`` (whole records ending in b'\\n') to the file ``path`` (_appendOpen), compressed in
 	``codec`` when given, under its locks: ``_pathLock`` and the file lock (``_lockFile``), so that no other writer
 	that takes them writes between the look at what the file holds and the write. A missing file is created."""
-	with _pathLock(path):
-		with open(path, 'a+b') as f:
-			_lockFile(f, mode=_APPEND)
-			try:
-				_appendOpen(f, payload, codec, header, tailPolicy, reporter, fsync, memberSize)
-			finally:
-				_unlockFile(f)
+	lock = _pathLock(path)
+	try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+		with lock:
+			with open(path, 'a+b') as f:
+				_lockFile(f, mode=_APPEND)
+				try:
+					_appendOpen(f, payload, codec, header, tailPolicy, reporter, fsync, memberSize)
+				finally:
+					_unlockFile(f)
+	except BaseException:
+		lock.letGo()
+		raise
 
 
 _CODEC_SUPPORT = {}
@@ -2174,12 +2184,13 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 											 teeLogger=teeLogger,
 											 delimiter=delimiter,
 											 ),delimiter=delimiter),delimiter,encoding,errors,what='header')
-			try:
+			lock = _pathLock(fileName)
+			try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
 				codec = _fileCodec(fileName)
 				data = _compressBytes(codec, headerBytes + b'\n') if codec else headerBytes + b'\n'  # before: no gap
 				# Not over a file another writer made since it was looked for ('xb'), nor a link (its target is made),
 				# and under the lock, as every writer writes: an append that took it first has written the header.
-				with _pathLock(fileName), open(os.path.realpath(fileName), 'xb') as file:  # lockf excludes no thread
+				with lock, open(os.path.realpath(fileName), 'xb') as file:  # lockf excludes no thread
 					_lockFile(file, mode=_APPEND)
 					try:
 						if not os.fstat(file.fileno()).st_size:
@@ -2195,6 +2206,9 @@ def _verifyFileExistence(fileName,createIfNotExist = True,teeLogger = None,heade
 					return True  # another writer made it meanwhile (not a directory, nor a link that leads nowhere)
 			except Exception:
 				pass
+			except BaseException:
+				lock.letGo()
+				raise
 			__teePrintOrNot('Failed to create '+fileName,'error',teeLogger=teeLogger)
 			if strict:
 				raise FileNotFoundError("Failed to create file")
@@ -4912,37 +4926,42 @@ def _specBackupPart(path, reporter):
 	For a rewrite that drops damaged members (spec §16.6). Raises OSError when
 	the copy cannot be made; a partial copy is removed.
 	"""
-	with _pathLock(path):
-		with open(path, 'r+b') as f:
-			_lockFile(f, mode=_REWRITE)
-			try:
-				first = backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
-				# Readable by whoever could read the part, writable by its owner only, never setuid,
-				# setgid, sticky or executable (the umask still applies on top).
-				st = os.fstat(f.fileno())
-				mode = st.st_mode & 0o644
-				suffix = 0
-				while True:
-					try:
-						# never overwrite an earlier backup; O_BINARY: no newline translation on Windows
-						flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
-						copy = os.fdopen(os.open(backup, flags, mode), 'wb')
-						break
-					except FileExistsError:
-						suffix += 1
-						backup = '{}.{}'.format(first, suffix)
+	lock = _pathLock(path)
+	try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+		with lock:
+			with open(path, 'r+b') as f:
+				_lockFile(f, mode=_REWRITE)
 				try:
-					with copy:
-						_matchOwner(copy.fileno(), st)
-						shutil.copyfileobj(f, copy)
-						copy.flush()
-						os.fsync(copy.fileno())
-				except BaseException:
-					os.remove(backup)  # a partial copy is no backup
-					raise
-				_fsyncDirectory(backup)  # the new name is durable before the part is rewritten
-			finally:
-				_unlockFile(f)
+					first = backup = '{}.damaged-{}'.format(path, time.strftime('%Y%m%dT%H%M%S'))
+					# Readable by whoever could read the part, writable by its owner only, never setuid,
+					# setgid, sticky or executable (the umask still applies on top).
+					st = os.fstat(f.fileno())
+					mode = st.st_mode & 0o644
+					suffix = 0
+					while True:
+						try:
+							# never overwrite an earlier backup; O_BINARY: no newline translation on Windows
+							flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
+							copy = os.fdopen(os.open(backup, flags, mode), 'wb')
+							break
+						except FileExistsError:
+							suffix += 1
+							backup = '{}.{}'.format(first, suffix)
+					try:
+						with copy:
+							_matchOwner(copy.fileno(), st)
+							shutil.copyfileobj(f, copy)
+							copy.flush()
+							os.fsync(copy.fileno())
+					except BaseException:
+						os.remove(backup)  # a partial copy is no backup
+						raise
+					_fsyncDirectory(backup)  # the new name is durable before the part is rewritten
+				finally:
+					_unlockFile(f)
+	except BaseException:
+		lock.letGo()
+		raise
 	reporter.note('backup', None, 'kept the bytes of {}, whose damaged members are not rewritten, in {}'.format(path, backup))
 	return backup
 
@@ -4958,21 +4977,26 @@ def _specAppendTo(f, path, payload, reporter, fsync=False, memberSize=None, proc
 	both taken under the lock, so no other locked writer's append falls between.
 	``proceed``: called once the lock is taken; False writes nothing and returns None.
 	"""
-	with _pathLock(path):
-		_seekRawStart(f)  # msvcrt locks from the raw position: lock and unlock the same range
-		_lockFile(f, mode=_APPEND)
-		try:
-			if proceed is not None and not proceed():
-				return None
-			before = _specStamp(os.fstat(f.fileno()))
-			offset = _appendOpen(f, payload, _parsePartName(path).codec, None, 'truncate', reporter, fsync, memberSize)
-			return offset, before, _specStamp(os.fstat(f.fileno()))
-		finally:
+	lock = _pathLock(path)
+	try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+		with lock:
+			_seekRawStart(f)  # msvcrt locks from the raw position: lock and unlock the same range
+			_lockFile(f, mode=_APPEND)
 			try:
-				_seekRawStart(f)
-			except OSError:
-				pass  # a failed write is already propagating; the lock must still be released
-			_unlockFile(f)
+				if proceed is not None and not proceed():
+					return None
+				before = _specStamp(os.fstat(f.fileno()))
+				offset = _appendOpen(f, payload, _parsePartName(path).codec, None, 'truncate', reporter, fsync, memberSize)
+				return offset, before, _specStamp(os.fstat(f.fileno()))
+			finally:
+				try:
+					_seekRawStart(f)
+				except OSError:
+					pass  # a failed write is already propagating; the lock must still be released
+				_unlockFile(f)
+	except BaseException:
+		lock.letGo()
+		raise
 
 
 def _specAppendPayload(path, payload, reporter, fsync=False, memberSize=None, proceed=None):
@@ -5040,58 +5064,63 @@ def _specRewriteInPlace(path, content, expect=None, memberSize=None, build=None)
 	codec = _parsePartName(path).codec
 	_requireCodec(codec)
 	raw = None if build else _compressBytes(codec, content, memberSize=memberSize) if codec else content  # (nothing: one empty member)
-	with _pathLock(path):
-		with open(path, 'r+b') as f:
-			_lockFile(f, mode=_REWRITE)
-			try:
-				st = os.fstat(f.fileno())
-				if expect is not None and _specStamp(st) != expect:
-					return None
-				if build:
-					content = build(f)
-					if content is None:
+	lock = _pathLock(path)
+	try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+		with lock:
+			with open(path, 'r+b') as f:
+				_lockFile(f, mode=_REWRITE)
+				try:
+					st = os.fstat(f.fileno())
+					if expect is not None and _specStamp(st) != expect:
+						return None
+					if build:
+						content = build(f)
+						if content is None:
+							return False, _specStamp(st)
+						raw = _compressBytes(codec, content, memberSize=memberSize) if codec else content
+					fd = f.fileno()
+					# Read unbuffered, as the file is written below: a read-ahead in f would leave it a stale position to
+					# close at. What a failed rewrite puts back is kept: the bytes the write overwrites (from the start to
+					# the shorter end) and the old size to cut back to. A clear of a huge file reads none of it.
+					size = st.st_size
+					old = _readFrom0(fd, min(size, len(raw)))
+					if size == len(raw) and old == raw:
 						return False, _specStamp(st)
-					raw = _compressBytes(codec, content, memberSize=memberSize) if codec else content
-				fd = f.fileno()
-				# Read unbuffered, as the file is written below: a read-ahead in f would leave it a stale position to
-				# close at. What a failed rewrite puts back is kept: the bytes the write overwrites (from the start to
-				# the shorter end) and the old size to cut back to. A clear of a huge file reads none of it.
-				size = st.st_size
-				old = _readFrom0(fd, min(size, len(raw)))
-				if size == len(raw) and old == raw:
-					return False, _specStamp(st)
-				try:
-					_reserveSpace(fd, len(raw))  # spec §19.8: a full disk refuses the rewrite before any byte changes
-					_writeFrom0(fd, raw)
-				except BaseException as e:
-					# Once the cut is made the rewrite is done: only the cut makes the file shorter, and it follows the
-					# whole write, so the new bytes are complete (what was cut off is not kept to put back).
-					if os.fstat(fd).st_size < size:
-						raise
-					# Put the old bytes back rather than leave a half-rewritten part (or one a failed
-					# reservation lengthened): the write left what it did not overwrite as it was.
 					try:
-						os.lseek(fd, 0, os.SEEK_SET)
-						view = memoryview(old)
-						while view:
-							view = view[os.write(fd, view):]
-						os.ftruncate(fd, size)
-						os.fsync(fd)
-					except OSError as undo:
-						damaged = '{}: the rewrite failed ({!r}) and the old bytes could not be put back ({}): the part is damaged'.format(
-							path, e, undo)
-						if isinstance(e, OSError):
-							raise OSError(e.errno, damaged)
-						_warn('TSVZ warning: ' + damaged)  # an interrupt stays an interrupt
-					raise
-				os.fsync(fd)
-				return True, _specStamp(os.fstat(fd))
-			finally:
-				try:
-					_seekRawStart(f)  # msvcrt unlocks from the raw position: the range it locked
-				except OSError:
-					pass
-				_unlockFile(f)
+						_reserveSpace(fd, len(raw))  # spec §19.8: a full disk refuses the rewrite before any byte changes
+						_writeFrom0(fd, raw)
+					except BaseException as e:
+						# Once the cut is made the rewrite is done: only the cut makes the file shorter, and it follows the
+						# whole write, so the new bytes are complete (what was cut off is not kept to put back).
+						if os.fstat(fd).st_size < size:
+							raise
+						# Put the old bytes back rather than leave a half-rewritten part (or one a failed
+						# reservation lengthened): the write left what it did not overwrite as it was.
+						try:
+							os.lseek(fd, 0, os.SEEK_SET)
+							view = memoryview(old)
+							while view:
+								view = view[os.write(fd, view):]
+							os.ftruncate(fd, size)
+							os.fsync(fd)
+						except OSError as undo:
+							damaged = '{}: the rewrite failed ({!r}) and the old bytes could not be put back ({}): the part is damaged'.format(
+								path, e, undo)
+							if isinstance(e, OSError):
+								raise OSError(e.errno, damaged)
+							_warn('TSVZ warning: ' + damaged)  # an interrupt stays an interrupt
+						raise
+					os.fsync(fd)
+					return True, _specStamp(os.fstat(fd))
+				finally:
+					try:
+						_seekRawStart(f)  # msvcrt unlocks from the raw position: the range it locked
+					except OSError:
+						pass
+					_unlockFile(f)
+	except BaseException:
+		lock.letGo()
+		raise
 
 
 def _reserveSpace(fd, length):
@@ -5607,9 +5636,20 @@ class _Flag(object):
 			self._waiters.remove(bell)
 
 
-class _SectionLock(_thread.RLock):
+class _RLock(_thread.RLock):
+	"""An RLock its holder can let go of whole, at a door where it holds none: _ServeStore.lock, which a read nests, is let
+	go of where a Ctrl-C leaves _serveRespond (5.15)."""
+	__slots__ = ()
+
+	def letGo(self):
+		"""Let go of what a Ctrl-C left this thread holding; the caller is in no section."""
+		while self._is_owned():
+			self.release()
+
+
+class _SectionLock(_RLock):
 	"""A lock for sections that TSVZ's own code never nests, which a Ctrl-C cannot leave held for good: a TSVZed's _memLock
-	(5.13).
+	(5.13), a path's lock (_pathLock) and a TSVZClient's (5.15).
 
 	A KeyboardInterrupt can land just after a ``with`` statement takes its lock and before the block is set up (seen on
 	3.14), or where the block's exit never runs (3.6's end of a block; CPython bpo-29988). A plain lock was then held for
@@ -5636,11 +5676,6 @@ class _SectionLock(_thread.RLock):
 	handler that sets the section's own key does the same: memory keeps its row, the file ends with the section's line.
 	(Its exit is a Python method, about 0.1 microsecond a section dearer than the RLock's own on 3.6, 0.04 on 3.14.)"""
 	__slots__ = ()
-
-	def letGo(self):
-		"""Let go of what a Ctrl-C left this thread holding; the caller is in no section."""
-		while self._is_owned():
-			self.release()
 
 	def __enter__(self):
 		if self._is_owned():
@@ -9071,7 +9106,7 @@ class _ServeStore(object):
 		self.strict = strict
 		self.teeLogger = teeLogger
 		self.verbose = verbose
-		self.lock = threading.RLock()
+		self.lock = _RLock()  # (reentrant: a read takes it and syncs; a Ctrl-C's hold is let go of in _serveRespond)
 		self.mapping = dict if lazy else OrderedDict  # a one-shot read fills a dict faster; popitem reverses either
 		self.data = self.mapping()
 		self.unreadable = False
@@ -9792,6 +9827,9 @@ def _serveRespond(store, line, bulk=None, logger=None):
 		status, rows, message = 1, [], str(e) or type(e).__name__
 		if logger is not None:
 			logger.teelog('tsvz: {}: request {!r} failed: {}'.format(store.path, line[:80], message), 'error')
+	except BaseException:
+		store.lock.letGo()  # (none held on entry: what a Ctrl-C left, bpo-29988; see _SectionLock)
+		raise
 	failing = store.writer.failing
 	if failing:
 		log.lines.append('TSVZ warning: {}: writes are failing ({}); writes acknowledged before they were written '
@@ -10357,7 +10395,7 @@ class TSVZClient(MutableMapping):
 		self._spec = _isSpecPath(fileName)
 		self.delimiter = get_delimiter(..., file_name=fileName)
 		self._backend = None
-		self._lock = threading.RLock()
+		self._lock = _SectionLock()  # (never nested: a hold found at a request's start is a Ctrl-C's, see _SectionLock)
 		self._connect()
 
 	def _connect(self):
@@ -10384,16 +10422,20 @@ class TSVZClient(MutableMapping):
 				bulk = None if bulk is None else [self._encoded(text) for text in bulk]
 		options = (['--sync'] if write and self._sync else []) + (['--x-written'] if write else [])
 		line = '\t'.join(options + fields)
-		with self._lock:  # one request at a time on the shared connection
-			try:
-				lines, diagnostics, status, message = self._backend.request(line, bulk)
-			except _ServeLost as e:
-				self._backend.close()
-				self._connect()
-				if not retry:
-					raise ConnectionError('the tsvz handler of {} went away ({}); {} may or may not have been '
-										  'applied'.format(self._fileName, e, fields[0]))
-				lines, diagnostics, status, message = self._backend.request(line, bulk)
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._lock:  # one request at a time on the shared connection
+				try:
+					lines, diagnostics, status, message = self._backend.request(line, bulk)
+				except _ServeLost as e:
+					self._backend.close()
+					self._connect()
+					if not retry:
+						raise ConnectionError('the tsvz handler of {} went away ({}); {} may or may not have been '
+											  'applied'.format(self._fileName, e, fields[0]))
+					lines, diagnostics, status, message = self._backend.request(line, bulk)
+		except BaseException:
+			self._lock.letGo()
+			raise
 		for text in diagnostics:
 			_warn(text, self.teeLogger)
 		if status == 2:
@@ -10591,10 +10633,14 @@ class TSVZClient(MutableMapping):
 	mapToFile = hardMapToFile = rewrite
 
 	def close(self):
-		with self._lock:
-			if self._backend is not None:
-				self._backend.close()
-				self._backend = None
+		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
+			with self._lock:
+				if self._backend is not None:
+					self._backend.close()
+					self._backend = None
+		except BaseException:
+			self._lock.letGo()
+			raise
 
 	def __del__(self):
 		try:

@@ -16917,86 +16917,6 @@ def test_the_exit_waits_for_the_writer_thread_through_waited(tmp_path, monkeypat
 	t.close()
 
 
-#: ARGV: TSVZ's directory, 'tsvzed' or 'client', the file, and 'opcodes' (3.7 and later: a step is a bytecode, not a line).
-#: Writes to a store, a KeyboardInterrupt raised at each Python step of one write in turn (sys.settrace: the same steps on
-#: every run and every Python) and caught, as a program that catches a Ctrl-C and goes on does; then one more write, and
-#: the exit. Prints the steps after which this thread still held the store's lock ("held": a set, a delete or a commit
-#: another thread's set would wait for), then the number of steps.
-_INTERRUPTED_WRITES = r"""
-import sys
-sys.path.insert(0, sys.argv[1])
-import TSVZ
-how, p = sys.argv[2], sys.argv[3]
-opcodes = len(sys.argv) > 4
-held = []
-if how == 'tsvzed':
-	store = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)
-	def write(key):
-		store[key] = [key, 'v']
-		store.commitAppendToFile()  # (the wait for the writer thread: a job, a _Flag)
-else:
-	store = TSVZ.TSVZClient(p)  # no handler: the engine in this process, its _ServeWriter
-	def write(key):
-		store[key] = [key, 'v']
-left = [0]
-def tracer(frame, event, arg):
-	if left[0] <= 0:
-		return None
-	if opcodes:
-		frame.f_trace_opcodes = True
-		if event != 'opcode' and sys.version_info < (3, 12):
-			# counted and raised at opcode events only, up to 3.11: on 3.9 an opcode event right after a line event overwrites
-			# the line event's error, and the next C call then fails with SystemError ('returned a result with an error
-			# set'). 3.12+ (settrace over sys.monitoring) sends no opcode event to a frame that turns them on at its call
-			# event, so there every event is a step, as before.
-			return tracer
-	left[0] -= 1
-	if not left[0]:
-		raise KeyboardInterrupt
-	return tracer
-at = 0
-while left[0] == 0:  # until a write is done before its step `at`
-	at += 1
-	left[0] = at
-	sys.settrace(tracer)
-	try:
-		write('k%d' % at)
-	except KeyboardInterrupt:
-		if how == 'tsvzed' and store._memLock._is_owned():
-			held.append(at)
-	finally:
-		sys.settrace(None)
-write('last')
-print('held', held)
-print(at)
-"""
-
-
-@pytest.mark.parametrize('how, steps', [
-	('client', 'lines'),  # (a TSVZed's set and commit: the step sweep below)
-])
-def test_a_ctrl_c_caught_in_a_write_leaves_the_store_writing_and_the_program_ending(tmp_path, how, steps):
-	# 5.12's threading.Event (a TSVZed's waits for its writer thread) and Condition (a TSVZClient's and the CLI's writer)
-	# held their lock while Python code ran, and a KeyboardInterrupt can skip a with statement's exit (bpo-29988): a
-	# Ctrl-C there left it held. A program that caught the Ctrl-C and went on writing waited for ever at its next commit,
-	# and one that ended hung at the exit; the interrupt at each step finds every such place. A TSVZed's set also lets
-	# go of its own lock where the Ctrl-C left it (5.13: no hold after the caught interrupt, at any step).
-	p = str(tmp_path / ('s.tsv' if how == 'tsvzed' else 's.tsvz'))
-	script = tmp_path / 'interrupted.py'
-	script.write_text(_INTERRUPTED_WRITES)
-	try:
-		# 120 s: the run takes a few seconds; only a write or an exit that waits for ever takes this long, on a machine
-		# the whole suite keeps busy.
-		done = subprocess.run([sys.executable, str(script), HERE, how, p] + (['opcodes'] if steps == 'opcodes' else []),
-							  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
-	except subprocess.TimeoutExpired as e:
-		raise AssertionError('a write or the exit waited for ever after a Ctrl-C: {}'.format(e.stderr))
-	assert done.returncode == 0, done.stderr
-	assert 'held []' in done.stdout, done.stdout  # (the steps after which the thread still held the lock)
-	assert int(done.stdout.split()[-1]) > 20, done.stdout  # (the steps went through the wait for the writer thread)
-	assert TSVZ.readTabularFile(p, verbose=False)['last'] == ['last', 'v']
-
-
 #: ARGV: TSVZ's directory, a directory for the cases, KIND ('tsv' or 'tsvz'), OP, AT ('raise', or a signal handler's name:
 #: HANDLERS), START and STOP (the steps swept; STOP 0: to the operation's end) [, 'child']. One case per step of TSVZ's
 #: code that OP runs in the main thread, each on a fresh file holding a, b and c. AT 'raise': a KeyboardInterrupt raised
@@ -17503,6 +17423,8 @@ def _sweep(tmp_path, kind, op, at, start=1, stop=0):
 _INTERRUPT_SWEPT = ([(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (
 	'set', 'set-existing', 'del', 'pop', 'popitem', 'setdefaults', 'commit', 'reload', 'rewrite', 'close')]
 	+ [('tsvz', 'move', 1, 0), ('tsv', 'closed-commit', 1, 0), ('tsvz', 'closed-rewrite', 1, 0)]
+	+ [(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (  # (a TSVZClient with no handler; one-shot calls)
+		'client-set', 'client-del', 'client-get', 'client-pop', 'oneshot-append', 'oneshot-create', 'oneshot-scrub', 'oneshot-clear')]
 	+ [('tsv', 'closed-rewrite', start, start + 1299 if start < 7801 else 0) for start in range(1, 9100, 1300)])
 
 
@@ -17722,6 +17644,122 @@ def test_a_ctrl_c_that_leaves_a_sets_lock_held_is_let_go_of_by_the_set_it_goes_u
 	finally:
 		t._memLock = real
 		t.close()
+
+
+def _free_elsewhere(lock):
+	"""True when another thread can take ``lock`` (and lets go of it again)."""
+	free = []
+
+	def probe():
+		got = lock.acquire(False)
+		if got:
+			lock.release()
+		free.append(got)
+	other = threading.Thread(target=probe)
+	other.start()
+	other.join(10)
+	return free == [True]
+
+
+_ONE_SHOT_CALLS = {
+	'append': lambda p: TSVZ.appendTabularFile(p, ['x', '1'], verbose=False),
+	'create': lambda p: TSVZ.appendTabularFile(p, ['x', '1'], verbose=False, createIfNotExist=True),  # (a missing file)
+	'scrub': lambda p: TSVZ.scrubTabularFile(p, verbose=False),
+	'clear': lambda p: TSVZ.clearTabularFile(p, verbose=False),
+}
+
+
+@pytest.mark.parametrize('where', ['enter', 'exit'])
+@pytest.mark.parametrize('call', sorted(_ONE_SHOT_CALLS))
+@pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
+def test_a_ctrl_c_that_leaves_a_paths_lock_held_is_let_go_of_by_the_call_it_goes_up_through(tmp_path, ext, call, where):
+	# The one-shot calls hold a path's in-process lock while they lock the file. A Ctrl-C that skipped the with statement's
+	# exit there (5.14, an RLock: 47 of 32,303 steps of these calls and a TSVZClient's on 3.14) left it held, and this
+	# process's writer threads of that path (a .tsvz TSVZed's appends, a TSVZClient's writer) waited for ever, and so did
+	# its exit. A path's lock is never nested by TSVZ's code: a section lock, let go of by the call the Ctrl-C goes up through.
+	p = str(tmp_path / ('f.' + ext))
+	if call != 'create':
+		TSVZ.appendTabularFile(p, ['a', '1'], verbose=False, createIfNotExist=True)
+	leaky = TSVZ._PATH_LOCKS[os.path.realpath(p)] = _LeakyLock()
+	leaky.where = where
+	leaky.victim = threading.current_thread()
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			_ONE_SHOT_CALLS[call](p)
+		assert not leaky._is_owned(), 'the Ctrl-C left the lock held by this thread'
+		assert _free_elsewhere(leaky)
+	finally:
+		leaky.letGo()
+		TSVZ._PATH_LOCKS.pop(os.path.realpath(p), None)
+
+
+def test_a_ctrl_c_in_a_one_shot_call_does_not_stop_a_tsvz_stores_commit_of_the_same_path(tmp_path):
+	# Worse than 5.12 in 5.13 and 5.14: a .tsvz store's commit runs on its writer thread, which takes the path's lock the
+	# caught Ctrl-C left held in the main thread. 5.12 committed in the calling thread, which the RLock let in.
+	p = str(tmp_path / 's.tsvz')
+	t = TSVZ.TSVZed(p, verbose=False, append_check_delay=60)
+	t['a'] = ['a', '1']
+	t.commitAppendToFile()
+	leaky = TSVZ._PATH_LOCKS[os.path.realpath(p)] = _LeakyLock()
+	leaky.victim = threading.current_thread()
+	committed = []
+
+	def commit():
+		t['b'] = ['b', '2']
+		t.commitAppendToFile()
+		committed.append(1)
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			TSVZ.appendTabularFile(p, ['x', '1'], verbose=False)
+		leaky.victim = None
+		other = threading.Thread(target=commit, daemon=True)
+		other.start()
+		other.join(10)  # (the commit takes milliseconds; the failure is a wait for ever)
+		assert committed, 'the commit waited for the lock the Ctrl-C left held'
+		assert TSVZ.readTabularFile(p, verbose=False)['b'] == ['b', '2']
+	finally:
+		leaky.letGo()  # (what 5.14 left held, so the store can close)
+		t.close()
+		TSVZ._PATH_LOCKS.pop(os.path.realpath(p), None)
+
+
+@pytest.mark.parametrize('where', ['enter', 'exit'])
+@pytest.mark.parametrize('which', ['client', 'engine'])
+@pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
+def test_a_ctrl_c_that_leaves_a_clients_lock_held_is_let_go_of(tmp_path, ext, which, where):
+	# A TSVZClient with no handler: its lock (one request at a time) and its engine's (a read nests it, so an RLock, let go
+	# of whole where a Ctrl-C leaves _serveRespond, which nothing calls holding it). A Ctrl-C that left either held made
+	# another thread's request wait for ever (the engine's: that thread then held the client's, so the first thread's
+	# next request waited too).
+	c = TSVZ.TSVZClient(str(tmp_path / ('c.' + ext)))
+	c['a'] = ['a', '1']
+	leaky = _LeakyLock()
+	leaky.where = where
+	leaky.victim = threading.current_thread()
+	if which == 'client':
+		c._lock = leaky
+	else:
+		c._backend.store.lock = leaky
+	done = []
+	other = None
+
+	def write():
+		c['b'] = ['b', '2']
+		done.append(1)
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			c['x'] = ['x', '1']
+		leaky.victim = None
+		other = threading.Thread(target=write, daemon=True)
+		other.start()
+		other.join(10)  # (a request takes milliseconds; the failure is a wait for ever)
+		assert done, "another thread's request waited for the lock the Ctrl-C left held"
+		assert c['b'] == ['b', '2']
+	finally:
+		leaky.letGo()  # (what 5.14 left held, so the other thread and the close end)
+		if other is not None:
+			other.join(10)
+		c.close()
 
 
 # --------------------------------------------------------------------------

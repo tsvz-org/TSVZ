@@ -109,38 +109,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-10-24, the user chose "One writer thread (Recommended)", whose description said "At exit the
   program finishes a write in progress, and a second Ctrl-C abandons it."
 
-### A caught Ctrl-C can leave a TSVZClient's, a handler's or a path's lock held for the program's other threads
-- Kind: deferred
-- What the operator sees: a program that catches a Ctrl-C and goes on can have another thread wait for ever, when the
-  Ctrl-C landed where a `with` statement's exit never ran (CPython bpo-29988; 5.13 measured the same event on a
-  `TSVZed`'s lock at 15 and 17 of 320 caught Ctrl-Cs that ended a write loop on 3.6 and 12 and 2 of 320 on 3.14 (two
-  measurements), and let go of it there; the rates for these three locks were not measured). The locks are `TSVZClient._lock` and `_ServeStore.lock`
-  (RLocks) and the in-process lock of a path, `_pathLock(path)` (an RLock). The exit is not affected by the first two:
-  the serve writer thread never takes them, and the exit's `close()` is the main thread's own, which an RLock lets in.
-  - `TSVZClient._lock` and `_ServeStore.lock`: another thread that uses the same client or store waits for ever. The
-    thread that was interrupted goes on, and the exit ends.
-  - `_pathLock(path)`: the writer threads of that path in this process take it (a `.tsvz` `TSVZed`'s part appends, a
-    `TSVZClient`'s or `tsvz` command's writer), and the main thread takes it in the one-shot calls
-    (`appendTabularFile`, `scrubTabularFile`, `clearTabularFile`, an in-place rewrite of a part, making a missing file).
-    A Ctrl-C that left it held there makes a writer of the same path in this process wait for ever, and so its exit (5.12
-    the same).
-  - One narrower case is worse than 5.12 (run in the 5.13 final review with the hold made by hand): a program with an
-    open `.tsvz` `TSVZed` on path P catches a Ctrl-C that landed in a one-shot call on the same P, then calls
-    `commitAppendToFile()` before the writer thread's next tick. 5.12 committed in the calling thread, which the RLock
-    let in (0.04 s); 5.13's commit waits for the writer thread, which waits for the lock the main thread still holds
-    (for ever, as both versions' exit does when the commit is left to the writer thread's tick).
-- Why: they are RLocks that TSVZ's code does nest (the scrub of a `.tsvz` part runs `_specBackupPart`, which takes the
-  path lock again, inside `_specRewriteInPlace`'s hold of it), so `_SectionLock`'s "a thread that finds itself holding it
-  holds it from a Ctrl-C" is not true of them. The mutators' fix (5.13: `except BaseException: letGo(); raise` around each
-  `with`) lets go of every hold, outer ones too. What fits is a lock that counts its holds, so an except clause lets go
-  down to the depth its section began at.
-- Plan (5.15): a counting subclass of the RLock for these three, the except clause at each main-thread `with` on them,
-  then the interrupted-writes sweep (`TSVZ_test.py::_INTERRUPTED_WRITES`) run on a `TSVZClient` and on the one-shot
-  calls with a hold check after each caught interrupt, and the narrower case above built as a test.
-- Revisit when: 5.15.
-- Noted: 2026-11-09, found in the 5.13 review; a deferral, not asked. 2026-11-10: moved to 5.15, as the compaction
-  release comes first.
-
 ### A signal handler that uses a store inside a set or delete can leave memory and the file apart on that key
 - Kind: deferred
 - What the operator sees: a program whose signal handler uses a `TSVZed` (flush on `SIGUSR1`: `commitAppendToFile()`;
