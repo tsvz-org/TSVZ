@@ -8035,13 +8035,16 @@ memoryOnly:{self.memoryOnly}
 	# it as anywhere else (as move_to_end's loops, _movedRows).
 	def _waitFor(self, job):
 		"""Wait for the writer thread to finish ``job``, in steps: a Ctrl-C stops the wait on every platform. True when the
-		thread stopped before it took the job, which is then taken back for the caller to run itself."""
+		thread stopped before it took the job, which is then taken back for the caller to run itself; and in a child that
+		a signal handler forked inside this wait, where no writer thread will ever take it (the fork hook dropped the
+		parent's jobs, _afterFork): 5.14's child ran it itself; until the 5.15 final review, it waited for ever."""
 		while not _waited(job[2], 0.1):
 			if not self._workerRuns():
 				try:
 					self._requests.remove(job)
 				except ValueError:
-					continue
+					if self._workerPid == os.getpid():
+						continue  # (the writer thread took it, and sets its flag however it ends)
 				return True
 		return False
 

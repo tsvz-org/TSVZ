@@ -18424,13 +18424,34 @@ elif case in ('writing', 'writing-set'):  # the parent's writer thread is inside
 	t.commitAppendToFile()  # (behind the rewrite)
 	os.write(ended, b'x')
 	status(pid)
+elif case == 'wait':  # a signal handler forks while this thread waits for the writer thread (_call), a job ahead of its own
+	started, done = threading.Event(), threading.Event()
+	threading.Thread(target=lambda: t._call(lambda: (started.set(), done.wait(10))), daemon=True).start()
+	started.wait(10)
+	waited, pids = TSVZ._waited, []
+	def handled(flag, timeout):  # (the signal lands in the wait's first step; the child goes on from the handler into it)
+		if not pids and threading.current_thread() is threading.main_thread():
+			pids.append(os.fork())
+			if pids[0] == 0:
+				signal.alarm(10)
+			else:
+				done.set()
+		return waited(flag, timeout)
+	TSVZ._waited = handled
+	t['b'] = ['b', '1']
+	t.commitAppendToFile()  # (queued behind the job ahead: the fork lands in its wait)
+	if pids[0] == 0:  # the child, its commit returned
+		t['c'] = ['c', '1']
+		t.close()
+		os._exit(0)
+	status(pids[0])
 t.close()
 """
 
 
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
 @pytest.mark.parametrize('case', ['exit', 'close', 'queued', 'held', 'file', 'file-rewrite', 'file-desynced', 'load', 'mp', 'mpclose', 'nohook',
-								  'writing', 'writing-set'])
+								  'writing', 'writing-set', 'wait'])
 @pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
 def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(tmp_path, ext, case):
 	# 5.14: a child that fork() made wrote nothing at its close or exit, and its commit wrote the rows its parent had
@@ -18444,7 +18465,9 @@ def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(t
 	# own reload() ran inline and raised _LoadStopped, which is meant never to leave the writer thread. A child forked while
 	# its parent's writer thread was inside a rewrite took the parent's mark of a write under way (_damaged), and at its exit
 	# wrote its fork-time memory over the parent's later rows: the parent's new row lost and its deleted row back, in the
-	# file and then in the parent's memory (5.15 final review; 5.14's child waited for ever there).
+	# file and then in the parent's memory (5.15 final review; 5.14's child waited for ever there). A child that a signal
+	# handler forked while its thread waited for the writer thread never returned from that call: the job was gone with
+	# the parent's (5.14's child ran it itself).
 	if case == 'nohook' and sys.version_info >= (3, 7):
 		pytest.skip('3.6: the fork hook is a wrapper of threading._after_fork')
 	if case in ('file-rewrite', 'writing', 'writing-set') and ext == 'tsvz':
@@ -18459,12 +18482,14 @@ def test_a_forked_childs_store_drops_the_parents_queue_and_writes_its_own_rows(t
 	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
 	with open(p, 'rb') as f:
 		lines = [line.split(b'\t')[0] for line in f.read().split(b'\n')]
-	written = case in ('exit', 'close', 'queued', 'held', 'mpclose', 'writing-set')
+	written = case in ('exit', 'close', 'queued', 'held', 'mpclose', 'writing-set', 'wait')
 	assert ('c' in rows) == written and lines.count(b'c') == int(written), (rows, done.stderr)
 	if case == 'queued':
 		assert rows['p1'] == ['p1', 'new'] and lines.count(b'p1') == 2  # (the parent's two: the child dropped its copy)
 	if case.startswith('writing'):
 		assert 'p2' in rows and 'b' not in rows and 'a' in rows, (rows, done.stderr)  # (the parent's later set and delete)
+	if case == 'wait':
+		assert lines.count(b'b') == 1, (rows, done.stderr)  # (the parent's: the child dropped its copy)
 	if case.startswith('file') or case == 'nohook':
 		said = 'its parent held the file (get_file_obj) at the fork' if case.startswith('file') else 'no fork hook ran in it'
 		assert done.stderr.count(said) == 1, done.stderr
