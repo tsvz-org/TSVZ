@@ -173,10 +173,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   0.97 s, where one with no read under way ends in 0.41 to 0.57 s; on 3.6, 0.46 to 0.97 s against 0.46 to 0.52 s.
 - Why: the tick's reads run inside its sync, which also serves its commits and rewrites; a stop there needs its own
   flag set at exit and its own sweep of the write path, more than this release's load stop.
-- Plan (5.16): the tick's reload, both kinds, runs with a stop of its own that `_atExit` sets when it lets go of the
+- Plan (5.17): the tick's reload, both kinds, runs with a stop of its own that `_atExit` sets when it lets go of the
   store (for a loose store, the same swap of its reader's file), and `_appendWork` ends on `_LoadStopped`; with a
   sweep of the tick's write path.
-- Revisit when: 5.16.
+- Revisit when: 5.17.
 - Noted: 2026-11-10, found by the 5.15 plan's measurement; a deferral, not asked.
 
 ### A Ctrl-C caught inside a set, delete, pop or move can leave that one key apart
@@ -198,11 +198,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     Checked on Python 3.14 for a set, both kinds (the 5.15 review's probe, with the handler alone as the control).
 - Why: a fix finishes the operation in the section's `except BaseException` clause, which changes what a cut set
   means (it completes) and needs its own sweep; 5.15's work on these sections was the signal handler's case.
-- Plan (5.16): the clause the sections already have calls the section's redo (`_setAgain`, `_delAgain` and the others
+- Plan (5.17): the clause the sections already have calls the section's redo (`_setAgain`, `_delAgain` and the others
   5.15 added for signal handlers) with its own arguments, under the lock, when the section had begun changing memory
   or found its hold let go of (the two-signal case): a set cut by a Ctrl-C completes, and the KeyboardInterrupt still
   goes up. With its own sweep.
-- Revisit when: 5.16.
+- Revisit when: 5.17.
 - Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked. The two-signal case and the move to the
   beginning's several keys were added 2026-11-11, from the 5.15 review.
 
@@ -226,9 +226,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   why 5.15's sweep missed `_call`'s.
 - Why: each loop has its own clean-up, and its own test, so moving them all is a release's work; a check that finds the
   new ones as they are written has to come first.
-- Plan (5.16): a static exception-table check in the suite (Python 3.12+), listing the uncovered back jumps in
+- Plan (5.17): a static exception-table check in the suite (Python 3.12+), listing the uncovered back jumps in
   functions the main thread of an open store runs; move each loop of those into a method, and write down the rest.
-- Revisit when: 5.16.
+- Revisit when: 5.17.
 - Noted: 2026-11-11, found by the 5.15 review; a deferral, not asked.
 
 ### A signal handler's change of the store inside popitem or move_to_end can make it raise the wrong exception
@@ -242,38 +242,67 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   of 824 when the handler changes the keys while the move lists them (a set of a new key, a delete, a move, a clear or
   a sync; 3 of 120 line steps on 3.6; counted at the 5.15 final review's fixes, as in the build before them). (A
   delete, pop or move whose key a handler's `clear()` took raises `KeyError`, as for a missing key: that is right.)
-  - Two handler calls, the second landing inside the redo the first one caused (`_again`; the 5.15 re-review's
-    probes, Python 3.14 and 3.9, one case per instruction of the redo):
-    - a flush, `clear()` or `reload()` between `queue and` and `queue[-1]` (`_moveAgain`, and `_requeue` for sets and
-      deletes) raises `IndexError: deque index out of range` out of the move, set, delete or pop, at 2 to 5 of 89 to
-      617 instructions: a kind 5.14 never raised there;
-    - a delete of the moved key, or `clear()`, between `dict.__contains__` and `dict.get` in `_moveAgain`'s listing
-      for a move to the end hands `_moveLines` a `None` row: `TypeError` in a two-column store (7 of 252
-      instructions), a `None` queued after the drop item in a one-column store (7 of 174), which the drop item's
-      rewrite skips;
-    - a `clear()` inside a move to the beginning's redo, after the first handler set a new key `y`, can leave memory
-      empty and the file holding `y` (the interrupted pass queued `y`'s lines; the next pass deletes only the keys the
-      section captured), and a flush there can leave memory's order apart from the file's.
-
-    After every exception memory and the file agree. Over every pair of handler calls 2, 10, 50 or 200 instructions
-    apart (7 handler pairs, 4 operations, 3.14), memory and the file end apart at 220 of 53,873 pairs, against 5.14's
-    19,094 of 52,102: 140 are the deferred "set of a new key" order, 37 the `y` case (5.14: 381), 43 order only (5.14:
-    418). Exceptions: `IndexError` in 24 pairs (5.14: none), `TypeError` in 196 (5.14: 120), `RuntimeError` in 782
-    (5.14: 628).
-- Why: found by the 5.15 plan's sweep (the move to the beginning's, by the fix round's; the two-handler cases by the
-  5.15 re-review); the change is small but in two hot methods, and wants its own tests. The two-handler cases need two
-  handler calls microseconds apart, and are far rarer than in 5.14.
-- Plan (5.16): `popitem` looks for its key again when the store changed between its look and its take, and raises
+  Two handler calls, the second inside the redo the first one caused, are the known limitation after this entry.
+- Why: found by the 5.15 plan's sweep (the move to the beginning's, by the fix round's); the change is small but in two
+  hot methods, and wants its own tests.
+- Plan (5.17): `popitem` looks for its key again when the store changed between its look and its take, and raises
   `KeyError('dictionary is empty')` when the store went empty; `move_to_end` raises `KeyError(key)` when its key went
-  inside it, and a move to the beginning lists the other keys again when the store changed while it listed them. For
-  two handlers: `_again` runs a change again when it raised while its lock was let go of (a handler ran inside it), as
-  it does one that ended without the lock, which covers a redo's `IndexError`, `TypeError` and `RuntimeError`;
-  `_moveAgain` counts the keys a pass queued lines for as captured by the next pass (`moved` extended before its
-  `extend`), so a key an interrupted pass re-added and a handler then took gets its deletion line; and a two-handler
-  sweep goes in the suite (the re-review's `pair.py` shape: two handler calls a few instructions apart, against 5.14's
-  counts).
-- Revisit when: 5.16.
-- Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked.
+  inside it, and a move to the beginning lists the other keys again when the store changed while it listed them.
+- Revisit when: 5.17.
+- Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked. The two-handler cases, added 2026-11-11 from the
+  5.15 re-review, became the known limitation after this entry the same day.
+
+### Two signal handler calls, the second inside the first one's redo, can make a set, delete, pop or move raise, or leave a key apart
+- Kind: known limitation
+- What the operator sees: a program whose signal handler uses a store (a commit, `clear()`, `reload()`, a set, delete
+  or move) while its main thread sets, deletes, pops or moves rows in it, and two signals land microseconds apart. The
+  first handler lets go of the section's lock, so the section makes its change again (its redo, `_again`, from 5.15),
+  and the second handler lands inside that redo. In the 5.15 re-review's probes (Python 3.14 and 3.9, one case per
+  instruction of the redo):
+  - a flush, `clear()` or `reload()` between `queue and` and `queue[-1]` (`_moveAgain`, and `_requeue` for sets and
+    deletes) raises `IndexError: deque index out of range` out of the move, set, delete or pop, at 2 to 5 of 89 to 617
+    instructions: a kind 5.14 never raised there;
+  - a delete of the moved key, or `clear()`, between `dict.__contains__` and `dict.get` in `_moveAgain`'s listing for a
+    move to the end hands `_moveLines` a `None` row: `TypeError` in a two-column store (7 of 252 instructions), a `None`
+    queued after the drop item in a one-column store (7 of 174), which the drop item's rewrite skips;
+  - a `clear()` inside a move to the beginning's redo, after the first handler set a new key `y`, can leave memory
+    empty and the file holding `y` (the interrupted pass queued `y`'s lines; the next pass deletes only the keys the
+    section captured), and a flush there can leave memory's order apart from the file's.
+
+  After every exception memory and the file agree. Over every pair of handler calls 2, 10, 50 or 200 instructions apart
+  (7 handler pairs, 4 operations, 3.14), memory and the file end apart at 220 of 53,873 pairs, against 5.14's 19,094 of
+  52,102: 140 are the deferred order of "A set of a new key can leave its place in memory apart from the file's", 37
+  the `y` case (5.14: 381), 43 order only (5.14: 418). Exceptions: `IndexError` in 24 pairs (5.14: none), `TypeError`
+  in 196 (5.14: 120), `RuntimeError` in 782 (5.14: 628).
+- Why: the cases need two handler calls microseconds apart, the second inside the first one's redo, and are far rarer
+  than in 5.14. Whatever handles the second signal is itself code a third can land in (as in "A second Ctrl-C inside a
+  set's clean-up" below), and the planned patches were a third round on `_moveAgain`, which both of 5.15's fix rounds
+  changed.
+- Revisit when: someone hits it (a program whose handlers can fire microseconds apart), or the redo is redesigned so
+  that an interrupted move keeps no captured rows or lines to go stale (the 5.15 design check's idea, not probed: the
+  move is made again in memory and asks for one rewrite, as a one-column delete's drop item does).
+- Approved: 2026-11-11, the user chose "Approve as KL (Recommended)", replacing the planned redo patches (`_again`
+  running a change again when it raised while its lock was let go of, `_moveAgain` counting the keys a pass queued
+  lines for as captured by the next pass, and a two-handler sweep in the suite). The user did not ask for it
+  explicitly: the 5.15 re-review found the cases, and the 5.15 design check proposed the known limitation.
+
+### A second signal handler inside letGo() makes the first one's use of the store raise RuntimeError
+- Kind: deferred
+- What the operator sees: a program whose signal handler uses a store, where the handler's section finds the store's
+  lock held by the main thread's section it interrupted and lets go of that hold (`_RLock.letGo()`: while the thread
+  holds it, release). A second signal whose handler uses the store too, landing in `letGo()` between its test of the
+  hold and its release, lets go of the hold itself; the first handler's release then finds none and raises
+  `RuntimeError: cannot release un-acquired lock` out of its commit, set or other use of the store. 5.14 the same
+  (`letGo()` is the same code). The suite meets it under load:
+  `test_a_real_signal_handler_that_uses_the_store_while_the_program_sets_rows_leaves_memory_and_the_file_as_it_set_them[commit-tsv]`
+  failed so in 1 of 6 suite runs of the 5.15 design check (on a prototype of 5.15 with the same `letGo()`), with four
+  suites and other probes on the host: under that load the handler's commit takes longer than the test's repeating
+  2 ms timer, so a second handler runs inside the first. The design check's probe (`nested.py`) puts the second handler at that line and gets the error on 5.14 and
+  5.15.
+- Why: found by the 5.15 design check; no worse than 5.14, and 5.16 is the hotfix of the one change the user chose.
+- Plan (5.17): `letGo()` ignores a release that finds no hold, as `_SectionLock.__exit__` does.
+- Revisit when: 5.17.
+- Noted: 2026-11-11, found by the 5.15 design check; a deferral, not asked.
 
 ### A set of a new key can leave its place in memory apart from the file's
 - Kind: deferred
@@ -285,9 +314,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   review's fixes: 20 of 325 landings on Python 3.14 for each such handler, with or without a header (4 of 59 line
   steps on 3.6), and a `.tsvz` store's 10 of 399 for a set of another key (2 of 72); 5.14 the same 20.
 - Why: found by the 5.15 final review's wider sweep; not worse than 5.14, and the fix is in the redo of every set.
-- Plan (5.16): `_setAgain` and `_specAgain` move a key that was new to the end when its line is still the last one
+- Plan (5.17): `_setAgain` and `_specAgain` move a key that was new to the end when its line is still the last one
   queued; the sweep's allowance goes.
-- Revisit when: 5.16.
+- Revisit when: 5.17.
 - Noted: 2026-11-11, found by the 5.15 final review; a deferral, not asked.
 
 ### A signal handler's clear() in a store with no header can leave a deleted key as a row of the key alone
@@ -301,9 +330,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   of 81, 17 of 120). 5.14: 63, 67 and 67 for the first three, and for a move the whole row back at 182 of 532. With a
   header every reader takes the line as a deletion (none in the sweeps with one).
 - Why: found by the 5.15 final review's wider sweep; 5.14 the same or worse.
-- Plan (5.16): the branch of `__appendEmptyLine` for a store with no column count writes what reads as a deletion
+- Plan (5.17): the branch of `__appendEmptyLine` for a store with no column count writes what reads as a deletion
   there (a drop item, as a one-column store's); the sweep's allowance goes.
-- Revisit when: 5.16.
+- Revisit when: 5.17.
 - Noted: 2026-11-11, found by the 5.15 final review; a deferral, not asked.
 
 ### A '#' key can leave memory when the store follows another process's change while rows are queued
@@ -315,9 +344,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   3.14 (a move queued, another process's line, then the follow; 5.14: 6 of 10). `reload()` drops it always.
 - Why: found by the 5.15 final review fixes' sweep of a store with a `#` key; 5.14 the same. Whether a whole read
   keeps `#` keys is a choice of what `reload()` means, as `_readWidened` keeps them and `reload()` does not.
-- Plan (5.16): decide whether a whole read keeps the `#` keys memory holds (in their place, as `_readWidened` does), and
+- Plan (5.17): decide whether a whole read keeps the `#` keys memory holds (in their place, as `_readWidened` does), and
   make the follow and `reload()` agree; the sweep's check of a `#` key's place then covers memory without it too.
-- Revisit when: 5.16.
+- Revisit when: 5.17.
 - Noted: 2026-11-11, found by the 5.15 final review's fixes; a deferral, not asked.
 
 ### Test gaps the 5.15 final review's fixes leave
@@ -333,9 +362,21 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: each handler and store adds sweeps to CI's serial run (each under 3.5 s on 3.14; the whole serial 3.14 run took
   13 min 7 s here with the 160 sweeps the fixes added, of the job's 40 minutes); the fixes added the ones that guard
   what they changed.
-- Plan (5.16): add them to the suite, measured against CI's time.
-- Revisit when: 5.16.
+- Plan (5.17): add them to the suite, measured against CI's time.
+- Revisit when: 5.17.
 - Noted: 2026-11-11, from the 5.15 final review's test gaps; a deferral, not asked.
+
+### The Ctrl-C sweep tests' 120 s limit is too short for suites run side by side
+- Kind: deferred
+- What the operator sees: nothing in the library. Each Ctrl-C sweep of the suite (`_sweep` in `TSVZ_test.py`) has
+  120 s, sized from CI, which runs the suite on its own. On a release run of four suites at once, 32 workers each on 32
+  cores, `test_a_ctrl_c_caught_at_any_step_of_an_operation_leaves_no_lock_held_and_memory_and_the_file_agreeing[tsv-oneshot-scrub]`
+  timed out at 120 s on Python 3.9 (5.15, 717aea9); alone it passed, in 13.6 s there (6.6 s on 3.14).
+- Why: a limit of the tests only, and 5.16 is the hotfix of the one change the user chose.
+- Plan (5.17): size the limit from the slowest sweep measured under a release run's load (four suites, 32 workers
+  each), and write that reason beside it.
+- Revisit when: 5.17.
+- Noted: 2026-11-11, from the 5.15 release run; a deferral, not asked.
 
 ### A write after close(), or in a forked child, can be cut by a Ctrl-C
 - Kind: known limitation
@@ -351,7 +392,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: calls after `close()` and writes from forked children are rare, and covering them means starting a writer
   thread again in both cases, with its lifetime to get right.
 - Revisit when: someone writes through a closed store or from a forked child and hits it. For the `.tsvz` `clear()`:
-  5.16, which sets `deSynced` before memory is emptied; a closed store would still need a reload.
+  5.17, which sets `deSynced` before memory is emptied; a closed store would still need a reload.
 - Approved: 2026-10-29, the user chose "Known limitation (Recommended)". (The `.tsvz` `clear()` is deferred, not
   approved.)
 
@@ -449,28 +490,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `rewrite_on_exit`, the child ending by `close()` or its normal exit).
 - Why: the merge rule takes in only what another writer appended after the bytes the damaged file held, since any
   other change may be the damage itself; a child that writes the file again is such a change, and the parent cannot
-  tell its rows from damage. Found by the 5.15 re-review; not this release's change, and rare (a rewrite that failed,
-  then a fork before the parent made the file again).
-- Revisit when: 5.16, or someone loses a forked child's rows this way. A first look: whether a forked child only
-  appends while the file may still be damaged (it cannot know its parent's state after the fork), so the parent's
-  merge rule takes its rows in as another writer's appends.
+  tell its rows from damage. The child writes it again because it takes its parent's failed rewrite to try again
+  (`_failures`) and its `rewrite_on_exit` (the 5.15 design check). Found by the 5.15 re-review; not this release's
+  change, and rare (a rewrite that failed, then a fork before the parent made the file again).
+- Plan (5.17): a forked child takes none of its parent's duties to the file or its single-writer settings (H2, the
+  user's pick, 2026-11-11): the fork hook also drops the failed writes' retries and a refused rewrite's back-off, and
+  turns `rewrite_on_exit` and `rewrite_interval` off, as 5.16 turns monitoring on. Its close and exit then only
+  append, and the parent's merge rule takes its rows in (the design check's prototype kept the child's row in 3 of the
+  re-review's 3 cases, on Python 3.14 and 3.6). A forked child then no longer compacts the file at its exit; a daemon
+  that wants that sets `rewrite_on_exit` again in the child.
+- Revisit when: 5.17, or someone loses a forked child's rows this way.
 - Noted: 2026-11-11, from the 5.15 re-review; a deferral, not asked.
-
-### A forked child of a store with monitoring off overwrites the rows its parent set after the fork
-- Kind: deferred
-- What the operator sees: a loose store with `monitor_external_changes=False` has replaced, deleted or moved a row
-  since its last rewrite (it is dirty), and the program forks a child. The parent sets a row after the fork. When the
-  child's store makes its rewrite at exit (`rewrite_on_exit`, or a due `rewrite_interval`), it writes its fork-time
-  memory over the file without reading it, so the parent's new row is lost if the parent closed first, or, for a due
-  `rewrite_interval`, even when the parent closes after the child. The child need not set anything. With monitoring on,
-  or with neither option, no row is lost. 5.14 and 5.15 the same (the fixer's probe on 939b464 and 7f474c3, Python
-  3.14 and 3.6).
-- Why: the child keeps its parent's `dirty` at the fork, though the parent's own rewrite mends what it marks. The fix,
-  clearing `dirty` in the fork hook as the queue and `_damaged` are cleared, is built and tested on the branch
-  `feat/516-fork-dirty`, but it came as a third fix round of 5.15, and that needs a design check of the fork state
-  first. Not this release's change: 5.15 is no worse than 5.14 here.
-- Revisit when: 5.16, after the design check of what a forked child keeps from its parent.
-- Noted: 2026-11-11, from the Haiku second opinion on the 5.15 final review; a deferral, not asked.
 
 ### A TSVZClient with no server, used in a forked child, waits for ever at its first write
 - Kind: deferred
@@ -480,10 +510,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   5.14 and 5.15, Python 3.14 and 3.6, `.tsv` and `.tsvz` (the 5.15 plan's `probe/forkclient.py`: no return in 10 s).
 - Why: 5.15's fork hook resets each `TSVZed`; the client's engine is another object with its own thread, and its
   reset needs its own design and tests.
-- Plan (5.16): built on 5.15's fork hook (`_storesAfterFork`): each live `_ServeWriter` (`_SERVE_OPEN_WRITERS`)
+- Plan (5.17): built on 5.15's fork hook (`_storesAfterFork`): each live `_ServeWriter` (`_SERVE_OPEN_WRITERS`)
   drops its inherited queue in the child and starts its thread again, either at its first `submit` there (a pid check
   once a request) or in the hook; measured to settle which.
-- Revisit when: 5.16.
+- Revisit when: 5.17.
 - Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked.
 
 ### A compressed file whose text has no final newline takes an appended member as lines of its own
@@ -520,9 +550,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   (L5). A running `TSVZed` makes the file again from memory at its next write, so
   its rows stay readable (not while that rewrite fails or is refused: see the README's fault tolerance), but a
   one-shot `tsvz set`, `appendTabularFile()`, a `TSVZedLite` or a `TSVZed` opened with
-  `monitor_external_changes=False` (for damage that lands after it loaded the file) appends without reading the
-  file first, so its rows land after the damage, where no read reaches them, and the next `TSVZed` or scrub that
-  makes the file again drops them. 4.9 to 5.3 do the same, also after a later member cut short (a writer
+  `monitor_external_changes=False` (for damage that lands after it loaded the file; from 5.16 not in a child that
+  `fork()` made, which follows the file, by reading) appends without reading the file first, so its rows land
+  after the damage, where no read reaches them, and the next `TSVZed` or scrub that makes the file again drops
+  them. 4.9 to 5.3 do the same, also after a later member cut short (a writer
   killed mid-append), which from 5.4 reads are no longer stopped by: it is left out and the members after it
   are read. A first member cut short still stops reads. A `TSVZed` that did read the file can meet the same:
   a writer that takes no lock (TSVZ before 5.1, another tool) and dies mid-write in the moment between the
@@ -532,7 +563,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   A writer that takes no lock cannot be waited for.
 - Revisit when: someone mixes one-shot appends with crashing writers on one compressed file.
 - Approved: 2026-10-29, the user chose "Known limitation (Recommended)"; 2026-11-04, "Add one line to the entry
-  (Recommended)" for a writer that takes no lock and dies between a `TSVZed`'s locked read and its append.
+  (Recommended)" for a writer that takes no lock and dies between a `TSVZed`'s locked read and its append. Narrowed in
+  5.16: a forked child's store follows the file whatever `monitor_external_changes` says (the user chose "Hotfix 5.16
+  with M", 2026-11-11).
 
 ### A file removed just as a write starts is followed as if rotated
 - Kind: known limitation
@@ -883,11 +916,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   (`a\t1\na\t\t1\nd\t1\n\na\t1\t2\n`, defaults `[#_defaults_#, '', '']`), a strict reader given a count of 3 that the
   writer was not given lost a cell (`c` from `[c, 2, X]` to `[c, 2, '']`), and tsvz-rs read `c, b` as `b, c`. So 5.15
   keeps 5.14's compaction; the suite holds the first two files as a test.
-- Plan (5.16): drop that line only where no reader that can read the file otherwise takes a line between: a reader
+- Plan (5.17): drop that line only where no reader that can read the file otherwise takes a line between: a reader
   given line 1 for its header (also where the writer has no header) and a reader given a count the writer was not
   given, as the random differential lists them; then the exhaustive differential with an empty header and count readers
   for a rewrite, and the random one.
-- Revisit when: 5.16.
+- Revisit when: 5.17.
 - Noted: 2026-11-09, found in the 5.12 review (the second half of 5.12's deferral "A compaction keeps a moved-up line only
   from the deletion that ends the other reader's life of the key", whose first half 5.14 builds); a deferral, not asked.
   2026-11-10: the 5.15 plan's rule was built and taken back, as above.

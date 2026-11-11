@@ -267,9 +267,9 @@ def test_basic_roundtrip():
 
 
 def test_version():
-	# (the scripts report the full form; pip and PyPI show it as 5.15)
-	assert TSVZ.version == '5.15'
-	assert TSVZ.__version__ == '5.15'
+	# (the scripts report the full form; pip and PyPI show it as 5.16)
+	assert TSVZ.version == '5.16'
+	assert TSVZ.__version__ == '5.16'
 	assert not hasattr(TSVZ, 'WalStore')
 
 
@@ -17162,7 +17162,7 @@ def storeCase(d, n):
 			notes.append('allow:twice')  # (cut after its write: written again by the next commit: "A line can be written twice")
 	if OP != 'setdefaults' and keys:  # (a setDefaults() changes how every row reads: not compared)
 		if OP in OPKEY and keys == [OPKEY[OP]]:
-			# Deferred (5.16): a Ctrl-C between a section's change of memory and its queued line leaves that key apart.
+			# Deferred (5.17): a Ctrl-C between a section's change of memory and its queued line leaves that key apart.
 			notes.append('allow:opkey')
 		else:
 			notes.append('fail:apart:%s mem=%r file=%r' % (','.join(keys), [mem.get(k) for k in keys], [rows.get(k) for k in keys]))
@@ -17277,7 +17277,7 @@ HANDLERS = {
 }
 HANDLER_PARTS = {'sync': (syncAppend, syncFollow)}  # (a handler of several steps: the writer thread's flush can land between them)
 # What a signal handler's clear() can make the operation it lands in raise, memory and the file agreeing: deferred to
-# 5.16 (popitem's StopIteration and RuntimeError, move_to_end's TypeError), or a delete's KeyError for a key gone.
+# 5.17 (popitem's StopIteration and RuntimeError, move_to_end's TypeError), or a delete's KeyError for a key gone.
 CLEARED = ('KeyError', 'StopIteration', 'RuntimeError', 'TypeError')
 
 
@@ -17405,14 +17405,14 @@ def handlerCase(d, n):
 	order = [k for k in t.keys() if not k.startswith('#')]
 	if keys:
 		if STORE == 'nohdr' and AT == 'clear' and all(k not in mem and rows[k] == [k] for k in keys):
-			# Deferred (5.16, docs/limitations.md "A signal handler's clear() in a store with no header"): after the clear the
+			# Deferred (5.17, docs/limitations.md "A signal handler's clear() in a store with no header"): after the clear the
 			# store has no column count, and the deletion line written after it is the lone key, which the file reads as a row.
 			notes.append('allow:lone-key')
 		else:
 			notes.append('fail:apart:%s mem=%r file=%r' % (','.join(keys), [mem.get(k) for k in keys], [rows.get(k) for k in keys]))
 	elif order != list(rows):  # (the same rows: in the same order?)
 		if OP == 'set' and [k for k in order if k != 'x'] == [k for k in rows if k != 'x']:
-			# Deferred (5.16, docs/limitations.md "A set of a new key can leave its place in memory apart from the file's"): a
+			# Deferred (5.17, docs/limitations.md "A set of a new key can leave its place in memory apart from the file's"): a
 			# handler's line queued between the set's change of memory and its own line; only x's place differs.
 			notes.append('allow:new-key-order')
 		else:
@@ -17422,7 +17422,7 @@ def handlerCase(d, n):
 			notes.append('fail:serial:file=%r serial=%r' % (list(rows.items()), serials(d)))
 		elif any(k.startswith('#') for k in t.keys()) and list(t.keys()) not in serialOrders(d):
 			# (where memory still holds its '#' key, its place among the rows: a serial one? A whole read of the file drops
-			# it, and following another process's line while rows are queued reads it whole, as 5.14 did: deferred, 5.16)
+			# it, and following another process's line while rows are queued reads it whole, as 5.14 did: deferred, 5.17)
 			notes.append('fail:memory-order:%r serial=%r' % (list(t.keys()), serialOrders(d)))
 	if OP in DEFAULTS_OPS:
 		if OP == 'setdefaults':  # (no line: memory holds the defaults the program set, or the handler's own)

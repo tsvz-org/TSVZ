@@ -477,3 +477,23 @@ entries go last, in the same commit as the change:
   the file is on disk). A child forked inside a parent's rewrite took it, and its close wrote its fork-time memory over
   the parent's later rows, as memory "the only good copy". The file's state is the parent's too: list every field a
   write in progress sets, not only the queue and the locks.
+
+## 2026-11-11 TSVZ 5.16: a forked child's store follows the file, whatever monitor_external_changes says
+- Changed: in a child that `fork()` made, each `TSVZed`'s `monitor_external_changes` is `True` from the fork on (the
+  fork hook, `_afterFork`), whatever the program gave: the child reads the file before a rewrite of its own (a
+  one-column delete's or move's commit, `rewrite_on_exit`, a due `rewrite_interval`) and follows what the parent wrote.
+  The parent keeps the value it was given.
+- Why we had to change: 5.15 made a forked child's `close()` and normal exit write its rows. With monitoring off, a
+  one-column delete or move commits by a rewrite that does not read the file first, so a child that deleted or moved a
+  key wrote its memory as it was at the fork over the rows its parent set after it: the file ended with `a` alone where
+  5.14 kept `a, b, p2` (5.14 lost them only at the child's explicit commit). 5.15 was worse than 5.14 there, found by
+  the design check after its release. A child of a store dirty at the fork, with `rewrite_on_exit` or a due
+  `rewrite_interval`, did the same at its exit (5.14 too).
+- Original design was wrong because: `monitor_external_changes=False` says "no other process writes this file", and a
+  fork makes that false: the parent goes on writing it. 5.15's hook reset what the parent's threads own (the queue, the
+  locks, a rewrite under way) but kept a setting whose premise the fork broke, and the review rounds found the fork
+  state one field at a time. A setting that assumes one writer belongs to the process that gave it, not to the object
+  a fork copies.
+- Lesson: at a fork, also reset in the child's copy every setting that assumes its process is the file's only writer
+  (no monitoring, a rewrite at exit that does not read first): the parent is now another writer. Say so where the
+  setting is documented, since the attribute reads otherwise in the child.
