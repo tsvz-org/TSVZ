@@ -349,8 +349,9 @@ can land in, and checks the locks, memory and the file after each.
   for it is taken back (its rows stay queued for the next commit), so a `clear()` no longer runs after the rows the
   program sets once it caught the Ctrl-C; one the thread has begun is still finished. A `.tsvz` `clear()` empties
   memory in its job, as it lists the queue, so a Ctrl-C can no longer leave memory empty and the file full. With a
-  Ctrl-C at each step of a `clear()` and rows set after it, 5.14 left memory and the file apart at 63 of 199 steps of a
-  loose store's and 153 of 219 of a `.tsvz` one (3.14); 5.15 at none.
+  Ctrl-C at each step of a `clear()` and rows set after it, 5.14 lost the rows set after it from memory and file alike
+  at 63 of 199 steps of a loose store's (the two agreed), and at 153 of 219 of a `.tsvz` one left memory and the file
+  apart or lost them from both (3.14); 5.15 at none.
 - **A first Ctrl-C anywhere in the exit's stop of the stores waits for their writes.** 5.14 waited only for one that
   landed inside a store's own stop; one in the steps around it abandoned every store, and the rows still queued were
   not written (10 of 519 steps of the `.tsv` exit and 13 of 337 of the `.tsvz` one on 3.14; 3 of 82 and 2 of 57 line
