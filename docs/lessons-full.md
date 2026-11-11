@@ -424,6 +424,12 @@ entries go last, in the same commit as the change:
   that a signal handler inside it dropped it first (a check of the hold before the release is not enough: the handler
   lands between the check and the release). Work moved to a thread that the exit waits for makes the exit wait for it:
   the exit has to tell a read, which it can leave, from a write, which it finishes. Find such places by raising the
-  interrupt at every step of the code in turn (`sys.settrace`, every bytecode with `f_trace_opcodes`), and test the
-  operator's cases too (a Ctrl-C that ends a loop of writes, caught and not; one during a big load; a signal handler that
-  uses the store), where the rates are highest.
+  interrupt at every step of the code in turn, and test the operator's cases too (a Ctrl-C that ends a loop of writes, caught and not; one during a big load; a signal handler that
+  uses the store), where the rates are highest. Sharpened in 5.15, when the step sweep went into the suite: step as a
+  real signal can land. On 3.12+ that is `sys.monitoring`'s instruction events, which start at a frame's first
+  instruction, where settrace's opcode events start late. Up to 3.11 it is settrace's `opcode` events, and only those:
+  on 3.9 an opcode event right after a `line` event overwrote the line event's raise, the interrupt ran on, and the next
+  C call failed with `SystemError` (CI's 3.9 job, red since 5.13). On 3.11+ the steps the exception table leaves out,
+  `NOT_TAKEN` and `NOP`, are skipped: no signal is raised there, and a raise there skipped both the `with` statement's
+  exit and the `except` clause, holds a real Ctrl-C never makes. And the sweep keeps no exception object: its traceback
+  kept the cut write's open file, whose lock the next write then waited for, a hang no real program meets.

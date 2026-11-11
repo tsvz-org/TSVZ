@@ -16973,9 +16973,7 @@ print(at)
 
 
 @pytest.mark.parametrize('how, steps', [
-	('tsvzed', 'lines'),
-	pytest.param('tsvzed', 'opcodes', marks=pytest.mark.skipif(sys.version_info < (3, 7), reason='f_trace_opcodes')),
-	('client', 'lines'),
+	('client', 'lines'),  # (a TSVZed's set and commit: the step sweep below)
 ])
 def test_a_ctrl_c_caught_in_a_write_leaves_the_store_writing_and_the_program_ending(tmp_path, how, steps):
 	# 5.12's threading.Event (a TSVZed's waits for its writer thread) and Condition (a TSVZClient's and the CLI's writer)
@@ -16997,6 +16995,542 @@ def test_a_ctrl_c_caught_in_a_write_leaves_the_store_writing_and_the_program_end
 	assert 'held []' in done.stdout, done.stdout  # (the steps after which the thread still held the lock)
 	assert int(done.stdout.split()[-1]) > 20, done.stdout  # (the steps went through the wait for the writer thread)
 	assert TSVZ.readTabularFile(p, verbose=False)['last'] == ['last', 'v']
+
+
+#: ARGV: TSVZ's directory, a directory for the cases, KIND ('tsv' or 'tsvz'), OP, AT ('raise', or a signal handler's name:
+#: HANDLERS), START and STOP (the steps swept; STOP 0: to the operation's end) [, 'child']. One case per step of TSVZ's
+#: code that OP runs in the main thread, each on a fresh file holding a, b and c. AT 'raise': a KeyboardInterrupt raised
+#: at that step and caught, as a program that catches a Ctrl-C and goes on does; then no lock this thread left held (but
+#: what the approved KL1 allows after close()), another thread's write through the same store, client or path returns,
+#: and (a TSVZed) after one more write, a commit and close(), memory and the file agree but on the operation's own key
+#: (deferred: a Ctrl-C between a section's change of memory and its line). A handler's name: that signal handler run at
+#: the step, as a real signal's runs inside whatever the main thread was doing; then after a commit and close() memory
+#: and the file agree on every key, and the operation's own line is counted (written twice: KL2). A case that has not
+#: ended in 25 s is a hang (its stacks printed), and the parent goes on after it: every hang the sweeps met was a wait for
+#: ever, while a case takes 1 to 20 ms. The parent prints the failures and the counts, and exits 1 on any failure or hang.
+_STEP_SWEEP = r"""
+import dis, faulthandler, os, shutil, subprocess, sys, threading
+HERE, BASE, KIND, OP, AT = sys.argv[1:6]
+START, STOP = int(sys.argv[6]), int(sys.argv[7])
+sys.path.insert(0, HERE)
+import TSVZ as T
+
+# The steps: each step of TSVZ's code in the main thread, the same on every run. 3.12+: every instruction
+# (sys.monitoring; settrace's opcode events start late there). 3.7 to 3.11: settrace's opcode events, and only those (on
+# 3.9 an opcode event right after a line event overwrites the line event's raise: the interrupt ran on, and the next C
+# call failed with SystemError). 3.6: lines. Left out on 3.11+: NOP and NOT_TAKEN, which the exception table leaves
+# out (a raise there skips the with statement's exit and the except clause), and where no signal is raised.
+MAIN = threading.get_ident()
+MON = getattr(sys, 'monitoring', None)
+OPCODES = sys.version_info >= (3, 7)
+SKIP = frozenset(dis.opmap[o] for o in ('NOT_TAKEN', 'NOP') if o in dis.opmap) if sys.version_info >= (3, 11) else ()
+CODE = T._stopLiveStores.__code__.co_filename  # (TSVZ.py, as its code names it)
+steps = None
+
+
+class Steps(object):
+	def __init__(self, n, act):
+		self.n, self.act, self.count, self.fired, self.where = n, act, 0, False, '?'
+
+	def hit(self, code, offset):
+		if code.co_code[offset] in SKIP:
+			return
+		self.count += 1
+		if self.count == self.n:
+			self.fired = True  # (counted no more: the steps of the checks that follow are not the operation's)
+			line = None
+			for start, at in dis.findlinestarts(code):
+				if start > offset:
+					break
+				line = at
+			self.where = '%s:%s:%s' % (code.co_name, line, dis.opname[code.co_code[offset]])  # (where it landed, for a failure's note)
+			self.act()
+
+
+def instruction(code, offset):
+	if code.co_filename == CODE and not steps.fired and threading.get_ident() == MAIN:
+		steps.hit(code, offset)
+
+
+def local(frame, event, arg):
+	if event == ('opcode' if OPCODES else 'line') and not steps.fired:
+		steps.hit(frame.f_code, frame.f_lasti)
+	return local
+
+
+def tracer(frame, event, arg):
+	if frame.f_code.co_filename != CODE:
+		return None
+	if OPCODES:
+		frame.f_trace_opcodes = True
+	return local
+
+
+if MON:
+	MON.use_tool_id(3, 'sweep')
+	MON.register_callback(3, MON.events.INSTRUCTION, instruction)
+unraisable = []
+if hasattr(sys, 'unraisablehook'):  # (3.8+)
+	sys.unraisablehook = lambda u: unraisable.append(u.exc_type)
+
+
+def stepped(n, act, run):
+	'''Run ``run()`` with ``act()`` called at its n-th step; True when the step was reached (else ``run`` ended first).
+	Returns (reached, the exception ``run`` raised or None).'''
+	global steps
+	steps = Steps(n, act)
+	del unraisable[:]
+	if MON:
+		MON.set_events(3, MON.events.INSTRUCTION)
+	else:
+		sys.settrace(tracer)
+	error = None
+	try:
+		run()
+	except BaseException as e:
+		error = (type(e), repr(e)[:200])  # (not the exception: its traceback would keep the cut write's open file, and its lock)
+	finally:
+		if MON:
+			MON.set_events(3, 0)
+		else:
+			sys.settrace(None)
+	if error is None and KeyboardInterrupt in unraisable:
+		# Python dropped it: raised where a generator was being closed, it reports it as unraisable and goes on (3.12,
+		# a closed rewrite's compaction plan): no Ctrl-C reaches the program there, nor does TSVZ see one.
+		error = (None, 'unraisable')
+	return steps.fired, error
+
+
+def interrupted(error, notes):
+	'''Note what the raise did: went up as a KeyboardInterrupt, or was dropped by Python (unraisable).'''
+	if error is not None and error[0] is None:
+		notes.append('allow:unraisable')
+	elif error is None or error[0] is not KeyboardInterrupt:
+		notes.append('fail:' + ('uncaught' if error is None else 'other:' + error[1]))
+
+
+def where():
+	return '@' + steps.where
+
+
+def interrupt():
+	raise KeyboardInterrupt
+
+
+def fileRows(p):
+	rows = T.readTabularFile(p, header='id\tv', verbose=False) if KIND == 'tsv' else T.readTabularFile(p, verbose=False)
+	return {k: list(v) for k, v in rows.items()}
+
+
+def apart(t, p):
+	mem = {k: list(v) for k, v in t.items()}
+	rows = fileRows(p)
+	return sorted(k for k in set(mem) | set(rows) if mem.get(k) != rows.get(k)), mem, rows
+
+
+def elsewhere(write):
+	'''``write()`` in another thread: False when it has not returned in 5 s (another thread's write takes microseconds:
+	this is a wait for a lock left held).'''
+	done = []
+
+	def run():
+		write()
+		done.append(1)
+	other = threading.Thread(target=run, daemon=True)
+	other.start()
+	other.join(5)
+	return bool(done)
+
+
+STORE_OPS = {
+	'set': lambda t: t.__setitem__('x', ['x', '1']),
+	'set-existing': lambda t: t.__setitem__('a', ['a', '9']),
+	'del': lambda t: t.__delitem__('a'),
+	'pop': lambda t: t.pop('a'),
+	'popitem': lambda t: t.popitem(),
+	'move': lambda t: t.move_to_end('a'),
+	'setdefaults': lambda t: t.setDefaults(['', 'D']),
+	'commit': lambda t: t.commitAppendToFile(),
+	'reload': lambda t: t.reload(),
+	'clear': lambda t: t.clear(),
+	'rewrite': lambda t: t.rewrite(force=True),
+	'close': lambda t: t.close(),
+	'closed-commit': lambda t: t.commitAppendToFile(),  # (after close(): the writer thread's work, in this thread)
+	'closed-rewrite': lambda t: t.rewrite(force=True),
+	'exit': None,
+}
+OPKEY = {'set': 'x', 'set-existing': 'a', 'del': 'a', 'pop': 'a', 'popitem': 'c', 'move': 'a'}
+
+
+def theExit(t):
+	try:
+		T._stopLiveStores()
+	finally:  # (atexit goes on to the next callback after one that raised)
+		again = getattr(T, '_stopLiveStoresAgain', None)
+		if again is not None:
+			again()
+
+
+def storeCase(d, n):
+	p = os.path.join(d, 'f.' + KIND)
+	if KIND == 'tsv':
+		with open(p, 'wb') as f:
+			f.write(b'id\tv\n')
+	t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60 if OP == 'exit' else 0.01)
+	for k in 'abc':
+		t[k] = [k, '1']
+	t.commitAppendToFile()
+	if OP in ('commit', 'closed-commit', 'closed-rewrite', 'exit'):
+		t['q'] = ['q', '1']  # (something queued)
+	if OP.startswith('closed-'):
+		t.close()
+		t['q2'] = ['q2', '1']
+	if OP == 'exit':
+		T._exitArmed = T._daemonsOut = False  # (as at the program's one exit)
+	reached, error = stepped(n, interrupt, lambda: (theExit if OP == 'exit' else STORE_OPS[OP])(t))
+	if not reached:
+		t.close()
+		return None
+	notes = []
+	if OP == 'exit':  # (a first Ctrl-C is caught in the exit: it waits for the writes, and only a second abandons them)
+		if error is not None and error[0] not in (None, KeyboardInterrupt):
+			notes.append('fail:other:' + error[1])
+		if 'q' not in fileRows(p):
+			notes.append('fail:lost:q')
+		return notes
+	interrupted(error, notes)
+	held = [name for name, lock in (('memLock', t._memLock), ) if lock._is_owned()]
+	if OP.startswith('closed-') and t.writeLock.locked():
+		held.append('writeLock')  # (no writer thread after close(): left by this thread)
+	if held and OP.startswith('closed-'):
+		# KL1, approved: a Ctrl-C in a write made after close() can leave the store's lock held (let go of at this
+		# thread's next section) or its writeLock (nothing lets go of it): the writes that follow would wait for ever.
+		notes.append('allow:kl1:' + '+'.join(held))
+		t._memLock.letGo()
+		return notes
+	if held:
+		notes.append('fail:held:' + '+'.join(held))
+	if not elsewhere(lambda: t.__setitem__('other', ['other', '1'])):
+		notes.append('fail:stuck')
+		return notes
+	if OP == 'clear':
+		t.commitAppendToFile()  # (a clear under way when the Ctrl-C came has ended once a job behind it has)
+	t['after'] = ['after', '1']
+	if OP == 'closed-rewrite' and KIND == 'tsv':
+		# A cut rewrite after close() can leave the file short of rows memory holds; the next rewrite makes it again
+		# from memory (approved: "A write after close(), or in a forked child, can be cut by a Ctrl-C").
+		t.rewrite(force=True)
+	else:
+		t.commitAppendToFile()
+	t.close()
+	keys, mem, rows = apart(t, p)
+	lost = [k for k in ('after', 'other') if k not in rows or k not in mem]
+	if lost:
+		notes.append('fail:lost:' + ','.join(lost))
+	if OP == 'closed-commit':
+		if 'q2' not in rows:
+			notes.append('fail:lost:q2')
+		with open(p, 'rb') as f:
+			copies = sum(1 for line in f.read().split(b'\n') if line.split(b'\t')[0] == b'q2')
+		if copies > 1:
+			notes.append('allow:twice')  # (cut after its write: written again by the next commit, KL2)
+	if OP != 'setdefaults' and keys:  # (a setDefaults() changes how every row reads: not compared)
+		if OP in OPKEY and keys == [OPKEY[OP]]:
+			# Deferred (5.16): a Ctrl-C between a section's change of memory and its queued line leaves that key apart.
+			notes.append('allow:opkey')
+		else:
+			notes.append('fail:apart:%s mem=%r file=%r' % (','.join(keys), [mem.get(k) for k in keys], [rows.get(k) for k in keys]))
+	return notes
+
+
+CLIENT_OPS = {
+	'client-set': lambda c, p, d: c.__setitem__('x', ['x', '1']),
+	'client-del': lambda c, p, d: c.__delitem__('a'),
+	'client-get': lambda c, p, d: c['a'],
+	'client-pop': lambda c, p, d: c.pop('a'),
+	'oneshot-append': lambda c, p, d: T.appendTabularFile(p, ['x', '1'], verbose=False),
+	'oneshot-create': lambda c, p, d: T.appendTabularFile(p, ['x', '1'], verbose=False, createIfNotExist=True),
+	'oneshot-scrub': lambda c, p, d: T.scrubTabularFile(p, verbose=False),
+	'oneshot-clear': lambda c, p, d: T.clearTabularFile(p, verbose=False),
+}
+
+
+def clientCase(d, n):
+	'''A TSVZClient with no handler (its engine in this process) or a one-shot call: no lock left held, and another
+	thread's write through the same client or to the same path returns.'''
+	p = os.path.join(d, 'f.' + KIND)
+	for k in 'abc':
+		T.appendTabularFile(p, [k, '1'], verbose=False, createIfNotExist=True)
+	if OP == 'oneshot-create':
+		p = os.path.join(d, 'new.' + KIND)  # (made by the append)
+	client = T.TSVZClient(p) if OP.startswith('client') else None
+	reached, error = stepped(n, interrupt, lambda: CLIENT_OPS[OP](client, p, d))
+	if not reached:
+		if client is not None:
+			client.close()
+		return None
+	notes = []
+	interrupted(error, notes)
+	locks = [('path', T._PATH_LOCKS.get(os.path.realpath(p)))]
+	if client is not None:
+		locks.append(('client', client._lock))
+		if hasattr(client._backend, 'store'):
+			locks.append(('store', client._backend.store.lock))
+	held = [name for name, lock in locks if lock is not None and lock._is_owned()]
+	if held:
+		notes.append('fail:held:' + '+'.join(held))
+	if client is not None:
+		write = lambda: client.__setitem__('other', ['other', '1'])
+	else:
+		write = lambda: T.appendTabularFile(p, ['other', '1'], verbose=False, createIfNotExist=True)
+	stuck = not elsewhere(write)
+	if stuck:
+		notes.append('fail:stuck')
+	for _, lock in locks:  # (what the case left, let go of: the next case starts clean)
+		while lock is not None and lock._is_owned():
+			lock.release()
+	if client is not None and not stuck:
+		client.close()
+	return notes
+
+
+HANDLED_OPS = {
+	'set': lambda t: t.__setitem__('x', ['x', '1']),
+	'set-existing': lambda t: t.__setitem__('a', ['a', '9']),
+	'del': lambda t: t.__delitem__('a'),
+	'pop': lambda t: t.pop('a'),
+	'popitem': lambda t: t.popitem(),
+	'move': lambda t: t.move_to_end('a'),
+	'set-defaults-row': lambda t: t.__setitem__(T.DEFAULTS_INDICATOR_KEY, [T.DEFAULTS_INDICATOR_KEY, 'D']),
+	'del-defaults-row': lambda t: t.__delitem__(T.DEFAULTS_INDICATOR_KEY),
+	'setdefaults': lambda t: t.setDefaults(['', 'D']),
+	'set-marker': lambda t: t.__setitem__(T.DEFAULTS_INDICATOR_KEY, [T.DEFAULTS_INDICATOR_KEY, 'D']),
+}
+DEFAULTS_OPS = ('set-defaults-row', 'del-defaults-row', 'setdefaults', 'set-marker')
+
+
+def own(t):
+	'''The handler that sets what the operation sets, another way.'''
+	if OP == 'setdefaults':
+		t.setDefaults(['', 'H'])
+	elif OP in DEFAULTS_OPS:
+		t[T.DEFAULTS_INDICATOR_KEY] = [T.DEFAULTS_INDICATOR_KEY, 'H']
+	else:
+		t[OPKEY[OP]] = [OPKEY[OP], 'H']
+
+
+def sync(t, p):
+	T.appendTabularFile(p, ['z', '1'], verbose=False)  # (another writer's line, under the lock as the format asks)
+	t.checkExternalChanges()
+	t.rewrite()  # (the writer thread reads the file into memory while the handler waits)
+
+
+HANDLERS = {
+	'reload': lambda t, p: t.reload(),
+	'clear': lambda t, p: t.clear(),
+	'sync': sync,
+	'own': lambda t, p: own(t),
+	'commit': lambda t, p: t.commitAppendToFile(),  # (a flush on SIGUSR1)
+	'set': lambda t, p: t.__setitem__('z', ['z', '1']),
+	'del': lambda t, p: t.__delitem__('b'),
+}
+# What a signal handler's clear() can make the operation it lands in raise, memory and the file agreeing: deferred to
+# 5.16 (popitem's StopIteration and RuntimeError, move_to_end's TypeError), or a delete's KeyError for a key gone.
+CLEARED = ('KeyError', 'StopIteration', 'RuntimeError', 'TypeError')
+
+
+def opened(p, setup=True):
+	if KIND == 'tsv' and not os.path.exists(p):
+		with open(p, 'wb') as f:
+			f.write(b'id\tv\n')
+	t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)
+	if setup:
+		for k in 'abc':
+			t[k] = [k, '1']
+		if OP == 'del-defaults-row':
+			t[T.DEFAULTS_INDICATOR_KEY] = [T.DEFAULTS_INDICATOR_KEY, 'S']
+		t.commitAppendToFile()
+	return t
+
+
+_ownLines = []
+
+
+def ownLines(d):
+	'''The lines the operation alone appends to the file (a run with no handler).'''
+	if not _ownLines:
+		p = os.path.join(d, 'ref.' + KIND)
+		t = opened(p)
+		with open(p, 'rb') as f:
+			before = f.read()
+		HANDLED_OPS[OP](t)
+		t.commitAppendToFile()
+		t.close()
+		with open(p, 'rb') as f:
+			after = f.read()
+		_ownLines.append([line for line in after[len(before):].split(b'\n') if line] if after.startswith(before) else [])
+		_ownLines.append(T._normalizeDefaults(t.defaults, t.delimiter) if OP == 'setdefaults' else None)
+		os.remove(p)
+	return _ownLines
+
+
+def handlerCase(d, n):
+	'''A signal handler that uses the store, run at the n-th step of the operation, as a real signal's runs inside
+	whatever the main thread was doing: after a commit and close(), memory and the file agree on every key (and on the
+	defaults), and the operation's own line is counted (written twice: KL2).'''
+	lines, defaults = ownLines(d)
+	p = os.path.join(d, 'f.' + KIND)
+	t = opened(p)
+	reached, error = stepped(n, lambda: HANDLERS[AT](t, p), lambda: HANDLED_OPS[OP](t))
+	if not reached:
+		t.close()
+		return None
+	notes = []
+	if error is not None and error[0] is not None:
+		if error[0].__name__ in CLEARED:
+			notes.append('allow:raised-' + error[0].__name__)
+		else:
+			notes.append('fail:other:' + error[1])
+	t.commitAppendToFile()
+	t.close()
+	keys, mem, rows = apart(t, p)
+	if keys:
+		notes.append('fail:apart:%s mem=%r file=%r' % (','.join(keys), [mem.get(k) for k in keys], [rows.get(k) for k in keys]))
+	if OP in DEFAULTS_OPS:
+		if OP == 'setdefaults':  # (no line: memory holds the defaults the program set, or the handler's own)
+			want = [defaults] + ([T._normalizeDefaults(['', 'H'], t.delimiter)] if AT == 'own' else [])
+		else:  # (memory's defaults are the file's)
+			again = opened(p, setup=False)
+			want = [again.defaults]
+			again.close()
+		if t.defaults not in want:
+			notes.append('fail:defaults mem=%r want=%r' % (t.defaults, want))
+	with open(p, 'rb') as f:
+		copies = f.read().split(b'\n').count(lines[0]) if lines else 0
+	if copies > 1:
+		notes.append(('fail' if AT == 'clear' else 'allow') + ':twice')
+	return notes
+
+
+def case(d, n):
+	if AT != 'raise':
+		return handlerCase(d, n)
+	if OP in CLIENT_OPS:
+		return clientCase(d, n)
+	return storeCase(d, n)
+
+
+def child():
+	n = START
+	while not STOP or n <= STOP:
+		d = os.path.join(BASE, 'case%d' % n)
+		os.mkdir(d)
+		faulthandler.dump_traceback_later(25, exit=True)
+		print('CASE %d' % n, flush=True)
+		notes = case(d, n)
+		faulthandler.cancel_dump_traceback_later()
+		shutil.rmtree(d, ignore_errors=True)
+		if notes is None:
+			print('END %d' % n, flush=True)
+			return
+		print('R %d %s' % (n, ' '.join(notes + ([where()] if any(note.startswith('fail') for note in notes) else [])) or 'ok'), flush=True)
+		n += 1
+	print('STOP', flush=True)
+
+
+def parent():
+	start, cases, fails, hangs, tags, shown = START, 0, 0, [], {}, []
+	while True:
+		proc = subprocess.Popen([sys.executable, __file__] + sys.argv[1:6] + [str(start), str(STOP), 'child'],
+								stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		out, err = proc.communicate()
+		last, ended = start, False
+		for line in out.decode(errors='replace').splitlines():
+			if line.startswith('CASE '):
+				last = int(line.split()[1])
+			elif line.startswith(('END', 'STOP')):
+				ended = True
+			elif line.startswith('R '):
+				cases += 1
+				for note in line.split(' ', 2)[2].split(' '):
+					if note.startswith(('fail:', 'allow:', 'ok')):
+						tag = ':'.join(note.split(':')[:2])
+						tags[tag] = tags.get(tag, 0) + 1
+				if ' fail:' in line:
+					fails += 1
+					if len(shown) < 5:
+						shown.append(line)
+		if ended:
+			break
+		hangs.append(last)
+		shown.append('HANG at step %d (rc %s): %s' % (last, proc.returncode, '\n'.join(
+			l for l in err.decode(errors='replace').splitlines() if 'TSVZ.py' in l or l.startswith(('Thread', 'Current')))[-1500:]))
+		start = last + 1
+		if len(hangs) > 3:
+			break
+	print('\n'.join(shown))
+	print('SUM %s %s %s steps %d..%s cases=%d fails=%d hangs=%d %s' % (KIND, OP, AT, START, STOP or 'end', cases, fails, len(hangs),
+		' '.join('%s=%d' % kv for kv in sorted(tags.items()))))
+	sys.exit(1 if fails or hangs else 0)
+
+
+if sys.argv[-1] == 'child':
+	child()
+else:
+	parent()
+"""
+
+
+def _sweep(tmp_path, kind, op, at, start=1, stop=0):
+	script = tmp_path / 'sweep.py'
+	script.write_text(_STEP_SWEEP)
+	cases = tmp_path / 'cases'
+	cases.mkdir()
+	try:
+		# 120 s: a sweep takes 1 to 30 s here (CI runs them one at a time); a case that hangs is ended by its 25 s
+		# watchdog, so only a wedged sweep takes this long, on a machine the whole suite keeps busy.
+		done = subprocess.run([sys.executable, str(script), HERE, str(cases), kind, op, at, str(start), str(stop)],
+							  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+	except subprocess.TimeoutExpired as e:
+		raise AssertionError('the sweep did not end: {}'.format(e.stdout))
+	assert done.returncode == 0, done.stdout + done.stderr
+	swept = int(done.stdout.split(' cases=')[1].split()[0])
+	assert start > 1 or swept >= 20, done.stdout  # (it went through the operation's steps)
+
+
+#: The operations a Ctrl-C is swept through: (kind, op, START, STOP). The .tsv rewrite after close() has about 9,000 steps
+#: on 3.14: in 7 parts of 1,300, so -n spreads them.
+_INTERRUPT_SWEPT = ([(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (
+	'set', 'set-existing', 'del', 'pop', 'popitem', 'setdefaults', 'commit', 'reload', 'rewrite', 'close')]
+	+ [('tsvz', 'move', 1, 0), ('tsv', 'closed-commit', 1, 0), ('tsvz', 'closed-rewrite', 1, 0)]
+	+ [('tsv', 'closed-rewrite', start, start + 1299 if start < 7801 else 0) for start in range(1, 9100, 1300)])
+
+
+@pytest.mark.parametrize('kind, op, start, stop', _INTERRUPT_SWEPT,
+						 ids=['-'.join(map(str, case)) if case[2] > 1 or case[3] else '-'.join(case[:2]) for case in _INTERRUPT_SWEPT])
+def test_a_ctrl_c_caught_at_any_step_of_an_operation_leaves_no_lock_held_and_memory_and_the_file_agreeing(tmp_path, kind, op, start, stop):
+	# 5.13 swept a set and a commit; the 5.13 final review's own sweep of the rest was not in the repo, so a change that left
+	# a hold there passed the suite. Each step of each operation, stepped as a real signal can land (_STEP_SWEEP).
+	_sweep(tmp_path, kind, op, 'raise', start, stop)
+
+
+#: The (kind, op, handler) a signal handler is swept through.
+_HANDLER_SWEPT = ([(kind, op, handler) for kind, ops in (
+	('tsv', ('set', 'set-existing', 'del', 'pop', 'popitem', 'move', 'set-defaults-row', 'del-defaults-row', 'setdefaults')),
+	('tsvz', ('set', 'set-existing', 'del', 'pop', 'popitem', 'set-marker'))) for op in ops for handler in ('commit', 'set', 'del')]
+	+ [('tsv', op, 'sync') for op in ('set', 'set-existing', 'del', 'pop', 'popitem', 'set-defaults-row', 'del-defaults-row', 'setdefaults')]
+	+ [('tsv', op, 'clear') for op in ('del', 'pop', 'popitem', 'del-defaults-row', 'setdefaults')]
+	+ [('tsvz', op, 'clear') for op in ('del', 'pop', 'popitem', 'set-marker')]
+	+ [('tsv', 'setdefaults', handler) for handler in ('reload', 'own')])
+
+
+@pytest.mark.parametrize('kind, op, handler', _HANDLER_SWEPT, ids=['-'.join(case) for case in _HANDLER_SWEPT])
+def test_a_signal_handler_that_uses_the_store_at_any_step_of_an_operation_leaves_memory_and_the_file_agreeing(tmp_path, kind, op, handler):
+	# A handler that uses the store lands inside the section it interrupted, and its own section, or its wait for the writer
+	# thread, lets go of that section's lock (_SectionLock). Each step of each operation, with each kind of handler: a flush
+	# (commit), reload(), clear(), another process's line followed (sync), a set of the operation's own key (own), a set and
+	# a delete of other keys.
+	_sweep(tmp_path, kind, op, handler)
 
 
 
