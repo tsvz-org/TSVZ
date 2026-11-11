@@ -17424,7 +17424,8 @@ def _sweep(tmp_path, kind, op, at, start=1, stop=0):
 #: on 3.14: in 7 parts of 1,300, so -n spreads them.
 _INTERRUPT_SWEPT = ([(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (
 	'set', 'set-existing', 'del', 'pop', 'popitem', 'setdefaults', 'commit', 'reload', 'rewrite', 'close')]
-	+ [('tsvz', 'move', 1, 0), ('tsv', 'closed-commit', 1, 0), ('tsvz', 'closed-commit', 1, 0), ('tsvz', 'closed-rewrite', 1, 0)]
+	+ [(kind, 'move', 1, 0) for kind in ('tsv', 'tsvz')]
+	+ [('tsv', 'closed-commit', 1, 0), ('tsvz', 'closed-commit', 1, 0), ('tsvz', 'closed-rewrite', 1, 0)]
 	+ [(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in ('clear', 'exit')]  # (exit: _stopLiveStores, a row queued)
 	+ [(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (  # (a TSVZClient with no handler; one-shot calls)
 		'client-set', 'client-del', 'client-get', 'client-pop', 'oneshot-append', 'oneshot-create', 'oneshot-scrub', 'oneshot-clear')]
@@ -17611,9 +17612,7 @@ def test_the_methods_that_change_memory_hold_no_cell_variables():
 	# every use: the 5.15 plan's first prototype of the redo did that and cost 7 to 9% of a set. The redos are methods.
 	for name in ('__setitem__', '__delitem__', 'pop', 'popitem', 'move_to_end', 'setDefaults', '_specSetItem',
 				 '_specSetMarker', '_specDelItem'):
-		# (before 3.12 a comprehension is a nested function (PEP 709): move_to_end's makes its key a cell, as in 5.14)
-		allowed = ('key',) if name == 'move_to_end' and sys.version_info < (3, 12) else ()
-		assert getattr(TSVZ.TSVZed, name).__code__.co_cellvars == allowed, name
+		assert getattr(TSVZ.TSVZed, name).__code__.co_cellvars == (), name  # (5.14's move_to_end had its key, before 3.12)
 
 
 class _LeakyLock(TSVZ._SectionLock):

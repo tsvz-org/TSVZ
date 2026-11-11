@@ -273,26 +273,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 5.16.
 - Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked.
 
-### The suite's interrupt sweep covers a set and a commit only
-- Kind: deferred
-- What the operator sees: nothing in the library. `TSVZ_test.py::_INTERRUPTED_WRITES` raises a KeyboardInterrupt at
-  each step of a `TSVZed`'s set and commit (and a `TSVZClient`'s set) and checks the store's lock after each. The other
-  operations a Ctrl-C can land in (a delete, pop, popitem, `move_to_end`, `setDefaults`, `reload()`, `clear()`,
-  `rewrite()`, `close()`, a commit or rewrite after `close()`) were swept only by the 5.13 final review's own script,
-  which is not in the repo, so a change that leaves a hold there would pass the suite. The review stepped by
-  `sys.monitoring` on 3.12 and later, which gives every instruction from the first call, where the suite's settrace
-  opcode events start late.
-- Why: the sweep was written for the hang 5.13 fixed, which a set and a commit show.
-- Plan (5.15), with the work on these locks: the review's 14 operations on `.tsv` and `.tsvz` in the suite, stepped by
-  `sys.monitoring` on 3.12 and later, with its checks after each caught interrupt (the hold, another thread's set,
-  memory against the file after `close()`); the steps of 3.14's `NOT_TAKEN` instructions in pop, popitem and
-  `move_to_end` left out (a real signal's KeyboardInterrupt is not raised there); the cases after `close()` checked
-  against the known limitation "A second Ctrl-C inside a set's clean-up, or a Ctrl-C in a write made after close() or
-  in a forked child, can leave a lock held", not for no hold. The review ran about 20,000 cases per Python: measure the
-  suite's time with it, and put what does not fit the default run behind a marker.
-- Revisit when: 5.15.
-- Noted: 2026-11-10, found in the 5.13 final review; a deferral, not asked.
-
 ### A compressed file whose text has no final newline takes an appended member as lines of its own
 - Kind: known limitation
 - What the operator sees: a `.tsv.gz` (or `.bz2`, `.xz`, `.zst`) written by hand or by another tool whose text

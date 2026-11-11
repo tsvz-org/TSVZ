@@ -7085,18 +7085,11 @@ memoryOnly:{self.memoryOnly}
 			with lock:
 				if not dict.__contains__(self, key):
 					raise KeyError(key)
-				moved = [(k, row) for k, row in OrderedDict.items(self) if k != key] if not last else [(key, dict.get(self, key))]
-				if not self.memoryOnly:  # refused before memory or the queue change, as a set or a delete is
-					for k, row in moved:
-						if not k.startswith('#'):
-							self._checkDelete(k)
-							self._checkWritable(row)
+				moved = self._movedRows(key, last)  # (refused before memory or the queue change, as a set or a delete is)
 				OrderedDict.move_to_end(self, key, last)
 				if self.memoryOnly:
 					return self
-				lines = []
-				for k, row in moved:
-					lines += self._queueMove(k, row)
+				lines = self._queueMoves(moved)
 				self.lastUpdateTime = get_time_ns()
 				lost = not lock._is_owned()
 			if lost:
@@ -7105,6 +7098,27 @@ memoryOnly:{self.memoryOnly}
 			self._memLock.letGo()
 			raise
 		return self
+
+	# move_to_end's loops are methods of their own: Python 3.14 leaves a loop's back jump and test inside a try block out
+	# of the exception table, so a Ctrl-C there (a real signal lands at the back jump) skipped the section's exit and its
+	# clean-up, and the lock stayed held. A call is covered: the KeyboardInterrupt goes up through it as anywhere else.
+	def _movedRows(self, key, last):
+		"""The rows move_to_end queues again (the caller holds _memLock): every other key's for a move to the beginning,
+		else the key's own; each checked as a set or a delete is (_checkDelete, _checkWritable)."""
+		moved = [(k, row) for k, row in OrderedDict.items(self) if k != key] if not last else [(key, dict.get(self, key))]
+		if not self.memoryOnly:
+			for k, row in moved:
+				if not k.startswith('#'):
+					self._checkDelete(k)
+					self._checkWritable(row)
+		return moved
+
+	def _queueMoves(self, moved):
+		"""Queue the lines that move each of ``moved`` (_queueMove), the caller holding _memLock; the lines."""
+		lines = []
+		for k, row in moved:
+			lines += self._queueMove(k, row)
+		return lines
 
 	def _queueMove(self, key, row):
 		"""Queue what moves ``key`` to the end of the legacy file for every reader, the caller holding _memLock: its
