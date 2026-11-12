@@ -267,9 +267,9 @@ def test_basic_roundtrip():
 
 
 def test_version():
-	# (the scripts report the full form; pip and PyPI show it as 5.16)
-	assert TSVZ.version == '5.16'
-	assert TSVZ.__version__ == '5.16'
+	# (the scripts report the full form; pip and PyPI show it as 5.17)
+	assert TSVZ.version == '5.17'
+	assert TSVZ.__version__ == '5.17'
 	assert not hasattr(TSVZ, 'WalStore')
 
 
@@ -284,6 +284,8 @@ import zlib
 import io
 import random
 import errno
+import json
+import signal
 import stat
 import subprocess
 import threading
@@ -17796,7 +17798,7 @@ def test_a_real_signal_handler_that_uses_the_store_while_the_program_sets_rows_l
 def test_the_methods_that_change_memory_hold_no_cell_variables():
 	# A nested function that uses a method's names makes them cell variables of the whole method, read through a cell at
 	# every use: the 5.15 plan's first prototype of the redo did that and cost 7 to 9% of a set. The redos are methods.
-	for name in ('__setitem__', '__delitem__', 'pop', 'popitem', 'move_to_end', 'setDefaults', '_specSetItem',
+	for name in ('__setitem__', '__delitem__', 'pop', 'popitem', 'move_to_end', '_move', 'setDefaults', '_specSetItem',
 				 '_specSetMarker', '_specDelItem'):
 		assert getattr(TSVZ.TSVZed, name).__code__.co_cellvars == (), name  # (5.14's move_to_end had its key, before 3.12)
 
@@ -18668,8 +18670,9 @@ def test_a_forked_child_of_a_one_column_store_with_monitoring_off_keeps_its_pare
 
 #: ARGV: TSVZ's directory, the file, MON ('off' or 'on': monitor_external_changes). A two-column store holding a and b
 #: (no rewrite option), then fork(): the parent sets a to 2 and commits, and the child then moves a to the end and ends by
-#: its normal exit, its status printed; the parent closes last. The child has 10 s (an alarm): it ends in well under a
-#: second, and a failure here is a stale row, not a wait.
+#: its normal exit, its status printed; the parent closes last. The child has 10 s (an alarm) from the parent's go-ahead:
+#: it ends in well under a second, and a failure here is a stale row, not a wait. (The alarm started at the fork until
+#: 5.17, so a parent slow over its set, commit and fsync on a busy machine failed the test with no fault in the store.)
 _FORKED_STALE_MOVE = r"""
 import os, signal, sys
 sys.path.insert(0, sys.argv[1])
@@ -18683,8 +18686,9 @@ t.commitAppendToFile()
 go = os.pipe()
 pid = os.fork()
 if pid == 0:
-	signal.alarm(10)
+	os.close(go[1])  # (the parent's end: a parent that dies before its go-ahead ends this read, not leaves it waiting)
 	os.read(go[0], 1)  # (the parent's a=2 is in the file)
+	signal.alarm(10)
 	t.move_to_end('a')
 	sys.exit(0)  # (the normal exit: atexit runs, and writes the move)
 t['a'] = ['a', '2']
@@ -18713,6 +18717,577 @@ def test_a_forked_child_that_moves_a_row_its_parent_changed_after_the_fork_keeps
 	assert done.returncode == 0 and 'child 0' in done.stdout, done.stdout + done.stderr
 	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
 	assert list(rows) == ['b', 'a'] and rows['a'] == ['a', '2'], (list(rows.items()), done.stderr)  # (the move, the parent's value)
+
+
+#: ARGV: TSVZ's directory, the file, MODE, WHO. A store holding a; this process holds get_file_obj(MODE) across a fork
+#: and waits for its child before it lets go. WHO child (the control): the child sets d and ends by its normal exit. WHO
+#: grand: the child holds nothing, forks a child of its own and waits for it; that grandchild sets d and ends by its
+#: normal exit, and the child ends with its status (100 + the signal that ended it, or its exit code). Alarms: 10 s in the
+#: grandchild and 20 s in the child, which outlives a grandchild that waits for ever to report it; each ends in well
+#: under a second.
+_FORKED_GRANDCHILD = r"""
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, mode, who = sys.argv[2], sys.argv[3], sys.argv[4]
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)  # (no tick writes)
+t['a'] = ['a', '1']
+t.commitAppendToFile()
+f = t.get_file_obj(mode)
+pid = os.fork()
+if pid == 0:
+	signal.alarm(20)
+	if who == 'child':
+		t['d'] = ['d', '1']
+		sys.exit(0)  # (the normal exit: atexit runs)
+	grand = os.fork()
+	if grand == 0:
+		signal.alarm(10)
+		t['d'] = ['d', '1']
+		sys.exit(0)
+	_, code = os.waitpid(grand, 0)
+	os._exit(100 + os.WTERMSIG(code) if os.WIFSIGNALED(code) else os.WEXITSTATUS(code))
+_, code = os.waitpid(pid, 0)
+t.release_file_obj(f)
+print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+t.close()
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
+@pytest.mark.parametrize('who', ['child', 'grand'])
+@pytest.mark.parametrize('mode', ['ab', 'r+b'])
+def test_a_forked_childs_own_child_writes_nothing_at_its_exit_where_an_ancestor_holds_the_file(tmp_path, mode, who):
+	# A child forked while its parent holds get_file_obj() writes nothing at its close or exit, and says so: the parent may
+	# be waiting for it (docs/limitations.md). Its own child did not learn of the hold: the fork hook copied only the direct
+	# parent's (_parentHeldFile = _fileObjHeld), and the child's own hook had set its _fileObjHeld to False. So the
+	# grandchild's exit wrote its row, waiting for the grandparent's file lock while the grandparent waited for the child
+	# and the child for it: all three waited for ever (5.15 and 5.16; 5.14's children wrote nothing at their exit). From
+	# 5.17 the hook keeps an ancestor's hold, and the warning names an ancestor. 'child' is the control.
+	p = str(tmp_path / 's.tsv')
+	script = tmp_path / 'forked.py'
+	script.write_text(_FORKED_GRANDCHILD)
+	# 60 s: the run takes a second; only a wait for ever takes this long, on a machine the suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, mode, who], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+						  universal_newlines=True, timeout=60)
+	assert done.returncode == 0 and 'child 0' in done.stdout, done.stdout + done.stderr
+	assert 'd' not in TSVZ.readTabularFile(p, header='id\tv', verbose=False), done.stderr
+	said = ('its parent held the file (get_file_obj) at the fork' if who == 'child' else
+			'an ancestor held the file (get_file_obj) at an earlier fork')
+	assert done.stderr.count(said) == 1, done.stderr
+
+
+#: ARGV: TSVZ's directory, the file, AGAIN ('again': the child sets rewrite_on_exit again; else 'as-forked'). A store with
+#: rewrite_on_exit, rewrite_interval and monitoring off, holding a twice (a superseded line) and b; then fork(): the child
+#: prints its three settings, sets c and ends by its normal exit; the parent prints its own once the child ended, and
+#: ends by os._exit (its own rewrite at exit would hide what the child's exit wrote). The child has 10 s (an alarm): it
+#: ends in well under a second.
+_FORKED_SETTINGS = r"""
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, again = sys.argv[2], sys.argv[3] == 'again'
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60,  # (no tick writes)
+				rewrite_on_exit=True, rewrite_interval=3600, monitor_external_changes=False)
+for value in '12':
+	t['a'] = ['a', value]
+	t.commitAppendToFile()
+t['b'] = ['b', '1']
+t.commitAppendToFile()
+pid = os.fork()
+if pid == 0:
+	signal.alarm(10)
+	print('child', t.rewrite_on_exit, t.rewrite_interval, t.monitor_external_changes, flush=True)
+	if again:
+		t.rewrite_on_exit = True
+	t['c'] = ['c', '1']
+	sys.exit(0)  # (the normal exit: atexit runs)
+_, code = os.waitpid(pid, 0)
+print('parent', t.rewrite_on_exit, t.rewrite_interval, t.monitor_external_changes,
+	  os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+os._exit(0)
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
+@pytest.mark.parametrize('again', ['as-forked', 'again'])
+def test_a_forked_child_takes_none_of_its_parents_single_writer_settings(tmp_path, again):
+	# The parent writes the file too, so a forked child takes none of the settings that assume one writer: it follows the
+	# file (monitor_external_changes reads True there, 5.16) and does not rewrite it on its own (rewrite_on_exit False,
+	# rewrite_interval 0, 5.17). The parent keeps what it was given. So the child's exit only appends: the superseded line of
+	# a stays, until a rewrite by anyone; a child that sets rewrite_on_exit again compacts the file at its exit, as before.
+	p = str(tmp_path / 's.tsv')
+	script = tmp_path / 'forked.py'
+	script.write_text(_FORKED_SETTINGS)
+	# 60 s: the run takes a second; only a wait for ever takes this long, on a machine the suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, again], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+						  universal_newlines=True, timeout=60)
+	assert done.returncode == 0, done.stdout + done.stderr
+	assert 'child False 0 True\n' in done.stdout and 'parent True 3600 False 0\n' in done.stdout, done.stdout + done.stderr
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False) == {'a': ['a', '2'], 'b': ['b', '1'], 'c': ['c', '1']}
+	compacted = b'id\tv\na\t2\nb\t1\nc\t1\n'
+	assert (_bytes(p) == compacted) == (again == 'again'), _bytes(p)
+
+
+#: ARGV: TSVZ's directory, the file, END. A store whose rewrite fails part way (an ENOSPC injected into its write, in this
+#: process only) leaves the file damaged and memory the only good copy; then fork(). Once the parent has set p2 and
+#: committed (merged after the damage), the child sets c2, commits and ends by END (close: close(), then os._exit; exit:
+#: its normal exit; roe-exit: the same with rewrite_on_exit); the parent then closes, and its rewrite gets through. The
+#: child has 10 s (an alarm) from the parent's go-ahead: it ends in well under a second.
+_FORKED_DAMAGED_PARENT = r"""
+import io, os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, end = sys.argv[2], sys.argv[3]
+with open(p, 'w') as f:
+	f.write('id\tv\n')
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60,  # (no tick writes)
+				rewrite_on_exit=end == 'roe-exit')
+for value in '01':
+	for k in 'abcdefgh':
+		t[k] = [k, value * 30]
+	t.commitAppendToFile()
+t.move_to_end('a')
+t.commitAppendToFile()
+real, parent, failing = TSVZ._writeLines, os.getpid(), [True]
+def cut(file, header, lines, *args, **kwargs):  # (a third of the rewrite written, then the disk is full)
+	if failing[0] and os.getpid() == parent:
+		buf = io.BytesIO()
+		real(buf, header, lines, *args, **kwargs)
+		file.write(buf.getvalue()[:len(buf.getvalue()) // 3])
+		file.flush()
+		raise OSError(28, 'No space left on device (injected)')
+	return real(file, header, lines, *args, **kwargs)
+TSVZ._writeLines = cut
+t.rewrite(force=True)
+failing[0] = False
+print('damaged', t._damaged, flush=True)
+go = os.pipe()
+pid = os.fork()
+if pid == 0:
+	os.close(go[1])
+	os.read(go[0], 1)  # (the parent's p2 is in the file)
+	signal.alarm(10)
+	t['c2'] = ['c2', '2']
+	t.commitAppendToFile()
+	if end == 'close':
+		t.close()
+		os._exit(0)
+	sys.exit(0)  # (the normal exit: atexit runs)
+t['p2'] = ['p2', '2']
+t.commitAppendToFile()
+os.write(go[1], b'x')
+_, code = os.waitpid(pid, 0)
+print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+t.close()
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
+@pytest.mark.parametrize('end', ['close', 'exit', 'roe-exit'])
+def test_a_forked_childs_row_survives_its_parents_failed_rewrite(tmp_path, end):
+	# A rewrite that fails part way leaves the file damaged and memory the only good copy, until a rewrite gets through
+	# (the merge rule: what another writer appends after the bytes the damage left is merged, anything else overwritten).
+	# A child forked then took its parent's failed rewrite to try again, and its rewrite_on_exit: its close or exit made
+	# the file again from its memory, and the parent's next rewrite took that for a change it could not merge and wrote
+	# over it, so the child's row was lost (5.14 to 5.16; the 5.15 re-review). From 5.17 the child takes none of its
+	# parent's duties to the file: its close and exit only append, and the parent's merge rule takes the row in.
+	p = str(tmp_path / 's.tsv')
+	script = tmp_path / 'forked.py'
+	script.write_text(_FORKED_DAMAGED_PARENT)
+	# 60 s: the run takes a second; only a wait for ever takes this long, on a machine the suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, end], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+						  universal_newlines=True, timeout=60)
+	assert done.returncode == 0 and 'damaged True' in done.stdout and 'child 0' in done.stdout, done.stdout + done.stderr
+	want = dict((k, [k, '1' * 30]) for k in 'abcdefgh')
+	want.update(p2=['p2', '2'], c2=['c2', '2'])
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False) == want, done.stderr
+
+
+#: ARGV: TSVZ's directory, the file (.tsv.gz). A store of 2,000 rows, then fork(): once the parent has set p2 and committed,
+#: the child sets and commits 50 rows one at a time, counting the bytes each commit looks at for damage (_decodeMembers);
+#: then another writer (a plain append, as a tool that is not TSVZ) leaves damage after them, and the child sets and
+#: commits d and ends by its normal exit. Printed: the bytes the first commit looked at, and those the 49 after it did.
+#: The child has 60 s (an alarm) from the parent's go-ahead: it takes about a second.
+_FORKED_GZ_COMMITS = r"""
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p = sys.argv[2]
+TSVZ.appendLinesTabularFile(p, [['k%04d' % i, 'v%d' % i] for i in range(2000)], header='id\tv', createIfNotExist=True,
+							verbose=False)
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)  # (no tick writes)
+go = os.pipe()
+pid = os.fork()
+if pid == 0:
+	os.close(go[1])
+	os.read(go[0], 1)  # (the parent's p2 is in the file)
+	signal.alarm(60)
+	looked = []
+	decode = TSVZ._decodeMembers
+	def counted(codec, data):
+		looked[-1] += len(data)
+		return decode(codec, data)
+	TSVZ._decodeMembers = counted
+	for i in range(50):
+		looked.append(0)
+		t['c%d' % i] = ['c%d' % i, 'x']
+		t.commitAppendToFile()
+	print('looked', looked[0], sum(looked[1:]), flush=True)
+	with open(p, 'ab') as f:
+		f.write(b'\x00\x01 these bytes do not decode \xff\xfe' * 4)
+	t['d'] = ['d', 'x']
+	t.commitAppendToFile()  # (it finds the damage, and makes the file again from memory)
+	sys.exit(0)  # (the normal exit: atexit runs)
+t['p2'] = ['p2', '1']
+t.commitAppendToFile()
+os.write(go[1], b'x')
+_, code = os.waitpid(pid, 0)
+print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+t.close()
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
+def test_a_forked_childs_commits_to_a_compressed_file_look_only_at_what_is_new(tmp_path):
+	# A commit to a compressed file that another process changed looks at what that process appended for damage (every read
+	# stops at it, so rows appended after it would be read by no one). It looked from the bytes the store last read or
+	# wrote, and a forked child has no tick to read the change and move that mark: each commit looked at the parent's
+	# member and at every member the child had appended since, so each cost more than the one before (5.16: 0.76 ms, then
+	# 5.02 ms by the 4,000th, on a 2,000-row .tsv.gz). From 5.17 the mark moves past what a commit looked at and wrote: the
+	# first commit looks at the parent's member, the next ones at nothing (the file kept still), and damage another writer
+	# leaves after them is still found (the file made again from memory: every row readable).
+	p = str(tmp_path / 's.tsv.gz')
+	script = tmp_path / 'forked.py'
+	script.write_text(_FORKED_GZ_COMMITS)
+	# 60 s for the child, 120 s here: the run takes a few seconds; only a wait for ever takes this long, on a machine the
+	# suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+						  universal_newlines=True, timeout=120)
+	assert done.returncode == 0 and 'child 0' in done.stdout, done.stdout + done.stderr
+	first, rest = [int(n) for n in done.stdout.split('looked ')[1].split()[:2]]
+	assert 0 < first < 200 and rest == 0, done.stdout  # (the parent's member, of about 30 bytes; then nothing)
+	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
+	assert len(rows) == 2052 and rows['p2'] == ['p2', '1'] and rows['c49'] == ['c49', 'x'] and rows['d'] == ['d', 'x'], len(rows)
+
+
+#: ARGV: TSVZ's directory, the file, WHERE, AT, HANDLER. A store holding a and b; WHERE child: a forked child's store, the
+#: parent waiting for it; closed: the store after close(), no fork. The main thread sets c and commits; a signal (SIGUSR1)
+#: lands inside that commit, AT lock (just after it takes the file's append lock: writeLock held, nothing written yet) or
+#: fsync (after its write), and its handler uses the same store. HANDLER: commit (after a set of h), reload, move
+#: (move_to_end('a')), moved (the same, after another writer changed a: the move follows the file first), clear, rewrite
+#: (rewrite(force=True)) or set (of h). Printed once the commit returns: whether the signal landed, and memory's keys in
+#: order; then the store commits what the handler queued, and the test reads the file. 10 s (an alarm): the commit takes
+#: milliseconds, and a wait for ever is what fails.
+_HANDLER_IN_OWN_WRITE = r"""
+import json, os, signal, sys, threading
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, where, at, handler = sys.argv[2:6]
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)  # (no tick writes)
+t['a'] = ['a', '1']
+t['b'] = ['b', '1']
+t.commitAppendToFile()
+def handle(sig, frame):
+	if handler == 'commit':
+		t['h'] = ['h', '1']
+		t.commitAppendToFile()
+	elif handler == 'reload':
+		t.reload()
+	elif handler in ('move', 'moved'):
+		t.move_to_end('a')
+	elif handler == 'clear':
+		t.clear()
+	elif handler == 'rewrite':
+		t.rewrite(force=True)
+	else:
+		t['h'] = ['h', '1']
+def work():
+	signal.alarm(10)
+	signal.signal(signal.SIGUSR1, handle)
+	fired, main = [], threading.get_ident()
+	name = '_fsync' if at == 'fsync' else '_lockFile'
+	real = getattr(TSVZ, name)
+	def hook(*args, **kwargs):
+		done = real(*args, **kwargs)
+		if not fired and threading.get_ident() == main and (at == 'fsync' or kwargs.get('mode') == TSVZ._APPEND):
+			fired.append(1)
+			os.kill(os.getpid(), signal.SIGUSR1)  # (the handler runs here, in the commit)
+		return done
+	setattr(TSVZ, name, hook)
+	if handler == 'moved':
+		with open(p, 'ab') as f:
+			f.write(b'a\t2\n')  # (another writer's change of a, which the store has not read)
+	t['c'] = ['c', '1']
+	t.commitAppendToFile()
+	setattr(TSVZ, name, real)
+	print(json.dumps([bool(fired), list(t), t.get('a')]), flush=True)
+	t.commitAppendToFile()
+if where == 'closed':
+	t.close()
+	work()
+	os._exit(0)
+pid = os.fork()
+if pid == 0:
+	work()
+	os._exit(0)
+_, code = os.waitpid(pid, 0)
+print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+t.close()
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork') or os.name != 'posix', reason='fork() and SIGUSR1')
+@pytest.mark.parametrize('handler', ['commit', 'reload', 'move', 'moved', 'clear', 'rewrite', 'set'])
+@pytest.mark.parametrize('at', ['lock', 'fsync'])
+@pytest.mark.parametrize('where', ['child', 'closed'])
+def test_a_forked_childs_or_closed_stores_signal_handler_inside_its_own_write_runs_after_it(tmp_path, where, at, handler):
+	# A store with no writer thread (a forked child's, or one after close()) writes in the thread that asks, under writeLock.
+	# A signal handler that lands inside such a write and uses the same store took writeLock again on the same thread, and
+	# waited for ever: a commit, reload(), clear() or rewrite() wherever it landed, and a move_to_end() that follows the
+	# file first (once the write's bytes are in, or after another writer's change). 5.14 to 5.16 alike (docs/limitations.md
+	# had them as a known limitation and a deferral). From 5.17 such a call is put off until the write it landed in ends,
+	# and made then (a move with its follow, so another writer's change of the row is kept); a set returns at once, as
+	# before. Memory and the file then agree.
+	p = str(tmp_path / 's.tsv')
+	script = tmp_path / 'handler.py'
+	script.write_text(_HANDLER_IN_OWN_WRITE)
+	# 60 s: the run takes a second; only a wait for ever takes this long, on a machine the suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, where, at, handler], stdout=subprocess.PIPE,
+						  stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	assert done.returncode == 0 and (where == 'closed' or 'child 0' in done.stdout), done.stdout + done.stderr
+	fired, memory, a = json.loads([line for line in done.stdout.split('\n') if line.startswith('[')][0])  # (TSVZ prints 'Created' first)
+	want = {'commit': ['a', 'b', 'c', 'h'], 'reload': ['a', 'b', 'c'], 'move': ['b', 'c', 'a'], 'moved': ['b', 'c', 'a'],
+			'clear': [], 'rewrite': ['a', 'b', 'c'], 'set': ['a', 'b', 'c', 'h']}[handler]
+	assert fired and memory == want, done.stdout + done.stderr
+	if handler == 'moved':
+		assert a == ['a', '2'], done.stdout  # (the move followed the other writer's change first)
+	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
+	assert list(rows) == want and (handler != 'moved' or rows['a'] == ['a', '2']), (list(rows.items()), done.stderr)
+	assert 'Failed' not in done.stderr, done.stderr
+
+
+def test_a_second_signal_handler_inside_letgo_lets_the_first_one_go_on():
+	# _RLock.letGo() lets go of what this thread holds, as long as it holds it. A second signal handler that uses the store,
+	# landing between its test of the hold and its release, let go of the hold itself, and the first handler's release then
+	# raised RuntimeError ("cannot release un-acquired lock") out of its commit, set or other use of the store (5.14 to 5.16;
+	# the suite's real-signal test met it once under load, its 2 ms timer firing again inside a handler's commit). A release
+	# that finds no hold is ignored now, as a section's exit ignores one.
+	class Landed(TSVZ._SectionLock):
+		second = []
+
+		def _is_owned(self):
+			owned = TSVZ._SectionLock._is_owned(self)
+			if owned and not Landed.second:
+				Landed.second.append(1)
+				self.letGo()  # (the second handler's let-go, between the first one's test and its release)
+			return owned
+	lock = Landed()
+	lock.acquire()
+	lock.letGo()
+	assert Landed.second and not lock._is_owned()
+
+
+#: ARGV: TSVZ's directory, the file, WHEN, END. A .tsv.gz store with monitor_external_changes=False holding a and b; damage
+#: (bytes that do not decode, from a writer that is not TSVZ) lands in the file WHEN: before the fork (after the store's
+#: load) or after it. The child sets c and ends by END (commit: commitAppendToFile(), then os._exit; close: close(), then
+#: os._exit; exit: its normal exit). The child has 10 s (an alarm) from the parent's go-ahead.
+_FORKED_AFTER_DAMAGE = r"""
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, when, end = sys.argv[2], sys.argv[3], sys.argv[4]
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60,  # (no tick writes)
+				monitor_external_changes=False)
+t['a'] = ['a', '1']
+t['b'] = ['b', '1']
+t.commitAppendToFile()
+def damage():
+	with open(p, 'ab') as f:
+		f.write(b'\x00\x01 these bytes do not decode \xff\xfe' * 4)
+if when == 'before':
+	damage()
+go = os.pipe()
+pid = os.fork()
+if pid == 0:
+	os.close(go[1])
+	os.read(go[0], 1)
+	signal.alarm(10)
+	t['c'] = ['c', '1']
+	if end == 'commit':
+		t.commitAppendToFile()
+		os._exit(0)
+	if end == 'close':
+		t.close()
+		os._exit(0)
+	sys.exit(0)  # (the normal exit: atexit runs)
+if when == 'after':
+	damage()
+os.write(go[1], b'x')
+_, code = os.waitpid(pid, 0)
+print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+os._exit(0)
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
+@pytest.mark.parametrize('end', ['commit', 'close', 'exit'])
+@pytest.mark.parametrize('when', ['before', 'after'])
+def test_a_forked_childs_rows_are_readable_after_damage_another_writer_left_with_monitoring_off(tmp_path, when, end):
+	# docs/limitations.md, "Appends that do not read the store first land after damage": a TSVZed with
+	# monitor_external_changes=False appends without reading the file, so after damage every read stops at, its rows land
+	# where no read reaches them. A forked child's store follows the file whatever the setting says (5.16), so its commit
+	# finds the damage and makes the file again from memory: 5.15 lost c in all six cases.
+	p = str(tmp_path / 's.tsv.gz')
+	script = tmp_path / 'forked.py'
+	script.write_text(_FORKED_AFTER_DAMAGE)
+	# 60 s: the run takes a second; only a wait for ever takes this long, on a machine the suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, when, end], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+						  universal_newlines=True, timeout=60)
+	assert done.returncode == 0 and 'child 0' in done.stdout, done.stdout + done.stderr
+	assert TSVZ.readTabularFile(p, header='id\tv', verbose=False) == {'a': ['a', '1'], 'b': ['b', '1'], 'c': ['c', '1']}, \
+		done.stderr
+
+
+#: ARGV: TSVZ's directory, the file, MODE, CHANGED, OP. A store that committed a and b; CHANGED 'changed': a line is then
+#: appended to the file by a plain open() (another writer's change, which the store has not read); 'still': none. The
+#: parent then holds get_file_obj(MODE), prints how its file lock is held (_HELD: 'ofd' byte ranges on Linux, 'flock'
+#: elsewhere), forks, and waits for the child while it holds the file. The child does OP (move: move_to_end('a');
+#: set+move: a set first; check+rewrite: checkExternalChanges() then rewrite()) and ends by its normal exit. 10 s (an
+#: alarm in the child): one that does not wait ends in well under a second, and a wait for ever is what is looked for.
+_FORKED_HELD = r"""
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, mode, changed, op = sys.argv[2], sys.argv[3], sys.argv[4] == 'changed', sys.argv[5]
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)  # (no tick writes)
+t['a'] = ['a', '1']
+t['b'] = ['b', '1']
+t.commitAppendToFile()
+if changed:
+	with open(p, 'ab') as g:
+		g.write(b'x\t1\n')
+f = t.get_file_obj(mode)
+print('lock', sorted(set(held[0] for held in TSVZ._HELD.values())), flush=True)
+pid = os.fork()
+if pid == 0:
+	signal.alarm(10)
+	if op.startswith('set'):
+		t['c'] = ['c', '1']
+	if 'move' in op:
+		t.move_to_end('a')
+	if 'check' in op:
+		t.checkExternalChanges()
+		t.rewrite()
+	sys.exit(0)  # (the normal exit: atexit runs)
+_, code = os.waitpid(pid, 0)
+t.release_file_obj(f)
+print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+t.close()
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork') or os.name != 'posix', reason='fork() and SIGALRM')
+@pytest.mark.parametrize('mode, changed, op', [('ab', 'changed', 'move'), ('ab', 'changed', 'set+move'),
+											   ('r+b', 'changed', 'move'), ('r+b', 'changed', 'check+rewrite'),
+											   ('ab', 'still', 'set+move'), ('r+b', 'still', 'move')])
+def test_a_forked_child_whose_parent_holds_the_file_waits_only_where_its_known_limitation_says(tmp_path, mode, changed, op):
+	# docs/limitations.md, "A forked child writes nothing at its close or exit when its parent held get_file_obj() at the
+	# fork": a child's move_to_end(), and its checkExternalChanges() then rewrite(), wait for ever while the parent holds the
+	# file and waits for it, where they follow a change to the file (one since the child's store last read or wrote it) and
+	# the hold keeps that read or its commit out: a hold in a mode without 'a' (the rewrite lock, which reads wait for), any
+	# hold where the file lock is a whole-file flock, or rows the child queued, which the follow commits. On Linux a child
+	# with nothing queued reads beside an 'ab' hold, and with no change to follow nothing waits. This pins those waits (the
+	# 5.16 final review's held.py, the docs pass's held2.py): a change that ends one fails here, and the entry changes with it.
+	p = str(tmp_path / 's.tsv')
+	script = tmp_path / 'forked.py'
+	script.write_text(_FORKED_HELD)
+	# 60 s: the run takes a second, or 10 s where the child waits (its alarm); only a wait past the alarm takes this long.
+	done = subprocess.run([sys.executable, str(script), HERE, p, mode, changed, op], stdout=subprocess.PIPE,
+						  stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	assert done.returncode == 0 and 'child' in done.stdout, done.stdout + done.stderr
+	flock = "'flock'" in [line for line in done.stdout.split('\n') if line.startswith('lock ')][0]  # (TSVZ prints 'Created' first)
+	waits = changed == 'changed' and ('a' not in mode or flock or op.startswith('set'))
+	assert ('child signal %d' % signal.SIGALRM in done.stdout) == waits and ('child 0' in done.stdout) == (not waits), \
+		done.stdout + done.stderr
+
+
+#: ARGV: TSVZ's directory, the file, KIND, CHILD. A store whose writer thread is inside a write (held in _writeLines until
+#: the child is forked): KIND clear (clear()'s), interval (the tick's rewrite, rewrite_interval due on a dirty store) or
+#: delete (a one-column store's delete, whose commit is a rewrite). Then the parent sets p2 and commits (behind the write),
+#: and the child, CHILD set: sets c, none: sets nothing, and ends by its normal exit; the parent closes last. The child has
+#: 10 s (an alarm) from the parent's go-ahead: it ends in well under a second.
+_FORKED_WRITING = r"""
+import os, signal, sys, threading, time
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, kind, child = sys.argv[2], sys.argv[3], sys.argv[4]
+one = kind == 'delete'
+row = (lambda k, v: [k]) if one else (lambda k, v: [k, v])
+t = TSVZ.TSVZed(p, header='id' if one else 'id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60,
+				rewrite_interval=0.05 if kind == 'interval' else 0)  # (no tick writes: the interval's rewrite is run below)
+t['a'] = row('a', '1')
+for value in '01':
+	t['b'] = row('b', value)
+	t.commitAppendToFile()  # (two columns: b's first line is superseded, the store dirty)
+if kind == 'interval':
+	time.sleep(0.2)  # (the file kept still for four times rewrite_interval: the rewrite is due)
+inside, go = threading.Event(), threading.Event()
+write, parent = TSVZ._writeLines, os.getpid()
+def held(*args, **kwargs):  # (the parent's write waits here, begun, until the child is forked)
+	if os.getpid() == parent and not inside.is_set():
+		inside.set()
+		go.wait(10)
+	return write(*args, **kwargs)
+TSVZ._writeLines = held
+if kind == 'clear':
+	job = t.clear
+elif kind == 'interval':
+	job = lambda: t._call(t._rewrite, False, None, True)  # (what the writer thread's tick runs)
+else:
+	def job():
+		del t['b']
+		t.commitAppendToFile()
+threading.Thread(target=job, daemon=True).start()
+inside.wait(10)
+ready = os.pipe()
+pid = os.fork()
+if pid == 0:
+	os.close(ready[1])
+	os.read(ready[0], 1)  # (the parent's write is over, and its p2 is in the file)
+	signal.alarm(10)
+	if child == 'set':
+		t['c'] = row('c', '1')
+	sys.exit(0)  # (the normal exit: atexit runs)
+go.set()
+t['p2'] = row('p2', '1')
+t.commitAppendToFile()  # (behind the write)
+os.write(ready[1], b'x')
+_, code = os.waitpid(pid, 0)
+print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+t.close()
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
+@pytest.mark.parametrize('child', ['none', 'set'])
+@pytest.mark.parametrize('kind', ['clear', 'interval', 'delete'])
+def test_a_forked_child_of_a_store_inside_a_write_keeps_what_its_parent_wrote_after(tmp_path, kind, child):
+	# The 5.15 final review's fork tests forked inside an explicit rewrite() (the 'writing' cases above); these fork inside a
+	# clear()'s write, the tick's interval rewrite and a one-column delete's commit, which set the same mark of a write under
+	# way (_damaged): taken by the child, its exit wrote its fork-time memory over the parent's later rows. The child takes
+	# none of its parent's duties to the file (5.15; 5.17's rule), so the parent's write, its p2 and its delete stay.
+	header = 'id' if kind == 'delete' else 'id\tv'
+	p = str(tmp_path / 's.tsv')
+	script = tmp_path / 'forked.py'
+	script.write_text(_FORKED_WRITING)
+	# 60 s: the run takes a second; only a wait for ever takes this long, on a machine the suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, kind, child], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+						  universal_newlines=True, timeout=60)
+	assert done.returncode == 0 and 'child 0' in done.stdout, done.stdout + done.stderr
+	keys = sorted(TSVZ.readTabularFile(p, header=header, verbose=False))
+	want = {'clear': ['p2'], 'interval': ['a', 'b', 'p2'], 'delete': ['a', 'p2']}[kind] + (['c'] if child == 'set' else [])
+	assert keys == sorted(want), (keys, done.stderr)
 
 
 # --------------------------------------------------------------------------

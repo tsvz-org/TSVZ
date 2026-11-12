@@ -44,7 +44,7 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.16'
+version = '5.17'
 __version__ = version
 author = 'pan@zopyr.us'
 COMMIT_DATE = '2026-11-11'
@@ -5660,9 +5660,14 @@ class _RLock(_thread.RLock):
 	__slots__ = ()
 
 	def letGo(self):
-		"""Let go of what a Ctrl-C left this thread holding; the caller is in no section."""
+		"""Let go of what a Ctrl-C left this thread holding; the caller is in no section. A release that finds no hold is
+		ignored, as _SectionLock.__exit__ ignores one: a second signal handler that uses the store, landing between the test
+		and the release, let go of it first (5.17; until then the first handler's use of the store raised RuntimeError)."""
 		while self._is_owned():
-			self.release()
+			try:
+				self.release()
+			except RuntimeError:
+				return  # (let go of by a handler inside this call)
 
 
 class _SectionLock(_RLock):
@@ -5965,9 +5970,12 @@ class TSVZed(OrderedDict):
 		mapToFile() or hardMapToFile(), or scrub the file, to compact it. The three automatic rewrites
 		(rewrite_on_load, rewrite_on_exit, rewrite_interval) are planned to go in a future version, for explicit calls.
 	rewrite_on_exit : bool, default=False
-		If True, rewrites the entire file when closing/exiting, dirty or not (5.6).
+		If True, rewrites the entire file when closing/exiting, dirty or not (5.6). In a child that fork() made it is False
+		(5.17): the parent writes the file too, so the child's close and exit only append; set it again there to have the
+		child's close rewrite.
 	rewrite_interval : float, default=0
-		Minimum time interval (in seconds) between full file rewrites. 0 means do not rewrite.
+		Minimum time interval (in seconds) between full file rewrites. 0 means do not rewrite. In a child that fork() made
+		it is 0 (5.17), as rewrite_on_exit is False.
 	append_check_delay : float, default=0.01
 		Time delay (in seconds) between checks of the append queue by the worker thread.
 	monitor_external_changes : bool, default=True
@@ -6177,6 +6185,7 @@ class TSVZed(OrderedDict):
 			self._writeFailing = False
 			self._specLoaded = False
 		self._requests = deque()  # the jobs _call hands the writer thread
+		self._deferred = deque()  # with no writer thread: the calls a signal handler made inside this store's own job (_runHere)
 		self._wake = _Flag()  # set when one is handed: the thread does not wait out its tick
 		self._workerDone = _Flag()  # set as the writer thread ends (_workerRuns)
 		self._workerPid = os.getpid()
@@ -7097,8 +7106,18 @@ memoryOnly:{self.memoryOnly}
 			# The move queues rows memory holds again, so memory must be the file first: another process's change since
 			# the last tick would be undone by those rows. What the writer thread's tick does: follow the change, and
 			# rewrite only when one is due. (A stat, so a loop of moves stays cheap.)
+			if not self._workerRuns() and self._jobHere():
+				# A signal handler's move inside this store's own write, with no writer thread (after close(), in a forked
+				# child): the follow waits for that write to end (_runHere), and so does the move, which must come after it.
+				self._deferred.extend([(self._checkExternalChanges, ()), (self._rewrite, (False, None, True)),
+									   (self._move, (key, last))])
+				return self
 			self.checkExternalChanges()
 			self._call(self._rewrite, False, None, True)
+		return self._move(key, last)
+
+	def _move(self, key, last):
+		"""move_to_end()'s move of a legacy store's ``key``, once memory follows the file."""
 		try:  # (a Ctrl-C that skipped the with statement's exit leaves no hold behind: see _SectionLock)
 			lock = self._memLock
 			with lock:
@@ -7200,7 +7219,8 @@ memoryOnly:{self.memoryOnly}
 					  self.teeLogger)
 			self._specSync(reloadInternalFromFile)
 			return False
-		return self._call(self._rewrite, force, reloadInternalFromFile)
+		made = self._call(self._rewrite, force, reloadInternalFromFile)
+		return True if made is self else made  # (self: put off until this store's own write ends, _runHere)
 
 	def _rewrite(self, force=False, reloadInternalFromFile=None, background=False):
 		"""rewrite() for a legacy file. ``background``: the background writer's tick, which takes in another process's
@@ -7256,12 +7276,14 @@ memoryOnly:{self.memoryOnly}
 
 	def _externalChange(self):
 		"""True when the file changed since this object last wrote or read it: a later modification time, or another
-		size than the bytes it knows (an append that landed right after its own, in the same tick)."""
+		size than the bytes it knows (an append that landed right after its own, in the same tick); or it holds another
+		process's change a commit wrote after without reading it (_unseen)."""
 		try:
 			st = os.stat(self._fileName)
 		except OSError:
 			return False
-		return self.externalFileUpdateTime < _updateTimeNs(st) or (self._known is not None and st.st_size != self._known[1])
+		return (self._unseen or self.externalFileUpdateTime < _updateTimeNs(st)
+				or (self._known is not None and st.st_size != self._known[1]))
 
 	# ``(identity, size, sha256)`` of the bytes this store last read or wrote in its legacy file; None when not known.
 	_known = None
@@ -7278,8 +7300,10 @@ memoryOnly:{self.memoryOnly}
 	# The last whole read took line 1 for a widening of this store's header (_legacyExtendsHeader): the file reads loose, what
 	# is appended to it too, and a narrower set is padded. Set by that read alone, and every whole read sets it again.
 	_followedWidening = False
-	# A commit appended after another process's change it has not read: the file holds unread bytes after _known, so
-	# the next read is whole. _known still says how the file begins (a commit looks for damage after it).
+	# A commit appended after another process's change it has not read: the file holds bytes not read into memory, so the
+	# next read is whole (_externalChange and _changedSince are True meanwhile). _known still says how the file begins, as
+	# far as a commit of a compressed file looked at it for damage and with what that commit wrote (5.17), and the file's
+	# time is that write's: the next commit looks only after it (_movedSince).
 	_unseen = False
 	_refusedAt = None  # when a rewrite was last refused for text that cannot be written (_specClock); None when it was not
 	_refusalReported = False
@@ -7291,7 +7315,7 @@ memoryOnly:{self.memoryOnly}
 	_loadJob = None  # the load job (reload()'s) the writer thread runs: it stops once its waiter left (_call)
 	_forkReset = None  # the pid of the forked child whose fork hook reset the store (_afterFork)
 	_fileObjHeld = False  # get_file_obj() holds the file (writeLock and the file lock) until release_file_obj()
-	_parentHeldFile = False  # in a forked child: the parent held the file through get_file_obj() at the fork
+	_parentHeldFile = False  # in a forked child: 'its parent' or 'an ancestor' held the file through get_file_obj() at a fork
 	_loadReader = None  # that load's reader of a loose file, whose file _call swaps for _STOPPED
 
 	def _refuse(self, where, error, explicit=False):
@@ -7605,7 +7629,13 @@ memoryOnly:{self.memoryOnly}
 		return f
 
 	def _changedSince(self, f):
-		"""True when the open file ``f`` may not hold what _known says: unknown, another file, size or time."""
+		"""True when the open file ``f`` may hold more than memory took in: it moved (_movedSince), or holds another
+		process's change not read yet (_unseen: _known may then reach past it, as far as a commit looked for damage)."""
+		return self._unseen or self._movedSince(f)
+
+	def _movedSince(self, f):
+		"""True when the open file ``f`` may not be as this store last read, wrote or looked at it (_known): unknown,
+		another file, size or time."""
 		st = os.fstat(f.fileno())
 		known = self._known
 		return (known is None or st.st_size != known[1] or _updateTimeNs(st) != self.externalFileUpdateTime
@@ -8006,16 +8036,19 @@ memoryOnly:{self.memoryOnly}
 	def _call(self, fn, *args):
 		"""``fn(*args)``, run on the store's writer thread while this one waits. A KeyboardInterrupt stops the wait: a
 		write the thread has begun is finished, one it has not begun is taken back (its rows stay queued), and a load
-		stops (5.15). Run here on that thread itself, or when it is not running (after close, in a forked child)."""
-		if self.appendThread is threading.current_thread() or not self._workerRuns():
+		stops (5.15). Run here on that thread itself, or in this thread when it is not running (after close, in a forked
+		child: _runHere)."""
+		if self.appendThread is threading.current_thread():
 			return fn(*args)
+		if not self._workerRuns():
+			return self._runHere(fn, args)
 		self._memLock.letGo()  # (no section waits for the writer thread, which may need the lock: a hold is a Ctrl-C's)
 		job = [fn, args, _Flag(), None, None, False]  # fn, args, done, result, error, stop (its waiter left: a load stops)
 		try:  # (from before the job is queued: a Ctrl-C between the two would leave it to run)
 			self._requests.append(job)
 			self._wake.set()
 			if self._waitFor(job):
-				return fn(*args)  # (the thread stopped before it took the job)
+				return self._runHere(fn, args)  # (the thread stopped before it took the job)
 		except BaseException:
 			# A Ctrl-C ended the wait. A job not started is taken back: it never runs, so a clear() cannot come after rows
 			# the program sets once it caught the Ctrl-C (5.14 ran it later). Not at exit, where queued and running writes
@@ -8034,6 +8067,54 @@ memoryOnly:{self.memoryOnly}
 		if job[4] is not None:
 			raise job[4]
 		return job[3]
+
+	def _runHere(self, fn, args):
+		"""``fn(*args)`` in this thread, for a store whose writer thread does not run (after close(), in a forked child):
+		one job at a time, as that thread runs them. A call that a signal handler (or anything else run inside the job,
+		such as a teeLogger) makes to this store, on the thread where its job runs, is put off: it goes in _deferred and
+		runs as soon as the job ends, however it ends, and returns ``self`` meanwhile (5.17). Run inside the job, it took
+		writeLock again, which the job holds through its write, and waited for ever (5.14 to 5.16: a handler's commit,
+		reload(), clear() or rewrite(), or a move that follows the file, landing inside a forked child's or a closed
+		store's own write); between the job's locked steps it ran in the middle of the job, which a writer thread, one job
+		at a time, never does. A store with a writer thread hands its jobs to it, and a handler's call waits there for the
+		job under way, as another thread's does (handlers run on the main thread, which hands that thread its jobs)."""
+		if self._jobHere():
+			self._deferred.append((fn, args))
+			return self
+		self._runDeferred()  # (one that a handler put off just as a job ended, after that job's last look)
+		try:
+			return self._runJob(fn, args)
+		finally:
+			self._runDeferred()
+
+	def _runJob(self, fn, args):
+		"""The frame where _runHere runs a job: _jobHere looks for it on the thread's stack."""
+		return fn(*args)
+
+	def _jobHere(self):
+		"""True when a job of this store runs in this thread below the caller (_runJob's frame on its stack): the caller is
+		a signal handler (or a teeLogger) that it called into. The stack itself says so, exactly, so no mark is kept that a
+		Ctrl-C could leave set (one would put off every later call, and nothing would write them)."""
+		code = TSVZed._runJob.__code__
+		frame = sys._getframe(1)
+		while frame is not None:
+			if frame.f_code is code and frame.f_locals.get('self') is self:
+				return True
+			frame = frame.f_back
+		return False
+
+	def _runDeferred(self):
+		"""Run the calls put off inside this store's job (_runHere), in the order they were made, each as a job of its own.
+		Their callers have gone on, so an error is reported, not raised; a KeyboardInterrupt goes up, and the calls it
+		did not reach are made at the next call that runs here (close() and the exit make one)."""
+		deferred = self._deferred
+		while deferred:
+			fn, args = deferred.popleft()
+			try:
+				self._runJob(fn, args)  # (not _runHere, which would run the ones after it first; one put off inside it joins the line)
+			except Exception as e:
+				self.__teePrintOrNot(f"Failed at {getattr(fn, '__name__', fn)}() for {self._fileName}, a call made inside this "
+									 f"store's own write (a signal handler's) and put off until it ended: {e!r}",'error')
 
 	# The wait's loop is a method of its own: Python 3.12 to 3.14 leave a loop's back jump inside a try block out of the
 	# exception table, so a Ctrl-C there (a real signal lands at the back jump, in the few instructions after a step of
@@ -8209,22 +8290,32 @@ memoryOnly:{self.memoryOnly}
 				_unlockFile(f)
 				f.close()
 				return self
-			known = None
+			known = looked = None
 			try:
 				known = None if self._changedSince(f) else self._known
 				if known is None and codec and not self._damaged and self.monitor_external_changes:
 					# Every read stops at damage in a compressed file (L5): rows appended after it would be read by no
 					# one. What another process appended after the bytes this store knows is looked at; damaged (or
 					# not after them), the file is read now, under the lock, and made again from memory (_remakeDue).
-					found = _readAfter(f, self._known)
-					if found is None or _decodeMembers(codec, found[0])[1]:
-						try:
-							self._syncFrom(f, True)
-						except Exception as e:  # the rows are appended all the same
-							self._failed('sync', f"Failed to read {self._fileName}: {e}", trace=False)
-						if self._remakeDue():
-							return 'remake'  # the lock is let go of first (finally)
-						known = None if self._changedSince(f) else self._known
+					# With no damage the mark moves past what was looked at and what this commit writes (below), the
+					# change still unread (_unseen: the next read is whole), so the next commit looks only at what is
+					# appended after it, and at nothing where the file kept still. It looked from the old mark every
+					# time: a forked child, which has no tick to read the change, decoded more at each commit (5.16: 0.76
+					# ms, then 5.02 ms by its 4,000th, on a 2,000-row .tsv.gz whose parent had written once).
+					if self._unseen and not self._movedSince(f):
+						looked = self._known  # (as this store's last commit looked at it and left it)
+					else:
+						found = _readAfter(f, self._known)
+						if found is None or _decodeMembers(codec, found[0])[1]:
+							try:
+								self._syncFrom(f, True)
+							except Exception as e:  # the rows are appended all the same
+								self._failed('sync', f"Failed to read {self._fileName}: {e}", trace=False)
+							if self._remakeDue():
+								return 'remake'  # the lock is let go of first (finally)
+							known = None if self._changedSince(f) else self._known
+						else:
+							looked = found[1]
 				if self._remake and not self._damaged and not self._refusalPending():
 					# Appended after damage every read stops at, the file not made again (that failed, or waits out its
 					# back-off): memory holds the only good copy, as after a rewrite that fails part way (the merge rule).
@@ -8266,12 +8357,14 @@ memoryOnly:{self.memoryOnly}
 						_fsync(f.fileno())  # a sync that fails fails the append: the rows stay queued
 					finally:
 						reporter.flush()
-					if known is not None and stat.S_ISREG(os.fstat(f.fileno()).st_mode):  # /dev/null holds none of it
+					mark = known if known is not None else looked if self._unseen else None  # (not once damaged: _known
+					# is then what the merge rule takes in after, _syncFrom)
+					if mark is not None and stat.S_ISREG(os.fstat(f.fileno()).st_mode):  # /dev/null holds none of it
 						# What it wrote, not what the file now holds: another writer's append that lands meanwhile
 						# (one that takes no lock) is still to be read, and one that landed first fails the next look.
-						digest = known[2].copy()
+						digest = mark[2].copy()
 						digest.update(written[0])
-						self._known = (_fileIdentity(os.fstat(f.fileno())), known[1] + len(written[0]), digest)
+						self._known = (_fileIdentity(os.fstat(f.fileno())), mark[1] + len(written[0]), digest)
 						self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)
 				with self._memLock:
 					for _ in range(len(rows)):
@@ -8301,7 +8394,7 @@ memoryOnly:{self.memoryOnly}
 				elif self._spec:
 					self._specSync()
 					if not self._workerRuns() and self._commitsAtClose():
-						self._specCommit()  # (no writer thread: a forked child's, or the exit let go of the store)
+						self._call(self._specCommit)  # (no writer thread: a forked child's, or the exit let go of the store)
 				else:
 					self._closing = True
 					self._reported = {}  # a failure that lasts to the end is reported once more: nothing tries after it
@@ -8312,7 +8405,7 @@ memoryOnly:{self.memoryOnly}
 						# after, only an explicit call rewrites: the bytes past it hold rows no read reached.
 						self.rewrite(force=self.rewrite_on_exit and not self._remake)  # Ensure any final sync operations are performed
 						if not self._workerRuns() and self._commitsAtClose():
-							self._commit()  # (no writer thread: a forked child's, or the exit let go of the store)
+							self._call(self._commit)  # (no writer thread: a forked child's, or the exit let go of the store)
 					except BaseException:
 						self._closing = self._exiting  # a Ctrl-C stopped the wait: the store runs on, but not at exit
 						raise
@@ -8342,17 +8435,36 @@ memoryOnly:{self.memoryOnly}
 
 		The child follows the file whatever monitor_external_changes was given (5.16): with it off, a rewrite of the
 		child's (a one-column delete's or move's commit, rewrite_on_exit, a due rewrite_interval) wrote its memory over the
-		file without reading it, and the rows the parent set after the fork were lost; 5.15's close and exit reached it."""
-		self._parentHeldFile = self._fileObjHeld
+		file without reading it, and the rows the parent set after the fork were lost; 5.15's close and exit reached it.
+
+		The rule (5.17): the child keeps its rows and what it knows of the file (_known, _unseen, _remake, the widths,
+		dirty), and takes none of the parent's duties to the file (its queue, jobs and load, _damaged, the failed writes
+		it is to try again, a refused rewrite's back-off) and none of the settings that assume one writer: monitoring off,
+		rewrite_on_exit and rewrite_interval. Taken, the parent's failed rewrite was tried again by the child's close, which
+		made the file again from the child's memory; the parent, still damaged, then took that for another writer's change
+		it could not merge and wrote over it, and the child's rows were lost (the 5.15 re-review). Its close and exit now
+		only append, and the parent's merge rule takes the rows in. So a forked child no longer compacts the file at its
+		exit: a program that wants that sets rewrite_on_exit again in the child, or opens the store after the fork.
+
+		A grandchild learns of an ancestor's hold too (_parentHeldFile: 'its parent', 'an ancestor'): the child's own hook
+		had set its _fileObjHeld to False, so its child took it for one that holds nothing, and its exit waited for ever
+		for the grandparent's file lock while the grandparent waited for the child (5.15 and 5.16; 5.14 ended there)."""
+		self._parentHeldFile = 'its parent' if self._fileObjHeld else self._parentHeldFile and 'an ancestor'
 		self._fileObjHeld = False
 		self.writeLock = threading.Lock()
 		self._memLock = _SectionLock()
 		self.appendQueue.clear()
 		self._requests.clear()
+		self._deferred.clear()  # (the parent's calls put off inside its own write: _runHere)
 		self._loadJob = self._loadReader = None  # (the parent's writer thread's load, not here: its stop is for it)
 		self._writing = 0
 		self._damaged = False
+		self._failures, self._reported = {}, {}  # (the parent's failed writes are the parent's to try again)
+		self._accepted()  # (and its refused rewrite's back-off)
+		if self._spec:
+			self._writeFailing = False  # (a failure the parent reported: the child's own is reported anew)
 		self.monitor_external_changes = True  # another process, the parent, writes this file: the child follows it
+		self.rewrite_on_exit, self.rewrite_interval = False, 0  # (compacting the file is the parent's, which writes it too)
 		self._forkReset = os.getpid()
 
 	def _commitsAtClose(self):
@@ -8365,9 +8477,10 @@ memoryOnly:{self.memoryOnly}
 		if self._workerPid == os.getpid() or (self._forkReset == os.getpid() and not self._parentHeldFile):
 			return True
 		if self.appendQueue:
+			held = {'its parent': 'its parent held the file (get_file_obj) at the fork',
+					'an ancestor': 'an ancestor held the file (get_file_obj) at an earlier fork'}.get(self._parentHeldFile)
 			_warnOnce(self, 'fork-close', self._fileName, 'the rows this forked child set are not written at its close or '
-					  'exit: ' + ('its parent held the file (get_file_obj) at the fork' if self._parentHeldFile else
-					  'no fork hook ran in it') + '; commitAppendToFile() writes them', self.teeLogger)
+					  'exit: ' + (held or 'no fork hook ran in it') + '; commitAppendToFile() writes them', self.teeLogger)
 		return False
 
 	def _finish(self):
