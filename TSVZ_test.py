@@ -18666,6 +18666,55 @@ def test_a_forked_child_of_a_one_column_store_with_monitoring_off_keeps_its_pare
 		assert sorted(keys) == ['a', 'b', 'p2'] and keys.index('a') > keys.index('b'), (keys, done.stderr)  # (its move)
 
 
+#: ARGV: TSVZ's directory, the file, MON ('off' or 'on': monitor_external_changes). A two-column store holding a and b
+#: (no rewrite option), then fork(): the parent sets a to 2 and commits, and the child then moves a to the end and ends by
+#: its normal exit, its status printed; the parent closes last. The child has 10 s (an alarm): it ends in well under a
+#: second, and a failure here is a stale row, not a wait.
+_FORKED_STALE_MOVE = r"""
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, mon = sys.argv[2], sys.argv[3] == 'on'
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60,  # (no tick writes)
+				monitor_external_changes=mon)
+t['a'] = ['a', '1']
+t['b'] = ['b', '1']
+t.commitAppendToFile()
+go = os.pipe()
+pid = os.fork()
+if pid == 0:
+	signal.alarm(10)
+	os.read(go[0], 1)  # (the parent's a=2 is in the file)
+	t.move_to_end('a')
+	sys.exit(0)  # (the normal exit: atexit runs, and writes the move)
+t['a'] = ['a', '2']
+t.commitAppendToFile()
+os.write(go[1], b'x')
+_, code = os.waitpid(pid, 0)
+print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+t.close()
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork()')
+@pytest.mark.parametrize('mon', ['off', 'on'])
+@pytest.mark.parametrize('ext', ['tsv', 'tsv.gz'])
+def test_a_forked_child_that_moves_a_row_its_parent_changed_after_the_fork_keeps_the_parents_value(tmp_path, ext, mon):
+	# A move writes the row again, with the value memory holds. A forked child whose store did not read the file (5.15, with
+	# monitor_external_changes=False) held the row as it was at the fork and wrote that stale value after the parent's new
+	# one: the file ended with a=1, the child's old copy, where 5.14 kept the parent's a=2 (5.16 final review). From 5.16 the
+	# child follows the file first whatever the setting says; 'on' is the control, which 5.15 already kept.
+	p = str(tmp_path / ('s.' + ext))
+	script = tmp_path / 'forked.py'
+	script.write_text(_FORKED_STALE_MOVE)
+	# 60 s: the run takes a second; only a wait for ever takes this long, on a machine the suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, mon], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+						  universal_newlines=True, timeout=60)
+	assert done.returncode == 0 and 'child 0' in done.stdout, done.stdout + done.stderr
+	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
+	assert list(rows) == ['b', 'a'] and rows['a'] == ['a', '2'], (list(rows.items()), done.stderr)  # (the move, the parent's value)
+
+
 # --------------------------------------------------------------------------
 # 5.08 release review, round 1
 # --------------------------------------------------------------------------
