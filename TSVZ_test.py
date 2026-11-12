@@ -18971,10 +18971,11 @@ def test_a_forked_childs_commits_to_a_compressed_file_look_only_at_what_is_new(t
 	assert len(rows) == 2052 and rows['p2'] == ['p2', '1'] and rows['c49'] == ['c49', 'x'] and rows['d'] == ['d', 'x'], len(rows)
 
 
-#: ARGV: TSVZ's directory, the file, WHERE, AT, HANDLER. A store holding a and b; WHERE child: a forked child's store, the
-#: parent waiting for it; closed: the store after close(), no fork. The main thread sets c and commits; a signal (SIGUSR1)
-#: lands inside that commit, AT lock (just after it takes the file's append lock: writeLock held, nothing written yet) or
-#: fsync (after its write), and its handler uses the same store. HANDLER: commit (after a set of h), reload, move
+#: ARGV: TSVZ's directory, the file (.tsv or .tsvz), WHERE, AT, HANDLER. A store holding a and b; WHERE child: a forked
+#: child's store, the parent waiting for it; closed: the store after close(), no fork. The main thread sets c and
+#: commits; a signal (SIGUSR1) lands inside that commit, AT lock (.tsv: just after it takes the file's append lock,
+#: writeLock held, nothing written yet), fsync (.tsv: after its write) or write (.tsvz: after its append to the active
+#: part, under writeLock), and its handler uses the same store. HANDLER: commit (after a set of h), reload, move
 #: (move_to_end('a')), moved (the same, after another writer changed a: the move follows the file first), clear, rewrite
 #: (rewrite(force=True)) or set (of h). Printed once the commit returns: whether the signal landed, and memory's keys in
 #: order; then the store commits what the handler queued, and the test reads the file. 10 s (an alarm): the commit takes
@@ -19006,11 +19007,11 @@ def work():
 	signal.alarm(10)
 	signal.signal(signal.SIGUSR1, handle)
 	fired, main = [], threading.get_ident()
-	name = '_fsync' if at == 'fsync' else '_lockFile'
+	name = {'fsync': '_fsync', 'lock': '_lockFile', 'write': '_specAppendPayload'}[at]
 	real = getattr(TSVZ, name)
 	def hook(*args, **kwargs):
 		done = real(*args, **kwargs)
-		if not fired and threading.get_ident() == main and (at == 'fsync' or kwargs.get('mode') == TSVZ._APPEND):
+		if not fired and threading.get_ident() == main and (at != 'lock' or kwargs.get('mode') == TSVZ._APPEND):
 			fired.append(1)
 			os.kill(os.getpid(), signal.SIGUSR1)  # (the handler runs here, in the commit)
 		return done
@@ -19039,17 +19040,20 @@ t.close()
 
 @pytest.mark.skipif(not hasattr(os, 'fork') or os.name != 'posix', reason='fork() and SIGUSR1')
 @pytest.mark.parametrize('handler', ['commit', 'reload', 'move', 'moved', 'clear', 'rewrite', 'set'])
-@pytest.mark.parametrize('at', ['lock', 'fsync'])
+@pytest.mark.parametrize('ext, at', [('tsv', 'lock'), ('tsv', 'fsync'), ('tsvz', 'write')])
 @pytest.mark.parametrize('where', ['child', 'closed'])
-def test_a_forked_childs_or_closed_stores_signal_handler_inside_its_own_write_runs_after_it(tmp_path, where, at, handler):
+def test_a_forked_childs_or_closed_stores_signal_handler_inside_its_own_write_runs_after_it(tmp_path, where, ext, at, handler):
 	# A store with no writer thread (a forked child's, or one after close()) writes in the thread that asks, under writeLock.
 	# A signal handler that lands inside such a write and uses the same store took writeLock again on the same thread, and
 	# waited for ever: a commit, reload(), clear() or rewrite() wherever it landed, and a move_to_end() that follows the
 	# file first (once the write's bytes are in, or after another writer's change). 5.14 to 5.16 alike (docs/limitations.md
 	# had them as a known limitation and a deferral). From 5.17 such a call is put off until the write it landed in ends,
 	# and made then (a move with its follow, so another writer's change of the row is kept); a set returns at once, as
-	# before. Memory and the file then agree.
-	p = str(tmp_path / 's.tsv')
+	# before. Memory and the file then agree. (.tsvz: a commit, reload() or clear(); its move_to_end() only reorders memory,
+	# and rewrite() is ignored.)
+	if ext == 'tsvz' and handler in ('move', 'moved', 'rewrite'):
+		pytest.skip('a .tsvz store neither follows the file for a move nor rewrites')
+	p = str(tmp_path / ('s.' + ext))
 	script = tmp_path / 'handler.py'
 	script.write_text(_HANDLER_IN_OWN_WRITE)
 	# 60 s: the run takes a second; only a wait for ever takes this long, on a machine the suite keeps busy.
