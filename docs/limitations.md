@@ -369,20 +369,29 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### Test gaps the 5.16 final review leaves
 - Kind: deferred
 - What the operator sees: nothing directly; the suite does not yet look at these, which the 5.16 final review's probes
-  did (it added one test, for the two-column move:
+  did (its fix round added one test, for the move of a row the parent changed after the fork, in a two-column store:
   `test_a_forked_child_that_moves_a_row_its_parent_changed_after_the_fork_keeps_the_parents_value`):
   - `monitor_external_changes` reads `True` in a forked child and keeps its value in the parent (the lessons entry
     names it; no test asserts it);
   - the narrowed "Appends that do not read the store first land after damage": a `.tsv.gz` store with monitoring off,
     damage landing before or after the fork, the child ending by commit, close or exit: its row is readable in 6 of 6
     cases on 5.16 and 0 of 6 on 5.15, and the store that did not fork still appends after the damage (`s/damage.py`);
-  - the two known limitations above, a forked child's `move_to_end()` while its parent holds the file and waits for it
-    (KL-c), and a signal handler inside a forked child's own write: no test pins the wait, so none notices if H2 or a
-    writer thread in the child ends it.
-- Why: found by the 5.16 final review; the hotfix adds the tests that guard what it changed, and the cases above need
-  a probe with an alarm each (a wait for ever is what they check).
-- Plan (5.17): add them to the suite with H2, each bounded by an alarm, the waits as tests that name the entry they
-  change with.
+  - two known limitations below: 5.16's widening of "A forked child writes nothing at its close or exit when its
+    parent held get_file_obj() at the fork" (a child's `move_to_end()`, or its `checkExternalChanges()` then
+    `rewrite()`, while its parent holds the file and waits for it), and "A signal handler that uses the store, landing
+    inside a forked child's own write, waits for ever". No test pins either wait, so none notices if a writer thread in
+    the child, or 5.17's planned change (a forked child takes none of its parent's duties to the file, and none of its
+    single-writer settings), ends it;
+  - the new test above starts its child's 10 s alarm at the fork, so a parent that takes 10 s over its set, commit and
+    fsync, on a machine a suite run keeps busy, fails it with no fault in the store. The alarm belongs after the
+    child's read of the parent's go-ahead, and the child should close its copy of the pipe's write end. The 5.16
+    re-review ran 640 of its cases on each of Python 3.14 and 3.6 (10 rounds of 16 runs of its 4 cases, side by side)
+    with no failure.
+- Why: found by the 5.16 final review (the new test's alarm, by the Haiku second opinion on its re-review); the hotfix
+  adds the tests that guard what it changed, and the cases above need a probe with an alarm each (a wait for ever is
+  what they check).
+- Plan (5.17): add them to the suite with that planned change, each bounded by an alarm, the waits as tests that name
+  the entry they change with; and move the new test's alarm after the go-ahead.
 - Revisit when: 5.17.
 - Noted: 2026-11-11, from the 5.16 final review's test gaps; a deferral, not asked.
 
@@ -465,8 +474,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - With `monitor_external_changes=False` too (5.16), a child's `move_to_end()`, and its `checkExternalChanges()`
     followed by `rewrite()`, wait for ever while the parent holds the file and waits for the child, as a default
     (monitoring-on) child's already did in 5.14 and 5.15; a monitoring-off child's returned before, and left its move
-    unwritten (the 5.16 final review's `s/held.py`, Python 3.14 and 3.6: 3 of 6 mode and operation cases never end,
-    where 5.15 and 5.14 ended in all 6; macOS not run).
+    unwritten. They wait where they follow a change to the file (one since the child's store last read or wrote it)
+    and the parent's hold keeps that read or its commit out:
+    - a hold in a mode without `a` (`'r+b'`, `'wb'`), which takes the rewrite lock and so holds off the read (a
+      `'wb'` hold empties the file, itself a change to follow);
+    - any hold where the file lock is a whole-file `flock`: POSIX systems other than Linux (by reading);
+    - rows the child queued itself, which the follow commits, waiting for the parent's append lock.
+
+    On Linux a child with nothing queued reads beside the default `'ab'` hold, since an append lock takes byte 1 and a
+    read bytes 2 and 0 (`_lockFile`), and the call returns; with no change to follow, nothing waits. (The 5.16 final
+    review's `s/held.py`, Python 3.14 and 3.6: 3 of 6 mode and operation cases never end, where 5.15 and 5.14 ended in
+    all 6. The 5.16 docs pass's `held2.py`, the same Pythons, with the change made apart: with a change to follow,
+    under `'ab'` only the cases with rows queued wait and under `'r+b'` all do; with none, no case waits; `'wb'`, on
+    3.14, waits in all 6. macOS not run.)
   - On Python 3.6 the same holds for a child in which TSVZ's fork hook did not run, because a library replaced
     `threading._after_fork` without calling the one it replaced: that child also keeps 5.14's other behaviour (its
     commit writes the rows the parent had queued too, and it keeps the locks the parent's threads held), and its
@@ -479,15 +499,18 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-11-10, the user chose "Approve as KL (Recommended)": a forked child writes nothing at close or exit
   when its parent held `get_file_obj()` at the fork, and warns once. The Python 3.6 child with no hook is the case the
   user's pick "Wrap it on 3.6 (Recommended)" named: that child keeps 5.14's behaviour and says so once. Widened
-  2026-11-11; the user chose "Widen KL-c (Recommended)": a child whose parent held the file at the fork writes nothing
-  at its close, even when both have let go of it since, for the stores with `rewrite_on_exit` or a pending sync, where
-  5.14 wrote the row. (The question's advice was "write before forking, or close the store in the child explicitly";
-  a `close()` in such a child writes nothing, and a commit before the fork writes none of the child's rows, so the
-  advice here is the 5.15 re-review's: let go of the file before forking, or commit in the child once the parent has
-  let go.) The Python 3.6 child whose explicit commit now waits for ever while the parent holds the file and waits for
-  it: the user chose "Ship it (Recommended)", 2026-11-11. Widened again 2026-11-11 (the 5.16 final review); the user
-  chose "Approve the widening (Recommended)": with `monitor_external_changes=False` a forked child's `move_to_end()`
-  (and `checkExternalChanges()` followed by `rewrite()`) waits there too, as a default child's did.
+  2026-11-11; the user chose "Widen KL-c (Recommended)" (KL-c: this entry's label in the reviews): a child whose parent
+  held the file at the fork writes nothing at its close, even when both have let go of it since, for the stores with
+  `rewrite_on_exit` or a pending sync, where 5.14 wrote the row. (The question's advice was "write before forking, or
+  close the store in the child explicitly"; a `close()` in such a child writes nothing, and a commit before the fork
+  writes none of the child's rows, so the advice here is the 5.15 re-review's: let go of the file before forking, or
+  commit in the child once the parent has let go.) The Python 3.6 child whose explicit commit now waits for ever while
+  the parent holds the file and waits for it: the user chose "Ship it (Recommended)", 2026-11-11. Widened again
+  2026-11-11 (the 5.16 final review); the user chose "Approve the widening (Recommended)": with
+  `monitor_external_changes=False` a forked child's `move_to_end()` (and `checkExternalChanges()` followed by
+  `rewrite()`) waits there too, as a default child's did. The same day the docs pass after the 5.16 re-review stated
+  when it waits (a change to follow, and a hold that keeps the read or the commit out), from the Haiku second opinion:
+  that narrows what was approved, and changes no behaviour.
 
 ### A signal handler that uses the store, landing inside a forked child's own write, waits for ever
 - Kind: known limitation
@@ -498,11 +521,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - Since 5.14, for a handler's `commitAppendToFile()` or `reload()` in any child (either `monitor_external_changes`),
     and for a monitoring-on child's `move_to_end()`, which follows the file first. 5.16 adds a monitoring-off child's
     `move_to_end()`, which follows the file now: 5.14 and 5.15 returned there.
+  - A handler's `move_to_end()` follows the file, and so waits, only where the file changed since the store last read
+    or wrote it (`deSynced or _externalChange()`): after the write's own bytes are in and before the write notes them,
+    or after another process's write the store has not read, such as the parent's. One that lands earlier in the
+    write, with no such change, returns.
   - Checked on Python 3.14 and 3.6 (the 5.16 final review's `s/sighand.py`: a signal raised at the fsync of the child's
-    commit, after its write, whose handler uses the same store).
+    commit, after its write, whose handler uses the same store). The 5.16 docs pass's `sighand2.py`, the same Pythons:
+    a handler's move raised just after the commit takes its file lock, before it writes, returns in 5.14, 5.15 and 5.16
+    with either setting.
 - Why: a fix needs a design change, not a hotfix's size: a writer thread in the child (as a running store has), or a
   `writeLock` that knows its holder, so that a call made from a handler inside the write can tell it is inside it.
-- Revisit when: 5.17, with H2 (a forked child takes none of its parent's duties), or someone hits it.
+- Revisit when: 5.17, with the planned change that a forked child takes none of its parent's duties to the file, and
+  none of its single-writer settings (in "A forked child's row is lost when its parent's failed rewrite has left the
+  file damaged"), or someone hits it.
 - Approved: 2026-11-11, the user chose "Approve as KL (Recommended)" on the 5.16 final review's question: a signal
   handler that uses the store, landing inside a forked child's own write, waits for ever (the whole case, which 5.14
   has, and not only 5.16's addition of a monitoring-off child's `move_to_end()`).
@@ -512,13 +543,40 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: a store after `close()` has no writer thread either, so its writes run in the calling thread
   under `writeLock`; a signal handler that lands inside such a write and calls the same store's `commitAppendToFile()`,
   `reload()` or, with monitoring on, `move_to_end()` waits for ever on that lock (a monitoring-off store's move
-  returns). 5.15 and 5.16 alike (the 5.16 fix round's `f516/s/closedhand.py`, Python 3.14 and 3.6: no fork, a 5 s
-  alarm).
+  returns). Its move waits only where it follows the file, as in the forked child's case: where the file changed since
+  the store last read or wrote it, as it has once the write's bytes are in; one that lands before the write has
+  changed the file, with no other change to follow, returns. 5.14, 5.15 and 5.16 alike (the 5.16 fix round's
+  `f516/s/closedhand.py`, Python 3.14 and 3.6: no fork, a 5 s alarm; its re-review ran it on 5.14 too; the 5.16 docs
+  pass's `sighand2.py` raised the signal just after the commit takes its file lock, before it writes: every handler's
+  move returned there).
 - Why: the same cause as the forked child's case above, which the user approved as a known limitation; this one
   needs no fork and was found while checking that entry, so it is planned work, not part of that approval.
-- Revisit when: 5.17: a `writeLock` that knows its holder, so a call made from a handler inside the write can tell it
-  is inside it (the fix the forked child's entry names), covers both.
+- Plan (5.17): a `writeLock` that knows its holder, so that a call made from a handler inside the write can tell it is
+  inside it (the design change the forked child's entry names). It is meant to cover both cases; it is not built or
+  tested yet.
+- Revisit when: 5.17.
 - Noted: 2026-11-11, from the 5.16 fix round; a deferral, not asked.
+
+### A forked child's own child does not learn that an ancestor holds the file, and waits for ever at its exit
+- Kind: deferred
+- What the operator sees: a process holds a store's file through `get_file_obj()`, forks a child and waits for it; the
+  child holds nothing, forks a child of its own and waits for it; that grandchild sets a row and ends by its normal
+  exit (or closes the store). The grandchild's exit writes the row, so it waits for the grandparent's file lock: the
+  grandparent waits for the child, the child for the grandchild, and all three wait for ever. A direct child writes
+  nothing there and says so ("A forked child writes nothing at its close or exit when its parent held get_file_obj()
+  at the fork", above), but the fork hook copies only the direct parent's hold (`_afterFork`:
+  `self._parentHeldFile = self._fileObjHeld`), and the child's own fork hook set its `_fileObjHeld` to False, so the
+  grandchild takes its parent for one that holds nothing. 5.15 the same; 5.14 ended there, as its children wrote
+  nothing at their close or exit (no `rewrite_on_exit`). Found by reading, then run (the 5.16 docs pass's `gc.py`,
+  Python 3.14 and 3.6, `'ab'` and `'r+b'` holds: the grandchild never ends on 5.16 and 5.15, and ends on 5.14 and on
+  5.16 with the fix below, writing nothing and saying so).
+- Why: found by the Haiku second opinion on the 5.16 re-review; 5.16 is no worse than 5.15 here, and is the hotfix of
+  the one change the user chose.
+- Plan (5.17): the fork hook keeps an ancestor's hold, `self._parentHeldFile = self._fileObjHeld or
+  self._parentHeldFile`, so a grandchild writes nothing at its close or exit and says so, as its parent does; with a
+  nested-fork test, bounded by an alarm.
+- Revisit when: 5.17.
+- Noted: 2026-11-11, from the Haiku second opinion on the 5.16 re-review; a deferral, not asked.
 
 ### A parent that forks and ends by os._exit does not write the rows it queued last
 - Kind: known limitation
@@ -551,7 +609,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   tell its rows from damage. The child writes it again because it takes its parent's failed rewrite to try again
   (`_failures`) and its `rewrite_on_exit` (the 5.15 design check). Found by the 5.15 re-review; not this release's
   change, and rare (a rewrite that failed, then a fork before the parent made the file again).
-- Plan (5.17): a forked child takes none of its parent's duties to the file or its single-writer settings (H2, the
+- Plan (5.17): a forked child takes none of its parent's duties to the file or its single-writer settings (the
   user's pick, 2026-11-11): the fork hook also drops the failed writes' retries and a refused rewrite's back-off, and
   turns `rewrite_on_exit` and `rewrite_interval` off, as 5.16 turns monitoring on. Its close and exit then only
   append, and the parent's merge rule takes its rows in (the design check's prototype kept the child's row in 3 of the
@@ -580,8 +638,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   with default settings has it today; 5.16 gives a monitoring-off child the same.
 - Why: found by the 5.16 final review; the same as a default child's since 5.14, and no row is lost. The fix is in how
   a child's commit follows the file, not a hotfix's size.
-- Plan (5.17), with H2: a child's commit takes in what it just read under the lock and moves its mark, so the next
-  commit reads only what is new.
+- Plan (5.17), with the change that a forked child takes none of its parent's duties to the file (planned in the entry
+  above): a child's commit takes in what it just read under the lock and moves its mark, so the next commit reads only
+  what is new.
 - Revisit when: 5.17.
 - Noted: 2026-11-11, from the 5.16 final review; a deferral, not asked. The user chose to ship 5.16 with it ("Ship
   after docs + test (Recommended)").
