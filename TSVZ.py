@@ -7624,10 +7624,10 @@ memoryOnly:{self.memoryOnly}
 		f = opener(self._fileName)
 		try:
 			_lockFile(f, mode=mode)
+			return f
 		except BaseException:
 			f.close()
 			raise
-		return f
 
 	def _changedSince(self, f):
 		"""True when the open file ``f`` may hold more than memory took in: it moved (_movedSince), or holds another
@@ -7667,19 +7667,17 @@ memoryOnly:{self.memoryOnly}
 				# refusal wait (_refusalWait) is over, without waiting for the file to keep still for rewrite_interval.
 				self.dirty = self.deSynced = self._damaged = True
 				self._known, self._unseen = _KNOWN_NOTHING, False  # merged whatever is there, whichever file it is
+			started = False
+			end = None
 			try:
 				f = self._openLocked(_openUntruncated)
 			except Exception as e:
 				self._failed('rewrite', f"Failed to open file {self._fileName}: {e}", trace=False)
 				self.deSynced = True
 				return False
-			if self._unattended():  # the exit let go of the store (abandoned) while this waited for the lock
-				_unlockFile(f)
-				f.close()
-				return False
-			started = False
-			end = None
 			try:
+				if self._unattended():  # the exit let go of the store (abandoned) while this waited for the lock
+					return False
 				for attempt in range(3):
 					if sync is not None and (self._damaged or (sync and self._changedSince(f))):
 						self._syncFrom(f, True)
@@ -7727,8 +7725,11 @@ memoryOnly:{self.memoryOnly}
 				except Exception:
 					self._known = None
 				finally:
-					_unlockFile(f)
-					_closeUnflushed(f)  # a buffer a failed write left is dropped, not written after the unlock
+					try:
+						_unlockFile(f)
+					finally:  # (closed whatever the unlock did: closing drops the lock, so a signal's exception raised in
+						# the unlock, or before this try began, never leaves the file locked under its traceback)
+						_closeUnflushed(f)  # a buffer a failed write left is dropped, not written after the unlock
 		return True
 
 	def _readWidened(self, f):
@@ -7762,8 +7763,10 @@ memoryOnly:{self.memoryOnly}
 		try:
 			read(f)
 		finally:
-			_unlockFile(f)
-			f.close()
+			try:
+				_unlockFile(f)
+			finally:  # (closed whatever the unlock did: as _writeFileStarted's)
+				f.close()
 
 	def _syncFrom(self, f, locked):
 		"""Take in what another process changed in the open legacy file ``f``: when it is the same file and still begins
@@ -8096,9 +8099,15 @@ memoryOnly:{self.memoryOnly}
 		The calls put off are made as jobs of their own, and their callers have gone on, so an error is reported, not
 		raised. A KeyboardInterrupt goes up, and drops the calls it did not reach (a commit's rows stay queued; a put-off
 		reload, rewrite, move or clear is not made, the handler having been told it was done), as a running store's _call
-		takes back a job it has not begun. One that ended the job drops them all, since it was cut where the job was, and
-		its traceback still holds what the job left: a commit cut just after it took the file lock holds the locked file
-		there, and the put-off commit, made while the Ctrl-C goes up, waited for ever for that lock (5.17 build)."""
+		takes back a job it has not begun. One that ended the job drops them all, since it was cut where the job was: a
+		write cut just as it took writeLock can leave it held (the approved known limitation), and a put-off call made
+		while the Ctrl-C goes up would wait for it for ever (a Ctrl-C at each step of a put-off commit, clear(), rewrite or
+		move: 5 to 9 hung steps a sweep without the drop, on Python 3.14 and 3.6; 5.17 design check). A SystemExit
+		(sys.exit()) still drains: a forked child that ends that way runs no exit hook, so the drain is what writes the
+		handler's row. What the job's frame leaves open is not the locked file: a write is under its clean-up from the
+		step that takes the file, and closes it whatever cut the clean-up (_openLocked, _commitOnceStarted,
+		_writeFileStarted, _readLocked), so the drain's commit finds the file free, as a program's own except clause that
+		commits again does (the 5.17 build waited for ever for the lock the cut write's traceback held)."""
 		line = self._jobHere()
 		if line is not None:
 			line.append((fn, args))
@@ -8312,6 +8321,7 @@ memoryOnly:{self.memoryOnly}
 				return self
 			self.dirty = True  # failed or refused: the rewrite that gets through makes the file again
 		with self.writeLock:
+			known = looked = None
 			try:
 				if self.verbose:
 					self.__teePrintOrNot(f"Commiting {len(self.appendQueue)} records to {self._fileName}")
@@ -8323,12 +8333,9 @@ memoryOnly:{self.memoryOnly}
 				self._failed('append', f"Failed to open file {self._fileName}: {e}", trace=False)
 				self.deSynced = True
 				return self
-			if self._unattended():  # the exit let go of the store (abandoned) while this waited for the lock
-				_unlockFile(f)
-				f.close()
-				return self
-			known = looked = None
 			try:
+				if self._unattended():  # the exit let go of the store (abandoned) while this waited for the lock
+					return self
 				known = None if self._changedSince(f) else self._known
 				if known is None and codec and not self._damaged and self.monitor_external_changes:
 					# Every read stops at damage in a compressed file (L5): rows appended after it would be read by no
@@ -8418,8 +8425,10 @@ memoryOnly:{self.memoryOnly}
 				self._failed('append', f"Failed to write at commitAppendToFile to {self._fileName}: {e}")
 				self.deSynced = True
 			finally:
-				_unlockFile(f)
-				f.close()
+				try:
+					_unlockFile(f)
+				finally:  # (closed whatever the unlock did: as _writeFileStarted's)
+					f.close()
 		return self
 	
 	def stopAppendThread(self):

@@ -19588,6 +19588,126 @@ def test_a_ctrl_c_that_cuts_a_write_after_a_handler_put_off_a_call_is_not_met_wi
 	assert memory == want and rows == want, done.stdout + done.stderr
 
 
+#: ARGV: TSVZ's directory, the file, WHERE, MODE, POINT, EXC. A store with no writer thread (WHERE closed: after close(); child:
+#: a forked child's), holding a and b. The main thread sets c and commits. A signal's exception EXC (sys: SystemExit, which
+#: sys.exit() raises; ki: KeyboardInterrupt) is raised at POINT, a place where a real signal is taken while the commit holds the
+#: locked file: unattended (as the commit, just after its _openLocked() returned the locked file, calls _unattended()) or
+#: unlock (as its clean-up calls _unlockFile, before the unlock). MODE: two: a first handler's set of h1 and commit land as the
+#: commit's job begins (put off until the job ends), then the exception is raised; one: at POINT a handler sets h, commits (put
+#: off) and ends by the exception, the README's pattern; none: the exception is raised and the program's own except clause
+#: commits again before the exception is dropped (a 'flush on Ctrl-C' clause). Printed, as JSON: how the commit ended ('hung'
+#: when it did not return in 10 s, an alarm), whether POINT was reached, and the file's keys.
+_A_CUT_WRITE_AT_THE_LOCKED_FILE = r"""
+import json, os, signal, sys, threading
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, where, mode, point, exc = sys.argv[2:7]
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)  # (no tick writes)
+t['a'] = ['a', '1']
+t['b'] = ['b', '1']
+t.commitAppendToFile()
+class Hung(BaseException):
+	pass
+def alarm(sig, frame):
+	raise Hung()
+def work():
+	signal.signal(signal.SIGALRM, alarm)
+	main = threading.get_ident()
+	state = {'first': False, 'point': False, 'opened': False}
+	realCommit, realOpen, realUnlock = TSVZ.TSVZed._commit, TSVZ.TSVZed._openLocked, TSVZ._unlockFile
+	realUnattended = TSVZ.TSVZed._unattended
+	def at_point():
+		if state['point'] or threading.get_ident() != main or (mode == 'two' and not state['first']):
+			return
+		state['point'] = True
+		if mode == 'one':
+			t['h'] = ['h', '1']
+			t.commitAppendToFile()
+		raise SystemExit(0) if exc == 'sys' else KeyboardInterrupt()
+	def commit(self):
+		if mode == 'two' and not state['first'] and threading.get_ident() == main:
+			state['first'] = True
+			self['h1'] = ['h1', '1']
+			self.commitAppendToFile()
+		return realCommit(self)
+	def openLocked(self, *args, **kwargs):
+		f = realOpen(self, *args, **kwargs)
+		state['opened'] = True
+		return f
+	def unattended(self):
+		if point == 'unattended' and state['opened']:
+			at_point()
+		return realUnattended(self)
+	def unlock(f):
+		if point == 'unlock':
+			at_point()
+		return realUnlock(f)
+	TSVZ.TSVZed._commit, TSVZ.TSVZed._openLocked, TSVZ.TSVZed._unattended, TSVZ._unlockFile = commit, openLocked, unattended, unlock
+	t['c'] = ['c', '1']
+	signal.alarm(10)
+	try:
+		try:
+			t.commitAppendToFile()
+			out = 'returned'
+		except (SystemExit, KeyboardInterrupt) as e:
+			out = type(e).__name__
+			if mode == 'none':
+				t.commitAppendToFile()  # (in the except clause: the traceback, and what it holds, is alive)
+				out += ', then the commit in the except clause returned'
+	except Hung:
+		out = 'hung'
+	signal.alarm(0)
+	TSVZ.TSVZed._commit, TSVZ.TSVZed._openLocked, TSVZ.TSVZed._unattended, TSVZ._unlockFile = realCommit, realOpen, realUnattended, realUnlock
+	print(json.dumps([out, state['point'], list(TSVZ.readTabularFile(p, header='id\tv', verbose=False))]), flush=True)
+if where == 'closed':
+	t.close()
+	work()
+	os._exit(0)
+pid = os.fork()
+if pid == 0:
+	work()
+	os._exit(0)
+_, code = os.waitpid(pid, 0)
+print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+os._exit(0)
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork') or os.name != 'posix', reason='fork() and SIGALRM')
+@pytest.mark.parametrize('shape', [
+	('two', 'unattended', 'sys'),    # a put-off commit, then a handler's sys.exit()
+	('one', 'unattended', 'sys'),    # the README's handler: set, commit, sys.exit()
+	('one', 'unlock', 'sys'),
+	('none', 'unattended', 'sys'),   # the program's except SystemExit: clause commits again
+	('none', 'unattended', 'ki'),    # the program's except KeyboardInterrupt: clause commits again
+], ids=lambda shape: '-'.join(shape))
+@pytest.mark.parametrize('where', ['child', 'closed'])
+def test_a_signal_that_cuts_a_stores_own_write_after_it_took_the_file_lock_leaves_no_locked_file_for_the_calls_after_it(
+		tmp_path, where, shape):
+	# A store with no writer thread (a forked child's, or one after close()) makes the calls a signal handler puts off inside
+	# its own write as that write ends, and a program's own except clause may commit again while the exception that cut the
+	# write is alive. A write holds its locked file from the step that takes it: where one of the store's own steps (the
+	# check after the open, the clean-up's unlock) was outside the try that lets go of the file, a SystemExit (sys.exit()) or
+	# a Ctrl-C landing there left the file open and locked for as long as the exception lived, and the next commit, the put-off
+	# one or the clause's, waited for that lock for ever (5.16 and the 5.17 build: the README's handler hung in about 2% of
+	# real signals, and a program's except clause every time it landed there). The file is closed whatever the clean-up did.
+	mode, point, exc = shape
+	p = str(tmp_path / 's.tsv')
+	script = tmp_path / 'cut.py'
+	script.write_text(_A_CUT_WRITE_AT_THE_LOCKED_FILE)
+	# 60 s: the run takes a second; only a wait for ever takes this long (the script's alarm ends it sooner), on a machine the
+	# suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, where, mode, point, exc], stdout=subprocess.PIPE,
+						  stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	assert done.returncode == 0 and (where == 'closed' or 'child 0' in done.stdout), done.stdout + done.stderr
+	out, reached, keys = json.loads([line for line in done.stdout.split('\n') if line.startswith('[')][0])
+	ended = {'sys': 'SystemExit', 'ki': 'KeyboardInterrupt'}[exc]
+	assert reached and out == ended + (', then the commit in the except clause returned' if mode == 'none' else ''), (
+		done.stdout + done.stderr)
+	# The cut commit's row c is written by the commit after it: the put-off one (with the handler's own row), or the clause's.
+	assert keys == ['a', 'b', 'c'] + {'two': ['h1'], 'one': ['h'], 'none': []}[mode], done.stdout + done.stderr
+
+
 #: ARGV: TSVZ's directory, the file, CALL, SECOND. A forked child's store (the script's worker) holding a and b. The main
 #: thread sets c and commits; a signal lands inside that commit just after its fsync (writeLock held), and its handler makes
 #: CALL (clear: clear(); rewrite: rewrite(force=True)), which is put off, then forks. The new process G returns from the
