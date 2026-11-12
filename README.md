@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.15**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.16**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -257,16 +257,25 @@ A child that `fork()` made (`os.fork()`, or `multiprocessing`'s fork children, w
 `fork` start method makes; Python 3.14's default on Linux, `forkserver`, makes children
 that inherit no store) drops the rows its parent had queued, which the parent writes,
 and writes the rows it sets itself at its `commitAppendToFile()`, its `close()` and its
-normal exit. One that ends by `os._exit`, as `multiprocessing`'s children do, writes
-only what it commits or closes. A parent that ends by `os._exit` (a daemon's fork) does
-not write what it had queued, so commit before forking a child that outlives its parent.
+normal exit. Its store follows the file whatever `monitor_external_changes` says, since
+the parent writes the file too (5.16). One that ends by `os._exit`, as `multiprocessing`'s
+children do, writes only what it commits or closes. A parent that ends by `os._exit` (a
+daemon's fork) does not write what it had queued, so commit before forking a child that
+outlives its parent.
 A child forked while its parent holds `get_file_obj()` writes nothing at its close or
 exit, since the parent may be waiting for it, and says so, even once both have let go of
-the file; its `commitAppendToFile()` writes once the parent lets go, so a child that
-commits while its parent holds the file and waits for it waits for ever. Let go of the
-file before forking, and the child's close and exit write. A child that a signal handler
-forks inside a `mapToFile()`, `hardMapToFile()` or `rewrite()` finishes that call with
-its own memory, as if it had made the call after the fork.
+the file. Its `commitAppendToFile()` writes once the parent lets go, so a child that
+commits while its parent holds the file and waits for it waits for ever. Its
+`move_to_end()`, and its `checkExternalChanges()` then `rewrite()`, follow a change to the
+file first (one since the child's store last read or wrote it; from 5.16 with
+`monitor_external_changes` off too), and wait for ever there as well where the parent's
+hold keeps that read or its commit out: a hold in a mode without `a` (`'r+b'`, `'wb'`),
+any hold where the file lock is a whole-file `flock` (POSIX systems other than Linux), or
+rows the child queued itself, which the follow commits. On Linux, a child with nothing
+queued reads beside the default `'ab'` hold, and the call returns. Let go of the file
+before forking, and the child's close and exit write. A child that a signal handler forks
+inside a `mapToFile()`, `hardMapToFile()` or `rewrite()` finishes that call with its own
+memory, as if it had made the call after the fork.
 
 A file another process removed is made
 again from memory by the store's next write, an append included (a removal in the
@@ -320,6 +329,50 @@ with no header (or `verifyHeader=False`), anything written to a file the damage 
 empty; the keys it sets or deletes then take its values, and the keys it left out keep
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
+
+## Upgrading to 5.16 from 5.15
+
+The file formats are unchanged, and an upgrade needs nothing. In a program that forks with `monitor_external_changes`
+off, the children's `move_to_end` is slower beside a parent that writes: it now follows the file first, as a default
+child's does, so it waits for the file's lock (12,711 moves in 2 s against 852,835, with the parent appending at 20 Hz
+to a 100,000-row file). The one change to the API is what `monitor_external_changes` reads in a child that `fork()` made
+(below).
+
+- **A forked child no longer writes over the rows its parent set after the fork when `monitor_external_changes` is
+  off.** In a child that `fork()` made, the store now follows the file whatever `monitor_external_changes` says (it
+  reads `True` there): the parent writes the file too. With monitoring off, a rewrite of the child's wrote its memory
+  as it was at the fork over the file without reading it, and a move wrote its row from that memory, so the parent's
+  later rows and values were lost:
+  - in a one-column store, when the child deleted or moved a key (there that is a rewrite, not a line) and then
+    closed, ended normally or committed. 5.15 lost them at each of the three, whatever the rewrite options. 5.14, with
+    neither `rewrite_on_exit` nor `rewrite_interval`, lost them only at the child's own `commitAppendToFile()`: its
+    close and exit wrote nothing, and so left the child's delete or move unwritten. (5.15's notes called this case as
+    in 5.14; for a one-column store it was not.)
+  - in any loose store, when the child's store had replaced, deleted or moved a row since the last rewrite (by itself,
+    or from the parent at the fork) and made its rewrite at exit, by `rewrite_on_exit` or a due `rewrite_interval`.
+    5.14 the same, where its child did not wait for ever on a lock it copied at the fork.
+  - in a store of two or more columns with no rewrite option, when the child moved a row the parent had changed after
+    the fork (the parent sets `a` to a new value; the child moves `a` to the end and exits). A move writes the row again
+    with the value memory holds, and the child's memory held `a` as it was at the fork: 5.15's file ended with that old
+    `a`, after the parent's new one. 5.14 kept the parent's value (its child wrote nothing at its exit, so the move
+    stayed unwritten); 5.16 keeps it and writes the move. This one was worse in 5.15 than in 5.14.
+
+  With monitoring on (the default) nothing changes. The parent keeps the setting it was given, so with monitoring off
+  its own rewrites still write over what a child wrote. A monitoring-off child now has what a default child has had
+  since 5.14, which is worse than 5.15 in three cases. Its `move_to_end()`, or its `checkExternalChanges()` then
+  `rewrite()`, waits for ever where its parent holds `get_file_obj()` and waits for it, when the call follows a change
+  to the file and the hold keeps the follow out (a hold in `'r+b'` or `'wb'`, a whole-file `flock` outside Linux, or
+  rows the child queued; on Linux, the default `'ab'` hold with none queued lets it through)
+  ([known](docs/limitations.md#a-forked-child-writes-nothing-at-its-close-or-exit-when-its-parent-held-get_file_obj-at-the-fork)).
+  A signal handler's `move_to_end()` inside its own write waits for ever when the move follows the file, as it does
+  once the write's bytes are in; one landing before the write changed the file, with no other change to follow, returns
+  ([known](docs/limitations.md#a-signal-handler-that-uses-the-store-landing-inside-a-forked-childs-own-write-waits-for-ever)).
+  Its `.tsv.gz` commits slow with each commit once the parent has written (on a 2,000-row file, 0.02 ms each in 5.15,
+  0.76 ms for the first 1,000 and 5.02 ms for the fourth in 5.16:
+  [deferred to 5.17](docs/limitations.md#a-forked-childs-commits-to-a-compressed-file-slow-with-every-commit-once-its-parent-has-written-with-monitoring-off)).
+  No row is lost in any of them.
+- **Known** and **Planned for 5.17**: the lists under 5.15, below. What 5.16 does not fix of 5.15's plan moves to 5.17,
+  and one planned fix is a known limitation now: two signal handler calls, the second inside the first one's redo.
 
 ## Upgrading to 5.15 from 5.14
 
@@ -389,7 +442,7 @@ can land in, and checks the locks, memory and the file after each.
 - **A Ctrl-C at a loop in `move_to_end` no longer leaves the store's lock held, and one in the wait for the writer
   thread no longer skips taking its job back** (Python 3.12 to 3.14, which leave a loop's back jump inside a `try` or
   `with` block out of the exception table, so a signal landing there skipped the block's exit and its clean-up). Other
-  loops of that shape are left (planned for 5.16, below).
+  loops of that shape are left (planned for 5.17, below).
 - Compactions are unchanged: the plan to drop a strict reader's first line of a key where it takes no row between it
   and its last moved the view of readers given other arguments than the writer's in the random differential (4 of
   20,000 `.tsv` argument sets), so it is deferred again
@@ -413,24 +466,47 @@ can land in, and checks the locks, memory and the file after each.
     held the file). Let go of the file (`release_file_obj()`) before forking; or commit in the child, which writes
     once the parent lets go of the file (and waits for ever if the parent holds it while it waits for that child; on
     Python 3.6, 5.14's child wrote there through a copy of the parent's lock). A commit before forking writes none of
-    the child's rows.
+    the child's rows. A child's `move_to_end()`, or its `checkExternalChanges()` then `rewrite()`, waits there too,
+    with monitoring off as well since 5.16, where it follows a change to the file first (as a default child's always
+    did) and the hold keeps that read or its commit out: a hold in `'r+b'` or `'wb'`, any hold where the file lock is a
+    whole-file `flock` (POSIX systems other than Linux), or rows the child queued itself. On Linux, with none queued,
+    it reads beside the default `'ab'` hold and returns.
+  - A signal handler that uses the store, landing inside a forked child's own write, waits for ever on the lock that
+    write holds (a child has no writer thread): a handler's `commitAppendToFile()` or `reload()` in any child since
+    5.14, and `move_to_end()` where the move follows the file first (in a child with monitoring on, and from 5.16 off
+    too): where the file changed since the store last read or wrote it, as it has once the write's bytes are in, or
+    after the parent's write. One that lands before the write changed the file, with no other change to follow,
+    returns, as a handler's set does.
   - A parent that forks and ends by `os._exit` does not write the rows it queued last: commit before forking.
-- **Planned for 5.16** ([docs/limitations.md](docs/limitations.md)): a Ctrl-C caught inside a set, delete, pop or move
-  still leaves that one key apart (memory changed, the line not queued; a move to the beginning, several keys' order),
-  and so does one that follows a signal handler's `reload()` inside the set; a Ctrl-C at the back jump of other loops
-  inside a `try` or `with` block can skip their clean-up on Python 3.12 to 3.14 (a static check comes first); a
-  `.tsvz` `clear()` after `close()` or in a forked child that a Ctrl-C cuts can leave memory empty and the file full;
-  a handler's change of the store inside `popitem()` or `move_to_end()` can make it raise `StopIteration`,
-  `RuntimeError` or `TypeError`, and two handler calls, the second inside the first one's redo, can make a set, delete,
-  pop or move raise `IndexError` or, rarely, leave a key apart (220 of 53,873 pairs; 5.14: 19,094 of 52,102); a
-  handler's new key, move or followed line inside a set of a new key can leave that key's place in memory apart from
-  the file's; a handler's `clear()` inside a delete, pop or move of a store with no header can leave the key in the
-  file as a row of the key alone; a `#` key can leave memory when the store follows another process's change while
-  rows are queued; a forked child's row is lost when its parent's failed rewrite has left the file damaged; with
-  `monitor_external_changes=False`, a forked child whose parent had replaced, deleted or moved a row since its last
-  rewrite writes its fork-time memory over the rows its parent set after the fork, at its rewrite at exit (these five
-  as in 5.14); a `TSVZClient` with no server, used in a forked child, waits for ever at its first write; a Ctrl-C while
-  the writer thread itself reloads after another process's change waits for that reload; and the compaction above.
+  - Two signal handler calls that use the store, microseconds apart, the second landing inside the first one's redo,
+    can make a set, delete, pop or move raise `IndexError` (5.14 never did there) or, rarely, leave a key apart
+    (memory and the file apart at 220 of 53,873 pairs of handler calls; 5.14: 19,094 of 52,102).
+- **Planned for 5.17** ([docs/limitations.md](docs/limitations.md)): a forked child takes none of its parent's duties to
+  the file or its single-writer settings (its parent's failed writes to try again, `rewrite_on_exit`,
+  `rewrite_interval`), so a forked child's row is no longer lost when its parent's failed rewrite has left the file
+  damaged (as in 5.14), and a forked child no longer compacts the file at its exit unless it sets `rewrite_on_exit`
+  again; a forked child's commits to a compressed file stop slowing with every commit once its parent has written
+  (5.14 and 5.15 do it for a default child, and 5.16 for every child); a forked child's own child, where the grandparent
+  holds `get_file_obj()` and each waits for its child, no longer waits for ever at its close or exit: it writes nothing
+  there and says so, as a direct child does (5.15 the same; 5.14's wrote nothing there and ended); a Ctrl-C caught
+  inside a set, delete, pop or move still leaves that one key apart (memory changed, the line not queued; a move to the
+  beginning, several keys' order), and so does one that follows a signal handler's `reload()` inside the set; a Ctrl-C
+  at the back jump of other loops inside a `try` or `with` block can skip their clean-up on Python 3.12 to 3.14 (a
+  static check comes first); a `.tsvz` `clear()` after `close()` or in a forked child that a Ctrl-C cuts can leave
+  memory empty and the file full; a handler's change of the store inside `popitem()` or `move_to_end()` can make it
+  raise `StopIteration`, `RuntimeError` or `TypeError`; a second signal handler that lands inside the first one's let-go
+  of the store's lock (`letGo()`, between its test of the hold and its release) makes the first one's use of the store
+  raise `RuntimeError: cannot release un-acquired lock` (5.14 the same): a release that finds no hold will be ignored,
+  as a section's exit does; a handler that lands inside a closed store's own write and uses that store waits for ever
+  there too, its `move_to_end()` only where it follows the file (5.14 and 5.15 the same; a `writeLock` that knows its
+  holder is planned to fix it and the forked child's case); a handler's new key, move or followed line inside a set of a
+  new key can leave that key's place in memory apart from the file's; a handler's `clear()` inside a delete, pop or move
+  of a store with no header can leave the key in the file as a row of the key alone; a `#` key can leave memory when the
+  store follows another process's change while rows are queued (these three as in 5.14); a `TSVZClient` with no server,
+  used in a forked child, waits for ever at its first write; a Ctrl-C while the writer thread itself reloads after
+  another process's change waits for that reload; the compaction above; and, in the suite, the Ctrl-C sweep tests' 120 s
+  limit, sized for parallel runs (one timed out at 120 s with four suites of 32 workers on 32 cores, where it takes
+  13.6 s alone).
 
 ## Upgrading to 5.14 from 5.13
 
@@ -521,7 +597,7 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
 
 - Deferred to 5.15: a compaction can keep a strict reader's first line of a key where no other key competes for its
   place, once (`a\na\tX\na\t2\t\na\t\t2\n` scrubbed with header `id\tv`, defaults `[#_defaults_#, '', '']` and count 2
-  keeps all four lines). Every reader reads it alike (deferred again to 5.16: see Upgrading to 5.15). See
+  keeps all four lines). Every reader reads it alike (deferred again to 5.17: see Upgrading to 5.15). See
   [docs/limitations.md](docs/limitations.md#a-compaction-can-keep-a-strict-readers-first-line-of-a-key-where-no-other-key-competes-for-its-place).
 
 - **Known: a program still running 3.39 to 5.2 can cut a wide row when another writer changes its file.** A `TSVZed` of
