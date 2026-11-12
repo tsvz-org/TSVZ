@@ -449,11 +449,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     fork: the message ends "an ancestor held the file (get_file_obj) at an earlier fork". 5.15 and 5.16 took the
     grandchild for one whose parent held nothing, and its exit waited for ever for the grandparent's lock while the
     grandparent waited for the child and the child for it (5.14's children wrote nothing at their exit, and ended).
+    That is the first half. The second: a grandchild cannot tell whether its ancestor still holds the file and waits for
+    it, so it writes nothing where the ancestor let go of the file long before, and 5.16's wrote its row there (the 5.17
+    final review's `gcrel.py`: a process holds `get_file_obj()` across the fork of a child, lets go of it and does not
+    wait; the child forks a child of its own, which sets a row and ends normally: the row is in the file in 5.16, and in
+    5.17 it is not, and the grandchild says so once; Python 3.14 and 3.6). So let go of the file before forking, as for a
+    child.
   - From 5.17 a forked child's `rewrite_on_exit` is False (a child takes none of its parent's single-writer settings),
     so the bullet above about a store with `rewrite_on_exit` is a child that set it again.
   - The suite pins the waits above, in the cases `held2.py` ran
     (`test_a_forked_child_whose_parent_holds_the_file_waits_only_where_its_known_limitation_says`, from 5.17): a change
-    that ends one fails there, and this entry changes with it.
+    that ends one fails there, and this entry changes with it. It pins the grandchild's silence too, both halves
+    (`test_a_forked_childs_own_child_writes_nothing_at_its_exit_where_an_ancestor_holds_the_file` and
+    `..._even_once_the_ancestor_let_go_of_the_file`).
 - Why: the child cannot tell whether its parent waits for it while holding the file. A write there waits for the
   parent's lock, and a parent that waits for the child (`waitpid`) would then never let go: the 5.15 plan's first
   design hung there (measured), as 5.14's close did with `rewrite_on_exit` or a pending sync. A child with no fork
@@ -473,7 +481,57 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `monitor_external_changes=False` a forked child's `move_to_end()` (and `checkExternalChanges()` followed by
   `rewrite()`) waits there too, as a default child's did. The same day the docs pass after the 5.16 re-review stated
   when it waits (a change to follow, and a hold that keeps the read or the commit out), from the Haiku second opinion:
-  that narrows what was approved, and changes no behaviour.
+  that narrows what was approved, and changes no behaviour. Widened again 2026-11-11 (the 5.17 final review); the user
+  chose "Approve the widening (Recommended)", with both halves put to them: a grandchild (or a later descendant) writes
+  nothing at its close or exit where an ancestor held the file at an earlier fork, so it no longer waits for ever for a
+  hold the ancestor still has; and one whose ancestor let go of the file long ago no longer writes its rows at its
+  close or exit either, where 5.16's wrote them.
+
+### After a parent's failed rewrite, a forked child no longer mends the file
+- Kind: known limitation
+- What the operator sees: a store's rewrite fails part way (a full disk, an I/O error) and leaves the file damaged, with
+  memory the only good copy. The program forks, and the parent ends without getting a rewrite through (a daemon's
+  `os._exit`, a kill). The child sets a row and ends by `close()` or its normal exit.
+  - 5.16: the child's close took the parent's failed rewrite to try again and made the file from its memory: all 9 rows
+    of the probe read right, in 6 of 6 `.tsv.gz` cases.
+  - 5.17: the child only appends after the damage, so a `.tsv.gz` file stays damaged, every read stops at the damage, and
+    none of the 9 rows reads right, the child's own included, in 4 of 6 cases (close or exit, with or without
+    `rewrite_on_exit` given to the parent's store). The other 2 are a child that sets `rewrite_on_exit` again, which
+    mends the file as before. A plain `.tsv` read right in both builds in the probe. (The 5.17 final review's
+    `daemon.py`, Python 3.14 and 3.6.)
+  - With the parent alive and its rewrite getting through, 5.17 keeps the child's row in 6 of 6 cases (`.tsv` and
+    `.tsv.gz`), where 5.16 lost it in 6 of 6 (`alive.py`): the parent, still damaged, took the child's remake for a change
+    it could not merge and wrote over it.
+  - To have a child mend the file, set `rewrite_on_exit` again in the child (the README's advice to a daemon), or open the
+    store after the fork. That mends a `.tsv.gz` file only where the parent appended nothing after the damage: with a
+    row the parent appended after it, the child's rewrite left it reading as empty (close) or as the child's row alone
+    (exit), in 5.16 as well (a variant of `daemon.py`, Python 3.14; a plain `.tsv` read right).
+  - The suite pins it (`test_a_forked_child_does_not_mend_a_compressed_file_its_parent_failed_to_rewrite_unless_it_sets_rewrite_on_exit_again`):
+    a change that ends it fails there, and this entry changes with it.
+- Why: a forked child takes none of its parent's duties to the file (the 5.17 design check; the user's pick "Take H2
+  (Recommended)"): the parent writes the file too, and a child that took the failed rewrite to try again made the parent
+  overwrite the child's rows. The child cannot tell a parent that will mend the file from one that will not.
+- Revisit when: someone needs it. One idea for a design check: a child whose parent is gone (`os.getppid()` changed since
+  the fork) is the only heir and takes the duty back. Not built or tested.
+- Approved: 2026-11-11, the user chose "Known limitation (Recommended)" on the 5.17 final review's question: after a
+  parent's failed rewrite, a forked child no longer mends the file; the README and its upgrade note say so, with the
+  workaround.
+
+### A call a signal handler puts off inside a store's own write is lost when the handler ends the process by os._exit
+- Kind: known limitation
+- What the operator sees: in a store with no writer thread (a forked child's, or one after `close()`), a signal
+  handler's `commitAppendToFile()`, `reload()`, `clear()`, `rewrite()` or `move_to_end()` that lands inside the store's own
+  write is made when that write ends (5.17). A handler that makes such a call and then ends the process by `os._exit()`
+  never lets the write end, so the call is not made: set a row, commit and `os._exit(0)` in the handler, and the row is
+  not written. By `sys.exit()` the exception unwinds through the write, which makes the calls put off first, and the
+  row is written. 5.16 waited for ever at the commit, so neither wrote it. (The 5.17 final review's `hs.py`, cases `exit`
+  and `sysexit`, Python 3.14 and 3.6.) The README says: end by `sys.exit()`, not `os._exit()`.
+  - The suite pins it (`test_a_signal_handler_that_ends_the_process_inside_a_stores_own_write_keeps_its_commit_only_by_sys_exit`).
+- Why: the call waits for the write it landed in, and that write never returns; running it at once, inside the write,
+  is what waited for ever.
+- Revisit when: someone ends the process from a handler inside such a write and cannot use `sys.exit()`.
+- Approved: 2026-11-11, the user chose "Approve as KL (Recommended)" on the 5.17 final review's question: a put-off call
+  is lost when the handler ends the process by `os._exit`.
 
 ### A signal handler's set inside a forked child's or a closed store's own write can leave memory apart from the file
 - Kind: deferred
@@ -485,13 +543,32 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   out of memory and in the queue: the file gets it, memory does not, until the next reload. 5.16 the same (the 5.17
   build's `setinjob.py`, Python 3.14, a forked child and a closed store; a running store, whose writes run on its writer
   thread while the handler's set waits for the lock, agrees). Not swept: how often each section is hit is not counted.
+  - The same family, from the 5.17 final review (`hs.py` and `l1.py`, Python 3.14 and 3.6, a forked child and a closed
+    store; 5.16 waited for ever at the first call of each, so none is worse than it): a call a handler makes inside such a
+    write is put off and made when the write ends (5.17), but the handler's own next call is made at once, and so comes
+    before it.
+    - A handler's `clear()` followed by a set of `h`: the set is made, then the put-off clear empties memory and the
+      queue, and `h` is in neither memory nor the file (`.tsv` and `.tsvz`). A handler's `reload()` followed by a set
+      keeps the set (a reload replays the queued rows on what it read).
+    - A handler's `reload()` returns before the reload, so a read right after it sees the old row.
+    - A put-off `move_to_end()` of a key that is gone (a `del` after it in the handler) does not raise `KeyError` to the
+      handler: the put-off move reports "Failed at _move()" later.
+    - A process a handler forks inside a closed store's own write, which sets a row and commits: its commit is put off
+      in the line it inherited and is not made (5.16's waited for ever on the writeLock it inherited held). A forked
+      child's store gives that process fresh locks and a new fork mark (5.17), and a closed store has no fork hook.
 - Why: found by the 5.17 build, by reading, while putting off a handler's commit or reload inside such a write; not worse
   than 5.16, and a fix touches every section of the write path, which wants its own sweep.
 - Plan (5.18): a set, delete, pop or move that finds the section lock held by its own thread, in a store with no writer
   thread, is put off until the write below it ends, as a commit is (`_jobHere`, looked up only then: only a handler or a
-  Ctrl-C's leftover finds the lock held); with a handler sweep over a forked child's and a closed store's writes.
+  Ctrl-C's leftover finds the lock held); with a handler sweep over a forked child's and a closed store's writes. It also
+  puts off a set (and a delete or move) made while calls are waiting, so that what a handler does to the store after
+  such a call happens after it. Where to find the waiting calls is to design: the line is in the job's frame now (5.17),
+  so a stack walk, 0.5 to 40 µs a call (the 5.17 final review's `cost2.py`), on a set that takes 1 to 2 µs; a count on the
+  store would read the same for another thread. A call that returns a value (`pop()`, `popitem()`, a read after the
+  handler's own set) cannot simply be put off, and a put-off delete of a missing key could no longer raise `KeyError`:
+  the sweep decides. A closed store's fork hook (for a process a handler forks inside its write) is part of it.
 - Revisit when: 5.18.
-- Noted: 2026-11-11, found by the 5.17 build; a deferral, not asked.
+- Noted: 2026-11-11, found by the 5.17 build; the 5.17 final review's findings added the same day; a deferral, not asked.
 
 ### A parent that forks and ends by os._exit does not write the rows it queued last
 - Kind: known limitation

@@ -255,7 +255,12 @@ on another store of the same file, whose thread waits for this lock.) A store wi
 background thread (after `close()`, or in a child that `fork()` made) writes in the
 thread that asks, one call at a time; a call that a signal handler makes to that store
 inside such a write is made as soon as the write ends, and returns at once (5.17; it
-waited for ever before).
+waited for ever before). What the handler does to the store after such a call happens
+before it: a set after its own `clear()` is lost when the clear is made, and a read after
+its `reload()` sees the old row ([deferred to 5.18](docs/limitations.md#a-signal-handlers-set-inside-a-forked-childs-or-a-closed-stores-own-write-can-leave-memory-apart-from-the-file)).
+A handler that ends the process by `os._exit()` after such a call loses the call: end by
+`sys.exit()`, which makes it first
+([known](docs/limitations.md#a-call-a-signal-handler-puts-off-inside-a-stores-own-write-is-lost-when-the-handler-ends-the-process-by-os_exit)).
 
 A child that `fork()` made (`os.fork()`, or `multiprocessing`'s fork children, which its
 `fork` start method makes; Python 3.14's default on Linux, `forkserver`, makes children
@@ -266,10 +271,14 @@ the parent writes the file too (5.16), and takes none of its parent's duties to 
 or settings that assume one writer (5.17): the parent's failed writes are the parent's to
 try again, and `rewrite_on_exit` and `rewrite_interval` read `False` and `0` in the
 child, so its close and exit only append. To have a child compact the file at its exit,
-set `rewrite_on_exit` again in the child, or open the store after the fork. One that
-ends by `os._exit`, as `multiprocessing`'s children do, writes only what it commits or
-closes. A parent that ends by `os._exit` (a daemon's fork) does not write what it had
-queued, so commit before forking a child that outlives its parent.
+set `rewrite_on_exit` again in the child, or open the store after the fork. That is also
+how a child mends a file that the parent's failed rewrite left damaged, where the parent
+ends without a rewrite getting through (a daemon's fork): the child's close no longer
+makes the file again, as 5.16's did, and a compressed file stays unreadable
+([known](docs/limitations.md#after-a-parents-failed-rewrite-a-forked-child-no-longer-mends-the-file)).
+One that ends by `os._exit`, as `multiprocessing`'s children do, writes only what it
+commits or closes. A parent that ends by `os._exit` (a daemon's fork) does not write what
+it had queued, so commit before forking a child that outlives its parent.
 A child forked while its parent holds `get_file_obj()`, or whose ancestor held it at an
 earlier fork (5.17), writes nothing at its close or exit, since the parent may be waiting
 for it, and says so, even once both have let go of the file. Its `commitAppendToFile()`
@@ -342,10 +351,11 @@ damaged file, as asked, and warns.
 ## Upgrading to 5.17 from 5.16
 
 The file formats are unchanged, and an upgrade needs nothing, except in a program whose forked children should compact the
-file at their exit: set `rewrite_on_exit` again in the child, or open the store after the fork. The changes to the API
-are what `rewrite_on_exit` and `rewrite_interval` read in a child that `fork()` made (as `monitor_external_changes` has
-since 5.16), the warning a forked child's own child prints, and what a call a signal handler makes inside a store's own
-write returns where the store has no writer thread (below).
+file at their exit, or should mend a file that their parent's failed rewrite left damaged, where the parent ends without
+mending it (a daemon's fork): set `rewrite_on_exit` again in the child, or open the store after the fork. The changes to
+the API are what `rewrite_on_exit` and `rewrite_interval` read in a child that `fork()` made (as
+`monitor_external_changes` has since 5.16), the warning a forked child's own child prints, and what a call a signal
+handler makes inside a store's own write returns where the store has no writer thread (below).
 
 - **A forked child takes none of its parent's duties to the file, and none of the settings that assume one writer.** At
   the fork its copy of each store already dropped the rows the parent had queued (5.15) and followed the file whatever
@@ -356,6 +366,13 @@ write returns where the store has no writer thread (below).
     close tried the parent's rewrite again and made the file from its own memory, and the parent, still waiting to make
     the file again, then took that for a change it could not merge and wrote over it (5.14 to 5.16, with or without
     `rewrite_on_exit`; the row is kept in each of the three cases now).
+  - **But a child no longer mends the file where its parent ends without a rewrite getting through.** A daemon's
+    `os._exit` after the fork, a kill: 5.16's child made the file again from its memory at its close or exit (all 9 rows
+    of the probe read right, in 6 of 6 `.tsv.gz` cases); 5.17's only appends after the damage, and a `.tsv.gz` file stays
+    unreadable, the child's own row included (4 of 6 cases; the other 2 are a child that sets `rewrite_on_exit` again,
+    which mends it as before; a plain `.tsv` read right in both). Set `rewrite_on_exit` again in the child, or open the
+    store after the fork
+    ([known](docs/limitations.md#after-a-parents-failed-rewrite-a-forked-child-no-longer-mends-the-file)).
   - A forked child no longer compacts the file at its exit: its close on a 100,000-row store with `rewrite_on_exit` took
     0.43 s, and takes 0.1 ms. Set `rewrite_on_exit` again in the child to have it rewrite.
 - **A forked child's own child no longer waits for ever at its exit where an ancestor holds the file.** A process that
@@ -363,7 +380,9 @@ write returns where the store has no writer thread (below).
   writes nothing at its close or exit and says so, as a direct child does ("an ancestor held the file (get_file_obj) at
   an earlier fork"); its `commitAppendToFile()` writes once the ancestor lets go of the file. In 5.15 and 5.16 it took its
   parent for one that held nothing, and its exit waited for the grandparent's file lock, while the grandparent waited for
-  the child and the child for it (5.14's children wrote nothing at their exit, and ended)
+  the child and the child for it (5.14's children wrote nothing at their exit, and ended). Nor does it write where the
+  ancestor let go of the file long before: it cannot tell whether the ancestor still holds the file and waits for it, and
+  5.16's wrote its row there (let go of the file before forking, as for a child)
   ([known](docs/limitations.md#a-forked-child-writes-nothing-at-its-close-or-exit-when-its-parent-held-get_file_obj-at-the-fork)).
 - **A signal handler that uses a store inside that store's own write no longer waits for ever, in a forked child or
   after `close()`.** Such a store has no writer thread, so its writes run in the thread that asks, and a handler's
@@ -374,8 +393,13 @@ write returns where the store has no writer thread (below).
   writer's change of the row is kept. A handler's set returns at once, as before; one that lands inside such a write's own
   change of memory (a reload's swap) can leave its row in the file and not in memory until the next reload
   ([deferred to 5.18](docs/limitations.md#a-signal-handlers-set-inside-a-forked-childs-or-a-closed-stores-own-write-can-leave-memory-apart-from-the-file);
-  5.16 the same). A running store is unchanged: its writes run on its writer thread, and a handler's call waits for the
-  one under way.
+  5.16 the same). What the handler does to the store after such a call happens before it: a set after its own `clear()` is
+  lost when the clear is made, a read after its `reload()` sees the old row, and a `move_to_end()` of a key the handler
+  deletes next reports its failure later instead of raising (also deferred to 5.18; 5.16 waited for ever at the first
+  call). A handler that ends the process by `os._exit()` after such a call loses the call, where `sys.exit()` makes it
+  first: end by `sys.exit()`
+  ([known](docs/limitations.md#a-call-a-signal-handler-puts-off-inside-a-stores-own-write-is-lost-when-the-handler-ends-the-process-by-os_exit)).
+  A running store is unchanged: its writes run on its writer thread, and a handler's call waits for the one under way.
 - **A forked child's commits to a compressed file no longer slow with each commit once its parent has written.** A
   commit looks at what another process appended for damage, which every read stops at; it looked from the bytes the
   store last read or wrote, and a child, with no writer thread to read the parent's change, looked again at the
@@ -395,9 +419,12 @@ write returns where the store has no writer thread (below).
   after the parent's go-ahead.
 - **Known** ([docs/limitations.md](docs/limitations.md)): the list under 5.15, below, with 5.16's widening, but for the
   signal handler inside a forked child's own write (fixed above, with the closed store's case); the forked child that
-  writes nothing at its close or exit where its parent held the file now covers a grandchild too (above).
+  writes nothing at its close or exit where its parent held the file now covers a grandchild too, even where the
+  ancestor let go of the file long before (above); and two new: a forked child no longer mends the file after its
+  parent's failed rewrite, and a call a handler puts off is lost when it ends the process by `os._exit()` (above).
 - **Planned for 5.18** ([docs/limitations.md](docs/limitations.md)): the rest of what was planned for 5.17 (the list under
-  5.15, below), and a signal handler's set inside a forked child's or a closed store's own write (above).
+  5.15, below), and a signal handler's set inside a forked child's or a closed store's own write, with what a handler does
+  to the store after a put-off call, and the process it forks inside a closed store's write (above).
 
 ## Upgrading to 5.16 from 5.15
 

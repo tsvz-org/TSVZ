@@ -522,15 +522,25 @@ entries go last, in the same commit as the change:
 - Changed: a store with no writer thread (after `close()`, in a forked child) runs one job at a time in the calling
   thread (`_runHere`); a call that a signal handler (or a teeLogger) makes to that store inside such a job, on the same
   thread, is put off until the job ends and returns at once (`self`; `True` for `rewrite()`), where it used to wait for
-  ever. A `move_to_end()` that has to follow the file first is put off whole, follow and move.
+  ever. A `move_to_end()` that has to follow the file first is put off whole, follow and move. The put-off calls are a
+  local of the job's own frame (`_runJob`), not an attribute of the store, and the frame keeps the store's fork mark
+  from when the job began (the 5.17 final review: the build had kept them on the store).
 - Why we had to change: the job holds `writeLock`, a plain lock, through its write; the handler's commit, `reload()`,
   `clear()` or `rewrite()`, and a move that follows the file, took it again on the same thread and waited for ever
   (5.14 to 5.16: an approved known limitation for forked children and a deferral for closed stores).
 - Original design was wrong because: the writer thread gives a store one job at a time, and a store without it ran its
   jobs as plain calls, so a call landing inside one ran inside it: on its lock, a wait for ever; between its locked
-  steps, in the middle of its work, which the writer thread never allows.
+  steps, in the middle of its work, which the writer thread never allows. The build then kept the calls it put off on
+  the store, and took the stack for exact: the final review found that another thread's call drained them, in the
+  middle of the first thread's job (a move ahead of the follow it came after, which undid another writer's change), and
+  that a process forked inside the job inherits the stack, so its own commit was taken for a nested call and put off for
+  ever.
 - Lesson: code that serialises work by handing it to a thread must serialise it the same way when it runs the work
-  itself. To tell a nested call (a signal handler, a callback) from a new one, ask the call stack, which says it
-  exactly: a "busy" flag or a lock's owner can be left set by a Ctrl-C, and would then put off every later call with
-  nothing left to make it. The plan named "a writeLock that knows its holder"; the lock is held only through each step
-  of a job, so its owner says nothing between the steps, and a holder a Ctrl-C left would read as a job under way.
+  itself. To tell a nested call (a signal handler, a callback) from a new one, ask the call stack: a "busy" flag or a
+  lock's owner can be left set by a Ctrl-C, and would then put off every later call with nothing left to make it. The
+  stack answers for this thread, and it is the whole story only while the process is the one the job began in: a forked
+  process inherits it, so the frame also keeps a mark of the process (the store's fork mark) and the lookup compares
+  it. What the nested call leaves for later belongs to the frame that is waiting for it, not to the shared object:
+  kept there, any thread can take it, and a frame that is gone takes it with it. The plan named "a writeLock that knows
+  its holder"; the lock is held only through each step of a job, so its owner says nothing between the steps, and a
+  holder a Ctrl-C left would read as a job under way.
