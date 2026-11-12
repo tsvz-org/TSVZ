@@ -297,8 +297,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `test_a_real_signal_handler_that_uses_the_store_while_the_program_sets_rows_leaves_memory_and_the_file_as_it_set_them[commit-tsv]`
   failed so in 1 of 6 suite runs of the 5.15 design check (on a prototype of 5.15 with the same `letGo()`), with four
   suites and other probes on the host: under that load the handler's commit takes longer than the test's repeating
-  2 ms timer, so a second handler runs inside the first. The design check's probe (`nested.py`) puts the second handler at that line and gets the error on 5.14 and
-  5.15.
+  2 ms timer, so a second handler runs inside the first. The design check's probe (`nested.py`) puts the second
+  handler at that line and gets the error on 5.14 and 5.15.
 - Why: found by the 5.15 design check; no worse than 5.14, and 5.16 is the hotfix of the one change the user chose.
 - Plan (5.17): `letGo()` ignores a release that finds no hold, as `_SectionLock.__exit__` does.
 - Revisit when: 5.17.
@@ -365,6 +365,26 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Plan (5.17): add them to the suite, measured against CI's time.
 - Revisit when: 5.17.
 - Noted: 2026-11-11, from the 5.15 final review's test gaps; a deferral, not asked.
+
+### Test gaps the 5.16 final review leaves
+- Kind: deferred
+- What the operator sees: nothing directly; the suite does not yet look at these, which the 5.16 final review's probes
+  did (it added one test, for the two-column move:
+  `test_a_forked_child_that_moves_a_row_its_parent_changed_after_the_fork_keeps_the_parents_value`):
+  - `monitor_external_changes` reads `True` in a forked child and keeps its value in the parent (the lessons entry
+    names it; no test asserts it);
+  - the narrowed "Appends that do not read the store first land after damage": a `.tsv.gz` store with monitoring off,
+    damage landing before or after the fork, the child ending by commit, close or exit: its row is readable in 6 of 6
+    cases on 5.16 and 0 of 6 on 5.15, and the store that did not fork still appends after the damage (`s/damage.py`);
+  - the two known limitations above, a forked child's `move_to_end()` while its parent holds the file and waits for it
+    (KL-c), and a signal handler inside a forked child's own write: no test pins the wait, so none notices if H2 or a
+    writer thread in the child ends it.
+- Why: found by the 5.16 final review; the hotfix adds the tests that guard what it changed, and the cases above need
+  a probe with an alarm each (a wait for ever is what they check).
+- Plan (5.17): add them to the suite with H2, each bounded by an alarm, the waits as tests that name the entry they
+  change with.
+- Revisit when: 5.17.
+- Noted: 2026-11-11, from the 5.16 final review's test gaps; a deferral, not asked.
 
 ### The Ctrl-C sweep tests' 120 s limit is too short for suites run side by side
 - Kind: deferred
@@ -442,6 +462,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - A child that calls `commitAppendToFile()` itself while its parent holds the file and waits for it: on Python 3.6
     5.14's child wrote, through the copy of the parent's lock it inherited; 5.15's waits for ever, as 5.14's already did
     on 3.7 and later, since 5.15's fork hook drops the inherited locks on 3.6 too.
+  - With `monitor_external_changes=False` too (5.16), a child's `move_to_end()`, and its `checkExternalChanges()`
+    followed by `rewrite()`, wait for ever while the parent holds the file and waits for the child, as a default
+    (monitoring-on) child's already did in 5.14 and 5.15; a monitoring-off child's returned before, and left its move
+    unwritten (the 5.16 final review's `s/held.py`, Python 3.14 and 3.6: 3 of 6 mode and operation cases never end,
+    where 5.15 and 5.14 ended in all 6; macOS not run).
   - On Python 3.6 the same holds for a child in which TSVZ's fork hook did not run, because a library replaced
     `threading._after_fork` without calling the one it replaced: that child also keeps 5.14's other behaviour (its
     commit writes the rows the parent had queued too, and it keeps the locks the parent's threads held), and its
@@ -460,7 +485,30 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   a `close()` in such a child writes nothing, and a commit before the fork writes none of the child's rows, so the
   advice here is the 5.15 re-review's: let go of the file before forking, or commit in the child once the parent has
   let go.) The Python 3.6 child whose explicit commit now waits for ever while the parent holds the file and waits for
-  it: the user chose "Ship it (Recommended)", 2026-11-11.
+  it: the user chose "Ship it (Recommended)", 2026-11-11. Widened again 2026-11-11 (the 5.16 final review); the user
+  chose "Approve the widening (Recommended)": with `monitor_external_changes=False` a forked child's `move_to_end()`
+  (and `checkExternalChanges()` followed by `rewrite()`) waits there too, as a default child's did.
+
+### A signal handler that uses the store, landing inside a forked child's own write, waits for ever
+- Kind: known limitation
+- What the operator sees: a signal handler that uses the store (a commit, `reload()` or a `move_to_end()`), landing
+  while a forked child is inside its own write, waits for ever on the lock that write holds: a child has no writer
+  thread, so its commit and rewrite run in its main thread under `writeLock`, which the handler, running on that same
+  thread inside the write, takes again. A handler's set returns.
+  - Since 5.14, for a handler's `commitAppendToFile()` or `reload()` in any child (either `monitor_external_changes`),
+    and for a monitoring-on child's `move_to_end()`, which follows the file first. 5.16 adds a monitoring-off child's
+    `move_to_end()`, which follows the file now: 5.14 and 5.15 returned there.
+  - A store after `close()`, which has no writer thread either, the same for a handler's `commitAppendToFile()`,
+    `reload()` and, with monitoring on, `move_to_end()`: 5.15 and 5.16 alike (a monitoring-off store's move returns).
+  - Checked on Python 3.14 and 3.6 (the 5.16 final review's `s/sighand.py`: a signal raised at the fsync of the child's
+    commit, after its write, whose handler uses the same store; and the closed store's by the same shape, run for this
+    entry).
+- Why: a fix needs a design change, not a hotfix's size: a writer thread in the child (as a running store has), or a
+  `writeLock` that knows its holder, so that a call made from a handler inside the write can tell it is inside it.
+- Revisit when: 5.17, with H2 (a forked child takes none of its parent's duties), or someone hits it.
+- Approved: 2026-11-11, the user chose "Approve as KL (Recommended)" on the 5.16 final review's question: a signal
+  handler that uses the store, landing inside a forked child's own write, waits for ever (the whole case, which 5.14
+  has, and not only 5.16's addition of a monitoring-off child's `move_to_end()`).
 
 ### A parent that forks and ends by os._exit does not write the rows it queued last
 - Kind: known limitation
@@ -501,6 +549,32 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   that wants that sets `rewrite_on_exit` again in the child.
 - Revisit when: 5.17, or someone loses a forked child's rows this way.
 - Noted: 2026-11-11, from the 5.15 re-review; a deferral, not asked.
+
+### A forked child's commits to a compressed file slow with every commit once its parent has written, with monitoring off
+- Kind: deferred
+- What the operator sees: a `.tsv.gz` store (or another compressed kind) with `monitor_external_changes=False`, a
+  parent that writes the file once after the fork, and a child that then sets and commits rows one at a time. Each
+  commit reads the whole file and decodes every member appended since the fork, because a child has no tick to read
+  the change and move its mark forward, so each commit costs more than the one before. Per set and commit on a 2,000
+  row file, over each 1,000 commits, on Python 3.14 (the 5.16 final review's `s/gzgrow.py`):
+
+  | Build, setting | 1st 1,000 | 2nd | 3rd | 4th |
+  |---|---|---|---|---|
+  | 5.15, monitoring off | 0.02 ms | 0.02 | 0.02 | 0.02 |
+  | 5.16, monitoring off | 0.76 ms | 2.21 | 3.54 | 5.02 |
+  | 5.15 and 5.14, monitoring on | 0.71 ms | 2.04 | 3.35 | 4.68 |
+
+  On 3.6, 5.16 takes 1.02 to 6.70 ms. On a 100,000-row file the first 200 commits cost 0.37 ms each against 0.02 ms.
+  A `.tsv` commit, a one-column delete's commit and a close with `rewrite_on_exit` are unchanged at 100,000 rows. It is
+  what a default (monitoring-on) child has in 5.14 and 5.15: a pool of fork workers committing rows to one `.tsv.gz`
+  with default settings has it today; 5.16 gives a monitoring-off child the same.
+- Why: found by the 5.16 final review; the same as a default child's since 5.14, and no row is lost. The fix is in how
+  a child's commit follows the file, not a hotfix's size.
+- Plan (5.17), with H2: a child's commit takes in what it just read under the lock and moves its mark, so the next
+  commit reads only what is new.
+- Revisit when: 5.17.
+- Noted: 2026-11-11, from the 5.16 final review; a deferral, not asked. The user chose to ship 5.16 with it ("Ship
+  after docs + test (Recommended)").
 
 ### A TSVZClient with no server, used in a forked child, waits for ever at its first write
 - Kind: deferred
