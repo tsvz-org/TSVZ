@@ -551,7 +551,20 @@ entries go last, in the same commit as the change:
   hole, and needs the hook. What the nested call leaves for later belongs to the frame that is waiting for it, not to
   the shared object: kept there, any thread can take it, and a frame that is gone takes it with it. The frame that
   holds it must not be the one that drains it, since a call landing after the frame's last look is lost: drain from
-  the caller once the frame is gone. A `finally` runs while a Ctrl-C's traceback still holds what the cut job left (a
-  locked file), so put-off work is dropped after a Ctrl-C, not made in that `finally`. The plan named "a writeLock that knows
-  its holder"; the lock is held only through each step of a job, so its owner says nothing between the steps, and a
-  holder a Ctrl-C left would read as a job under way.
+  the caller once the frame is gone. A resource is under its clean-up from the step that takes it: the write took its
+  locked file, then ran one more check of the store's own outside the `try` that lets go of it, and its clean-up called
+  `_unlockFile` before it closed the file, so a `SystemExit` (`sys.exit()`) or a Ctrl-C landing in either (a real signal
+  is taken at a function's entry, as `_unattended()` is called, and at a call) left the file open and locked for as long
+  as the exception's traceback lived, and the drain's commit, or a program's own `except SystemExit:` clause that commits
+  again, waited for it for ever (the 5.17 round 2 review's N1; the README's handler hung in about 2% of real signals, and
+  5.16 hung in a program's clause the same way). Round 2 fixed it where it showed, at the drain, for a Ctrl-C only
+  (R1), and the same hang came back with `SystemExit`: the third round's design check found the leak older than 5.17 and
+  removed it at its source: the `try` begins where the file is taken, and the file is closed whatever `_unlockFile` did
+  (closing the descriptor drops its lock). Put-off work is still dropped after a Ctrl-C, not made in that `finally`: a
+  cut can leave `writeLock` held (on Python 3.14, a signal between `with`'s enter and its block), and without the drop a
+  Ctrl-C at 5 to 9 steps of a put-off call's sweep hung again. The plan named "a writeLock that knows its holder"; the
+  lock is held only through each step of a job, so its owner says nothing between the steps, a holder a Ctrl-C left would
+  read as a job under way, and the design check made `writeLock` an `RLock` and swept 5.16 with it: 619 of 1,060 steps
+  still hung (the nested commit opens the file again, and waits for the file lock its own write holds). What is left is
+  the approved limitation of a lock a cut write leaves held (Python 3.14: about 0.5% of real signals), for which a lock
+  that knows its holder, letting go of a hold found where the stack shows no job, is the 5.18 candidate.

@@ -139,6 +139,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - A commit after `close()` or in a forked child that a Ctrl-C cuts just after its write writes its rows again at the
     next commit: 195 of 1,037 steps of such a `.tsvz` commit on 3.14 (from 5.15, which keeps them queued until they
     are on disk), 170 of 1,175 of a loose one (as in 5.14).
+  - A handler's `sys.exit()` inside such a commit does the same (widened 2026-11-12; 5.17). The handler sets `h` and
+    commits as the write's bytes are on disk and the queue is not popped yet: the commit is put off and made as the
+    `SystemExit` goes up, and writes the cut commit's rows, still queued, again: the file's lines are `a b c c h` (`c`
+    the cut commit's row; a handler at the commit's fsync, a closed store and a forked child, Python 3.14 and 3.6). The
+    last copy wins and every read is right. 5.16 waited for ever there (the handler's commit took the `writeLock` the cut
+    commit held).
   - The last copy wins, so every reader reads the same rows, and the file is longer until its next rewrite (a `.tsvz`
     file until a scrub): a line for each copy, or up to two lines for each row after a move to the beginning. The
     exception is a stale copy: when another process writes one of those keys between the two copies (while the
@@ -160,7 +166,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   extra copy (Recommended)". (Item 4: the 5.15 plan's fix that keeps a cut `.tsvz` commit's rows queued.) Widened
   2026-11-11 to moves; the user chose "Approve the widening (Recommended)": a handler landing inside a move can leave a
   second copy of the moved lines (a move to the front can double the file) until the next rewrite, and a `clear()`
-  handler there can write a deletion line twice; no data or order is wrong.
+  handler there can write a deletion line twice; no data or order is wrong. Widened 2026-11-12 to a handler's
+  `sys.exit()` inside the store's own commit (the file's lines `a b c c h`; the last copy wins and every read is right;
+  5.16 waited for ever there); the user chose "Widen it (Recommended)".
 
 ### A Ctrl-C while the writer thread reloads after another process's change waits for that reload
 - Kind: deferred
@@ -394,15 +402,53 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     the same in these two cases, and in every `.tsvz` commit of a running store, which ran in the caller's thread
     there. What the cut write leaves in the file is the entry above. (A cut `.tsvz` commit drops no row from 5.15: its
     rows stay queued until they are on disk.)
+  - A signal handler's `sys.exit()` inside such a write, on Python 3.14 (widened 2026-11-12; 5.17). A signal can land
+    just after `with self.writeLock:` has taken the lock and before its block begins, and the exception skips the release
+    (CPython's own gap). The call the handler put off (a commit, `reload()`, `clear()`, `rewrite()` or `move_to_end()`;
+    5.17) is made as the exception goes up, and waits for ever for the `writeLock` the cut write left held: the process
+    does not end, and the handler's row is not written. The README's handler (set, commit, `sys.exit()`) in a
+    set-and-commit loop of a closed store and of a forked child, a real SIGUSR1 from another process, 4,000 runs each:
+    32 of 8,000 hung on 3.14, every one waiting at `with self.writeLock:` (none in 8,000 on 3.11, none in 8,000 on 3.12; 3.13 not run).
+    5.16 waited for ever at 127 and 121 of 160 real signals of that loop (a closed store, a forked child), this landing
+    among them (by reading: its handler's commit took the lock the gap left held). Two signals inside one commit (a first handler's call put off, then a second handler's
+    `sys.exit()`; the first simulated at the start of each commit of the loop, the second a real SIGUSR1, 4,000 runs each):
+    28 of 8,000 hung on 3.14, all at `writeLock` (none on 3.11), where 5.16 ended in all of them (it made the first
+    handler's call at once): this case stays worse than 5.16 on 3.14.
 - Why: `writeLock` is held for the caller across calls by `get_file_obj()`, so a thread that finds itself holding
   it cannot take that for a Ctrl-C's leftover; whatever lets go of a lock is itself code a second Ctrl-C can land in;
   calls after `close()` and writes from forked children are rare.
-- Revisit when: someone hits it, or a closed store or a forked child gets a writer thread.
+- Revisit when: someone hits it, or a closed store or a forked child gets a writer thread. 5.18's candidate is a
+  `writeLock` that knows its holder, in the one job it can do: at `_runHere`'s door, where the stack shows no job of this
+  store on this thread and `get_file_obj()` holds nothing, a hold by this thread is a leftover and is let go of. It needs
+  its own sweep: with a reentrant lock, a nested taker that is not put off would run inside the write where it waits today
+  (a plain reentrant `writeLock` hung at 619 of 1,060 steps of 5.16's commit: the nested commit opens the file again, and
+  waits for the file lock its own write holds; the 5.17 design check).
 - Approved: 2026-11-10, the user chose "Approve as KL (Recommended)" on the question: "One rare case is left, for a
   program that catches Ctrl-C and keeps running: a second Ctrl-C landing inside the cleanup that lets go of the lock,
   or a write after close() or in a forked child, can still leave a store's lock held, and another thread then waits
   for ever (as in 5.12)." The wording is the 5.13 final review's, which adds the `writeLock` case: its hang hits the
-  program's own next commit, not only another thread.
+  program's own next commit, not only another thread. Widened 2026-11-12 to a handler's `sys.exit()` that lands as a
+  write takes `writeLock` on Python 3.14 (the last bullet); the user chose "Widen it (Recommended)".
+
+### On Python 3.6 to 3.10 a signal handler that ends the process inside a store's own write can still hang, in a few of 8,000 signals
+- Kind: known limitation
+- What the operator sees: in a store with no writer thread (a forked child's, or one after `close()`), a signal handler that
+  sets a row, commits and ends by `sys.exit()` (the README's handler) lands inside the store's own write; its commit is
+  put off and made as the write ends (5.17). Up to Python 3.10 the interpreter checks for signals after the instruction
+  that ends a `try` or `with` block, so one instruction at the end of each block of the write's clean-up is outside
+  every clean-up. A signal that lands there leaves the locked file open under the `SystemExit`'s traceback (or `writeLock`
+  held, at the end of its `with` block): the handler's commit waits for that lock for ever, and the process does not end.
+  The README's handler in a set-and-commit loop, a real SIGUSR1 from another process, a closed store and a forked child,
+  4,000 runs each: 2 of 8,000 hung on 3.6 (in two runs, 2 and 2: three at the file lock, one at `writeLock`), 2 on 3.9
+  and none on 3.10. 3.11 and later take a signal only at a function's entry, a loop's back jump and after a call: the same
+  runs hung in none on 3.11 (none in 8,000), and the hangs that are left on 3.14 are the lock-held entry's. The 5.17 build hung at
+  230, 220 and 195 of 8,000 on 3.6, 3.9 and 3.10, and 5.16 at about 3 of 4.
+- Why: no arrangement of `try` closes it (the 5.17 design check), and the interpreters are end-of-life, kept so the
+  tools still run on them; the fix would add parts to the 3.11 and later path.
+- Revisit when: someone hits it where they cannot move to Python 3.11 or later, or a closed store or a forked child gets a
+  writer thread.
+- Approved: 2026-11-12, the user chose "Known limitation (Recommended)" on the 5.17 design check's question: Python 3.6
+  to 3.10 keep a few hangs in 8,000 real signals that no arrangement of `try` removes.
 
 ### A forked child writes nothing at its close or exit when its parent held get_file_obj() at the fork
 - Kind: known limitation
@@ -568,8 +614,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   queued for the next commit). A handler that makes such a call and then ends the process by `os._exit()`
   never lets the write end, so the call is not made: set a row, commit and `os._exit(0)` in the handler, and the row is
   not written. By `sys.exit()` the exception unwinds through the write, which makes the calls put off first, and the
-  row is written. 5.16 waited for ever at the commit, so neither wrote it. (The 5.17 final review's `hs.py`, cases `exit`
-  and `sysexit`, Python 3.14 and 3.6.) The README says: end by `sys.exit()`, not `os._exit()`.
+  row is written, but for two cases where the call waits for ever and the process does not end: on Python 3.14, a signal
+  that lands just after the write has taken `writeLock` leaves it held (32 of 8,000 real signals in a commit loop; the
+  entry on a lock left held, above), and on Python 3.6 to 3.10 one that lands at the end of a `try` block leaves the
+  file locked (2 of 8,000 on 3.6; the entry on Python 3.6 to 3.10, above). 5.16 waited for ever at the commit, so
+  neither wrote it, and at 127 and 121 of 160 real signals altogether. (The 5.17 final review's `hs.py`, cases `exit` and
+  `sysexit`, Python 3.14 and 3.6.) The README says: end by `sys.exit()`, not `os._exit()`.
   - The suite pins it (`test_a_signal_handler_that_ends_the_process_inside_a_stores_own_write_keeps_its_commit_only_by_sys_exit`).
 - Why: the call waits for the write it landed in, and that write never returns; running it at once, inside the write,
   is what waited for ever.
@@ -651,8 +701,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   store would read the same for another thread. A call that returns a value (`pop()`, `popitem()`, a read after the
   handler's own set) cannot simply be put off, and a put-off delete of a missing key could no longer raise `KeyError`:
   the sweep decides. A closed store's fork hook (for a process a handler forks inside its write) is part of it.
+  - **A design check comes first**, before that put-off is extended to sets, deletes, pops and moves (the 5.17 design check's
+    question D). It compares it with the other way to remove this whole class: a store with no
+    writer thread stops running its writes on the calling thread. By reading, that is one of two shapes: a forked child's
+    store starts its writer thread again at its first write, or `_runHere` runs each job on a helper thread and waits for
+    it as `_call` does. Either would remove the put-off line, the frame lookup, the drain, a Ctrl-C's drop, the `os._exit`
+    limitation, F4, this entry's other cases, and both cut-write limitations. Its costs are real: the thread's lifetime in
+    a child, a thread hand-off on every commit of a child, and the exit path, where a new thread may not start (Python 3.12
+    and later refuse it during shutdown, from memory: to check). Nothing of it was built or run.
+  - **A `writeLock` that knows its holder**, for the approved limitation of a lock a cut write leaves held (Python 3.14),
+    is the other candidate: see that entry.
 - Revisit when: 5.18.
-- Noted: 2026-11-11, found by the 5.17 build; the 5.17 final review's findings added the same day; a deferral, not asked.
+- Noted: 2026-11-11, found by the 5.17 build; the 5.17 final review's findings added the same day; the design check's
+  condition added 2026-11-12; a deferral, not asked.
 
 ### A parent that forks and ends by os._exit does not write the rows it queued last
 - Kind: known limitation
