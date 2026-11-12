@@ -497,3 +497,40 @@ entries go last, in the same commit as the change:
 - Lesson: at a fork, also reset in the child's copy every setting that assumes its process is the file's only writer
   (no monitoring, a rewrite at exit that does not read first): the parent is now another writer. Say so where the
   setting is documented, since the attribute reads otherwise in the child.
+
+## 2026-11-11 TSVZ 5.17: a forked child keeps what it knows of the file and drops what it was doing
+- Changed: in a child that `fork()` made, each `TSVZed` now also reads `rewrite_on_exit` `False` and `rewrite_interval`
+  `0` from the fork on (as `monitor_external_changes` reads `True` since 5.16), and drops the parent's failed writes to
+  try again, their reports and a refused rewrite's back-off. A child's close and exit only append, so a forked child
+  no longer compacts the file at its exit unless it sets `rewrite_on_exit` again (the user accepted that cost, picking
+  "Take H2 (Recommended)"). A child's own child learns of an ancestor's `get_file_obj()` hold too, and its warning names
+  "an ancestor".
+- Why we had to change: a child forked after its parent's rewrite failed part way took that rewrite to try again (and
+  `rewrite_on_exit`): its close made the file again from its memory, and the parent, still damaged, took that for a
+  change it could not merge and wrote over it, losing the child's row (the 5.15 re-review). Each of 5.15's review rounds
+  had found one more field the fork hook should reset (`_damaged`, `dirty`, the monitoring setting); the design check
+  found the next ones (`_failures`, the rewrite settings) and the grandchild's lost hold.
+- Original design was wrong because: the hook reset a list of fields, one per finding, instead of applying a rule; and
+  it copied the parent's hold into the child's "parent held" flag only, which the child's own hook then read as its
+  own hold, so a grandchild saw none.
+- Lesson: decide what a forked copy inherits by a rule, not a list: it keeps what it knows of the shared resource (its
+  rows, what it last read of the file, the widths), and drops what the original was doing to it (its queue, its jobs, a
+  write under way, failed writes to try again) and every setting that assumes one writer. Carry an ancestor's hold down
+  every generation, not only to the first.
+
+## 2026-11-11 TSVZ 5.17: a call made inside a store's own write, on the same thread, runs once that write ends
+- Changed: a store with no writer thread (after `close()`, in a forked child) runs one job at a time in the calling
+  thread (`_runHere`); a call that a signal handler (or a teeLogger) makes to that store inside such a job, on the same
+  thread, is put off until the job ends and returns at once (`self`; `True` for `rewrite()`), where it used to wait for
+  ever. A `move_to_end()` that has to follow the file first is put off whole, follow and move.
+- Why we had to change: the job holds `writeLock`, a plain lock, through its write; the handler's commit, `reload()`,
+  `clear()` or `rewrite()`, and a move that follows the file, took it again on the same thread and waited for ever
+  (5.14 to 5.16: an approved known limitation for forked children and a deferral for closed stores).
+- Original design was wrong because: the writer thread gives a store one job at a time, and a store without it ran its
+  jobs as plain calls, so a call landing inside one ran inside it: on its lock, a wait for ever; between its locked
+  steps, in the middle of its work, which the writer thread never allows.
+- Lesson: code that serialises work by handing it to a thread must serialise it the same way when it runs the work
+  itself. To tell a nested call (a signal handler, a callback) from a new one, ask the call stack, which says it
+  exactly: a "busy" flag or a lock's owner can be left set by a Ctrl-C, and would then put off every later call with
+  nothing left to make it. The plan named "a writeLock that knows its holder"; the lock is held only through each step
+  of a job, so its owner says nothing between the steps, and a holder a Ctrl-C left would read as a job under way.

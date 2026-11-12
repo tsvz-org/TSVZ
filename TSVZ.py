@@ -6077,6 +6077,8 @@ class TSVZed(OrderedDict):
 	  progress is finished (a second Ctrl-C abandons it); a store with nothing to write is not waited for. A
 	  .tsvz-family store's commitAppendToFile(), clear() and reload() are handed to it the same way (5.13; they
 	  ran in the calling thread, whose Ctrl-C could leave writeLock held, and the writer thread waited for it).
+	  After close() and in a child that fork() made there is no background thread: these run in the calling
+	  thread, one at a time, and one a signal handler calls inside another is made once that one ends (5.17).
 	- Its reads of a legacy file (the load, reload() and the background read) hold the file's READ lock, so
 	  another process's rewrite under the file lock is waited out, never met part way; its appends take the
 	  append lock (which, on Linux, readers do not wait for) and its rewrites the rewrite lock (_lockFile).
