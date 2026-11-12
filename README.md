@@ -462,7 +462,7 @@ can land in, and checks the locks, memory and the file after each.
   - A signal handler that uses the store, landing inside a forked child's own write, waits for ever on the lock that
     write holds (a child has no writer thread): a handler's `commitAppendToFile()` or `reload()` in any child since
     5.14, and `move_to_end()` where the child follows the file (monitoring on; from 5.16 off too). A handler's set
-    returns. A store after `close()` is the same, but for a monitoring-off store's `move_to_end()`, which returns.
+    returns.
   - A parent that forks and ends by `os._exit` does not write the rows it queued last: commit before forking.
   - Two signal handler calls that use the store, microseconds apart, the second landing inside the first one's redo,
     can make a set, delete, pop or move raise `IndexError` (5.14 never did there) or, rarely, leave a key apart
@@ -481,7 +481,8 @@ can land in, and checks the locks, memory and the file after each.
   `RuntimeError` or `TypeError`; a second signal handler that lands inside the first one's let-go of the store's lock
   (`letGo()`, between its test of the hold and its release) makes the first one's use of the store raise
   `RuntimeError: cannot release un-acquired lock` (5.14 the same): a release that finds no hold will be ignored, as a
-  section's exit does; a handler's new key, move or followed line inside a set of a new key can leave that key's place
+  section's exit does; a handler that lands inside a closed store's own write and uses that store waits for ever
+  there too (5.15 the same; a lock that knows its holder fixes it and the forked child's case); a handler's new key, move or followed line inside a set of a new key can leave that key's place
   in memory apart from the file's; a handler's `clear()` inside a delete, pop or move of a store with no header can
   leave the key in the file as a row of the key alone; a `#` key can leave memory when the store follows another
   process's change while rows are queued (these three as in 5.14); a `TSVZClient` with no server, used in a forked

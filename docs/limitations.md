@@ -498,17 +498,27 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - Since 5.14, for a handler's `commitAppendToFile()` or `reload()` in any child (either `monitor_external_changes`),
     and for a monitoring-on child's `move_to_end()`, which follows the file first. 5.16 adds a monitoring-off child's
     `move_to_end()`, which follows the file now: 5.14 and 5.15 returned there.
-  - A store after `close()`, which has no writer thread either, the same for a handler's `commitAppendToFile()`,
-    `reload()` and, with monitoring on, `move_to_end()`: 5.15 and 5.16 alike (a monitoring-off store's move returns).
   - Checked on Python 3.14 and 3.6 (the 5.16 final review's `s/sighand.py`: a signal raised at the fsync of the child's
-    commit, after its write, whose handler uses the same store; and the closed store's by the same shape, run for this
-    entry).
+    commit, after its write, whose handler uses the same store).
 - Why: a fix needs a design change, not a hotfix's size: a writer thread in the child (as a running store has), or a
   `writeLock` that knows its holder, so that a call made from a handler inside the write can tell it is inside it.
 - Revisit when: 5.17, with H2 (a forked child takes none of its parent's duties), or someone hits it.
 - Approved: 2026-11-11, the user chose "Approve as KL (Recommended)" on the 5.16 final review's question: a signal
   handler that uses the store, landing inside a forked child's own write, waits for ever (the whole case, which 5.14
   has, and not only 5.16's addition of a monitoring-off child's `move_to_end()`).
+
+### A signal handler that uses a closed store, landing inside that store's own write, waits for ever
+- Kind: deferred
+- What the operator sees: a store after `close()` has no writer thread either, so its writes run in the calling thread
+  under `writeLock`; a signal handler that lands inside such a write and calls the same store's `commitAppendToFile()`,
+  `reload()` or, with monitoring on, `move_to_end()` waits for ever on that lock (a monitoring-off store's move
+  returns). 5.15 and 5.16 alike (the 5.16 fix round's `f516/s/closedhand.py`, Python 3.14 and 3.6: no fork, a 5 s
+  alarm).
+- Why: the same cause as the forked child's case above, which the user approved as a known limitation; this one
+  needs no fork and was found while checking that entry, so it is planned work, not part of that approval.
+- Revisit when: 5.17: a `writeLock` that knows its holder, so a call made from a handler inside the write can tell it
+  is inside it (the fix the forked child's entry names), covers both.
+- Noted: 2026-11-11, from the 5.16 fix round; a deferral, not asked.
 
 ### A parent that forks and ends by os._exit does not write the rows it queued last
 - Kind: known limitation
