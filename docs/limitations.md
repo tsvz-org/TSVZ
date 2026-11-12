@@ -439,7 +439,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     review's `s/held.py`, Python 3.14 and 3.6: 3 of 6 mode and operation cases never end, where 5.15 and 5.14 ended in
     all 6. The 5.16 docs pass's `held2.py`, the same Pythons, with the change made apart: with a change to follow,
     under `'ab'` only the cases with rows queued wait and under `'r+b'` all do; with none, no case waits; `'wb'`, on
-    3.14, waits in all 6. macOS not run.)
+    3.14, waits in all 6. macOS: the suite's test of 5.17, below, on macOS 26 with Python 3.12 and 3.14, where the lock is
+    a whole-file `flock`: the `'ab'` hold with a change to follow waits there too, as stated.)
   - On Python 3.6 the same holds for a child in which TSVZ's fork hook did not run, because a library replaced
     `threading._after_fork` without calling the one it replaced: that child also keeps 5.14's other behaviour (its
     commit writes the rows the parent had queued too, and it keeps the locks the parent's threads held), and its
