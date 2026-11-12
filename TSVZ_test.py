@@ -18781,7 +18781,8 @@ def test_a_forked_childs_own_child_writes_nothing_at_its_exit_where_an_ancestor_
 #: go of it and does not wait while it holds it (it says so by a pipe, and waits for its child after). WHO child (the
 #: control): the child sets d and ends by its normal exit. WHO grand: the child forks a child of its own once the file is
 #: let go of; that grandchild sets d and ends by its normal exit, and the child ends with its status (100 + the signal that
-#: ended it, or its exit code). Alarms: 10 s in the grandchild and 20 s in the child; each ends in well under a second.
+#: ended it, or its exit code). Alarms: 10 s in the grandchild and 20 s in the child, both from the parent's go-ahead; each
+#: ends in well under a second.
 _FORKED_GRANDCHILD_AFTER_RELEASE = r"""
 import os, signal, sys
 sys.path.insert(0, sys.argv[1])
@@ -18794,9 +18795,9 @@ f = t.get_file_obj('ab')
 go = os.pipe()
 pid = os.fork()
 if pid == 0:
-	signal.alarm(20)
 	os.close(go[1])
 	os.read(go[0], 1)  # (the parent let go of the file)
+	signal.alarm(20)
 	if who == 'child':
 		t['d'] = ['d', '1']
 		sys.exit(0)  # (the normal exit: atexit runs)
@@ -19000,6 +19001,8 @@ def test_a_forked_child_does_not_mend_a_compressed_file_its_parent_failed_to_rew
 	done = subprocess.run([sys.executable, str(script), HERE, p, end, 'exits', again], stdout=subprocess.PIPE,
 						  stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
 	assert done.returncode == 0 and 'damaged True' in done.stdout and 'child 0' in done.stdout, done.stdout + done.stderr
+	# (the child as forked appended c2 after the damage; one that rewrote left no damage for it to be after)
+	assert ('appended True' in done.stdout) == (again == 'as-forked'), done.stdout + done.stderr
 	want = dict((k, [k, '1' * 30]) for k in 'abcdefgh')
 	want.update(c2=['c2', '2'])
 	with contextlib.redirect_stderr(io.StringIO()):
@@ -19202,9 +19205,9 @@ def test_a_second_signal_handler_inside_letgo_lets_the_first_one_go_on():
 #: waiting for it; closed: the store after close(), no fork. The main thread sets c and commits; a signal (SIGUSR1) lands
 #: inside that commit, just after its fsync (c written, writeLock held), and its handler does CASE. fork: forks (os.fork(),
 #: as multiprocessing's fork start method does) a process that sets g, commits and ends by os._exit, as those children do;
-#: os-exit, sys-exit: set h, commit, and end the process by os._exit(0) or sys.exit(0). Printed by the worker once the
-#: commit returns (not after os-exit): the processes the handler forked, waited for. The workers have 10 s (an alarm): they
-#: end in well under a second.
+#: os-exit, sys-exit: set h, commit, print that it ends the process, and end it by os._exit(0) or sys.exit(0). Printed by
+#: the worker once the commit returns (not after os-exit): the processes the handler forked, waited for. The workers have
+#: 10 s (an alarm): they end in well under a second.
 _HANDLER_FORKS_OR_ENDS = r"""
 import os, signal, sys, threading
 sys.path.insert(0, sys.argv[1])
@@ -19227,6 +19230,7 @@ def handle(sig, frame):
 	else:
 		t['h'] = ['h', '1']
 		t.commitAppendToFile()
+		print('handler ends the process', flush=True)
 		(os._exit if case == 'os-exit' else sys.exit)(0)
 def work():
 	signal.alarm(10)
@@ -19294,6 +19298,7 @@ def test_a_signal_handler_that_ends_the_process_inside_a_stores_own_write_keeps_
 	done = subprocess.run([sys.executable, str(script), HERE, p, where, end], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
 						  universal_newlines=True, timeout=60)
 	assert done.returncode == 0 and (where == 'closed' or 'child 0' in done.stdout), done.stdout + done.stderr
+	assert 'handler ends the process' in done.stdout, done.stdout + done.stderr  # (it ran: c is in the file either way)
 	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
 	assert list(rows) == ['a', 'b', 'c'] + (['h'] if end == 'sys-exit' else []), (list(rows), done.stderr)
 
@@ -19305,7 +19310,8 @@ def test_a_signal_handler_that_ends_the_process_inside_a_stores_own_write_keeps_
 #: yes: a second thread calls commitAppendToFile() then, and the main thread's write is held until that thread waits for
 #: writeLock (its own commit's write, or a follow that a call of the main thread's it took would make); that thread's
 #: waits for the main thread's whole commit to end, put-off calls included. THREAD no: the control. Printed: a's row in
-#: memory once both have ended. 10 s (an alarm): the run takes a second.
+#: memory once both have ended, and whether the second thread waited for writeLock and is still alive. 10 s (an alarm): the
+#: run takes a second.
 _HANDLER_MOVE_AND_ANOTHER_THREAD = r"""
 import os, signal, sys, threading
 sys.path.insert(0, sys.argv[1])
@@ -19362,6 +19368,7 @@ def work():
 		other.join(5)
 	t.commitAppendToFile()
 	print('a', t.get('a'), flush=True)
+	print('second', waiting.is_set(), other.is_alive(), flush=True)  # (it waited for writeLock; it ended)
 if where == 'closed':
 	t.close()
 	work()
@@ -19395,6 +19402,9 @@ def test_another_threads_commit_does_not_make_the_calls_a_handler_put_off_in_thi
 						  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
 	assert done.returncode == 0 and (where == 'closed' or 'child 0' in done.stdout), done.stdout + done.stderr
 	assert "a ['a', '2']\n" in done.stdout, done.stdout + done.stderr
+	# (the interleaving was forced: the second thread reached writeLock while the main thread's commit was inside its write,
+	# and has ended; without it the second-thread case would pass without testing anything)
+	assert 'second %s False\n' % (second != 'alone') in done.stdout, done.stdout + done.stderr
 	rows = TSVZ.readTabularFile(p, header='id\tv', verbose=False)
 	assert list(rows) == ['b', 'c', 'a'] and rows['a'] == ['a', '2'], (list(rows.items()), done.stderr)
 
@@ -19419,11 +19429,13 @@ def test_a_call_put_off_inside_a_stores_own_job_that_fails_is_reported_and_the_c
 		t._call(made.append, 'inside later')  # (put off inside a call made from the line: it joins the line)
 
 	def job():
-		assert t._call(boom) is t and t._call(later) is t and made == []  # (put off: nothing has run)
+		# (put off: each returns the store, and nothing has run)
+		assert t._call(boom) is t and t._call(later) is t and t._call(made.append, 'third') is t and made == []
 		return 'job'
 
 	assert t._call(job) == 'job'
-	assert made == ['later', 'inside later']
+	# (the call put off inside `later` comes after the third, which was put off before it; run at once it would come first)
+	assert made == ['later', 'third', 'inside later']
 	out = capsys.readouterr().out
 	assert 'Failed at boom() for' in out and 'ValueError(' in out and 'put off and failed' in out, out
 	assert t._call(made.append, 'next') is None and made[-1] == 'next'  # (nothing left on the store: a call runs at once)
@@ -19462,15 +19474,214 @@ def test_a_call_that_lands_as_a_stores_job_frame_ends_is_made(tmp_path):
 
 	def land(frame, event, arg):  # (a profile function: it runs as the job's frame returns, which is still on the stack)
 		if event == 'return' and frame.f_code is code and not landed:
-			landed.append(1)
-			t._call(made.append, 'landed')
+			put_off = t._call(made.append, 'landed') is t  # (put off: it returns the store and has not run)
+			landed.append((put_off, list(made)))
 
 	sys.setprofile(land)
 	try:
 		t._call(made.append, 'job')
 	finally:
 		sys.setprofile(None)
-	assert landed and made == ['job', 'landed']
+	assert landed == [(True, ['job'])] and made == ['job', 'landed']
+
+
+#: ARGV: TSVZ's directory, the file, WHERE, CALL. A store with no writer thread (WHERE closed: after close(); child: a forked
+#: child's), holding a and b. The main thread sets c and commits. As that commit's job begins (before it takes writeLock), a
+#: signal handler's call lands, as a handler's can: CALL (commit: sets h1 and commits; clear: clear(); rewrite:
+#: rewrite(force=True)), which is put off until the job ends. Then a Ctrl-C lands just after the commit's _openLocked() has
+#: returned the locked file (simulated: a KeyboardInterrupt raised right after it returns, so that the traceback holds the
+#: open file, as it does when a real one lands there). Printed, as JSON: how the commit ended ('KeyboardInterrupt', as a
+#: Ctrl-C ends it; 'hung' when it did not return in 10 s, an alarm), whether the Ctrl-C was raised, the keys in memory, and
+#: the file's rows after one more commit. The run takes well under a second.
+_CTRL_C_AFTER_A_HANDLERS_CALL = r"""
+import json, os, signal, sys, threading
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, where, call = sys.argv[2:5]
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)  # (no tick writes)
+t['a'] = ['a', '1']
+t['b'] = ['b', '1']
+t.commitAppendToFile()
+class Hung(BaseException):
+	pass
+def alarm(sig, frame):
+	raise Hung()
+def work():
+	signal.signal(signal.SIGALRM, alarm)
+	main = threading.get_ident()
+	state = {'handler': False, 'ki': False}
+	realCommit, realOpen = TSVZ.TSVZed._commit, TSVZ.TSVZed._openLocked
+	def commit(self):
+		if not state['handler'] and threading.get_ident() == main:
+			state['handler'] = True  # (the handler's call: the job is under way, so it is put off)
+			if call == 'commit':
+				self['h1'] = ['h1', '1']
+				self.commitAppendToFile()
+			elif call == 'clear':
+				self.clear()
+			else:
+				self.rewrite(force=True)
+		return realCommit(self)
+	def openLocked(self, *args, **kwargs):
+		f = realOpen(self, *args, **kwargs)
+		if state['handler'] and not state['ki'] and threading.get_ident() == main:
+			state['ki'] = True
+			raise KeyboardInterrupt  # (the Ctrl-C: the file is locked, and the traceback holds it)
+		return f
+	TSVZ.TSVZed._commit, TSVZ.TSVZed._openLocked = commit, openLocked
+	t['c'] = ['c', '1']
+	signal.alarm(10)
+	try:
+		t.commitAppendToFile()
+		out = 'returned'
+	except KeyboardInterrupt:
+		out = 'KeyboardInterrupt'
+	except Hung:
+		out = 'hung'
+	signal.alarm(0)
+	TSVZ.TSVZed._commit, TSVZ.TSVZed._openLocked = realCommit, realOpen
+	signal.alarm(10)
+	try:
+		t.commitAppendToFile()
+	except Hung:
+		out += ' and the next commit hung'
+	signal.alarm(0)
+	with open(p) as f:
+		rows = [line.split('\t')[0] for line in f.read().split('\n')[1:] if line]
+	print(json.dumps([out, state['ki'], list(t), rows]), flush=True)
+if where == 'closed':
+	t.close()
+	work()
+	os._exit(0)
+pid = os.fork()
+if pid == 0:
+	work()
+	os._exit(0)
+_, code = os.waitpid(pid, 0)
+print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+os._exit(0)
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork') or os.name != 'posix', reason='fork() and SIGALRM')
+@pytest.mark.parametrize('call', ['commit', 'clear', 'rewrite'])
+@pytest.mark.parametrize('where', ['child', 'closed'])
+def test_a_ctrl_c_that_cuts_a_write_after_a_handler_put_off_a_call_is_not_met_with_that_call(tmp_path, where, call):
+	# A store with no writer thread (a forked child's, or one after close()) puts off a signal handler's call inside its own
+	# write and makes it as the write ends. A Ctrl-C that cut the write just after it took the file lock ended it with the
+	# traceback still holding the locked file, so the put-off commit, clear() or rewrite(force=True), made while the
+	# KeyboardInterrupt went up, waited for ever for that lock, and the Ctrl-C never reached the program (5.17 build; 5.16 made
+	# the handler's call at once, and the Ctrl-C raised KeyboardInterrupt). A Ctrl-C that ends the write drops what it put
+	# off now, as a running store's _call takes back a job it has not begun: the rows of a put-off commit stay queued, and the
+	# next commit writes them.
+	p = str(tmp_path / 's.tsv')
+	script = tmp_path / 'handler.py'
+	script.write_text(_CTRL_C_AFTER_A_HANDLERS_CALL)
+	# 60 s: the run takes a second; only a wait for ever takes this long (the script's alarms end it sooner), on a machine the
+	# suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, where, call], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+						  universal_newlines=True, timeout=60)
+	assert done.returncode == 0 and (where == 'closed' or 'child 0' in done.stdout), done.stdout + done.stderr
+	out, ki, memory, rows = json.loads([line for line in done.stdout.split('\n') if line.startswith('[')][0])
+	assert (out, ki) == ('KeyboardInterrupt', True), done.stdout + done.stderr
+	want = ['a', 'b', 'c'] + (['h1'] if call == 'commit' else [])
+	assert memory == want and rows == want, done.stdout + done.stderr
+
+
+#: ARGV: TSVZ's directory, the file, CALL, SECOND. A forked child's store (the script's worker) holding a and b. The main
+#: thread sets c and commits; a signal lands inside that commit just after its fsync (writeLock held), and its handler makes
+#: CALL (clear: clear(); rewrite: rewrite(force=True)), which is put off, then forks. The new process G returns from the
+#: handler, as a fork that is not followed by exec or _exit does, and so goes on with the write it was forked in, and its
+#: end. Before G goes on, the process the job began in (P) finishes its commit and the put-off call, sets x and commits.
+#: G ends by os._exit once its copy of the commit returns. SECOND yes: a second signal lands in G at its first fsync (the one
+#: of a put-off call it makes again), and its handler sets g and commits. Printed: the file's rows once P's commit and x were
+#: written, how G ended, and the file's rows after G ended. 10 s (alarms; G's from P's go-ahead).
+_HANDLER_FORKS_AND_RETURNS = r"""
+import os, signal, sys, threading
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, call, second = sys.argv[2], sys.argv[3], sys.argv[4] == 'yes'
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)  # (no tick writes)
+t['a'] = ['a', '1']
+t['b'] = ['b', '1']
+t.commitAppendToFile()
+def rows():
+	return list(TSVZ.readTabularFile(p, header='id\tv', verbose=False))
+def work():
+	signal.alarm(10)
+	go = os.pipe()
+	me = [os.getpid(), None]
+	def handle(sig, frame):
+		if os.getpid() != me[0]:  # (G: the second signal)
+			t['g'] = ['g', '1']
+			t.commitAppendToFile()
+			return
+		if call == 'clear':
+			t.clear()
+		else:
+			t.rewrite(force=True)
+		pid = os.fork()
+		if pid == 0:
+			os.close(go[1])
+			os.read(go[0], 1)  # (P has written x)
+			signal.alarm(10)
+			return  # (G goes on with the write it was forked in)
+		me[1] = pid
+	signal.signal(signal.SIGUSR1, handle)
+	fired, main = [], threading.get_ident()
+	real = TSVZ._fsync
+	def hook(*args, **kwargs):
+		done = real(*args, **kwargs)
+		if os.getpid() not in fired and threading.get_ident() == main and (second or not fired):
+			fired.append(os.getpid())
+			os.kill(os.getpid(), signal.SIGUSR1)
+		return done
+	TSVZ._fsync = hook
+	t['c'] = ['c', '1']
+	t.commitAppendToFile()
+	TSVZ._fsync = real
+	if os.getpid() != me[0]:  # G: its copy of the commit returned
+		os._exit(0)
+	t['x'] = ['x', '1']
+	t.commitAppendToFile()
+	print('P', rows(), flush=True)
+	os.write(go[1], b'x')
+	_, code = os.waitpid(me[1], 0)
+	print('G', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+	print('after G', rows(), flush=True)
+pid = os.fork()
+if pid == 0:
+	work()
+	os._exit(0)
+_, code = os.waitpid(pid, 0)
+print('child', os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code), flush=True)
+os._exit(0)
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork') or os.name != 'posix', reason='fork() and SIGUSR1')
+@pytest.mark.parametrize('second', ['alone', 'second signal in G'])
+@pytest.mark.parametrize('call', ['clear', 'rewrite'])
+def test_a_process_a_handler_forks_inside_a_forked_childs_write_does_not_make_its_parents_put_off_call_again(
+		tmp_path, call, second):
+	# A process G that a handler forks inside a forked child's own write (P's) and that returns from the handler, as a fork
+	# with no exec or _exit does, goes on with its copy of the write, and then of the put-off calls waiting in P's line,
+	# which it inherited with the stack. A put-off clear() then emptied the file again of what P had set and committed since
+	# (the 5.17 re-review; 5.16 waited for ever at the handler's clear()). Worse, a second handler call in G, during that
+	# drained call, found the frame, which holds P's fork mark, and was not put off: it waited for ever for G's own writeLock,
+	# held by the drained call (the re-review's Haiku lead). The drain is made only in the process whose store has the frame's
+	# mark, so G makes none of P's calls, and its own would be put off. (A closed store has no fork hook, and no mark that
+	# tells G from P: docs/limitations.md.)
+	p = str(tmp_path / 's.tsv')
+	script = tmp_path / 'handler.py'
+	script.write_text(_HANDLER_FORKS_AND_RETURNS)
+	# 60 s: the run takes a second; only a wait for ever takes this long (the script's alarms end it sooner), on a machine the
+	# suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, call, 'yes' if second != 'alone' else 'no'],
+						  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	want = "['a', 'b', 'c', 'x']" if call == 'rewrite' else "['x']"  # (a put-off clear() empties P's file once: the rows set since stay)
+	assert done.returncode == 0 and 'G 0\n' in done.stdout and 'child 0\n' in done.stdout, done.stdout + done.stderr
+	assert 'P %s\n' % want in done.stdout and 'after G %s\n' % want in done.stdout, done.stdout + done.stderr
 
 
 #: ARGV: TSVZ's directory, the file, WHEN, END. A .tsv.gz store with monitor_external_changes=False holding a and b; damage

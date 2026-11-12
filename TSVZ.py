@@ -8073,13 +8073,13 @@ memoryOnly:{self.memoryOnly}
 		"""``fn(*args)`` in this thread, for a store whose writer thread does not run (after close(), in a forked child):
 		one job at a time, as that thread runs them. A call that a signal handler (or anything else run inside the job,
 		such as a teeLogger) makes to this store, on the thread where its job runs, is put off: it joins the job's line
-		and is made as soon as the job ends, however it ends, after any put off before it, and returns ``self`` meanwhile
-		(5.17). Run inside the job, it took writeLock again, which the job holds through its write, and waited for ever
-		(5.14 to 5.16: a handler's commit, reload(), clear() or rewrite(), or a move that follows the file, landing
-		inside a forked child's or a closed store's own write); between the job's locked steps it ran in the middle of the
-		job, which a writer thread, one job at a time, never does. A store with a writer thread hands its jobs to it, and
-		a handler's call waits there for the job under way, as another thread's does (handlers run on the main thread,
-		which hands that thread its jobs).
+		and is made as soon as the job ends, however it ends unless a Ctrl-C ended it, after any put off before it, and
+		returns ``self`` meanwhile (5.17). Run inside the job, it took writeLock again, which the job holds through its
+		write, and waited for ever (5.14 to 5.16: a handler's commit, reload(), clear() or rewrite(), or a move that
+		follows the file, landing inside a forked child's or a closed store's own write); between the job's locked steps it
+		ran in the middle of the job, which a writer thread, one job at a time, never does. A store with a writer thread
+		hands its jobs to it, and a handler's call waits there for the job under way, as another thread's does (handlers
+		run on the main thread, which hands that thread its jobs).
 
 		The line is a local of the job's own frame (_runJob's), where _jobHere finds it, not an attribute of the store:
 		- another thread must not drain it: kept on the store, a second thread's call took the calls this thread's job
@@ -8087,13 +8087,18 @@ memoryOnly:{self.memoryOnly}
 		  another writer's change of the row: the 5.17 final review's second opinion);
 		- a process forked inside the job must not find it: it inherits the stack, and the fork mark the frame keeps
 		  (_forkReset when the job began) is how _jobHere tells it from the process the job began in (a commit there
-		  wrote nothing).
-		The line is drained here, once the job's frame is gone: a call that lands as that frame ends still joins the
+		  wrote nothing), and the drain (_drain) is made only in the process the job began in: a process forked inside
+		  the job that returns from the handler goes on with its copy of the job, and must not make its parent's calls
+		  again (a clear() put off there emptied the file of the rows the parent wrote after it).
+		The line is drained from here, once the job's frame is gone: a call that lands as that frame ends still joins the
 		line, and one that lands after it runs as a job of its own.
 
 		The calls put off are made as jobs of their own, and their callers have gone on, so an error is reported, not
 		raised. A KeyboardInterrupt goes up, and drops the calls it did not reach (a commit's rows stay queued; a put-off
-		reload, rewrite or move is not made), as a running store's _call takes back a job it has not begun."""
+		reload, rewrite, move or clear is not made, the handler having been told it was done), as a running store's _call
+		takes back a job it has not begun. One that ended the job drops them all, since it was cut where the job was, and
+		its traceback still holds what the job left: a commit cut just after it took the file lock holds the locked file
+		there, and the put-off commit, made while the Ctrl-C goes up, waited for ever for that lock (5.17 build)."""
 		line = self._jobHere()
 		if line is not None:
 			line.append((fn, args))
@@ -8101,14 +8106,24 @@ memoryOnly:{self.memoryOnly}
 		line, fork = deque(), self._forkReset
 		try:
 			return self._runJob(fn, args, line, fork)
+		except KeyboardInterrupt:
+			line.clear()
+			raise
 		finally:
-			while line:
-				fn, args = line.popleft()
-				try:
-					self._runJob(fn, args, line, fork)  # (not _runHere: one put off inside it joins the line)
-				except Exception as e:
-					self.__teePrintOrNot(f"Failed at {getattr(fn, '__name__', fn)}() for {self._fileName}, a call made inside this "
-										 f"store's own write (a signal handler's) and put off until it ended: {e!r}",'error')
+			self._drain(line, fork)
+
+	def _drain(self, line, fork):
+		"""Make the calls put off inside a job (_runHere's ``line``), each as a job of its own, in the process the job began
+		in (``fork``: the store's fork mark when it began). A method, not a loop in _runHere's finally: Python 3.12 leaves the
+		back jump of a loop in a finally out of the exception table, so a Ctrl-C there skipped the finally's cleanup (as in
+		_waitFor)."""
+		while line and fork == self._forkReset:
+			fn, args = line.popleft()
+			try:
+				self._runJob(fn, args, line, fork)  # (not _runHere: one put off inside it joins the line)
+			except Exception as e:
+				self.__teePrintOrNot(f"Failed at {getattr(fn, '__name__', fn)}() for {self._fileName}, a call made inside this "
+									 f"store's own write (a signal handler's) and put off until it ended: {e!r}",'error')
 
 	def _runJob(self, fn, args, line, fork):
 		"""The frame where _runHere runs a job: _jobHere looks for it on the thread's stack, and reads its locals. ``line``:
@@ -8125,8 +8140,9 @@ memoryOnly:{self.memoryOnly}
 		handler's ``os.fork()``, ``multiprocessing``'s fork start method) inherits the stack with the frame, but the write
 		below it is its parent's, and a call put off there would wait in a line that nothing in the new process drains.
 		The fork hook gives that process's store a new mark, which tells it from the frame's. (A closed store has no
-		hook: a process forked inside its job keeps the mark None, finds the frame, and its calls are put off and not
-		made, where 5.16's waited for ever on the writeLock it inherited held. docs/limitations.md.)"""
+		hook: a process forked inside its job keeps the store's mark (None, or the pid of the forked child whose store
+		was closed), finds the frame, and its calls are put off and not made, where 5.16's waited for ever on the
+		writeLock it inherited held. docs/limitations.md.)"""
 		code = TSVZed._runJob.__code__
 		frame = sys._getframe(1)
 		while frame is not None:
