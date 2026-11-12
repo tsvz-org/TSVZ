@@ -6187,7 +6187,6 @@ class TSVZed(OrderedDict):
 			self._writeFailing = False
 			self._specLoaded = False
 		self._requests = deque()  # the jobs _call hands the writer thread
-		self._deferred = deque()  # with no writer thread: the calls a signal handler made inside this store's own job (_runHere)
 		self._wake = _Flag()  # set when one is handed: the thread does not wait out its tick
 		self._workerDone = _Flag()  # set as the writer thread ends (_workerRuns)
 		self._workerPid = os.getpid()
@@ -7108,11 +7107,11 @@ memoryOnly:{self.memoryOnly}
 			# The move queues rows memory holds again, so memory must be the file first: another process's change since
 			# the last tick would be undone by those rows. What the writer thread's tick does: follow the change, and
 			# rewrite only when one is due. (A stat, so a loop of moves stays cheap.)
-			if not self._workerRuns() and self._jobHere():
+			line = None if self._workerRuns() else self._jobHere()
+			if line is not None:
 				# A signal handler's move inside this store's own write, with no writer thread (after close(), in a forked
 				# child): the follow waits for that write to end (_runHere), and so does the move, which must come after it.
-				self._deferred.extend([(self._checkExternalChanges, ()), (self._rewrite, (False, None, True)),
-									   (self._move, (key, last))])
+				line.extend([(self._checkExternalChanges, ()), (self._rewrite, (False, None, True)), (self._move, (key, last))])
 				return self
 			self.checkExternalChanges()
 			self._call(self._rewrite, False, None, True)
@@ -7315,9 +7314,9 @@ memoryOnly:{self.memoryOnly}
 	_letGo = False  # the exit let go of the store (_atExit), or abandoned it: its writer thread starts no write
 	_exiting = False  # _stopLiveStores stops it at exit: a Ctrl-C there finishes the store, which does not run on
 	_loadJob = None  # the load job (reload()'s) the writer thread runs: it stops once its waiter left (_call)
-	_forkReset = None  # the pid of the forked child whose fork hook reset the store (_afterFork)
+	_forkReset = None  # the pid of the forked child whose fork hook reset the store (_afterFork); a job's frame keeps it (_jobHere)
 	_fileObjHeld = False  # get_file_obj() holds the file (writeLock and the file lock) until release_file_obj()
-	_parentHeldFile = False  # in a forked child: 'its parent' or 'an ancestor' held the file through get_file_obj() at a fork
+	_parentHeldFile = False  # in a forked child: what the warning says when its parent or an ancestor held the file (get_file_obj) at a fork
 	_loadReader = None  # that load's reader of a loose file, whose file _call swaps for _STOPPED
 
 	def _refuse(self, where, error, explicit=False):
@@ -8073,50 +8072,70 @@ memoryOnly:{self.memoryOnly}
 	def _runHere(self, fn, args):
 		"""``fn(*args)`` in this thread, for a store whose writer thread does not run (after close(), in a forked child):
 		one job at a time, as that thread runs them. A call that a signal handler (or anything else run inside the job,
-		such as a teeLogger) makes to this store, on the thread where its job runs, is put off: it goes in _deferred and
-		runs as soon as the job ends, however it ends, and returns ``self`` meanwhile (5.17). Run inside the job, it took
-		writeLock again, which the job holds through its write, and waited for ever (5.14 to 5.16: a handler's commit,
-		reload(), clear() or rewrite(), or a move that follows the file, landing inside a forked child's or a closed
-		store's own write); between the job's locked steps it ran in the middle of the job, which a writer thread, one job
-		at a time, never does. A store with a writer thread hands its jobs to it, and a handler's call waits there for the
-		job under way, as another thread's does (handlers run on the main thread, which hands that thread its jobs)."""
-		if self._jobHere():
-			self._deferred.append((fn, args))
-			return self
-		self._runDeferred()  # (one that a handler put off just as a job ended, after that job's last look)
-		try:
-			return self._runJob(fn, args)
-		finally:
-			self._runDeferred()
+		such as a teeLogger) makes to this store, on the thread where its job runs, is put off: it joins the job's line
+		and is made as soon as the job ends, however it ends, after any put off before it, and returns ``self`` meanwhile
+		(5.17). Run inside the job, it took writeLock again, which the job holds through its write, and waited for ever
+		(5.14 to 5.16: a handler's commit, reload(), clear() or rewrite(), or a move that follows the file, landing
+		inside a forked child's or a closed store's own write); between the job's locked steps it ran in the middle of the
+		job, which a writer thread, one job at a time, never does. A store with a writer thread hands its jobs to it, and
+		a handler's call waits there for the job under way, as another thread's does (handlers run on the main thread,
+		which hands that thread its jobs).
 
-	def _runJob(self, fn, args):
-		"""The frame where _runHere runs a job: _jobHere looks for it on the thread's stack."""
+		The line is a local of the job's own frame (_runJob's), where _jobHere finds it, not an attribute of the store:
+		- another thread must not drain it: kept on the store, a second thread's call took the calls this thread's job
+		  had put off and made them ahead of the rest of that job (a move before the follow it came after, which undid
+		  another writer's change of the row: the 5.17 final review's second opinion);
+		- a process forked inside the job must not find it: it inherits the stack, and the fork mark the frame keeps
+		  (_forkReset when the job began) is how _jobHere tells it from the process the job began in (a commit there
+		  wrote nothing).
+		The line is drained here, once the job's frame is gone: a call that lands as that frame ends still joins the
+		line, and one that lands after it runs as a job of its own.
+
+		The calls put off are made as jobs of their own, and their callers have gone on, so an error is reported, not
+		raised. A KeyboardInterrupt goes up, and drops the calls it did not reach (a commit's rows stay queued; a put-off
+		reload, rewrite or move is not made), as a running store's _call takes back a job it has not begun."""
+		line = self._jobHere()
+		if line is not None:
+			line.append((fn, args))
+			return self
+		line, fork = deque(), self._forkReset
+		try:
+			return self._runJob(fn, args, line, fork)
+		finally:
+			while line:
+				fn, args = line.popleft()
+				try:
+					self._runJob(fn, args, line, fork)  # (not _runHere: one put off inside it joins the line)
+				except Exception as e:
+					self.__teePrintOrNot(f"Failed at {getattr(fn, '__name__', fn)}() for {self._fileName}, a call made inside this "
+										 f"store's own write (a signal handler's) and put off until it ended: {e!r}",'error')
+
+	def _runJob(self, fn, args, line, fork):
+		"""The frame where _runHere runs a job: _jobHere looks for it on the thread's stack, and reads its locals. ``line``:
+		the calls put off inside it (and inside the jobs that make them); ``fork``: the store's fork mark when it began."""
 		return fn(*args)
 
 	def _jobHere(self):
-		"""True when a job of this store runs in this thread below the caller (_runJob's frame on its stack): the caller is
-		a signal handler (or a teeLogger) that it called into. The stack itself says so, exactly, so no mark is kept that a
-		Ctrl-C could leave set (one would put off every later call, and nothing would write them)."""
+		"""The line of calls put off inside this store's job that runs in this thread below the caller (_runJob's frame on
+		its stack), or None. The caller is a signal handler (or a teeLogger) that the job ran. The stack says so, so no
+		mark is kept that a Ctrl-C could leave set (one would put off every later call, and nothing would write them).
+
+		A frame counts when it is this store's job (``self``: another store's job, or a nested store's, is not), on this
+		thread's stack (another thread's is not there), and begun in this process: a process that forks inside a job (a
+		handler's ``os.fork()``, ``multiprocessing``'s fork start method) inherits the stack with the frame, but the write
+		below it is its parent's, and a call put off there would wait in a line that nothing in the new process drains.
+		The fork hook gives that process's store a new mark, which tells it from the frame's. (A closed store has no
+		hook: a process forked inside its job keeps the mark None, finds the frame, and its calls are put off and not
+		made, where 5.16's waited for ever on the writeLock it inherited held. docs/limitations.md.)"""
 		code = TSVZed._runJob.__code__
 		frame = sys._getframe(1)
 		while frame is not None:
-			if frame.f_code is code and frame.f_locals.get('self') is self:
-				return True
+			if frame.f_code is code:
+				local = frame.f_locals
+				if local.get('self') is self and local.get('fork') == self._forkReset:
+					return local.get('line')
 			frame = frame.f_back
-		return False
-
-	def _runDeferred(self):
-		"""Run the calls put off inside this store's job (_runHere), in the order they were made, each as a job of its own.
-		Their callers have gone on, so an error is reported, not raised; a KeyboardInterrupt goes up, and the calls it
-		did not reach are made at the next call that runs here (close() and the exit make one)."""
-		deferred = self._deferred
-		while deferred:
-			fn, args = deferred.popleft()
-			try:
-				self._runJob(fn, args)  # (not _runHere, which would run the ones after it first; one put off inside it joins the line)
-			except Exception as e:
-				self.__teePrintOrNot(f"Failed at {getattr(fn, '__name__', fn)}() for {self._fileName}, a call made inside this "
-									 f"store's own write (a signal handler's) and put off until it ended: {e!r}",'error')
+		return None
 
 	# The wait's loop is a method of its own: Python 3.12 to 3.14 leave a loop's back jump inside a try block out of the
 	# exception table, so a Ctrl-C there (a real signal lands at the back jump, in the few instructions after a step of
@@ -8446,18 +8465,20 @@ memoryOnly:{self.memoryOnly}
 		made the file again from the child's memory; the parent, still damaged, then took that for another writer's change
 		it could not merge and wrote over it, and the child's rows were lost (the 5.15 re-review). Its close and exit now
 		only append, and the parent's merge rule takes the rows in. So a forked child no longer compacts the file at its
-		exit: a program that wants that sets rewrite_on_exit again in the child, or opens the store after the fork.
+		exit, and does not make the file again after a failed rewrite of the parent's that the parent never gets through
+		(a compressed file stays unreadable: docs/limitations.md): a program that wants either sets rewrite_on_exit again
+		in the child, or opens the store after the fork.
 
-		A grandchild learns of an ancestor's hold too (_parentHeldFile: 'its parent', 'an ancestor'): the child's own hook
+		A grandchild learns of an ancestor's hold too (_parentHeldFile holds the warning's text for it): the child's own hook
 		had set its _fileObjHeld to False, so its child took it for one that holds nothing, and its exit waited for ever
 		for the grandparent's file lock while the grandparent waited for the child (5.15 and 5.16; 5.14 ended there)."""
-		self._parentHeldFile = 'its parent' if self._fileObjHeld else self._parentHeldFile and 'an ancestor'
+		self._parentHeldFile = ('its parent held the file (get_file_obj) at the fork' if self._fileObjHeld else
+								self._parentHeldFile and 'an ancestor held the file (get_file_obj) at an earlier fork')
 		self._fileObjHeld = False
 		self.writeLock = threading.Lock()
 		self._memLock = _SectionLock()
 		self.appendQueue.clear()
 		self._requests.clear()
-		self._deferred.clear()  # (the parent's calls put off inside its own write: _runHere)
 		self._loadJob = self._loadReader = None  # (the parent's writer thread's load, not here: its stop is for it)
 		self._writing = 0
 		self._damaged = False
@@ -8479,10 +8500,9 @@ memoryOnly:{self.memoryOnly}
 		if self._workerPid == os.getpid() or (self._forkReset == os.getpid() and not self._parentHeldFile):
 			return True
 		if self.appendQueue:
-			held = {'its parent': 'its parent held the file (get_file_obj) at the fork',
-					'an ancestor': 'an ancestor held the file (get_file_obj) at an earlier fork'}.get(self._parentHeldFile)
 			_warnOnce(self, 'fork-close', self._fileName, 'the rows this forked child set are not written at its close or '
-					  'exit: ' + (held or 'no fork hook ran in it') + '; commitAppendToFile() writes them', self.teeLogger)
+					  'exit: ' + (self._parentHeldFile or 'no fork hook ran in it') + '; commitAppendToFile() writes them',
+					  self.teeLogger)
 		return False
 
 	def _finish(self):
