@@ -497,3 +497,74 @@ entries go last, in the same commit as the change:
 - Lesson: at a fork, also reset in the child's copy every setting that assumes its process is the file's only writer
   (no monitoring, a rewrite at exit that does not read first): the parent is now another writer. Say so where the
   setting is documented, since the attribute reads otherwise in the child.
+
+## 2026-11-11 TSVZ 5.17: a forked child keeps what it knows of the file and drops what it was doing
+- Changed: in a child that `fork()` made, each `TSVZed` now also reads `rewrite_on_exit` `False` and `rewrite_interval`
+  `0` from the fork on (as `monitor_external_changes` reads `True` since 5.16), and drops the parent's failed writes to
+  try again, their reports and a refused rewrite's back-off. A child's close and exit only append, so a forked child
+  no longer compacts the file at its exit unless it sets `rewrite_on_exit` again (the user accepted that cost, picking
+  "Take H2 (Recommended)"). A child's own child learns of an ancestor's `get_file_obj()` hold too, and its warning names
+  "an ancestor".
+- Why we had to change: a child forked after its parent's rewrite failed part way took that rewrite to try again (and
+  `rewrite_on_exit`): its close made the file again from its memory, and the parent, still damaged, took that for a
+  change it could not merge and wrote over it, losing the child's row (the 5.15 re-review). Each of 5.15's review rounds
+  had found one more field the fork hook should reset (`_damaged`, `dirty`, the monitoring setting); the design check
+  found the next ones (`_failures`, the rewrite settings) and the grandchild's lost hold.
+- Original design was wrong because: the hook reset a list of fields, one per finding, instead of applying a rule; and
+  it copied the parent's hold into the child's "parent held" flag only, which the child's own hook then read as its
+  own hold, so a grandchild saw none.
+- Lesson: decide what a forked copy inherits by a rule, not a list: it keeps what it knows of the shared resource (its
+  rows, what it last read of the file, the widths), and drops what the original was doing to it (its queue, its jobs, a
+  write under way, failed writes to try again) and every setting that assumes one writer. Carry an ancestor's hold down
+  every generation, not only to the first.
+
+## 2026-11-11 TSVZ 5.17: a call made inside a store's own write, on the same thread, runs once that write ends
+- Changed: a store with no writer thread (after `close()`, in a forked child) runs one job at a time in the calling
+  thread (`_runHere`); a call that a signal handler (or a teeLogger) makes to that store inside such a job, on the same
+  thread, is put off until the job ends and returns at once (`self`; `True` for `rewrite()`), where it used to wait for
+  ever. A `move_to_end()` that has to follow the file first is put off whole, follow and move. The put-off calls are a
+  local of the job's own frame (`_runJob`), not an attribute of the store, and the frame keeps the store's fork mark
+  from when the job began (the 5.17 final review: the build had kept them on the store). They are drained from
+  `_runHere`, once that frame is gone, only in the process the job began in, and not after a Ctrl-C (the 5.17
+  re-review).
+- Why we had to change: the job holds `writeLock`, a plain lock, through its write; the handler's commit, `reload()`,
+  `clear()` or `rewrite()`, and a move that follows the file, took it again on the same thread and waited for ever
+  (5.14 to 5.16: an approved known limitation for forked children and a deferral for closed stores).
+- Original design was wrong because: the writer thread gives a store one job at a time, and a store without it ran its
+  jobs as plain calls, so a call landing inside one ran inside it: on its lock, a wait for ever; between its locked
+  steps, in the middle of its work, which the writer thread never allows. The build then kept the calls it put off on
+  the store, and took the stack for exact: the final review found that another thread's call drained them, in the
+  middle of the first thread's job (a move ahead of the follow it came after, which undid another writer's change), and
+  that a process forked inside the job inherits the stack, so its own commit was taken for a nested call and put off for
+  ever. The first fix drained inside the frame, and a call landing after the frame's last look was lost; the next
+  drained from `_runHere`, and the re-review found two more holes: a process forked inside the job that returns from the
+  handler drains its copy of the parent's line, and makes the parent's calls again (a put-off `clear()` emptied the file
+  of what the parent wrote after it), and a Ctrl-C that cut the job just after it took the file lock ended it with the
+  traceback still holding the locked file, so the put-off commit made while the Ctrl-C went up waited for ever for that
+  lock.
+- Lesson: code that serialises work by handing it to a thread must serialise it the same way when it runs the work
+  itself. To tell a nested call (a signal handler, a callback) from a new one, ask the call stack: a "busy" flag or a
+  lock's owner can be left set by a Ctrl-C, and would then put off every later call with nothing left to make it. The
+  stack answers for this thread, and it is the whole story only while the process is the one the job began in: a forked
+  process inherits it, so the frame also keeps a mark of the process (the store's fork mark) and the lookup compares
+  it, and so does the drain. The mark is the fork hook's: an object the hook does not reach (a closed store) keeps the
+  hole, and needs the hook. What the nested call leaves for later belongs to the frame that is waiting for it, not to
+  the shared object: kept there, any thread can take it, and a frame that is gone takes it with it. The frame that
+  holds it must not be the one that drains it, since a call landing after the frame's last look is lost: drain from
+  the caller once the frame is gone. A resource is under its clean-up from the step that takes it: the write took its
+  locked file, then ran one more check of the store's own outside the `try` that lets go of it, and its clean-up called
+  `_unlockFile` before it closed the file, so a `SystemExit` (`sys.exit()`) or a Ctrl-C landing in either (a real signal
+  is taken at a function's entry, as `_unattended()` is called, and at a call) left the file open and locked for as long
+  as the exception's traceback lived, and the drain's commit, or a program's own `except SystemExit:` clause that commits
+  again, waited for it for ever (the 5.17 round 2 review's N1; the README's handler hung in about 2% of real signals, and
+  5.16 hung in a program's clause the same way). Round 2 fixed it where it showed, at the drain, for a Ctrl-C only
+  (R1), and the same hang came back with `SystemExit`: the third round's design check found the leak older than 5.17 and
+  removed it at its source: the `try` begins where the file is taken, and the file is closed whatever `_unlockFile` did
+  (closing the descriptor drops its lock). Put-off work is still dropped after a Ctrl-C, not made in that `finally`: a
+  cut can leave `writeLock` held (on Python 3.14, a signal between `with`'s enter and its block), and without the drop a
+  Ctrl-C at 5 to 9 steps of a put-off call's sweep hung again. The plan named "a writeLock that knows its holder"; the
+  lock is held only through each step of a job, so its owner says nothing between the steps, a holder a Ctrl-C left would
+  read as a job under way, and the design check made `writeLock` an `RLock` and swept 5.16 with it: 619 of 1,060 steps
+  still hung (the nested commit opens the file again, and waits for the file lock its own write holds). What is left is
+  the approved limitation of a lock a cut write leaves held (Python 3.14: 0.4 to 0.6% of real signals), for which a lock
+  that knows its holder, letting go of a hold found where the stack shows no job, is a candidate for 5.18, to be measured.

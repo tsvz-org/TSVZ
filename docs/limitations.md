@@ -139,6 +139,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - A commit after `close()` or in a forked child that a Ctrl-C cuts just after its write writes its rows again at the
     next commit: 195 of 1,037 steps of such a `.tsvz` commit on 3.14 (from 5.15, which keeps them queued until they
     are on disk), 170 of 1,175 of a loose one (as in 5.14).
+  - A handler's `sys.exit()` inside such a commit does the same (widened 2026-11-12; 5.17). The handler sets `h` and
+    commits as the write's bytes are on disk and the queue is not popped yet: the commit is put off and made as the
+    `SystemExit` goes up, and writes the cut commit's rows, still queued, again: the file's lines are `a b c c h` (`c`
+    the cut commit's row; a handler at the commit's fsync, a closed store and a forked child, Python 3.14 and 3.6). The
+    last copy wins and every read is right. 5.16 waited for ever there (the handler's commit took the `writeLock` the cut
+    commit held).
   - The last copy wins, so every reader reads the same rows, and the file is longer until its next rewrite (a `.tsvz`
     file until a scrub): a line for each copy, or up to two lines for each row after a move to the beginning. The
     exception is a stale copy: when another process writes one of those keys between the two copies (while the
@@ -160,7 +166,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   extra copy (Recommended)". (Item 4: the 5.15 plan's fix that keeps a cut `.tsvz` commit's rows queued.) Widened
   2026-11-11 to moves; the user chose "Approve the widening (Recommended)": a handler landing inside a move can leave a
   second copy of the moved lines (a move to the front can double the file) until the next rewrite, and a `clear()`
-  handler there can write a deletion line twice; no data or order is wrong.
+  handler there can write a deletion line twice; no data or order is wrong. Widened 2026-11-12 to a handler's
+  `sys.exit()` inside the store's own commit (the file's lines `a b c c h`; the last copy wins and every read is right;
+  5.16 waited for ever there); the user chose "Widen it (Recommended)".
 
 ### A Ctrl-C while the writer thread reloads after another process's change waits for that reload
 - Kind: deferred
@@ -173,10 +181,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   0.97 s, where one with no read under way ends in 0.41 to 0.57 s; on 3.6, 0.46 to 0.97 s against 0.46 to 0.52 s.
 - Why: the tick's reads run inside its sync, which also serves its commits and rewrites; a stop there needs its own
   flag set at exit and its own sweep of the write path, more than this release's load stop.
-- Plan (5.17): the tick's reload, both kinds, runs with a stop of its own that `_atExit` sets when it lets go of the
+- Plan (5.18): the tick's reload, both kinds, runs with a stop of its own that `_atExit` sets when it lets go of the
   store (for a loose store, the same swap of its reader's file), and `_appendWork` ends on `_LoadStopped`; with a
   sweep of the tick's write path.
-- Revisit when: 5.17.
+- Revisit when: 5.18.
 - Noted: 2026-11-10, found by the 5.15 plan's measurement; a deferral, not asked.
 
 ### A Ctrl-C caught inside a set, delete, pop or move can leave that one key apart
@@ -198,11 +206,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     Checked on Python 3.14 for a set, both kinds (the 5.15 review's probe, with the handler alone as the control).
 - Why: a fix finishes the operation in the section's `except BaseException` clause, which changes what a cut set
   means (it completes) and needs its own sweep; 5.15's work on these sections was the signal handler's case.
-- Plan (5.17): the clause the sections already have calls the section's redo (`_setAgain`, `_delAgain` and the others
+- Plan (5.18): the clause the sections already have calls the section's redo (`_setAgain`, `_delAgain` and the others
   5.15 added for signal handlers) with its own arguments, under the lock, when the section had begun changing memory
   or found its hold let go of (the two-signal case): a set cut by a Ctrl-C completes, and the KeyboardInterrupt still
   goes up. With its own sweep.
-- Revisit when: 5.17.
+- Revisit when: 5.18.
 - Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked. The two-signal case and the move to the
   beginning's several keys were added 2026-11-11, from the 5.15 review.
 
@@ -226,9 +234,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   why 5.15's sweep missed `_call`'s.
 - Why: each loop has its own clean-up, and its own test, so moving them all is a release's work; a check that finds the
   new ones as they are written has to come first.
-- Plan (5.17): a static exception-table check in the suite (Python 3.12+), listing the uncovered back jumps in
+- Plan (5.18): a static exception-table check in the suite (Python 3.12+), listing the uncovered back jumps in
   functions the main thread of an open store runs; move each loop of those into a method, and write down the rest.
-- Revisit when: 5.17.
+- Revisit when: 5.18.
 - Noted: 2026-11-11, found by the 5.15 review; a deferral, not asked.
 
 ### A signal handler's change of the store inside popitem or move_to_end can make it raise the wrong exception
@@ -245,10 +253,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   Two handler calls, the second inside the redo the first one caused, are the known limitation after this entry.
 - Why: found by the 5.15 plan's sweep (the move to the beginning's, by the fix round's); the change is small but in two
   hot methods, and wants its own tests.
-- Plan (5.17): `popitem` looks for its key again when the store changed between its look and its take, and raises
+- Plan (5.18): `popitem` looks for its key again when the store changed between its look and its take, and raises
   `KeyError('dictionary is empty')` when the store went empty; `move_to_end` raises `KeyError(key)` when its key went
   inside it, and a move to the beginning lists the other keys again when the store changed while it listed them.
-- Revisit when: 5.17.
+- Revisit when: 5.18.
 - Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked. The two-handler cases, added 2026-11-11 from the
   5.15 re-review, became the known limitation after this entry the same day.
 
@@ -286,24 +294,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   lines for as captured by the next pass, and a two-handler sweep in the suite). The user did not ask for it
   explicitly: the 5.15 re-review found the cases, and the 5.15 design check proposed the known limitation.
 
-### A second signal handler inside letGo() makes the first one's use of the store raise RuntimeError
-- Kind: deferred
-- What the operator sees: a program whose signal handler uses a store, where the handler's section finds the store's
-  lock held by the main thread's section it interrupted and lets go of that hold (`_RLock.letGo()`: while the thread
-  holds it, release). A second signal whose handler uses the store too, landing in `letGo()` between its test of the
-  hold and its release, lets go of the hold itself; the first handler's release then finds none and raises
-  `RuntimeError: cannot release un-acquired lock` out of its commit, set or other use of the store. 5.14 the same
-  (`letGo()` is the same code). The suite meets it under load:
-  `test_a_real_signal_handler_that_uses_the_store_while_the_program_sets_rows_leaves_memory_and_the_file_as_it_set_them[commit-tsv]`
-  failed so in 1 of 6 suite runs of the 5.15 design check (on a prototype of 5.15 with the same `letGo()`), with four
-  suites and other probes on the host: under that load the handler's commit takes longer than the test's repeating
-  2 ms timer, so a second handler runs inside the first. The design check's probe (`nested.py`) puts the second
-  handler at that line and gets the error on 5.14 and 5.15.
-- Why: found by the 5.15 design check; no worse than 5.14, and 5.16 is the hotfix of the one change the user chose.
-- Plan (5.17): `letGo()` ignores a release that finds no hold, as `_SectionLock.__exit__` does.
-- Revisit when: 5.17.
-- Noted: 2026-11-11, found by the 5.15 design check; a deferral, not asked.
-
 ### A set of a new key can leave its place in memory apart from the file's
 - Kind: deferred
 - What the operator sees: a program's signal handler sets another new key, moves a key, or follows another process's
@@ -314,9 +304,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   review's fixes: 20 of 325 landings on Python 3.14 for each such handler, with or without a header (4 of 59 line
   steps on 3.6), and a `.tsvz` store's 10 of 399 for a set of another key (2 of 72); 5.14 the same 20.
 - Why: found by the 5.15 final review's wider sweep; not worse than 5.14, and the fix is in the redo of every set.
-- Plan (5.17): `_setAgain` and `_specAgain` move a key that was new to the end when its line is still the last one
+- Plan (5.18): `_setAgain` and `_specAgain` move a key that was new to the end when its line is still the last one
   queued; the sweep's allowance goes.
-- Revisit when: 5.17.
+- Revisit when: 5.18.
 - Noted: 2026-11-11, found by the 5.15 final review; a deferral, not asked.
 
 ### A signal handler's clear() in a store with no header can leave a deleted key as a row of the key alone
@@ -330,9 +320,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   of 81, 17 of 120). 5.14: 63, 67 and 67 for the first three, and for a move the whole row back at 182 of 532. With a
   header every reader takes the line as a deletion (none in the sweeps with one).
 - Why: found by the 5.15 final review's wider sweep; 5.14 the same or worse.
-- Plan (5.17): the branch of `__appendEmptyLine` for a store with no column count writes what reads as a deletion
+- Plan (5.18): the branch of `__appendEmptyLine` for a store with no column count writes what reads as a deletion
   there (a drop item, as a one-column store's); the sweep's allowance goes.
-- Revisit when: 5.17.
+- Revisit when: 5.18.
 - Noted: 2026-11-11, found by the 5.15 final review; a deferral, not asked.
 
 ### A '#' key can leave memory when the store follows another process's change while rows are queued
@@ -344,9 +334,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   3.14 (a move queued, another process's line, then the follow; 5.14: 6 of 10). `reload()` drops it always.
 - Why: found by the 5.15 final review fixes' sweep of a store with a `#` key; 5.14 the same. Whether a whole read
   keeps `#` keys is a choice of what `reload()` means, as `_readWidened` keeps them and `reload()` does not.
-- Plan (5.17): decide whether a whole read keeps the `#` keys memory holds (in their place, as `_readWidened` does), and
+- Plan (5.18): decide whether a whole read keeps the `#` keys memory holds (in their place, as `_readWidened` does), and
   make the follow and `reload()` agree; the sweep's check of a `#` key's place then covers memory without it too.
-- Revisit when: 5.17.
+- Revisit when: 5.18.
 - Noted: 2026-11-11, found by the 5.15 final review's fixes; a deferral, not asked.
 
 ### Test gaps the 5.15 final review's fixes leave
@@ -355,45 +345,16 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   wider sweep (and the fixes' run of it) did, and where it found nothing beyond the deferrals above:
   - the handler sweep runs no one-column store, and not the handlers `rewrite()`, a pop of another key, `popitem()`, a
     delete of the operation's own key and a move of the operation's own key;
-  - a fork is tested while the parent's writer thread is inside an explicit `rewrite()`, not inside a `clear()`'s, a
-    one-column delete's commit's or the tick's interval rewrite (the review's probe ran the interval rewrite; the
-    others set the same flag, by reading);
   - the Ctrl-C sweep compares rows, not their order.
+
+  (A fork inside a `clear()`'s write, the tick's interval rewrite and a one-column delete's commit, not only inside an
+  explicit `rewrite()`, is tested from 5.17.)
 - Why: each handler and store adds sweeps to CI's serial run (each under 3.5 s on 3.14; the whole serial 3.14 run took
   13 min 7 s here with the 160 sweeps the fixes added, of the job's 40 minutes); the fixes added the ones that guard
   what they changed.
-- Plan (5.17): add them to the suite, measured against CI's time.
-- Revisit when: 5.17.
-- Noted: 2026-11-11, from the 5.15 final review's test gaps; a deferral, not asked.
-
-### Test gaps the 5.16 final review leaves
-- Kind: deferred
-- What the operator sees: nothing directly; the suite does not yet look at these, which the 5.16 final review's probes
-  did (its fix round added one test, for the move of a row the parent changed after the fork, in a two-column store:
-  `test_a_forked_child_that_moves_a_row_its_parent_changed_after_the_fork_keeps_the_parents_value`):
-  - `monitor_external_changes` reads `True` in a forked child and keeps its value in the parent (the lessons entry
-    names it; no test asserts it);
-  - the narrowed "Appends that do not read the store first land after damage": a `.tsv.gz` store with monitoring off,
-    damage landing before or after the fork, the child ending by commit, close or exit: its row is readable in 6 of 6
-    cases on 5.16 and 0 of 6 on 5.15, and the store that did not fork still appends after the damage (`s/damage.py`);
-  - two known limitations below: 5.16's widening of "A forked child writes nothing at its close or exit when its
-    parent held get_file_obj() at the fork" (a child's `move_to_end()`, or its `checkExternalChanges()` then
-    `rewrite()`, while its parent holds the file and waits for it), and "A signal handler that uses the store, landing
-    inside a forked child's own write, waits for ever". No test pins either wait, so none notices if a writer thread in
-    the child, or 5.17's planned change (a forked child takes none of its parent's duties to the file, and none of its
-    single-writer settings), ends it;
-  - the new test above starts its child's 10 s alarm at the fork, so a parent that takes 10 s over its set, commit and
-    fsync, on a machine a suite run keeps busy, fails it with no fault in the store. The alarm belongs after the
-    child's read of the parent's go-ahead, and the child should close its copy of the pipe's write end. The 5.16
-    re-review ran 640 of its cases on each of Python 3.14 and 3.6 (10 rounds of 16 runs of its 4 cases, side by side)
-    with no failure.
-- Why: found by the 5.16 final review (the new test's alarm, by the Haiku second opinion on its re-review); the hotfix
-  adds the tests that guard what it changed, and the cases above need a probe with an alarm each (a wait for ever is
-  what they check).
-- Plan (5.17): add them to the suite with that planned change, each bounded by an alarm, the waits as tests that name
-  the entry they change with; and move the new test's alarm after the go-ahead.
-- Revisit when: 5.17.
-- Noted: 2026-11-11, from the 5.16 final review's test gaps; a deferral, not asked.
+- Plan (5.18): add them to the suite, measured against CI's time.
+- Revisit when: 5.18.
+- Noted: 2026-11-11, from the 5.15 final review's test gaps; a deferral, not asked. The fork bullet was done in 5.17.
 
 ### The Ctrl-C sweep tests' 120 s limit is too short for suites run side by side
 - Kind: deferred
@@ -402,10 +363,30 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   cores, `test_a_ctrl_c_caught_at_any_step_of_an_operation_leaves_no_lock_held_and_memory_and_the_file_agreeing[tsv-oneshot-scrub]`
   timed out at 120 s on Python 3.9 (5.15, 717aea9); alone it passed, in 13.6 s there (6.6 s on 3.14).
 - Why: a limit of the tests only, and 5.16 is the hotfix of the one change the user chose.
-- Plan (5.17): size the limit from the slowest sweep measured under a release run's load (four suites, 32 workers
+- Plan (5.18): size the limit from the slowest sweep measured under a release run's load (four suites, 32 workers
   each), and write that reason beside it.
-- Revisit when: 5.17.
+- Revisit when: 5.18.
 - Noted: 2026-11-11, from the 5.15 release run; a deferral, not asked.
+
+### Test gaps the review of 5.17's third fix round leaves
+- Kind: deferred
+- What the operator sees: nothing in the library; two gaps in the suite.
+  - The real-signal handler test's `reload` cases
+    (`test_a_real_signal_handler_that_uses_the_store_while_the_program_sets_rows_leaves_memory_and_the_file_as_it_set_them[reload-*]`)
+    ask for at least 50 handler calls in 30 s. On a loaded host the timer's handler runs fewer times: 24 copies beside 24
+    CPU burners, Python 3.11, 27 to 74 calls (every `.tsv` run 27 to 41), memory and the file agreeing in all 48 runs.
+  - The round's own test
+    (`test_a_signal_that_cuts_a_stores_own_write_after_it_took_the_file_lock_leaves_no_locked_file_for_the_calls_after_it`)
+    pins the commit's half of the fix only: a build with the previous `_writeFileStarted`, `_readLocked` and
+    `_openLocked` and this round's commit passed the 1,150 related tests. The rewrite's and `clear()`'s half (the design
+    check's sweeps: 91 to 9 and 87 to 5 hung steps) has no test.
+- Why: the first is a limit sized without load, as in the entry above; the second was found by mutating the fix, after
+  the round.
+- Plan (5.18): size the count from a release run's load, or count handler landings inside sets instead of calls;
+  parametrize the round's test over `rewrite(force=True)` and `clear()` (`_writeFileStarted` calls `_unattended()` after its
+  open and `_unlockFile` in its clean-up, so the test's two landing points apply as they are).
+- Revisit when: 5.18.
+- Noted: 2026-11-12, from the review of the third fix round; a deferral, not asked.
 
 ### A write after close(), or in a forked child, can be cut by a Ctrl-C
 - Kind: known limitation
@@ -421,7 +402,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: calls after `close()` and writes from forked children are rare, and covering them means starting a writer
   thread again in both cases, with its lifetime to get right.
 - Revisit when: someone writes through a closed store or from a forked child and hits it. For the `.tsvz` `clear()`:
-  5.17, which sets `deSynced` before memory is emptied; a closed store would still need a reload.
+  5.18, which sets `deSynced` before memory is emptied; a closed store would still need a reload.
 - Approved: 2026-10-29, the user chose "Known limitation (Recommended)". (The `.tsvz` `clear()` is deferred, not
   approved.)
 
@@ -436,20 +417,78 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - After `close()`, or in a child that `fork()` made, a store has no writer thread, and `commitAppendToFile()`,
     `rewrite()`, `mapToFile()`, `clear()` and `reload()` run in the caller's thread. A Ctrl-C there can leave the
     store's lock held (let go of as above), or its `writeLock`, which nothing lets go of: the program's next commit
-    or rewrite of that store then waits for ever. With an interrupt at each bytecode of one such commit or rewrite:
-    `writeLock` left held at 6 to 13 steps of about 1,000 to 9,400 (3.14 and 3.11; none at 3.6's line steps). 5.12 did
+    or rewrite of that store then waits for ever. The lock left held can be the file's lock too: two signals about 1 µs
+    apart, the first cutting `_writeFileStarted`'s unlock and the second landing at the entry of its
+    `_closeUnflushed(f)` (a function's entry takes a signal from Python 3.11), leave the file open and locked under the
+    traceback (by reading, not run). With an interrupt at each bytecode of one such commit or rewrite: `writeLock` left held at 6 to 13 steps of about 1,000 to 9,400 (3.14 and 3.11; none at 3.6's line steps). 5.12 did
     the same in these two cases, and in every `.tsvz` commit of a running store, which ran in the caller's thread
     there. What the cut write leaves in the file is the entry above. (A cut `.tsvz` commit drops no row from 5.15: its
     rows stay queued until they are on disk.)
+  - A signal handler's `sys.exit()` inside such a write, on Python 3.14 (widened 2026-11-12; 5.17). A signal can land
+    just after `with self.writeLock:` has taken the lock and before its block begins, and the exception skips the release
+    (CPython's own gap). The call the handler put off (a commit, `reload()`, `clear()`, `clear_file()`, `rewrite()`,
+    `mapToFile()`, `hardMapToFile()`, `checkExternalChanges()` or `move_to_end()`; 5.17) is made as the exception goes
+    up, and waits for ever for the `writeLock` the cut write left held: the process does not end, and the handler's row
+    is not written. The README's handler (set, commit, `sys.exit()`) in a
+    set-and-commit loop of a closed store and of a forked child, a real SIGUSR1 from another process, 4,000 runs each:
+    32 of 8,000 hung on 3.14 (46 in the review of the third fix round), every one waiting at `with self.writeLock:`
+    (none in 8,000 on each of 3.11, 3.12 and 3.13). 5.16 waited for ever at 127 and 121 of 160 real signals of that loop (a closed
+    store, a forked child), this landing among them: of 8,000 real signals on 5.16 (3.14) 29 landed on that `with`
+    line, and every one hung (its handler's commit took the lock the gap left held), and a landing there simulated
+    hangs 5.16, in a closed store and in a forked child, on 3.14, 3.11 and 3.6. A program's own `except SystemExit:` or
+    `except KeyboardInterrupt:` clause that commits again waits for ever after a signal cut there too (simulated at
+    the gap, a closed store and a forked child, 3.14 and 3.6: 5.16 and 5.17 both). Two signals inside one commit (a
+    first handler's call put off, then a second handler's `sys.exit()`; the first simulated at the start of each commit
+    of the loop, the second a real SIGUSR1, 4,000 runs each): 28 of 8,000 hung on 3.14, all at `writeLock` (none on 3.11), where 5.16 ended in all of them (it made the first
+    handler's call at once): this case stays worse than 5.16 on 3.14.
 - Why: `writeLock` is held for the caller across calls by `get_file_obj()`, so a thread that finds itself holding
   it cannot take that for a Ctrl-C's leftover; whatever lets go of a lock is itself code a second Ctrl-C can land in;
   calls after `close()` and writes from forked children are rare.
-- Revisit when: someone hits it, or a closed store or a forked child gets a writer thread.
+- Revisit when: someone hits it, or a closed store or a forked child gets a writer thread. A candidate for 5.18, to be
+  measured: a `writeLock` that knows its holder, used only to let go of a hold a cut write left, in the one job it can
+  do: at `_runHere`'s door, where the stack shows no job of this
+  store on this thread and `get_file_obj()` holds nothing, a hold by this thread is a leftover and is let go of. It needs
+  its own sweep: with a reentrant lock, a nested taker that is not put off would run inside the write where it waits today
+  (a plain reentrant `writeLock` hung at 619 of 1,060 steps of 5.16's commit: the nested commit opens the file again, and
+  waits for the file lock its own write holds; the 5.17 design check).
 - Approved: 2026-11-10, the user chose "Approve as KL (Recommended)" on the question: "One rare case is left, for a
   program that catches Ctrl-C and keeps running: a second Ctrl-C landing inside the cleanup that lets go of the lock,
   or a write after close() or in a forked child, can still leave a store's lock held, and another thread then waits
   for ever (as in 5.12)." The wording is the 5.13 final review's, which adds the `writeLock` case: its hang hits the
-  program's own next commit, not only another thread.
+  program's own next commit, not only another thread. Widened 2026-11-12 to a handler's `sys.exit()` that lands as a
+  write takes `writeLock` on Python 3.14 (the last bullet); the user chose "Widen it (Recommended)".
+
+### On Python 3.6 to 3.9 a signal handler that ends the process inside a store's own write can still hang, in a few of 8,000 signals
+- Kind: known limitation
+- What the operator sees: in a store with no writer thread (a forked child's, or one after `close()`), a signal handler that
+  sets a row, commits and ends by `sys.exit()` (the README's handler) lands inside the store's own write; its commit is
+  put off and made as the write ends (5.17). Up to Python 3.9 the interpreter checks for signals after the instruction
+  that ends a `try` or `with` block, so one instruction at the end of each block of the write's clean-up is outside
+  every clean-up. A signal that lands there leaves the locked file open under the `SystemExit`'s traceback (or `writeLock`
+  held, at the end of its `with` block): the handler's commit waits for that lock for ever, and the process does not end.
+  The README's handler in a set-and-commit loop, a real SIGUSR1 from another process, a closed store and a forked child,
+  4,000 runs each: 2 of 8,000 hung on 3.6 in each of two such runs (three of the four at the file lock, one at
+  `writeLock`), 2 on 3.9 and none on 3.10. From 3.10 a signal is taken only after a call and at a loop's back jump (from 3.11 also at a
+  function's entry), so none lands between a block's last instruction and the next: a timer's signal into a function
+  with a `try` and one with a `with`, 3 million calls each, left the `finally` unrun 367 and 286 times and the lock held
+  125 and 189 times on 3.6 and 3.9, and never on 3.10 and 3.11. The handler's runs hung in none on 3.11 and 3.12 (none
+  in 8,000 each), and the hangs that are left on 3.14 are the lock-held entry's. The 5.17 build before this fix (a581b13)
+  hung at 230, 220 and 195 of 8,000 on 3.6, 3.9 and 3.10, and 5.16 at about 3 of 4 (3.14).
+- Why: the interpreters are end-of-life, kept so the tools still run on them. The file-lock part could be closed by
+  arranging each write's `try` (the review of the third fix round, by reading the 3.6 and 3.9 bytecode; not built or run): the file
+  stored inside the `try` whose `finally` closes it, before it is locked; the unlock the last step of every path out of
+  that `try` (the normal end, each early return and each `except` that ends normally); the close in the `finally`; so
+  `_openLocked` could no longer be the step that locks and returns the file (on 3.9 its `return f` falls outside its
+  `except`). One signal then leaves at most an unlocked open file. That restructures all four functions of the write path
+  that 3.11 and later run, every return and `except` path of each, for 2 of 8,000 signals on end-of-life
+  interpreters. The `writeLock` part needs more than a `try`: the end of a `with` block is the gap, and a plain `Lock`
+  has no owner for a `finally` to test.
+- Revisit when: someone hits it where they cannot move to Python 3.11 or later, or a closed store or a forked child gets a
+  writer thread.
+- Approved: 2026-11-12, the user chose "Known limitation (Recommended)" on the 5.17 design check's question: Python 3.6
+  to 3.10 keep a few hangs in 8,000 real signals that no arrangement of `try` removes. Re-approved 2026-11-12 after the
+  reason was corrected (3.6 to 3.9, and an arrangement exists for the file lock): the user chose "Known limitation,
+  corrected (Recommended)".
 
 ### A forked child writes nothing at its close or exit when its parent held get_file_obj() at the fork
 - Kind: known limitation
@@ -486,11 +525,29 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     review's `s/held.py`, Python 3.14 and 3.6: 3 of 6 mode and operation cases never end, where 5.15 and 5.14 ended in
     all 6. The 5.16 docs pass's `held2.py`, the same Pythons, with the change made apart: with a change to follow,
     under `'ab'` only the cases with rows queued wait and under `'r+b'` all do; with none, no case waits; `'wb'`, on
-    3.14, waits in all 6. macOS not run.)
+    3.14, waits in all 6. macOS: the suite's test of 5.17, below, on macOS 26 with Python 3.12 and 3.14, where the lock is
+    a whole-file `flock`: the `'ab'` hold with a change to follow waits there too, as stated.)
   - On Python 3.6 the same holds for a child in which TSVZ's fork hook did not run, because a library replaced
     `threading._after_fork` without calling the one it replaced: that child also keeps 5.14's other behaviour (its
     commit writes the rows the parent had queued too, and it keeps the locks the parent's threads held), and its
     message ends "no fork hook ran in it".
+  - From 5.17 the same holds for a child's own child, and any later one, where an ancestor held the file at an earlier
+    fork: the message ends "an ancestor held the file (get_file_obj) at an earlier fork". 5.15 and 5.16 took the
+    grandchild for one whose parent held nothing, and its exit waited for ever for the grandparent's lock while the
+    grandparent waited for the child and the child for it (5.14's children wrote nothing at their exit, and ended).
+    That is the first half. The second: a grandchild cannot tell whether its ancestor still holds the file and waits for
+    it, so it writes nothing where the ancestor let go of the file long before, and 5.16's wrote its row there (the 5.17
+    final review's `gcrel.py`: a process holds `get_file_obj()` across the fork of a child, lets go of it and does not
+    wait; the child forks a child of its own, which sets a row and ends normally: the row is in the file in 5.16, and in
+    5.17 it is not, and the grandchild says so once; Python 3.14 and 3.6). So let go of the file before forking, as for a
+    child.
+  - From 5.17 a forked child's `rewrite_on_exit` is False (a child takes none of its parent's single-writer settings),
+    so the bullet above about a store with `rewrite_on_exit` is a child that set it again.
+  - The suite pins the waits above, in the cases `held2.py` ran
+    (`test_a_forked_child_whose_parent_holds_the_file_waits_only_where_its_known_limitation_says`, from 5.17): a change
+    that ends one fails there, and this entry changes with it. It pins the grandchild's silence too, both halves
+    (`test_a_forked_childs_own_child_writes_nothing_at_its_exit_where_an_ancestor_holds_the_file` and
+    `..._even_once_the_ancestor_let_go_of_the_file`).
 - Why: the child cannot tell whether its parent waits for it while holding the file. A write there waits for the
   parent's lock, and a parent that waits for the child (`waitpid`) would then never let go: the 5.15 plan's first
   design hung there (measured), as 5.14's close did with `rewrite_on_exit` or a pending sync. A child with no fork
@@ -510,73 +567,247 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `monitor_external_changes=False` a forked child's `move_to_end()` (and `checkExternalChanges()` followed by
   `rewrite()`) waits there too, as a default child's did. The same day the docs pass after the 5.16 re-review stated
   when it waits (a change to follow, and a hold that keeps the read or the commit out), from the Haiku second opinion:
-  that narrows what was approved, and changes no behaviour.
+  that narrows what was approved, and changes no behaviour. Widened again 2026-11-11 (the 5.17 final review); the user
+  chose "Approve the widening (Recommended)", with both halves put to them: a grandchild (or a later descendant) writes
+  nothing at its close or exit where an ancestor held the file at an earlier fork, so it no longer waits for ever for a
+  hold the ancestor still has; and one whose ancestor let go of the file long ago no longer writes its rows at its
+  close or exit either, where 5.16's wrote them.
 
-### A signal handler that uses the store, landing inside a forked child's own write, waits for ever
+### After a parent's failed rewrite, a forked child no longer mends the file
 - Kind: known limitation
-- What the operator sees: a signal handler that uses the store (a commit, `reload()` or a `move_to_end()`), landing
-  while a forked child is inside its own write, waits for ever on the lock that write holds: a child has no writer
-  thread, so its commit and rewrite run in its main thread under `writeLock`, which the handler, running on that same
-  thread inside the write, takes again. A handler's set returns.
-  - Since 5.14, for a handler's `commitAppendToFile()` or `reload()` in any child (either `monitor_external_changes`),
-    and for a monitoring-on child's `move_to_end()`, which follows the file first. 5.16 adds a monitoring-off child's
-    `move_to_end()`, which follows the file now: 5.14 and 5.15 returned there.
-  - A handler's `move_to_end()` follows the file, and so waits, only where the file changed since the store last read
-    or wrote it (`deSynced or _externalChange()`): after the write's own bytes are in and before the write notes them,
-    or after another process's write the store has not read, such as the parent's. One that lands earlier in the
-    write, with no such change, returns.
-  - Checked on Python 3.14 and 3.6 (the 5.16 final review's `s/sighand.py`: a signal raised at the fsync of the child's
-    commit, after its write, whose handler uses the same store). The 5.16 docs pass's `sighand2.py`, the same Pythons:
-    a handler's move raised just after the commit takes its file lock, before it writes, returns in 5.14, 5.15 and 5.16
-    with either setting.
-- Why: a fix needs a design change, not a hotfix's size: a writer thread in the child (as a running store has), or a
-  `writeLock` that knows its holder, so that a call made from a handler inside the write can tell it is inside it.
-- Revisit when: 5.17, with the planned change that a forked child takes none of its parent's duties to the file, and
-  none of its single-writer settings (in "A forked child's row is lost when its parent's failed rewrite has left the
-  file damaged"), or someone hits it.
-- Approved: 2026-11-11, the user chose "Approve as KL (Recommended)" on the 5.16 final review's question: a signal
-  handler that uses the store, landing inside a forked child's own write, waits for ever (the whole case, which 5.14
-  has, and not only 5.16's addition of a monitoring-off child's `move_to_end()`).
+- What the operator sees: a store's rewrite fails part way (a full disk, an I/O error) and leaves the file damaged, with
+  memory the only good copy. The program forks, and the parent ends without getting a rewrite through (a daemon's
+  `os._exit`, a kill). The child sets a row and ends by `close()` or its normal exit.
+  - 5.16: the child's close took the parent's failed rewrite to try again and made the file from its memory: all 9 rows
+    of the probe read right, in 6 of 6 `.tsv.gz` cases.
+  - 5.17: the child only appends after the damage (where the parent appended nothing after it: see the bullet that
+    starts "Where the parent appended after the damage"), so a `.tsv.gz` file stays damaged, every read stops at the
+    damage, and none of the 9 rows reads right, the child's own included, in 4 of 6 cases (close or exit, with or without
+    `rewrite_on_exit` given to the parent's store). The other 2 are a child that sets `rewrite_on_exit` again, which
+    mends the file as before. A plain `.tsv` read right in both builds in the probe. (The 5.17 final review's
+    `daemon.py`, Python 3.14 and 3.6.)
+  - With the parent alive and its rewrite getting through, 5.17 keeps the child's row in 6 of 6 cases (`.tsv` and
+    `.tsv.gz`), where 5.16 lost it in 6 of 6 (`alive.py`): the parent, still damaged, took the child's remake for a change
+    it could not merge and wrote over it.
+  - Where the parent appended after the damage (the same setup, the parent setting `p2` and committing after the fork,
+    before the child goes on), the child's exit does not only append. The damaged file is another writer's change to it:
+    the child's exit reads the file, which reads as empty (the first member does not decode), and makes the file again
+    from that read, so what the read did not get goes. That is the README's documented rule for another writer's damage;
+    the child now takes the parent for another writer. The child's memory held `a` to `h` and its own `c2` at its exit
+    hook (9 rows); the file ends with `c2` alone, and `a` to `h` are gone, and the parent's `p2` with them. Setting
+    `rewrite_on_exit` again gives the same, and a header only (25 bytes) where it ends by `close()`. 5.16 the same or
+    worse, header only on close:
 
-### A signal handler that uses a closed store, landing inside that store's own write, waits for ever
-- Kind: deferred
-- What the operator sees: a store after `close()` has no writer thread either, so its writes run in the calling thread
-  under `writeLock`; a signal handler that lands inside such a write and calls the same store's `commitAppendToFile()`,
-  `reload()` or, with monitoring on, `move_to_end()` waits for ever on that lock (a monitoring-off store's move
-  returns). Its move waits only where it follows the file, as in the forked child's case: where the file changed since
-  the store last read or wrote it, as it has once the write's bytes are in; one that lands before the write has
-  changed the file, with no other change to follow, returns. 5.14, 5.15 and 5.16 alike (the 5.16 fix round's
-  `f516/s/closedhand.py`, Python 3.14 and 3.6: no fork, a 5 s alarm; its re-review ran it on 5.14 too; the 5.16 docs
-  pass's `sighand2.py` raised the signal just after the commit takes its file lock, before it writes: every handler's
-  move returned there).
-- Why: the same cause as the forked child's case above, which the user approved as a known limitation; this one
-  needs no fork and was found while checking that entry, so it is planned work, not part of that approval.
-- Plan (5.17): a `writeLock` that knows its holder, so that a call made from a handler inside the write can tell it is
-  inside it (the design change the forked child's entry names). It is meant to cover both cases; it is not built or
-  tested yet.
-- Revisit when: 5.17.
-- Noted: 2026-11-11, from the 5.16 fix round; a deferral, not asked.
+    | Child, `.tsv.gz`, the parent appended `p2` after the damage | 5.16 | 5.17 |
+    |---|---|---|
+    | Sets `rewrite_on_exit` again, ends by close | header only (25 bytes) | header only (25 bytes) |
+    | Sets `rewrite_on_exit` again, ends by exit | `c2` alone | `c2` alone |
+    | As forked, ends by exit | `c2` alone | `c2` alone |
+    | As forked, ends by close | header only (25 bytes) | the damage kept (199 bytes), still unreadable |
 
-### A forked child's own child does not learn that an ancestor holds the file, and waits for ever at its exit
+    (The 5.17 re-review's `daemon_p2.py`, Python 3.14; a plain `.tsv` read right in every case.)
+  - To have a child mend the file, set `rewrite_on_exit` again in the child (the README's advice to a daemon), or open the
+    store after the fork. That mends a `.tsv.gz` file only where the parent appended nothing after the damage: with a
+    row the parent appended after it, the child's rewrite left it reading as empty (close) or as the child's row alone
+    (exit), in 5.16 as well (the bullet above; a variant of `daemon.py`, Python 3.14; a plain `.tsv` read right).
+  - The suite pins it (`test_a_forked_child_does_not_mend_a_compressed_file_its_parent_failed_to_rewrite_unless_it_sets_rewrite_on_exit_again`):
+    a change that ends it fails there, and this entry changes with it.
+- Why: a forked child takes none of its parent's duties to the file (the 5.17 design check; the user's pick "Take H2
+  (Recommended)"): the parent writes the file too, and a child that took the failed rewrite to try again made the parent
+  overwrite the child's rows. The child cannot tell a parent that will mend the file from one that will not.
+- Revisit when: someone needs it. One idea for a design check: a child whose parent is gone (`os.getppid()` changed since
+  the fork) is the only heir and takes the duty back. Not built or tested. The next entry, a deferral for 5.18, is the same
+  design question for the remake a failed rewrite leaves, and the two are designed together.
+- Approved: 2026-11-11, the user chose "Known limitation (Recommended)" on the 5.17 final review's question: after a
+  parent's failed rewrite, a forked child no longer mends the file; the README and its upgrade note say so, with the
+  workaround. Widened 2026-11-12: the user chose "Widen W1 with the facts (Recommended)". (What the widening added: the
+  bullet "Where the parent appended after the damage", the as-forked exit case, and the reach of the workaround in the
+  bullet after it.)
+
+### A forked child keeps the remake its parent's failed rewrite left, and makes the file again over a live parent's
 - Kind: deferred
-- What the operator sees: a process holds a store's file through `get_file_obj()`, forks a child and waits for it; the
-  child holds nothing, forks a child of its own and waits for it; that grandchild sets a row and ends by its normal
-  exit (or closes the store). The grandchild's exit writes the row, so it waits for the grandparent's file lock: the
-  grandparent waits for the child, the child for the grandchild, and all three wait for ever. A direct child writes
-  nothing there and says so ("A forked child writes nothing at its close or exit when its parent held get_file_obj()
-  at the fork", above), but the fork hook copies only the direct parent's hold (`_afterFork`:
-  `self._parentHeldFile = self._fileObjHeld`), and the child's own fork hook set its `_fileObjHeld` to False, so the
-  grandchild takes its parent for one that holds nothing. 5.15 the same; 5.14 ended there, as its children wrote
-  nothing at their close or exit (no `rewrite_on_exit`). Found by reading, then run (the 5.16 docs pass's `gc.py`,
-  Python 3.14 and 3.6, `'ab'` and `'r+b'` holds: the grandchild never ends on 5.16 and 5.15, and ends on 5.14 and on
-  5.16 with the fix below, writing nothing and saying so).
-- Why: found by the Haiku second opinion on the 5.16 re-review; 5.16 is no worse than 5.15 here, and is the hotfix of
-  the one change the user chose.
-- Plan (5.17): the fork hook keeps an ancestor's hold, `self._parentHeldFile = self._fileObjHeld or
-  self._parentHeldFile`, so a grandchild writes nothing at its close or exit and says so, as its parent does; with a
-  nested-fork test, bounded by an alarm.
-- Revisit when: 5.17.
-- Noted: 2026-11-11, from the Haiku second opinion on the 5.16 re-review; a deferral, not asked.
+- What the operator sees: another writer leaves damage in a `.tsv.gz` file, which every read stops at. The store's commit
+  reads it under the lock and takes the file to be made again (`_remake`), and that remake fails part way (a full disk):
+  `_damaged` and `_remake` are both set. The program then forks. The child's store drops `_damaged` and the failed-write
+  retry (it takes none of its parent's duties, 5.17) but keeps `_remake`, so its commit or close makes the whole file
+  again from its memory. The live parent's close, still `_damaged`, takes that for a change it cannot merge ("Overwriting
+  external changes") and writes over it: the child's row is lost. 5.16 and 5.17 the same, close and exit alike (the 5.17
+  re-review's `g1.py`, Python 3.14: the file reads `a` to `h`, `p2` and `x`, without the child's `c2`); it is the lost
+  child row of the 5.15 re-review, which 5.17's H2 fixed for the failed-write state and not for `_remake`.
+  - With the parent gone (`os._exit` after the child), the child's remake mends the file, in 5.16 and in 5.17: all rows and
+    `c2` read right.
+- Why: not worse than 5.16. The fix is one line in `_afterFork`: drop `_remake` where the parent was `_damaged` (a
+  prototype: a live parent keeps `c2`, `p2` and every row, close and exit alike). It would also move the dead-parent case,
+  which 5.16 and 5.17 mend, into the approved limitation above ("a forked child no longer mends the file"), and that
+  needs the user's OK: it is the same design question as that entry's, so it is decided there.
+- Plan (5.18): design it with the entry above. A child whose parent is gone (`os.getppid()` changed since the fork) is the
+  only heir and takes the duty back, the remake too; a child whose parent lives leaves the remake, and the repair, to it.
+  A test from `g1.py` for the live parent (the child's row kept) and the dead parent (the file mended).
+- Revisit when: 5.18.
+- Noted: 2026-11-12, found by the 5.17 re-review's second opinion (Grok); a deferral, not asked.
+
+### A call a signal handler puts off inside a store's own write is lost when the handler ends the process by os._exit
+- Kind: known limitation
+- What the operator sees: in a store with no writer thread (a forked child's, or one after `close()`), a signal
+  handler's `commitAppendToFile()`, `reload()`, `clear()`, `clear_file()`, `rewrite()`, `mapToFile()`, `hardMapToFile()`,
+  `checkExternalChanges()` or `move_to_end()` that lands inside the store's own write is made as soon as that write ends, unless a Ctrl-C ended it (5.17; a Ctrl-C drops it, and a commit's rows stay
+  queued for the next commit). A handler that makes such a call and then ends the process by `os._exit()`
+  never lets the write end, so the call is not made: set a row, commit and `os._exit(0)` in the handler, and the row is
+  not written. By `sys.exit()` the exception unwinds through the write, which makes the calls put off first, and the
+  row is written, but for two cases where the call waits for ever and the process does not end: on Python 3.14, a signal
+  that lands just after the write has taken `writeLock` leaves it held (32 of 8,000 real signals in a commit loop; the
+  entry on a lock left held, above), and on Python 3.6 to 3.9 one that lands at the end of a `try` or `with` block leaves the
+  file locked, or `writeLock` held (2 of 8,000 on 3.6; the entry on Python 3.6 to 3.9, above). 5.16 waited for ever at the commit, so
+  neither wrote it, and at 127 and 121 of 160 real signals altogether. (The 5.17 final review's `hs.py`, cases `exit` and
+  `sysexit`, Python 3.14 and 3.6.) The README says: end by `sys.exit()`, not `os._exit()`.
+  - The suite pins it (`test_a_signal_handler_that_ends_the_process_inside_a_stores_own_write_keeps_its_commit_only_by_sys_exit`).
+- Why: the call waits for the write it landed in, and that write never returns; running it at once, inside the write,
+  is what waited for ever.
+- Revisit when: someone ends the process from a handler inside such a write and cannot use `sys.exit()`.
+- Approved: 2026-11-11, the user chose "Approve as KL (Recommended)" on the 5.17 final review's question: a put-off call
+  is lost when the handler ends the process by `os._exit`. (The 2026-11-12 sentence on the two cases where a call waits
+  for ever points to two other entries, the widened lock-held one and the Python 3.6 to 3.9 one; it widens nothing here.)
+
+### A signal handler's set inside a forked child's or a closed store's own write can leave memory apart from the file
+- Kind: deferred
+- What the operator sees: a store with no writer thread (a forked child's, or one after `close()`) writes in the thread
+  that asks, and those writes hold the store's section lock (`_memLock`) where they change memory and the queue together:
+  a reload's swap of memory, a commit's listing of the queue. A signal handler that sets a row (or deletes, pops or moves
+  one) and lands inside such a section takes the lock from it, as a handler inside a set does (5.13), and the write goes
+  on without it. A handler's set of a new key `h` that lands in a `reload()` just before its swap of memory leaves `h`
+  out of memory and in the queue: the file gets it, memory does not, until the next reload. 5.16 the same (the 5.17
+  build's `setinjob.py`, Python 3.14, a forked child and a closed store; a running store, whose writes run on its writer
+  thread while the handler's set waits for the lock, agrees). Not swept: how often each section is hit is not counted.
+  - The same family, from the 5.17 final review (`hs.py` and `l1.py`, Python 3.14 and 3.6, a forked child and a closed
+    store; 5.16 waited for ever at the first call of each, so none is worse than it): a call a handler makes inside such a
+    write is put off and made when the write ends (5.17), but the handler's own next call is made at once, and so comes
+    before it.
+    - A handler's `clear()` followed by a set of `h`: the set is made, then the put-off clear empties memory and the
+      queue, and `h` is in neither memory nor the file (`.tsv` and `.tsvz`). A handler's `reload()` followed by a set
+      keeps the set (a reload replays the queued rows on what it read).
+    - A handler's `reload()` returns before the reload, so a read right after it sees the old row.
+    - A put-off `move_to_end()` of a key that is gone (a `del` after it in the handler) does not raise `KeyError` to the
+      handler: the put-off move reports "Failed at _move()" later.
+    - A process a handler forks inside a closed store's own write, which sets a row and commits: its commit is put off
+      in the line it inherited and is not made (5.16's waited for ever on the writeLock it inherited held). A forked
+      child's store gives that process fresh locks and a new fork mark (5.17), and a closed store has no fork hook.
+      The same missing hook: a process that returns from the handler into the closed store's write makes the parent's
+      put-off calls again (a put-off `clear()` empties the file of the rows the parent wrote after it; the 5.17
+      re-review's `forkreturn.py`), where a forked child's store makes none (fixed for it in 5.17). 5.16 waited for ever at
+      the first call.
+  - From the 5.17 re-review (`sw-*` sweeps over every instruction of `TSVZ.py` on the main thread, Python 3.14 and 3.6;
+    5.16 waited for ever at the first call of each, except where it says the same):
+    - **Another handler's call between the drained calls runs ahead of them.** Handler 1 calls `move_to_end('a')` inside
+      a commit, which puts off three calls (the check, the rewrite, the move). Handler 2 calls `move_to_end('b')` and
+      lands in the drain, between those calls. It finds no job's frame (the waiting line lives in `_runHere`'s frame
+      between the drained calls, which `_jobHere` does not look at) and is made at once, ahead of the rest of handler 1's:
+      memory and the file end `[c, b, a]` where the order of the calls gives `[c, a, b]`; the rows agree (28 of 5,517
+      instructions of the drain in the sweep, 86 on Python 3.6). Also a put-off call made by another handler, not only
+      by the handler's own next one. A candidate (the re-review's prototype, `proto5`): `_jobHere` also takes a non-empty
+      line from a `_runHere` or `_drain` frame of the same store and mark, with identity checks only, so a call made
+      while put-off calls wait joins them in order. It costs about 0.5 µs on a call of 1 to 2 µs (1.3 to 1.4 µs becomes
+      1.8 to 2.1 µs; 27 to 28 µs becomes 33 to 36 µs at 1,000 frames of stack), which 5.17 does not spend on every call
+      for an ordering this rare. A plain set, or a `move_to_end()` with nothing to follow, is never put off, so it comes
+      before waiting calls with or without it: that is the plan below.
+    - **A handler's set inside the commit's queue scan or a reload's swap makes the main call raise `RuntimeError`.** In
+      a store with no writer thread, the main thread runs `commitAppendToFile()` or `reload()`; a handler's plain
+      `t['h'] = ...` lands in `_dropQueued`'s scan of the queue or in `_replaceRows`. The main call raises
+      `RuntimeError` ("deque mutated during iteration", or "OrderedDict mutated during iteration") to the program. The
+      rows stay queued, and the next commit writes them. 5.16 the same: a commit, 17 of 1,060 instructions then and 17 of
+      1,177 in 5.17; a reload, 16 of 3,211 and 16 of 3,305; Python 3.6, a commit, 2 of 220. It is the section-lock family
+      above, and the plan below, which puts off a set that finds the lock held, covers it.
+    - **A process a handler forks inside a forked child's plain commit, which returns from the handler, reports a failed
+      write.** It goes on with its copy of the commit, after the fork hook has emptied its queue, so its
+      `popleft()` raises and it prints "Failed to write at commitAppendToFile ... pop from an empty deque". Every row is
+      fine. 5.16 the same (the re-review's `forkreturn.py` with a handler that only forks). Plan: cover it as 5.17 covers a
+      `clear()`'s write, an interval rewrite and a one-column delete's commit, with a fork-inside-a-write test of a plain
+      commit.
+    - **A handler's `move_to_end()`, or a set, inside the last commit of a close or an exit is never written.** A forked
+      child with another writer's change unread sets `c` and calls `close()`; a handler lands at the close commit's fsync
+      and calls `move_to_end('b')`. The move is put off and made after the commit, and its 2 lines stay queued: memory
+      says `[a, c, b]`, the file `[a, b, c]`. The exit path is the same. A handler's plain set there leaves its line
+      queued and not written. 5.16: the set the same, the move waited for ever (the re-review's `g2.py`, Python 3.14; a
+      second `close()` of a closed store commits nothing in 5.16 as well, so it does not count). Plan: close and exit of a
+      store with no writer thread commit once more when a handler queued lines during their last commit. It needs its
+      own design: a handler can land in that commit too, and the cases where a close or an exit writes nothing (the
+      held-file limitation above) must stay as they are.
+- Why: found by the 5.17 build, by reading, while putting off a handler's commit or reload inside such a write; not worse
+  than 5.16, and a fix touches every section of the write path, which wants its own sweep.
+- Plan (5.18): a set, delete, pop or move that finds the section lock held by its own thread, in a store with no writer
+  thread, is put off until the write below it ends, as a commit is (`_jobHere`, looked up only then: only a handler or a
+  Ctrl-C's leftover finds the lock held); with a handler sweep over a forked child's and a closed store's writes. It also
+  puts off a set (and a delete or move) made while calls are waiting, so that what a handler does to the store after
+  such a call happens after it. Where to find the waiting calls is to design: the line is in the job's frame now (5.17),
+  so a stack walk, 0.5 to 40 µs a call (the 5.17 final review's `cost2.py`), on a set that takes 1 to 2 µs; a count on the
+  store would read the same for another thread. A call that returns a value (`pop()`, `popitem()`, a read after the
+  handler's own set) cannot simply be put off, and a put-off delete of a missing key could no longer raise `KeyError`:
+  the sweep decides. A closed store's fork hook (for a process a handler forks inside its write) is part of it.
+  - **A design check comes first**, before that put-off is extended to sets, deletes, pops and moves (the 5.17 design check's
+    question D). It compares it with the other way to remove this whole class: a store with no
+    writer thread stops running its writes on the calling thread. By reading, that is one of two shapes: a forked child's
+    store starts its writer thread again at its first write, or `_runHere` runs each job on a helper thread and waits for
+    it as `_call` does. Either would remove the put-off line, the frame lookup, the drain, a Ctrl-C's drop, the `os._exit`
+    limitation, F4, this entry's other cases, and both cut-write limitations ("A write after close(), or in a forked child, can
+    be cut by a Ctrl-C" and "A second Ctrl-C inside a set's clean-up, or a Ctrl-C in a write made after close() or in a
+    forked child, can leave a lock held"). Its costs are real: the thread's lifetime in
+    a child, a thread hand-off on every commit of a child, and the exit path, where a new thread may not start (a thread
+    starts and joins from an `atexit` handler on Python 3.11, 3.12 and 3.14, which is where TSVZ runs its exit hook
+    (checked); later in the interpreter's shutdown it may not). Nothing of it was built or run.
+  - **A `writeLock` that knows its holder**, used only to let go of a hold a cut write left (the approved limitation of
+    a lock left held, Python 3.14), is the other candidate, to be measured: see that entry.
+- Revisit when: 5.18.
+- Noted: 2026-11-11, found by the 5.17 build; the 5.17 final review's findings added the same day; the design check's
+  condition added 2026-11-12; a deferral, not asked.
+
+### A Ctrl-C that a TSVZedLite catches in a .tsvz write can leave its file append-locked until it closes
+- Kind: deferred
+- What the operator sees: a program keeps a `TSVZedLite` on a plain `.tsvz` file open (it holds the file open for its
+  lifetime), sets rows, and catches `KeyboardInterrupt` and goes on. A Ctrl-C that lands in `_specAppendTo`'s `finally`,
+  in `_seekRawStart` before the unlock or in `_unlockFile` before its unlock call, leaves the Lite's file append-locked
+  until the Lite closes or the process ends. Then the Lite's own `clear_file()` waits for ever (it opens the part again,
+  and its rewrite lock waits for the append lock); another process's append (`appendTabularFile`, `tsvz set`, a
+  `TSVZed`'s commit) waits until the Lite closes, and so does a scrub or a rewrite by anyone. The Lite's own later sets
+  go on (a lock taken again through the same open file description does not conflict; by reading). Real SIGINTs from
+  another process 2 to 30 ms into a set loop, caught, 1,920 each: the append lock was still held after 104 on 3.14 (72 in
+  `_seekRawStart`, 32 in `_unlockFile`), 91 on 3.11, and 120 on 5.16 (3.14). The Lite's `clear_file()` hung in all 54
+  held cases of the 3.14 run (55 of 55 on 5.16) and another process's `appendTabularFile` in all 44 it was tried on (it
+  returned once the Lite closed). On macOS and other flock systems, by reading: the held lock is a whole-file exclusive
+  `flock`, so other processes' reads wait too.
+- Why: not worse than 5.16 (`_specAppendTo`, `_unlockFile`, `_specWrite` and `_specAppendPayload` are the same text in
+  5.16 and 5.17); found by the review of the third fix round, after that round put every write of a `TSVZed` under its
+  clean-up from the step that takes its file. The Lite's `.tsvz` append is the one site whose file outlives the call
+  (`_specAppendTo(f, ...)` with its long-lived `self.fileObj`), so a close cannot drop its lock.
+- Plan (5.18): fix at source. The Lite appends through `_specAppendPayload`, which returns the same `(offset, before,
+  after)`, so the lock sits on a descriptor of its own that a `with` closes, and a cut clean-up drops the lock with the
+  close. A nested `try` in `_specAppendTo` alone would close the 72 landings in `_seekRawStart` and not the 32 in
+  `_unlockFile`. Check the Lite's reads at offsets through its kept `fileObj` after appends made through another
+  descriptor, and add a test like the third round's.
+- Revisit when: 5.18.
+- Noted: 2026-11-12, found by the review of the third fix round; a deferral, not asked.
+
+### A Ctrl-C caught in get_file_obj() or release_file_obj() can leave writeLock held, and the store's next commit then waits for ever
+- Kind: deferred
+- What the operator sees: a program holds the store's file with `get_file_obj('ab')`, writes, lets go of it with
+  `release_file_obj(f)` in a `finally`, and catches `KeyboardInterrupt` and goes on. A Ctrl-C that lands in
+  `release_file_obj`'s `finally` before its nested `try` (in `getFileUpdateTimeNs()`, or in `_unlockFile`), at the
+  function's entry, or in `get_file_obj` just after `writeLock.acquire()`, leaves `writeLock` held, and usually the file
+  locked. The store's next commit, on its writer thread, then waits for ever, and so does the commit at exit. Real
+  SIGINTs from another process into a `get_file_obj()`/`release_file_obj()` loop of a running `.tsv` store, caught, 960
+  each: the next commit hung after 331 on 3.14 and 314 on 3.11 (files on tmpfs), 44 (4.6%) on 3.14 with the files on an
+  XFS disk, where an fsync takes real time (16 in `getFileUpdateTimeNs`, 13 in `_unlockFile`, 15 at `get_file_obj`'s
+  acquire gap, where the writer thread held `writeLock` for its own fsync), and 311 on 5.16 (3.14, tmpfs).
+  `get_file_obj`, `release_file_obj` and `_startWrite` are the same text in 5.16 and 5.17. (A second Ctrl-C, or an error
+  and a Ctrl-C, inside `get_file_obj`'s `except` clause leaves the same: `_unlockFile(locked)` there is unprotected.)
+- Why: not worse than 5.16, and a Ctrl-C landing in the code that takes or lets go of a lock is the family of the
+  approved lock-held limitation; found by the review of the third fix round.
+- Plan (5.18): fix at source. Nest `release_file_obj`'s `finally` (the time noted, then the unlock, then the close, then
+  `_fileObjHeld = False` and `writeLock.release()` last, innermost), and `get_file_obj`'s `except` path the same: one
+  Ctrl-C anywhere in them then still lets go of everything, which closes about 300 of the 331 hangs on tmpfs and 29 of
+  the 44 on disk. The acquire gap and the function's entry cannot be closed with a `try` (whatever takes or lets go of a
+  lock is itself code a Ctrl-C can land in), and go with the other candidate, a `writeLock` that knows its holder: a
+  hold by this thread with `_fileObjHeld` false and no job on the stack is a leftover (see the lock-held entry).
+- Revisit when: 5.18.
+- Noted: 2026-11-12, found by the review of the third fix round (a second opinion's lead, run); a deferral, not asked.
 
 ### A parent that forks and ends by os._exit does not write the rows it queued last
 - Kind: known limitation
@@ -593,58 +824,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-11-10, the user chose "Approve as KL (Recommended)": a parent that forks and ends by `os._exit`
   loses the rows it queued last; the README says to commit before forking.
 
-### A forked child's row is lost when its parent's failed rewrite has left the file damaged
-- Kind: deferred
-- What the operator sees: a loose store's rewrite fails part way (a full disk, an I/O error), leaving the file damaged
-  and memory "the only good copy", and the program then forks a child that sets and commits a row. The row reaches the
-  file: the child's write makes the file again from its memory, which followed the file. When the still-damaged
-  parent's next rewrite gets through (its retry, or its close), it finds the file no longer begins with the bytes it
-  held when its rewrite stopped, warns "Overwriting external changes ... memory is written over them", and writes its
-  own memory over the file: the child's row is lost, while the parent's own rows, those it appended after the fork
-  included, stay. 5.14, 5.15 before its final review's fixes, and 5.15 the same (the 5.15 re-review's
-  `s/forkdamaged.py`, Python 3.14: an ENOSPC injected part way into the parent's rewrite, with and without
-  `rewrite_on_exit`, the child ending by `close()` or its normal exit).
-- Why: the merge rule takes in only what another writer appended after the bytes the damaged file held, since any
-  other change may be the damage itself; a child that writes the file again is such a change, and the parent cannot
-  tell its rows from damage. The child writes it again because it takes its parent's failed rewrite to try again
-  (`_failures`) and its `rewrite_on_exit` (the 5.15 design check). Found by the 5.15 re-review; not this release's
-  change, and rare (a rewrite that failed, then a fork before the parent made the file again).
-- Plan (5.17): a forked child takes none of its parent's duties to the file or its single-writer settings (the
-  user's pick, 2026-11-11): the fork hook also drops the failed writes' retries and a refused rewrite's back-off, and
-  turns `rewrite_on_exit` and `rewrite_interval` off, as 5.16 turns monitoring on. Its close and exit then only
-  append, and the parent's merge rule takes its rows in (the design check's prototype kept the child's row in 3 of the
-  re-review's 3 cases, on Python 3.14 and 3.6). A forked child then no longer compacts the file at its exit; a daemon
-  that wants that sets `rewrite_on_exit` again in the child.
-- Revisit when: 5.17, or someone loses a forked child's rows this way.
-- Noted: 2026-11-11, from the 5.15 re-review; a deferral, not asked.
-
-### A forked child's commits to a compressed file slow with every commit once its parent has written, with monitoring off
-- Kind: deferred
-- What the operator sees: a `.tsv.gz` store (or another compressed kind) with `monitor_external_changes=False`, a
-  parent that writes the file once after the fork, and a child that then sets and commits rows one at a time. Each
-  commit reads the whole file and decodes every member appended since the fork, because a child has no tick to read
-  the change and move its mark forward, so each commit costs more than the one before. Per set and commit on a 2,000
-  row file, over each 1,000 commits, on Python 3.14 (the 5.16 final review's `s/gzgrow.py`):
-
-  | Build, setting | 1st 1,000 | 2nd | 3rd | 4th |
-  |---|---|---|---|---|
-  | 5.15, monitoring off | 0.02 ms | 0.02 | 0.02 | 0.02 |
-  | 5.16, monitoring off | 0.76 ms | 2.21 | 3.54 | 5.02 |
-  | 5.15 and 5.14, monitoring on | 0.71 ms | 2.04 | 3.35 | 4.68 |
-
-  On 3.6, 5.16 takes 1.02 to 6.70 ms. On a 100,000-row file the first 200 commits cost 0.37 ms each against 0.02 ms.
-  A `.tsv` commit, a one-column delete's commit and a close with `rewrite_on_exit` are unchanged at 100,000 rows. It is
-  what a default (monitoring-on) child has in 5.14 and 5.15: a pool of fork workers committing rows to one `.tsv.gz`
-  with default settings has it today; 5.16 gives a monitoring-off child the same.
-- Why: found by the 5.16 final review; the same as a default child's since 5.14, and no row is lost. The fix is in how
-  a child's commit follows the file, not a hotfix's size.
-- Plan (5.17), with the change that a forked child takes none of its parent's duties to the file (planned in the entry
-  above): a child's commit takes in what it just read under the lock and moves its mark, so the next commit reads only
-  what is new.
-- Revisit when: 5.17.
-- Noted: 2026-11-11, from the 5.16 final review; a deferral, not asked. The user chose to ship 5.16 with it ("Ship
-  after docs + test (Recommended)").
-
 ### A TSVZClient with no server, used in a forked child, waits for ever at its first write
 - Kind: deferred
 - What the operator sees: a program opens a `TSVZClient` on a file no `tsvz serve` handler serves (the client then
@@ -653,10 +832,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   5.14 and 5.15, Python 3.14 and 3.6, `.tsv` and `.tsvz` (the 5.15 plan's `probe/forkclient.py`: no return in 10 s).
 - Why: 5.15's fork hook resets each `TSVZed`; the client's engine is another object with its own thread, and its
   reset needs its own design and tests.
-- Plan (5.17): built on 5.15's fork hook (`_storesAfterFork`): each live `_ServeWriter` (`_SERVE_OPEN_WRITERS`)
+- Plan (5.18): built on 5.15's fork hook (`_storesAfterFork`): each live `_ServeWriter` (`_SERVE_OPEN_WRITERS`)
   drops its inherited queue in the child and starts its thread again, either at its first `submit` there (a pid check
   once a request) or in the hook; measured to settle which.
-- Revisit when: 5.17.
+- Revisit when: 5.18.
 - Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked.
 
 ### A compressed file whose text has no final newline takes an appended member as lines of its own
@@ -694,7 +873,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   its rows stay readable (not while that rewrite fails or is refused: see the README's fault tolerance), but a
   one-shot `tsvz set`, `appendTabularFile()`, a `TSVZedLite` or a `TSVZed` opened with
   `monitor_external_changes=False` (for damage that lands after it loaded the file; from 5.16 not in a child that
-  `fork()` made, which follows the file, by reading) appends without reading the file first, so its rows land
+  `fork()` made, which follows the file: the suite's test from 5.17) appends without reading the file first, so its rows land
   after the damage, where no read reaches them, and the next `TSVZed` or scrub that makes the file again drops
   them. 4.9 to 5.3 do the same, also after a later member cut short (a writer
   killed mid-append), which from 5.4 reads are no longer stopped by: it is left out and the members after it
@@ -1059,11 +1238,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   (`a\t1\na\t\t1\nd\t1\n\na\t1\t2\n`, defaults `[#_defaults_#, '', '']`), a strict reader given a count of 3 that the
   writer was not given lost a cell (`c` from `[c, 2, X]` to `[c, 2, '']`), and tsvz-rs read `c, b` as `b, c`. So 5.15
   keeps 5.14's compaction; the suite holds the first two files as a test.
-- Plan (5.17): drop that line only where no reader that can read the file otherwise takes a line between: a reader
+- Plan (5.18): drop that line only where no reader that can read the file otherwise takes a line between: a reader
   given line 1 for its header (also where the writer has no header) and a reader given a count the writer was not
   given, as the random differential lists them; then the exhaustive differential with an empty header and count readers
   for a rewrite, and the random one.
-- Revisit when: 5.17.
+- Revisit when: 5.18.
 - Noted: 2026-11-09, found in the 5.12 review (the second half of 5.12's deferral "A compaction keeps a moved-up line only
   from the deletion that ends the other reader's life of the key", whose first half 5.14 builds); a deferral, not asked.
   2026-11-10: the 5.15 plan's rule was built and taken back, as above.
