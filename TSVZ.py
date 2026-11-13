@@ -47,7 +47,7 @@ elif os.name == 'posix':
 version = '5.17'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-11-11'
+COMMIT_DATE = '2026-11-12'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
