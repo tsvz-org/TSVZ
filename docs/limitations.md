@@ -480,7 +480,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   that `try` (the normal end, each early return and each `except` that ends normally); the close in the `finally`; so
   `_openLocked` could no longer be the step that locks and returns the file (on 3.9 its `return f` falls outside its
   `except`). One signal then leaves at most an unlocked open file. That restructures all four functions of the write path
-  that 3.11 and later run, every return and `except` path of each, for 2 to 3 of 8,000 signals on end-of-life
+  that 3.11 and later run, every return and `except` path of each, for 2 of 8,000 signals on end-of-life
   interpreters. The `writeLock` part needs more than a `try`: the end of a `with` block is the gap, and a plain `Lock`
   has no owner for a `finally` to test.
 - Revisit when: someone hits it where they cannot move to Python 3.11 or later, or a closed store or a forked child gets a
