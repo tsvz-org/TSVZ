@@ -18924,6 +18924,7 @@ def cut(file, header, lines, *args, **kwargs):  # (a third of the rewrite writte
 		raise OSError(28, 'No space left on device (injected)')
 	return real(file, header, lines, *args, **kwargs)
 TSVZ._writeLines = cut
+TSVZ._FAILURE_RETRY_FIRST = 3600  # (the parent's writer thread retries the failed rewrite after 0.1 s, and on a busy host mends the file before the child appends)
 t.rewrite(force=True)
 failing[0] = False
 with open(p, 'rb') as f:
@@ -19689,8 +19690,8 @@ def test_a_signal_that_cuts_a_stores_own_write_after_it_took_the_file_lock_leave
 	# write is alive. A write holds its locked file from the step that takes it: where one of the store's own steps (the
 	# check after the open, the clean-up's unlock) was outside the try that lets go of the file, a SystemExit (sys.exit()) or
 	# a Ctrl-C landing there left the file open and locked for as long as the exception lived, and the next commit, the put-off
-	# one or the clause's, waited for that lock for ever (5.16 and the 5.17 build: the README's handler hung in about 2% of
-	# real signals, and a program's except clause every time it landed there). The file is closed whatever the clean-up did.
+	# one or the clause's, waited for that lock for ever (the README's handler hung in about 2% of real signals in the 5.17
+	# build before this fix and in about 3 of 4 in 5.16, and a program's except clause every time it landed there). The file is closed whatever the clean-up did.
 	mode, point, exc = shape
 	p = str(tmp_path / 's.tsv')
 	script = tmp_path / 'cut.py'

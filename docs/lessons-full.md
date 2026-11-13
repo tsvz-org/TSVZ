@@ -566,5 +566,5 @@ entries go last, in the same commit as the change:
   lock is held only through each step of a job, so its owner says nothing between the steps, a holder a Ctrl-C left would
   read as a job under way, and the design check made `writeLock` an `RLock` and swept 5.16 with it: 619 of 1,060 steps
   still hung (the nested commit opens the file again, and waits for the file lock its own write holds). What is left is
-  the approved limitation of a lock a cut write leaves held (Python 3.14: about 0.5% of real signals), for which a lock
-  that knows its holder, letting go of a hold found where the stack shows no job, is the 5.18 candidate.
+  the approved limitation of a lock a cut write leaves held (Python 3.14: 0.4 to 0.6% of real signals), for which a lock
+  that knows its holder, letting go of a hold found where the stack shows no job, is a candidate for 5.18, to be measured.

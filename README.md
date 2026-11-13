@@ -264,8 +264,8 @@ A handler that ends the process by `os._exit()` after such a call loses the call
 ([known](docs/limitations.md#a-call-a-signal-handler-puts-off-inside-a-stores-own-write-is-lost-when-the-handler-ends-the-process-by-os_exit)),
 but for a write cut just as it takes its lock: on Python 3.14 a signal that lands just after `with self.writeLock:` has
 taken the lock leaves it held, and the call waits for ever (32 of 8,000 real signals in a commit loop;
-[known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and on Python 3.6 to 3.10 one that lands at the end of a `try` block can leave the file locked
-(2 of 8,000 on 3.6; [known](docs/limitations.md#on-python-36-to-310-a-signal-handler-that-ends-the-process-inside-a-stores-own-write-can-still-hang-in-a-few-of-8000-signals)).
+[known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and on Python 3.6 to 3.9 one that lands at the end of a `try` or `with` block can leave the file locked, or
+`writeLock` held (2 of 8,000 on 3.6; [known](docs/limitations.md#on-python-36-to-39-a-signal-handler-that-ends-the-process-inside-a-stores-own-write-can-still-hang-in-a-few-of-8000-signals)).
 
 A child that `fork()` made (`os.fork()`, or `multiprocessing`'s fork children, which its
 `fork` start method makes; Python 3.14's default on Linux, `forkserver`, makes children
@@ -392,8 +392,9 @@ handler makes inside a store's own write returns where the store has no writer t
   5.16's wrote its row there (let go of the file before forking, as for a child)
   ([known](docs/limitations.md#a-forked-child-writes-nothing-at-its-close-or-exit-when-its-parent-held-get_file_obj-at-the-fork)).
 - **A signal handler that uses a store inside that store's own write no longer waits for ever, in a forked child or
-  after `close()`.** Such a store has no writer thread, so its writes run in the thread that asks, and a handler's
-  `commitAppendToFile()`, `reload()`, `clear()`, `rewrite()` or `mapToFile()` landing inside one took the lock that
+  after `close()`, except where the write is cut as it takes its lock (below).** Such a store has no writer thread, so its
+  writes run in the thread that asks, and a handler's `commitAppendToFile()`, `reload()`, `clear()`, `clear_file()`,
+  `rewrite()`, `mapToFile()`, `hardMapToFile()` or `checkExternalChanges()` landing inside one took the lock that
   write holds again, and waited for ever (5.14 to 5.16; a `move_to_end()` too where it follows the file first, as it does
   once the write's bytes are in). The call is now made as soon as the write ends, unless a Ctrl-C ended it (which drops
   it: a put-off commit's rows stay queued for the next commit), after any made before it, and returns
@@ -408,30 +409,35 @@ handler makes inside a store's own write returns where the store has no writer t
   first: end by `sys.exit()`
   ([known](docs/limitations.md#a-call-a-signal-handler-puts-off-inside-a-stores-own-write-is-lost-when-the-handler-ends-the-process-by-os_exit)), except for a write cut just as it takes its lock: on Python 3.14 a signal landing just after
   `with self.writeLock:` has taken the lock leaves it held and the call waits for ever (32 of 8,000 real signals of the
-  README's handler in a commit loop; [known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and on Python 3.6 to 3.10 one landing at the end of a `try` block can
-  leave the file locked (2 of 8,000 on 3.6; [known](docs/limitations.md#on-python-36-to-310-a-signal-handler-that-ends-the-process-inside-a-stores-own-write-can-still-hang-in-a-few-of-8000-signals)).
+  README's handler in a commit loop; [known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and on Python 3.6 to 3.9 one landing at the end of a `try` or `with` block can
+  leave the file locked, or `writeLock` held (2 of 8,000 on 3.6; [known](docs/limitations.md#on-python-36-to-39-a-signal-handler-that-ends-the-process-inside-a-stores-own-write-can-still-hang-in-a-few-of-8000-signals)).
   A process a handler forks inside a closed store's own write, and that sets a row and commits, loses that commit, where
   a forked child's store keeps it (the closed store has no fork hook; deferred to 5.18; 5.16 waited for ever at the
   handler's first call). A running store is unchanged: its writes run on its writer thread, and a handler's call waits
   for the one under way.
-- **A write that a `sys.exit()` or a Ctrl-C cuts no longer leaves its locked file open, so a commit made while the
-  exception goes up no longer waits for ever.** A store's write holds its locked file from the step that takes it, but
+- **In a closed `TSVZed`'s or a forked child's own write, a `sys.exit()` or a Ctrl-C that cuts the write no longer
+  leaves its locked file open, so a commit made while the exception goes up no longer waits for ever, except where the
+  cut leaves a lock held (below).** A store's write holds its locked file from the step that takes it, but
   the `try` that lets go of it began a few instructions later (a check of the store's own sat in between), and its
   clean-up closed the file after the unlock, so an exception raised in either left the file open and locked for as long
   as the exception's traceback lived. In a forked child's or a closed store's own write, where the call a handler made is
   put off and made as the write ends, the handler's `sys.exit()` landing there made that commit wait for the lock for ever
   (the README's handler hung at 161 of 8,000 real signals on 3.14, 170 on 3.11 and 230 on 3.6, in the 5.17
-  build; 5.16 at about 3 of 4), and so did a program's own `except SystemExit:` or `except KeyboardInterrupt:` clause
-  that commits again (5.16 and the 5.17 build both: in every run where the signal landed there). The `try` now begins
-  where the file is taken, and the file is closed whatever the unlock did: that handler hangs at 32 of 8,000 on 3.14
-  (all at the `writeLock` below) and 2 on 3.6, in none on 3.11 or 3.12, and the clause's commit returns. What is left
-  is two known limitations, both for a handler that ends the process: a lock a cut write leaves held on Python 3.14
-  (that handler, and two signals inside one commit, where 28 of 8,000 hang and 5.16 ended; [known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and
-  Python 3.6 to 3.10, where a signal at the end of a `try` block still leaves the file locked
-  ([known](docs/limitations.md#on-python-36-to-310-a-signal-handler-that-ends-the-process-inside-a-stores-own-write-can-still-hang-in-a-few-of-8000-signals)).
-- The planned "write lock that knows its holder" became a look at the call stack for the store's own job (above): a
-  reentrant write lock still hung at 619 of 1,060 steps of a commit's sweep, since the nested commit opens the file again
-  and waits for the file lock its own write holds.
+  build before this fix; 5.16 at about 3 of 4), and so did a program's own `except SystemExit:` or
+  `except KeyboardInterrupt:` clause that commits again (5.16 and the 5.17 build before this fix both: in every run
+  where the signal landed there). The `try` now begins where the file is taken, and the file is closed whatever the
+  unlock did: that handler hangs at 32 of 8,000 on 3.14 (all at the `writeLock` below) and 2 on 3.6, in none on 3.11 or
+  3.12, and the clause's commit returns, except where the cut leaves a lock held. What is left is two known
+  limitations: a lock a cut write leaves held on Python 3.14 (that handler, and two signals inside one commit, where 28
+  of 8,000 hang and 5.16 ended, and a program's own `except` clause that commits again, which waits for ever there as
+  in 5.16; [known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and Python 3.6 to 3.9, where a signal at the end of a `try` or `with`
+  block still leaves the file locked, or `writeLock` held ([known](docs/limitations.md#on-python-36-to-39-a-signal-handler-that-ends-the-process-inside-a-stores-own-write-can-still-hang-in-a-few-of-8000-signals)). A `TSVZedLite`'s write of a
+  `.tsvz` file is not covered: a Ctrl-C it catches can leave the file append-locked until the Lite closes, as in 5.16
+  ([deferred to 5.18](docs/limitations.md#a-ctrl-c-that-a-tsvzedlite-catches-in-a-tsvz-write-can-leave-its-file-append-locked-until-it-closes)).
+- The planned "write lock that knows its holder", which was to tell a call made inside the store's own write from a new
+  one, became a look at the call stack for the store's own job (above): a reentrant write lock still hung at 619 of
+  1,060 steps of a commit's sweep, since the nested commit opens the file again and waits for the file lock its own
+  write holds.
 - **A forked child's commits to a compressed file no longer slow with each commit once its parent has written.** A
   commit looks at what another process appended for damage, which every read stops at; it looked from the bytes the
   store last read or wrote, and a child, with no writer thread to read the parent's change, looked again at the
@@ -454,16 +460,22 @@ handler makes inside a store's own write returns where the store has no writer t
   writes nothing at its close or exit where its parent held the file now covers a grandchild too, even where the
   ancestor let go of the file long before (above); and three new: a forked child no longer mends the file after its
   parent's failed rewrite, a call a handler puts off is lost when it ends the process by `os._exit()` (above), and on
-  Python 3.6 to 3.10 a handler's `sys.exit()` can still hang (above); and two widened: the lock a cut write can leave held
+  Python 3.6 to 3.9 a handler's `sys.exit()` can still hang (above); and two widened: the lock a cut write can leave held
   now includes a handler's `sys.exit()` on Python 3.14 (above), and a line can be written twice by a handler's
   `sys.exit()` inside a commit too (the file's lines `a b c c h`; the last copy wins).
 - **Planned for 5.18** ([docs/limitations.md](docs/limitations.md)): the rest of what was planned for 5.17 (the list under
   5.15, below), and a signal handler's set inside a forked child's or a closed store's own write, with what a handler does
   to the store after a put-off call, and the process it forks inside a closed store's write (the handler bullet above),
   a handler's `move_to_end()` or set inside the last commit of a close or an exit, and the remake that a forked child
-  keeps from its parent's failed rewrite; a `writeLock` that knows its holder, for the lock a cut write leaves held on
-  Python 3.14; and, before the put-off grows to sets, deletes, pops and moves, a design check against a store that
-  stops running its writes on the calling thread.
+  keeps from its parent's failed rewrite; a `TSVZedLite` on a `.tsvz` file whose caught Ctrl-C leaves its file
+  append-locked until it closes ([deferred](docs/limitations.md#a-ctrl-c-that-a-tsvzedlite-catches-in-a-tsvz-write-can-leave-its-file-append-locked-until-it-closes); 5.16 the same); a program that holds the file with
+  `get_file_obj()`, lets go of it in a `finally` and catches a Ctrl-C there, which can leave `writeLock` held, so that
+  the store's next commit waits for ever ([deferred](docs/limitations.md#a-ctrl-c-caught-in-get_file_obj-or-release_file_obj-can-leave-writelock-held-and-the-stores-next-commit-then-waits-for-ever); 5.16 the same); two test gaps (a
+  real-signal test's count of handler calls under load, and the round's test of the rewrite's and `clear()`'s half of the
+  fix; [deferred](docs/limitations.md#test-gaps-the-review-of-517s-third-fix-round-leaves)); and, before the put-off grows to sets, deletes, pops and moves, a design check
+  against a store that stops running its writes on the calling thread. A candidate for 5.18, to be measured: a `writeLock`
+  that knows its holder, used only to let go of a hold a cut write left (the lock a cut write leaves held on Python
+  3.14).
 
 ## Upgrading to 5.16 from 5.15
 
