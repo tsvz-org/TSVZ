@@ -21262,7 +21262,8 @@ def test_a_ctrl_c_at_release_file_objs_look_at_the_raw_file_still_closes_the_fil
 	log = done.stdout + done.stderr
 	assert cut, log
 	assert (writeLock, held, closed, other, unchanged, commit, noise) == (False, False, True, 'returned', True, 'returned', []), log
-	# (what a cut look costs is what was written through the file: a compressed member it left cut short is skipped, and warned of)
+	# (what a cut look costs is what was written through the file: a text hold leaves a member cut short, which the read skips
+	# and warns of; a small binary hold leaves nothing)
 	with contextlib.redirect_stderr(io.StringIO()):
 		keys = sorted(TSVZ.readTabularFile(p, header='id\tv', verbose=False))
 	assert [key for key in keys if key != 'k'] == ['a', 'o', 'z'], keys
@@ -21296,12 +21297,12 @@ def test_a_second_release_file_obj_of_a_file_let_go_of_leaves_another_threads_wr
 
 
 #: ARGV: TSVZ's directory, the file (.tsvz), NAME, HOW, NTH. A TSVZedLite holding a sets b; a KeyboardInterrupt is raised
-#: at the NTH call of TSVZ.NAME in that set's append clean-up (_seekRawStart, _unlockFile), once: HOW in, as the call
-#: begins; after, just after it returned; popped, for _unlockFile, with its _HELD entry gone and the lock not let go of
-#: yet. The program catches it and goes on. Printed, as JSON: whether the cut was made, another process's
-#: appendTabularFile of o ('returned' or 'hung', 10 s), the Lite's own clear_file() ('returned' or 'hung', 10 s; before
-#: any later set, whose own unlock through the same open file hid a lock left there in 5.17), and after a set of c, the
-#: Lite's c and len, and the file's keys.
+#: at the NTH call of TSVZ.NAME in that set's append (_seekRawStart: 1, the append's start, before the lock; 2, after the
+#: write; _unlockFile), once: HOW in, as the call begins; after, just after it returned; popped, for _unlockFile, with its
+#: _HELD entry gone and the lock not let go of yet. The program catches it and goes on. Printed, as JSON: whether the cut
+#: was made, another process's appendTabularFile of o ('returned' or 'hung', 10 s), the Lite's own clear_file() ('returned'
+#: or 'hung', 10 s; before any later set, whose own unlock through the same open file hid a lock left there in 5.17), and
+#: after a set of c, the Lite's c and len, and the file's keys.
 _A_CTRL_C_IN_A_LITES_TSVZ_APPEND = r"""
 import json, os, signal, subprocess, sys
 sys.path.insert(0, sys.argv[1])
@@ -21361,9 +21362,10 @@ _LITE_APPEND_CUTS = [('_seekRawStart', how, nth) for how in ('in', 'after') for 
 @pytest.mark.parametrize('name, how, nth', _LITE_APPEND_CUTS, ids=['%s-%s-%d' % cut for cut in _LITE_APPEND_CUTS])
 def test_a_ctrl_c_a_tsvzedlite_catches_in_a_tsvz_write_leaves_its_file_unlocked(tmp_path, name, how, nth):
 	# A TSVZedLite keeps its .tsvz part open for its lifetime. Its appends went through that open file, so a Ctrl-C that cut
-	# the append's clean-up (the seek after the write, or the unlock) left the part append-locked until the Lite closed: its own clear_file()
-	# and other processes' appends waited (5.17: 104 of 1,920 caught real Ctrl-Cs). An append now opens the part for itself,
-	# and the lock goes with that descriptor's close, whatever step the Ctrl-C cut.
+	# the append's clean-up (the seek after the write, or the unlock before its call) left the part append-locked until the Lite
+	# closed: its own clear_file() and other processes' appends waited (5.17: 104 of 1,920 caught real Ctrl-Cs). An append now
+	# opens the part for itself, and the lock goes with that descriptor's close, whatever step the Ctrl-C cut.
+	# The seek's first call and the unlock's 'after' case cut where 5.17 held no lock either: coverage, which 5.17 passes.
 	p = str(tmp_path / 'l.tsvz')
 	script = tmp_path / 'cut.py'
 	script.write_text(_A_CTRL_C_IN_A_LITES_TSVZ_APPEND)
@@ -21438,8 +21440,9 @@ def _lite_after(tmp_path, how):
 def test_a_tsvzedlite_whose_part_was_moved_away_sets_and_reads_through_the_part_it_holds(tmp_path, how):
 	# A TSVZedLite appends through a descriptor of its own (5.18: so that a Ctrl-C cannot leave the part locked), and reads
 	# its rows through the part it keeps open. When the path no longer names that part (another process renamed, removed or
-	# replaced it), the set must still land where the reads look: the 5.18 build appended to a new header-less file at the
-	# path, and the read of the new key raised KeyError. 5.17 appended through the kept part, and so does this.
+	# replaced it), the set must still land where the reads look: the first 5.18 build appended to whatever the path named then
+	# (a new header-less file after a rename or a removal, the copy after a replace), and the read of the new key raised
+	# KeyError. 5.17 appended through the kept part, and so does this.
 	t, p, home, away = _lite_after(tmp_path, how)
 	try:
 		t['b'] = ['b', 'B']
@@ -21514,104 +21517,127 @@ def alarm(sig, frame):
 	raise Hung()
 signal.signal(signal.SIGALRM, alarm)
 handle = server = None
-if case == 'served':
-	handle = TSVZ._ServeHandle(p)
-	handle.lock()
-	handle.start(TSVZ._ServeStore(p, create=True))
-	serving = threading.Thread(target=handle.serve, daemon=True)
-	serving.start()
-elif case == 'process':
-	cli = os.path.join(sys.argv[1], 'TSVZ.py')
-	server = subprocess.Popen([sys.executable, cli, 'serve', p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-	deadline = time.monotonic() + 20
-	while TSVZ._serveFind(p) is None:
-		assert server.poll() is None and time.monotonic() < deadline, 'the handler did not start'
-		time.sleep(0.02)
-c = TSVZ.TSVZClient(p)
-c['a'] = ['a', 'A']
-c['b'] = ['b', 'B']
-release = threading.Event()
-if case == 'queued':
-	writer = c._backend.store.writer
-	realAppend, waiting = writer.store._append, threading.Event()
-	def held(payload, fsync):
-		waiting.set()
-		release.wait(20)
-		return realAppend(payload, fsync)
-	writer.store._append = held
-	setter = threading.Thread(target=c.__setitem__, args=('q', ['q', 'Q']))
-	setter.start()
-	assert waiting.wait(10)  # (q's request holds c's lock, and the writer thread waits before it writes q)
-elif case == 'lock':
-	holding = threading.Event()
-	def hold():
-		with c._lock:
-			holding.set()
+# (the child that fork() makes inherits server and the finally below, and leaves by sys.exit(0): there, on Python 3.6, a kill
+# stopped the handler, which the parent's check after the wait catches)
+main = os.getpid()
+# (30 s over the setup, which takes about 0.1 s and waits 20 s at most for the handler to start: a request has no limit of its
+# own, and the test's 60 s would end this script and leave the handler running)
+signal.alarm(30)
+try:
+	if case == 'served':
+		handle = TSVZ._ServeHandle(p)
+		handle.lock()
+		handle.start(TSVZ._ServeStore(p, create=True))
+		serving = threading.Thread(target=handle.serve, daemon=True)
+		serving.start()
+	elif case == 'process':
+		cli = os.path.join(sys.argv[1], 'TSVZ.py')
+		errors = os.path.join(os.path.dirname(p), 'serve.err')  # (the handler's stderr, for the message below)
+		with open(errors, 'w') as err:
+			server = subprocess.Popen([sys.executable, cli, 'serve', p], stdout=subprocess.DEVNULL, stderr=err)
+		# (20 s: the handler starts in 0.06 to 0.08 s on Python 3.6 and 3.14, and in 1.6 s at most beside 128 CPU burners on 32
+		# cores, 2026-11-14)
+		deadline = time.monotonic() + 20
+		while TSVZ._serveFind(p) is None:
+			assert server.poll() is None and time.monotonic() < deadline, \
+				'the handler did not start (status %s): %s' % (server.poll(), open(errors).read())
+			time.sleep(0.02)
+	c = TSVZ.TSVZClient(p)
+	c['a'] = ['a', 'A']
+	c['b'] = ['b', 'B']
+	release = threading.Event()
+	if case == 'queued':
+		writer = c._backend.store.writer
+		realAppend, waiting = writer.store._append, threading.Event()
+		def held(payload, fsync):
+			waiting.set()
 			release.wait(20)
-	holder = threading.Thread(target=hold, daemon=True)
-	holder.start()
-	assert holding.wait(10)
-sent, go = os.pipe(), os.pipe()
-pid = os.fork()
-if pid == 0:
+			return realAppend(payload, fsync)
+		writer.store._append = held
+		setter = threading.Thread(target=c.__setitem__, args=('q', ['q', 'Q']))
+		setter.start()
+		assert waiting.wait(10)  # (q's request holds c's lock, and the writer thread waits before it writes q)
+	elif case == 'lock':
+		holding = threading.Event()
+		def hold():
+			with c._lock:
+				holding.set()
+				release.wait(20)
+		holder = threading.Thread(target=hold, daemon=True)
+		holder.start()
+		assert holding.wait(10)
+	sent, go = os.pipe(), os.pipe()
+	pid = os.fork()
+	if pid == 0:
+		signal.alarm(10)
+		try:
+			if case in ('served', 'process'):
+				realRequest = TSVZ._ServeConnection.request
+				def request(self, line, bulk=None):
+					sock = self.sock
+					class Paused(object):
+						def sendall(self, data):
+							sock.sendall(data)
+							os.write(sent[1], b's')  # (the request is on the connection; its answer is not read yet)
+							os.read(go[0], 1)
+						def __getattr__(self, name):
+							return getattr(sock, name)
+					self.sock = Paused()
+					try:
+						return realRequest(self, line, bulk)
+					finally:
+						self.sock = sock
+				TSVZ._ServeConnection.request = request
+				got = c['a']
+			else:
+				c['x'] = ['x', 'X']
+				got = [c['a'], c['x']]
+		except Hung:
+			got = 'hung'
+		print(json.dumps(['child', got]), flush=True)
+		signal.signal(signal.SIGALRM, signal.SIG_DFL)  # (an exit that waits for ever is ended by the alarm)
+		signal.alarm(10)
+		sys.exit(0)
 	signal.alarm(10)
 	try:
+		parent = None
 		if case in ('served', 'process'):
-			realRequest = TSVZ._ServeConnection.request
-			def request(self, line, bulk=None):
-				sock = self.sock
-				class Paused(object):
-					def sendall(self, data):
-						sock.sendall(data)
-						os.write(sent[1], b's')  # (the request is on the connection; its answer is not read yet)
-						os.read(go[0], 1)
-					def __getattr__(self, name):
-						return getattr(sock, name)
-				self.sock = Paused()
-				try:
-					return realRequest(self, line, bulk)
-				finally:
-					self.sock = sock
-			TSVZ._ServeConnection.request = request
-			got = c['a']
-		else:
-			c['x'] = ['x', 'X']
-			got = [c['a'], c['x']]
+			os.read(sent[0], 1)
+			parent = c['b']
+			os.write(go[1], b'g')
+		_, code = os.waitpid(pid, 0)
+		status = os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code)
 	except Hung:
-		got = 'hung'
-	print(json.dumps(['child', got]), flush=True)
-	signal.signal(signal.SIGALRM, signal.SIG_DFL)  # (an exit that waits for ever is ended by the alarm)
-	signal.alarm(10)
-	sys.exit(0)
-signal.alarm(10)
-try:
-	parent = None
-	if case in ('served', 'process'):
-		os.read(sent[0], 1)
-		parent = c['b']
+		status = 'hung'
 		os.write(go[1], b'g')
-	_, code = os.waitpid(pid, 0)
-	status = os.WEXITSTATUS(code) if os.WIFEXITED(code) else 'signal %d' % os.WTERMSIG(code)
-except Hung:
-	status = 'hung'
-	os.write(go[1], b'g')
-signal.alarm(0)
-release.set()
-if case == 'queued':
-	setter.join(10)
-print(json.dumps(['status', status]), flush=True)
-print(json.dumps(['parent', parent]), flush=True)
-c['y'] = ['y', 'Y']
-c.close()
-if handle is not None:
-	handle.stop()
-	serving.join(10)
-	handle.close()
-if server is not None:
-	subprocess.run([sys.executable, cli, 'stop', p], timeout=20, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-	server.wait(20)
-print(json.dumps(['file', [line.split('\t')[0] for line in open(p).read().split('\n') if line and not line.startswith('#')]]),
-	flush=True)
+	# (20 s from here to the last print, so that a handler that stops answering ends this script with its log, not the test's
+	# 60 s: the cleanup takes about 0.3 s, mostly the handler's `stop` and exit, and 1.0 s at most beside 128 CPU burners on 32
+	# cores, 2026-11-14)
+	signal.alarm(20)
+	if server is not None:
+		assert server.poll() is None, 'the handler stopped before the cleanup (the child must leave it to this process)'
+	release.set()
+	if case == 'queued':
+		setter.join(10)
+	print(json.dumps(['status', status]), flush=True)
+	print(json.dumps(['parent', parent]), flush=True)
+	c['y'] = ['y', 'Y']
+	c.close()
+	if handle is not None:
+		handle.stop()
+		serving.join(10)
+		handle.close()
+	if server is not None:
+		subprocess.run([sys.executable, cli, 'stop', p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+		server.wait()
+	print(json.dumps(['file', [line.split('\t')[0] for line in open(p).read().split('\n') if line and not line.startswith('#')]]),
+		flush=True)
+finally:
+	if os.getpid() == main:  # (not in the child: it must leave the handler to the parent)
+		signal.alarm(0)
+		if server is not None and server.poll() is None:  # (a failed case must not leave `tsvz serve` running)
+			server.kill()
+			server.wait()
 os._exit(0)
 """
 
