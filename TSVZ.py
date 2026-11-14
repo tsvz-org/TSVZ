@@ -8600,6 +8600,7 @@ memoryOnly:{self.memoryOnly}
 				file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding, teeLogger=self.teeLogger)
 			_lockFile(file, mode=_APPEND if 'a' in modes else _REWRITE)
 			locked = file
+			file._tsvzRaw = None  # (None: this file itself holds the lock; release_file_obj() reads it with no call)
 			if 'w' in modes:
 				file.truncate(0)
 				file = _compressedWriter(self._fileName, file) or file
@@ -8645,18 +8646,24 @@ memoryOnly:{self.memoryOnly}
 		Each step of the clean-up runs in the finally of the one before, writeLock let go of last, so a Ctrl-C that cuts
 		one still lets go of the rest (5.18); a cut unlock leaves the lock only until the close drops it. The guard reads
 		an attribute, where writeLock.locked() was a call a signal could land at, and which the writer thread's own hold
-		also answered: a second release of a file already let go of then let go of that hold. A Ctrl-C at the look at
-		``_tsvzRaw`` costs what was written through ``file``: a codec's writer is closed after the unlock, and the file that
-		holds the lock unflushed (a member cut short at most; nothing is written after this returns). Left: a Ctrl-C at this
-		function's entry, and just after get_file_obj() takes writeLock (docs/limitations.md)."""
+		also answered: a second release of a file already let go of then let go of that hold. The file that holds the lock
+		(``file``, or its ``_tsvzRaw`` under a codec's writer) is read before the clean-up with no call, so from Python 3.11
+		no Ctrl-C lands between this function's entry and its first step, and the clean-up always unlocks and closes that
+		file. Left: a Ctrl-C at this function's entry, and just after get_file_obj() takes writeLock (docs/limitations.md)."""
 		if file is None or not self._fileObjHeld:  # (outside the try: a guard cut inside it would let go of a lock it refused)
 			return
-		raw = file  # (a cut getattr leaves the file itself, whose fileno() serves the unlock)
+		try:  # (attribute reads, no call: from Python 3.11 no signal lands between the entry and the first step below)
+			raw = file._tsvzRaw  # the locked file under a codec's writer; None: ``file`` holds the lock itself
+		except AttributeError:
+			raw = None  # (a file get_file_obj() did not hand out: taken as the locked file)
+		if raw is None:
+			raw = file
 		try:
-			raw = getattr(file, '_tsvzRaw', file)
-			if raw is not file:
+			if raw is file:
+				raw.flush()  # (the first step, with no jump taken before it: on Python 3.10 a taken jump is a step a signal lands at)
+			else:
 				file.close()  # the codec's writer writes all it holds, and its trailer, into the file
-			raw.flush()
+				raw.flush()
 			_fsync(raw.fileno())
 		except Exception as e:
 			self.__teePrintOrNot(f"Failed to release file {self._fileName}: {e}",'error')
@@ -8670,10 +8677,6 @@ memoryOnly:{self.memoryOnly}
 				finally:
 					try:
 						_closeUnflushed(raw)  # (closing drops the lock too, where a Ctrl-C cut the unlock)
-						# Then the file that holds the lock, whatever raw names (a Ctrl-C that cut the look at _tsvzRaw above left the
-						# codec's writer there, whose close leaves the file open: its buffer would be written, unlocked, when the file
-						# is collected). Not in a try of its own: one more would be one more step a signal lands at on Python 3.6 to 3.9.
-						_closeUnflushed(getattr(file, '_tsvzRaw', raw))
 					finally:
 						self._fileObjHeld = False
 						self.writeLock.release()
