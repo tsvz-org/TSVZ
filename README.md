@@ -409,7 +409,8 @@ that `fork()` made connects anew there (below).
   handler's change inside `popitem()` or `move_to_end()`, a new key's place, the lone key after a handler's `clear()`, a
   `#` key, the 5.15 final review's test gaps, the loops' back jumps, and a Ctrl-C during the writer thread's own reload.
   Then a store opened by a relative path, which follows the path after `os.chdir()`; a Ctrl-C inside
-  `release_file_obj()` before its flush, which loses what was written through the file; and the compaction.
+  `release_file_obj()` before its flush, which loses what was written through the file; a Ctrl-C while `get_file_obj()`
+  makes a compressed file's codec writer, which writes after the unlock; and the compaction.
 
 ## Upgrading to 5.17 from 5.16
 

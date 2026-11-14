@@ -763,7 +763,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `release_file_obj(f)` in a `finally`, and catches `KeyboardInterrupt` and goes on (real SIGINTs from another process
   into such a loop of a running `.tsv` store, caught, 960 a run: the 5.17 re-review's `gfoki`). A Ctrl-C lands just after
   `writeLock.acquire()` returns and before `_fileObjHeld` is set: 8 of 960 on 3.14 and 9 on 3.11 (tmpfs) and 15 on an
-  XFS disk (the writer thread held `writeLock` for its own fsync) in 5.17, 8 on 5.16, and 5 to 8, 5 to 8 and none on
+  XFS disk (the writer thread held `writeLock` for its own fsync) in 5.17, 8 on 5.16, and 5 to 8, 5 to 9 and none on
   5.18. Nothing lets go of the lock, so the writer thread's next commit waits for ever, and so does the commit at exit.
   (From 5.18, on Python 3.11 and later, a Ctrl-C anywhere else in `get_file_obj()`'s and `release_file_obj()`'s
   clean-up lets go of everything: 5.17 hung after 329, 312 and 43 of these 960. For 3.6 to 3.10, see the next entry.)
@@ -834,14 +834,34 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   empties the file once it is locked, as `open()` does). Of those, in `release_file_obj()`: none on Python 3.11 and
   3.14 in either, and 0 to 4 on 3.6 to 3.10 in either.
 - Why: the clean-up closes the file that holds the lock unflushed, so that nothing is written through it after
-  the unlock. A flush first was not in 5.18's plan. Found by the 5.18 re-review's second opinion; the same as 5.17.
-- Plan (5.19): flush under the lock as the clean-up's first step (the codec's writer first, for a compressed
-  hold), inside an existing `finally` link rather than a new one (a new link added hangs on 3.6 and 3.9 in 5.18's
+  the unlock. A flush in the clean-up, for a release a Ctrl-C cut before its own flush, was not in 5.18's plan; the
+  release itself flushes first, as 5.17's did. Found by the 5.18 re-review's second opinion; the same as 5.17.
+- Plan (5.19): for a release a Ctrl-C cut before its own flush, flush under the lock as the clean-up's first step (the
+  codec's writer first, for a compressed hold), inside an existing `finally` link rather than a new one (a new link added hangs on 3.6 and 3.9 in 5.18's
   round 1), so that a cut release still writes what was written through the file. A codec writer's close that a
   Ctrl-C cut cannot be run again, so that member stays cut short. Close a text file through the buffered file
   under it, so that its close writes nothing after the unlock, and keep the error a failed flush raises there
   today. Measure it with gfoki and this rewrite loop. A program that retries after the `KeyboardInterrupt` may
   then append the rows twice; a key's later line wins.
+- Revisit when: 5.19.
+- Noted: 2026-11-14, found by the 5.18 re-review's second opinion; a deferral, not asked.
+
+### A Ctrl-C caught while get_file_obj() makes a compressed file's codec writer writes after the unlock
+- Kind: deferred
+- What the operator sees: a program takes `get_file_obj('wb')` of a compressed store and catches a Ctrl-C that lands
+  while the codec's writer is made, after the take locked and emptied the file. The failure path lets go of the lock
+  and then closes the file, which writes what the codec had put in its buffer (part of a member's header) at the
+  start of the file. A one-shot append that was waiting for the lock then fails with an error that the first member
+  is cut short, its row not written. The holder's next commit warns once and makes the file again. Another process's
+  row written before that close would be written over: in 110 runs with a real waiting append, it never was. In
+  `'ab'` and `'a'` the late bytes are an empty member at the end, which reads as nothing. Real Ctrl-Cs caught in a
+  tight loop of small compressed `'wb'` holds: 39 to 66 of 960 wrote late (Python 3.14 and 3.6). 5.17 does the same.
+- Why: the failure path unlocks first and then closes the file with a flush. Found by the 5.18 re-review's second
+  opinion; the same as 5.17.
+- Plan (5.19): close the codec's writer or text wrapper it made, then close the locked file without a flush
+  (`_closeUnflushed`), so that nothing is written after the unlock. Add a test that cuts just after the writer is
+  made and finds the file empty. A candidate was measured: no byte after the unlock, and a waiting append kept its
+  row in 100 of 100.
 - Revisit when: 5.19.
 - Noted: 2026-11-14, found by the 5.18 re-review's second opinion; a deferral, not asked.
 
