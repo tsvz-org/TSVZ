@@ -417,37 +417,41 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   - After `close()`, or in a child that `fork()` made, a store has no writer thread, and `commitAppendToFile()`,
     `rewrite()`, `mapToFile()`, `clear()` and `reload()` run in the caller's thread. A Ctrl-C there can leave the
     store's lock held (let go of as above), or its `writeLock`, which nothing lets go of: the program's next commit
-    or rewrite of that store then waits for ever. The lock left held can be the file's lock too: two signals about 1 µs
+    or rewrite of that store then waits for ever. The lock left held can be the file's lock too: two Ctrl-Cs about 1 µs
     apart, the first cutting `_writeFileStarted`'s unlock and the second landing at the entry of its
     `_closeUnflushed(f)` (a function's entry takes a signal from Python 3.11), leave the file open and locked under the
-    traceback (by reading, not run). With an interrupt at each bytecode of one such commit or rewrite: `writeLock` left held at 6 to 13 steps of about 1,000 to 9,400 (3.14 and 3.11; none at 3.6's line steps). 5.12 did
+    traceback (simulated: a second signal sent at that entry, Python 3.6 to 3.14, and the clause's commit waits for
+    ever). With an interrupt at each bytecode of one such commit or rewrite: `writeLock` left held at 6 to 13 steps of about 1,000 to 9,400 (3.14 and 3.11; none at 3.6's line steps). 5.12 did
     the same in these two cases, and in every `.tsvz` commit of a running store, which ran in the caller's thread
     there. What the cut write leaves in the file is the entry above. (A cut `.tsvz` commit drops no row from 5.15: its
     rows stay queued until they are on disk.)
   - A signal handler's `sys.exit()` inside such a write, on Python 3.14 (widened 2026-11-12; 5.17). A signal can land
     just after `with self.writeLock:` has taken the lock and before its block begins, and the exception skips the release
-    (CPython's own gap). The call the handler put off (a commit, `reload()`, `clear()`, `clear_file()`, `rewrite()`,
-    `mapToFile()`, `hardMapToFile()`, `checkExternalChanges()` or `move_to_end()`; 5.17) is made as the exception goes
-    up, and waits for ever for the `writeLock` the cut write left held: the process does not end, and the handler's row
-    is not written. The README's handler (set, commit, `sys.exit()`) in a
-    set-and-commit loop of a closed store and of a forked child, a real SIGUSR1 from another process, 4,000 runs each:
-    32 of 8,000 hung on 3.14 (46 in the review of the third fix round), every one waiting at `with self.writeLock:`
-    (none in 8,000 on each of 3.11, 3.12 and 3.13). 5.16 waited for ever at 127 and 121 of 160 real signals of that loop (a closed
-    store, a forked child), this landing among them: of 8,000 real signals on 5.16 (3.14) 29 landed on that `with`
-    line, and every one hung (its handler's commit took the lock the gap left held), and a landing there simulated
-    hangs 5.16, in a closed store and in a forked child, on 3.14, 3.11 and 3.6. A program's own `except SystemExit:` or
-    `except KeyboardInterrupt:` clause that commits again waits for ever after a signal cut there too (simulated at
-    the gap, a closed store and a forked child, 3.14 and 3.6: 5.16 and 5.17 both). Two signals inside one commit (a
-    first handler's call put off, then a second handler's `sys.exit()`; the first simulated at the start of each commit
-    of the loop, the second a real SIGUSR1, 4,000 runs each): 28 of 8,000 hung on 3.14, all at `writeLock` (none on 3.11), where 5.16 ended in all of them (it made the first
-    handler's call at once): this case stays worse than 5.16 on 3.14.
+    (CPython's own gap). The call the handler put off (a `.tsv`-family store's commit, `reload()`, `clear()`,
+    `clear_file()`, `rewrite()`, `mapToFile()`, `hardMapToFile()` or `move_to_end()`; a `.tsvz` store's commit,
+    `reload()`, `clear()`, `clear_file()`, and a `rewrite()`'s commit and reload; 5.17) is made as the exception goes up,
+    and waits for ever for the `writeLock` the cut write left held: the process does not end, and the handler's row is
+    not written. The README's handler (set, commit, `sys.exit()`) in a set-and-commit loop of a closed store and of a
+    forked child, a real SIGUSR1 from another process, 4,000 runs each (the 5.17 re-review's `rs4w`): 32 of 8,000 hung on
+    3.14 (46 in the review of the third fix round), every one waiting at `with self.writeLock:` (none in 8,000 on each of
+    3.11, 3.12 and 3.13). 5.16 waited for ever at 127 and 121 of 160 real signals of that loop (a closed store, a forked
+    child; the round-2 review's `rs2`). Of 8,000 real signals of the same loop on 5.16 (3.14, `rs4w`), 29 landed on that
+    `with` line, and every one hung (its handler's commit took the lock the gap left held), and a landing there
+    simulated hangs 5.16, in a closed store and in a forked child, on 3.14, 3.11 and 3.6. A program's own
+    `except SystemExit:` or `except KeyboardInterrupt:` clause that commits again waits for ever after a signal cut there
+    too (simulated at the gap, a closed store and a forked child, 3.14 and 3.6: 5.16 and 5.17 both). Two signals inside
+    one commit (a first handler's call put off, then a second handler's `sys.exit()`; the first simulated at the start of
+    each commit of the loop, the second a real SIGUSR1, 4,000 runs each): 28 and 29 of 8,000 hung on 3.14 in two runs
+    (`rs5`), all at `writeLock` (none on 3.11), where 5.16 ended in all of them (it made the first handler's call at
+    once): this case stays worse than 5.16 on 3.14.
 - Why: `writeLock` is held for the caller across calls by `get_file_obj()`, so a thread that finds itself holding
   it cannot take that for a Ctrl-C's leftover; whatever lets go of a lock is itself code a second Ctrl-C can land in;
   calls after `close()` and writes from forked children are rare.
-- Revisit when: someone hits it, or a closed store or a forked child gets a writer thread. A candidate for 5.18, to be
-  measured: a `writeLock` that knows its holder, used only to let go of a hold a cut write left, in the one job it can
-  do: at `_runHere`'s door, where the stack shows no job of this
-  store on this thread and `get_file_obj()` holds nothing, a hold by this thread is a leftover and is let go of. It needs
+- Revisit when: someone hits it, or a closed store or a forked child gets a writer thread. A candidate for 5.19, to be
+  measured: a `writeLock` that knows its holder, used only to let go of a hold a cut write left. Its test and its doors
+  are those of "A Ctrl-C caught just as get_file_obj() takes writeLock leaves it held" below: a hold by this thread is a
+  leftover where `get_file_obj()` holds nothing and no job or `get_file_obj()` frame of this store is on this thread's
+  stack, and it is let go of at `_call`, `stopAppendThread()` and `_runHere`, before anything waits for that lock. It needs
   its own sweep: with a reentrant lock, a nested taker that is not put off would run inside the write where it waits today
   (a plain reentrant `writeLock` hung at 619 of 1,060 steps of 5.16's commit: the nested commit opens the file again, and
   waits for the file lock its own write holds; the 5.17 design check).
@@ -470,8 +474,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   4,000 runs each: 2 of 8,000 hung on 3.6 in each of two such runs (three of the four at the file lock, one at
   `writeLock`), 2 on 3.9 and none on 3.10. From 3.10 a signal is taken only after a call and at a loop's back jump (from 3.11 also at a
   function's entry), so none lands between a block's last instruction and the next: a timer's signal into a function
-  with a `try` and one with a `with`, 3 million calls each, left the `finally` unrun 367 and 286 times and the lock held
-  125 and 189 times on 3.6 and 3.9, and never on 3.10 and 3.11. The handler's runs hung in none on 3.11 and 3.12 (none
+  with a `try` and one with a `with`, 3 million calls each, left the `finally` unrun 367 to 755 and 286 to 612 times and
+  the lock held 125 to 384 and 189 to 432 times on 3.6 and 3.9 (three runs of the same `gap.py`), and never on 3.10 and
+  3.11. The handler's runs hung in none on 3.11 and 3.12 (none
   in 8,000 each), and the hangs that are left on 3.14 are the lock-held entry's. The 5.17 build before this fix (a581b13)
   hung at 230, 220 and 195 of 8,000 on 3.6, 3.9 and 3.10, and 5.16 at about 3 of 4 (3.14).
 - Why: the interpreters are end-of-life, kept so the tools still run on them. The file-lock part could be closed by
@@ -487,8 +492,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   writer thread.
 - Approved: 2026-11-12, the user chose "Known limitation (Recommended)" on the 5.17 design check's question: Python 3.6
   to 3.10 keep a few hangs in 8,000 real signals that no arrangement of `try` removes. Re-approved 2026-11-12 after the
-  reason was corrected (3.6 to 3.9, and an arrangement exists for the file lock): the user chose "Known limitation,
-  corrected (Recommended)".
+  reason was corrected (3.6 to 3.9, and an arrangement exists for the file lock, by reading the 3.6 and 3.9 bytecode,
+  not built): the user chose "Known limitation, corrected (Recommended)".
 
 ### A forked child writes nothing at its close or exit when its parent held get_file_obj() at the fork
 - Kind: known limitation
@@ -650,7 +655,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: known limitation
 - What the operator sees: in a store with no writer thread (a forked child's, or one after `close()`), a signal
   handler's `commitAppendToFile()`, `reload()`, `clear()`, `clear_file()`, `rewrite()`, `mapToFile()`, `hardMapToFile()`,
-  `checkExternalChanges()` or `move_to_end()` that lands inside the store's own write is made as soon as that write ends, unless a Ctrl-C ended it (5.17; a Ctrl-C drops it, and a commit's rows stay
+  `checkExternalChanges()` or `move_to_end()` (of a `.tsv`-family store; a `.tsvz` store puts off only its commit,
+  `reload()`, `clear()`, `clear_file()`, and a `rewrite()`'s commit and reload) that lands inside the store's own write
+  is made as soon as that write ends, unless a Ctrl-C ended it (5.17; a Ctrl-C drops it, and a commit's rows stay
   queued for the next commit). A handler that makes such a call and then ends the process by `os._exit()`
   never lets the write end, so the call is not made: set a row, commit and `os._exit(0)` in the handler, and the row is
   not written. By `sys.exit()` the exception unwinds through the write, which makes the calls put off first, and the
@@ -658,8 +665,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   that lands just after the write has taken `writeLock` leaves it held (32 of 8,000 real signals in a commit loop; the
   entry on a lock left held, above), and on Python 3.6 to 3.9 one that lands at the end of a `try` or `with` block leaves the
   file locked, or `writeLock` held (2 of 8,000 on 3.6; the entry on Python 3.6 to 3.9, above). 5.16 waited for ever at the commit, so
-  neither wrote it, and at 127 and 121 of 160 real signals altogether. (The 5.17 final review's `hs.py`, cases `exit` and
-  `sysexit`, Python 3.14 and 3.6.) The README says: end by `sys.exit()`, not `os._exit()`.
+  neither wrote it (the 5.17 final review's `hs.py`, cases `exit` and `sysexit`, Python 3.14 and 3.6), and at 127 and 121
+  of 160 real signals altogether (the round-2 review's `rs2`). The README says: end by `sys.exit()`, not `os._exit()`.
   - The suite pins it (`test_a_signal_handler_that_ends_the_process_inside_a_stores_own_write_keeps_its_commit_only_by_sys_exit`).
 - Why: the call waits for the write it landed in, and that write never returns; running it at once, inside the write,
   is what waited for ever.
@@ -752,7 +759,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     forked child, can leave a lock held"). Its costs are real: the thread's lifetime in
     a child, a thread hand-off on every commit of a child, and the exit path, where a new thread may not start (a thread
     starts and joins from an `atexit` handler on Python 3.11, 3.12 and 3.14, which is where TSVZ runs its exit hook
-    (checked); later in the interpreter's shutdown it may not). Nothing of it was built or run.
+    (checked on 3.11, 3.12 and 3.14; TSVZ's hook is `atexit.register(_stopLiveStores)`); later in the interpreter's shutdown it may not). Nothing of it was built or run.
   - **A `writeLock` that knows its holder**, used only to let go of a hold a cut write left (the approved limitation of
     a lock left held, Python 3.14), is the other candidate, to be measured: see that entry.
 - Revisit when: 5.18.
@@ -785,29 +792,72 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 5.18.
 - Noted: 2026-11-12, found by the review of the third fix round; a deferral, not asked.
 
-### A Ctrl-C caught in get_file_obj() or release_file_obj() can leave writeLock held, and the store's next commit then waits for ever
+### A Ctrl-C caught in release_file_obj()'s or get_file_obj()'s clean-up can leave writeLock held, and the store's next commit then waits for ever
 - Kind: deferred
 - What the operator sees: a program holds the store's file with `get_file_obj('ab')`, writes, lets go of it with
   `release_file_obj(f)` in a `finally`, and catches `KeyboardInterrupt` and goes on. A Ctrl-C that lands in
-  `release_file_obj`'s `finally` before its nested `try` (in `getFileUpdateTimeNs()`, or in `_unlockFile`), at the
-  function's entry, or in `get_file_obj` just after `writeLock.acquire()`, leaves `writeLock` held, and usually the file
-  locked. The store's next commit, on its writer thread, then waits for ever, and so does the commit at exit. Real
-  SIGINTs from another process into a `get_file_obj()`/`release_file_obj()` loop of a running `.tsv` store, caught, 960
-  each: the next commit hung after 331 on 3.14 and 314 on 3.11 (files on tmpfs), 44 (4.6%) on 3.14 with the files on an
-  XFS disk, where an fsync takes real time (16 in `getFileUpdateTimeNs`, 13 in `_unlockFile`, 15 at `get_file_obj`'s
-  acquire gap, where the writer thread held `writeLock` for its own fsync), and 311 on 5.16 (3.14, tmpfs).
-  `get_file_obj`, `release_file_obj` and `_startWrite` are the same text in 5.16 and 5.17. (A second Ctrl-C, or an error
-  and a Ctrl-C, inside `get_file_obj`'s `except` clause leaves the same: `_unlockFile(locked)` there is unprotected.)
+  `release_file_obj`'s guard (its `writeLock.locked()` call) or `finally` before its nested `try` (in
+  `getFileUpdateTimeNs()`, or in `_unlockFile`) leaves `writeLock` held, and usually the file locked. The store's next
+  commit, on its writer thread, then waits for ever, and so does the commit at exit. Real SIGINTs from another process
+  into a `get_file_obj()`/`release_file_obj()` loop of a running `.tsv` store, caught, 960 each (the 5.17 re-review's
+  `gfoki`): the next commit hung after 329 on 3.14 and 312 on 3.11 (files on tmpfs), 43 (4.5%) on 3.14 with the files on
+  an XFS disk, where an fsync takes real time (16 in `getFileUpdateTimeNs`, 12 in `_unlockFile`, 15 at `get_file_obj`'s
+  acquire gap), and 311 on 5.16 (3.14, tmpfs). Those counts include the landings of the two entries after this one (the
+  acquire gap and the function's entry). `get_file_obj`, `release_file_obj` and `_startWrite` are the same text in 5.16
+  and 5.17. (A second Ctrl-C, or an error and a Ctrl-C, inside `get_file_obj`'s `except` clause leaves the same:
+  `_unlockFile(locked)` there is unprotected.)
 - Why: not worse than 5.16, and a Ctrl-C landing in the code that takes or lets go of a lock is the family of the
   approved lock-held limitation; found by the review of the third fix round.
 - Plan (5.18): fix at source. Nest `release_file_obj`'s `finally` (the time noted, then the unlock, then the close, then
   `_fileObjHeld = False` and `writeLock.release()` last, innermost), and `get_file_obj`'s `except` path the same: one
-  Ctrl-C anywhere in them then still lets go of everything, which closes about 300 of the 331 hangs on tmpfs and 29 of
-  the 44 on disk. The acquire gap and the function's entry cannot be closed with a `try` (whatever takes or lets go of a
-  lock is itself code a Ctrl-C can land in), and go with the other candidate, a `writeLock` that knows its holder: a
-  hold by this thread with `_fileObjHeld` false and no job on the stack is a leftover (see the lock-held entry).
+  Ctrl-C anywhere in them then still lets go of everything. That closes about 319 of the 329 hangs on tmpfs and 28 of
+  the 43 on disk, estimated from where the Ctrl-Cs landed (not built when this was written); the rest are the two entries
+  after this one.
 - Revisit when: 5.18.
 - Noted: 2026-11-12, found by the review of the third fix round (a second opinion's lead, run); a deferral, not asked.
+  Split 2026-11-13 into this entry and the two after it, and its counts corrected from the run's output.
+
+### A Ctrl-C caught just as get_file_obj() takes writeLock leaves it held, and the store's next commit then waits for ever
+- Kind: deferred
+- What the operator sees: the program of the entry above. A Ctrl-C lands just after `writeLock.acquire()` returns and
+  before `_fileObjHeld` is set: 8 of 960 on 3.14 and 9 on 3.11 (tmpfs), 15 on disk (the writer thread held `writeLock`
+  for its own fsync), and 8 on 5.16 (the 5.17 re-review's `gfoki`). Nothing lets go of the lock, so the writer thread's
+  next commit waits for ever, and so does the commit at exit.
+- Why: no `try` can tell this hold from a real one (by reading). On the main thread, a record written after `acquire()`
+  returns has the same gap (by reading). A blocking `acquire()` that a signal interrupts raises without taking the lock
+  (run on 3.6 to 3.14), so an `except` clause cannot tell a lock it took from one it never got.
+- Plan (5.19), with the lock-held entry's candidate, in the design check of stores with no writer thread: a `writeLock`
+  that records its holder as it is taken.
+  - A `threading.RLock`: its owner is set in C with the take, and `_is_owned()` answers for the calling thread. The take
+    is never nested.
+  - The test: a hold by this thread is a leftover, and is let go of, when all three hold: `_fileObjHeld` is false, no job
+    of this store is on this thread's stack (`_jobHere()`), and no `get_file_obj()` frame of this store is on it (a
+    handler that lands in the gap itself).
+  - The doors the holding thread passes before anything waits for that lock: `_call`, before it hands the writer thread
+    its job (a commit, `reload()`, `clear()`, a rewrite); `stopAppendThread()`, before `close()`, or the exit's `_atExit`,
+    waits for the writer thread's last commit; `_runHere`, for a store with no writer thread (the same door narrows the
+    3.14 `with self.writeLock:` gap). A plain set passes no door: the writer thread's tick waits until the program's next
+    such call, as in the two-Ctrl-C case.
+  - Its costs, to measure with its own sweep: a re-take by the holder no longer waits (a plain reentrant `writeLock` hung
+    at 619 of 1,060 steps of 5.16's commit); a `release_file_obj()` from another thread than `get_file_obj()`'s raises
+    `RuntimeError` (a non-owner's release); `RLock.locked()` exists only from 3.14. Checked 2026-11-13 on 3.6, 3.9, 3.11,
+    3.13 and 3.14: `_is_owned` is there; `locked` only on 3.14; a release from another thread raises `RuntimeError`; an
+    interrupted acquire is not owned.
+- Revisit when: 5.19.
+- Noted: 2026-11-12, found by the 5.17 re-review; its door named 2026-11-13. A deferral, not asked.
+
+### A Ctrl-C caught as release_file_obj() begins can leave writeLock held, and the store's next commit then waits for ever
+- Kind: known limitation
+- What the operator sees: the program of the entries above. A Ctrl-C lands at `release_file_obj()`'s entry (a function's
+  entry takes a signal from Python 3.11), before any of its steps. `writeLock` and the file lock stay held, and the next
+  commit and the commit at exit wait for ever. Of 960 caught real SIGINTs a run (the 5.17 re-review's `gfoki`): 2 on
+  3.14 and 3 on 3.11 (tmpfs), none on an XFS disk; 5.16: 3.
+- Why: `_fileObjHeld` is still True there, so no test can tell the leftover from a program that still holds the file (the
+  lock-held entry's Why). `get_file_obj()` is the 3.39 compatibility API, which the store's own writes do not use, and
+  this is a few in a thousand Ctrl-Cs caught in a tight loop of it.
+- Revisit when: someone hits it, or the store gets a way to tell a leftover from a hold.
+- Approved: 2026-11-12, the user chose "Known limitation (Recommended)" on the 5.17 re-review's question: a Ctrl-C at
+  `release_file_obj()`'s entry can leave `writeLock` held, and the store's next commit then waits for ever.
 
 ### A parent that forks and ends by os._exit does not write the rows it queued last
 - Kind: known limitation
