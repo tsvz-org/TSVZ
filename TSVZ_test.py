@@ -21493,11 +21493,13 @@ def test_a_set_on_a_closed_tsvzedlite_raises_and_writes_nothing(tmp_path):
 #: parent thread's set of q is in flight at the fork (its request holds c's lock, and the engine's writer thread waits
 #: before it writes q). lock: a parent thread holds c's lock across the fork. served: a handler in a thread of the parent;
 #: the child's get of a is sent and its answer not read yet (patched: its socket's sendall waits for the parent's go)
-#: while the parent gets b. The child ends by sys.exit() (its exit runs), with 10 s (an alarm); its requests 10 s too.
+#: while the parent gets b. process: the same, with the handler in another process (`tsvz serve`) and no thread started in
+#: this one (on Python 3.6, whose fork hook runs only in a process that has started a thread: 5.18 starts one at import).
+#: The child ends by sys.exit() (its exit runs), with 10 s (an alarm); its requests 10 s too.
 #: Printed, as JSON lines: the child's ('child', what it got or 'hung'), its exit status, the parent's, and the file's
 #: keys, one for each line of the file.
 _A_CLIENT_ACROSS_A_FORK = r"""
-import json, os, signal, sys, threading
+import json, os, signal, subprocess, sys, threading, time
 sys.path.insert(0, sys.argv[1])
 import TSVZ
 p, case = sys.argv[2], sys.argv[3]
@@ -21506,13 +21508,20 @@ class Hung(BaseException):
 def alarm(sig, frame):
 	raise Hung()
 signal.signal(signal.SIGALRM, alarm)
-handle = None
+handle = server = None
 if case == 'served':
 	handle = TSVZ._ServeHandle(p)
 	handle.lock()
 	handle.start(TSVZ._ServeStore(p, create=True))
 	serving = threading.Thread(target=handle.serve, daemon=True)
 	serving.start()
+elif case == 'process':
+	cli = os.path.join(sys.argv[1], 'TSVZ.py')
+	server = subprocess.Popen([sys.executable, cli, 'serve', p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+	deadline = time.monotonic() + 20
+	while TSVZ._serveFind(p) is None:
+		assert server.poll() is None and time.monotonic() < deadline, 'the handler did not start'
+		time.sleep(0.02)
 c = TSVZ.TSVZClient(p)
 c['a'] = ['a', 'A']
 c['b'] = ['b', 'B']
@@ -21542,7 +21551,7 @@ pid = os.fork()
 if pid == 0:
 	signal.alarm(10)
 	try:
-		if case == 'served':
+		if case in ('served', 'process'):
 			realRequest = TSVZ._ServeConnection.request
 			def request(self, line, bulk=None):
 				sock = self.sock
@@ -21572,7 +21581,7 @@ if pid == 0:
 signal.alarm(10)
 try:
 	parent = None
-	if case == 'served':
+	if case in ('served', 'process'):
 		os.read(sent[0], 1)
 		parent = c['b']
 		os.write(go[1], b'g')
@@ -21593,6 +21602,9 @@ if handle is not None:
 	handle.stop()
 	serving.join(10)
 	handle.close()
+if server is not None:
+	subprocess.run([sys.executable, cli, 'stop', p], timeout=20, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+	server.wait(20)
 print(json.dumps(['file', [line.split('\t')[0] for line in open(p).read().split('\n') if line and not line.startswith('#')]]),
 	flush=True)
 os._exit(0)
@@ -21600,14 +21612,16 @@ os._exit(0)
 
 
 @pytest.mark.skipif(not hasattr(os, 'fork') or os.name != 'posix', reason='fork() and SIGALRM')
-@pytest.mark.parametrize('case', ['local', 'queued', 'lock', 'served'])
+@pytest.mark.parametrize('case', ['local', 'queued', 'lock', 'served', 'process'])
 @pytest.mark.parametrize('ext', ['tsv', 'tsvz'])
 def test_a_tsvzclient_made_before_a_fork_connects_anew_in_the_child(tmp_path, ext, case):
 	# A TSVZClient's connection, or its local engine with its writer thread, and its lock are the process's own: in a child
 	# that fork() made, the next request connects anew, or opens an engine of its own (5.18). In 5.17 the child shared its
 	# parent's connection, so the answers could cross (the parent's get of b read the child's row a), the local engine's
 	# writer thread was not in the child, so its first write waited for ever, and a lock a parent thread held at the fork
-	# was held for ever there. The child writes none of the parent's rows, and its exit waits for nothing.
+	# was held for ever there. The child writes none of the parent's rows, and its exit waits for nothing. The 'process'
+	# case (a handler in another process, no thread started here) fails on Python 3.6 without the thread TSVZ starts at
+	# import, since 3.6 runs the fork hook only in a process that has started one; on 3.7 and later it passes either way.
 	p = str(tmp_path / ('c.' + ext))
 	script = tmp_path / 'fork.py'
 	script.write_text(_A_CLIENT_ACROSS_A_FORK)
@@ -21617,7 +21631,7 @@ def test_a_tsvzclient_made_before_a_fork_connects_anew_in_the_child(tmp_path, ex
 	log = done.stdout + done.stderr
 	out = dict(json.loads(line) for line in done.stdout.split('\n') if line.startswith('['))
 	assert done.returncode == 0 and out.get('status') == 0, log
-	if case == 'served':
+	if case in ('served', 'process'):
 		assert (out['parent'], out['child']) == (['b', 'B'], ['a', 'A']), log
 		assert sorted(out['file']) == ['a', 'b', 'y'], log
 	else:

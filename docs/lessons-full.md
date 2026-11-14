@@ -589,6 +589,7 @@ entries go last, in the same commit as the change:
   engine's thread, a lock), each kind registered in a weak registry the hook walks; one it cannot reach keeps the
   parent's, and a connection shared across the fork crosses the two processes' answers. Reset by dropping the copy and
   taking a path the object already has for a lost connection, not by restarting the parent's machinery in the child.
+  On Python 3.6 the hook is called only in a process that has started a thread, so the module starts one.
 
 ## 2026-11-13 TSVZ 5.18: a TSVZedLite's own descriptor is opened on the file it keeps, not on its name
 - Changed: a `TSVZedLite`'s `.tsvz` append opens the part for itself (so a Ctrl-C that cuts its clean-up cannot leave the

@@ -5741,10 +5741,11 @@ def _storesAfterFork():
 if hasattr(os, 'register_at_fork'):  # Python 3.7+
 	os.register_at_fork(after_in_child=_storesAfterFork)
 elif hasattr(threading, '_after_fork'):
-	# Python 3.6 has no os.register_at_fork, but os.fork() runs threading._after_fork() in every child (PyOS_AfterFork):
-	# the hook goes there (the user's pick, 2026-11-10). 3.6 is frozen, so this private name cannot change under it. A
-	# library that later replaces it without calling it turns this off: such a child writes nothing at its close and
-	# exit, and says so (TSVZed._commitsAtClose).
+	# Python 3.6 has no os.register_at_fork, but os.fork() runs threading._after_fork() in the child (PyOS_AfterFork), once
+	# the process has started a thread (3.6 sets its threads up at the first thread start: before that, os.fork() does
+	# not call it): the hook goes there (the user's pick, 2026-11-10). 3.6 is frozen, so this private name cannot change
+	# under it. A library that later replaces it without calling it turns this off: such a child writes nothing at its
+	# close and exit, and says so (TSVZed._commitsAtClose).
 	_threadingAfterFork = threading._after_fork
 
 	def _afterFork36():
@@ -5753,6 +5754,12 @@ elif hasattr(threading, '_after_fork'):
 		finally:
 			_storesAfterFork()
 	threading._after_fork = _afterFork36
+	# A program that has started no thread yet is reached too (5.18: a served TSVZClient in such a program shared its
+	# parent's connection in the child; a TSVZed starts its writer thread, a client with no handler its engine's): start
+	# one that does nothing, and wait for it.
+	_firstThread36 = threading.Thread(target=lambda: None)
+	_firstThread36.start()
+	_firstThread36.join()
 
 
 _exitArmed = False  # _stopLiveStores reached its inner try: from there on it takes a first Ctrl-C as the first
