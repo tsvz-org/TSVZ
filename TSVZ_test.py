@@ -17534,10 +17534,11 @@ def _sweep(tmp_path, kind, op, at, start=1, stop=0):
 	cases = tmp_path / 'cases'
 	cases.mkdir()
 	try:
-		# 120 s: a sweep takes 1 to 30 s here (CI runs them one at a time); a case that hangs is ended by its 25 s
-		# watchdog, so only a wedged sweep takes this long, on a machine the whole suite keeps busy.
+		# 480 s: the slowest sweep took 234.5 s (tsv-oneshot-scrub) on Python 3.9 (settrace, the slowest) with -n 32 beside
+		# 96 CPU burners, 4 times the 32 cores, as four suites of 32 workers load a release run (2026-11-13); doubled. A case
+		# that hangs is ended by its 25 s watchdog, so only a wedged sweep takes this long.
 		done = subprocess.run([sys.executable, str(script), HERE, str(cases), kind, op, at, str(start), str(stop)],
-							  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+							  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=480)
 	except subprocess.TimeoutExpired as e:
 		raise AssertionError('the sweep did not end: {}'.format(e.stdout))
 	assert done.returncode == 0, done.stdout + done.stderr

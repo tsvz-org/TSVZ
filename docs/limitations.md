@@ -374,18 +374,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   allowance going as its fix lands; the main session's call (a deferral, not asked).
 - Noted: 2026-11-11, from the 5.15 final review's test gaps; a deferral, not asked. The fork bullet was done in 5.17.
 
-### The Ctrl-C sweep tests' 120 s limit is too short for suites run side by side
-- Kind: deferred
-- What the operator sees: nothing in the library. Each Ctrl-C sweep of the suite (`_sweep` in `TSVZ_test.py`) has
-  120 s, sized from CI, which runs the suite on its own. On a release run of four suites at once, 32 workers each on 32
-  cores, `test_a_ctrl_c_caught_at_any_step_of_an_operation_leaves_no_lock_held_and_memory_and_the_file_agreeing[tsv-oneshot-scrub]`
-  timed out at 120 s on Python 3.9 (5.15, 717aea9); alone it passed, in 13.6 s there (6.6 s on 3.14).
-- Why: a limit of the tests only, and 5.16 is the hotfix of the one change the user chose.
-- Plan (5.18): size the limit from the slowest sweep measured under a release run's load (four suites, 32 workers
-  each), and write that reason beside it.
-- Revisit when: 5.18.
-- Noted: 2026-11-11, from the 5.15 release run; a deferral, not asked.
-
 ### A write after close(), or in a forked child, can be cut by a Ctrl-C
 - Kind: known limitation
 - What the operator sees: a `TSVZed` has no writer thread once it is closed, nor in a child that `fork()` made, so
@@ -780,9 +768,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: a program holds the store's file with `get_file_obj('ab')`, writes, lets go of it with
   `release_file_obj(f)` in a `finally`, and catches `KeyboardInterrupt` and goes on (real SIGINTs from another process
   into such a loop of a running `.tsv` store, caught, 960 a run: the 5.17 re-review's `gfoki`). A Ctrl-C lands just after
-  `writeLock.acquire()` returns and before `_fileObjHeld` is set: 8 of 960 on 3.14 and 9 on 3.11 (tmpfs), 15 on disk (the writer thread held `writeLock`
-  for its own fsync), and 8 on 5.16; 6, 8 and none on 5.18. Nothing lets go of the lock, so the writer thread's next
-  commit waits for ever, and so does the commit at exit. (From 5.18 a Ctrl-C anywhere else in `get_file_obj()`'s and
+  `writeLock.acquire()` returns and before `_fileObjHeld` is set: 8 of 960 on 3.14 and 9 on 3.11 (tmpfs) and 15 on an
+  XFS disk (the writer thread held `writeLock` for its own fsync) in 5.17, 8 on 5.16, and 6, 8 and none on 5.18. Nothing
+  lets go of the lock, so the writer thread's next commit waits for ever, and so does the commit at exit. (From 5.18 a Ctrl-C anywhere else in `get_file_obj()`'s and
   `release_file_obj()`'s clean-up lets go of everything: 5.17 hung after 329, 312 and 43 of these 960.)
 - Why: no `try` can tell this hold from a real one (by reading). On the main thread, a record written after `acquire()`
   returns has the same gap (by reading). A blocking `acquire()` that a signal interrupts raises without taking the lock

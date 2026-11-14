@@ -395,9 +395,10 @@ that `fork()` made connects anew there (below).
   file and answer within 300 s").
 - The suite times its deadlines on the monotonic clock too, and binds its test sockets in short directories that it
   removes when each test ends (two tests failed on macOS, whose limit for a socket path is 104 bytes, and the
-  conformance and benchmark tests left a directory in `/tmp` or `$TMPDIR` for each fake handler). The real-signal
-  test's run (30 s and 50 handler calls, or 100 s) is sized under load, and the test of a write cut after it took the
-  file lock covers a rewrite and a `clear()` too.
+  conformance and benchmark tests left a directory in `/tmp` or `$TMPDIR` for each fake handler). Its step sweeps' limit
+  (480 s, twice the slowest at four times the cores' load on Python 3.9) and the real-signal test's run (30 s and 50
+  handler calls, or 100 s) are sized under load, and the test of a write cut after it took the file lock covers a rewrite
+  and a `clear()` too.
 - **Known** ([docs/limitations.md](docs/limitations.md)): the list under 5.17, and a Ctrl-C at `release_file_obj()`'s
   entry (above).
 - **Planned for 5.19** ([docs/limitations.md](docs/limitations.md)): first a design check of stores with no writer thread
