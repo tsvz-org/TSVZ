@@ -17191,18 +17191,22 @@ CLIENT_OPS = {
 	'oneshot-create': lambda c, p, d: T.appendTabularFile(p, ['x', '1'], verbose=False, createIfNotExist=True),
 	'oneshot-scrub': lambda c, p, d: T.scrubTabularFile(p, verbose=False),
 	'oneshot-clear': lambda c, p, d: T.clearTabularFile(p, verbose=False),
+	'lite-set': lambda c, p, d: c.__setitem__('x', ['x', '1']),  # (a TSVZedLite: its file stays open between calls)
+	'lite-del': lambda c, p, d: c.__delitem__('a'),  # (an appended deletion in a .tsvz file)
 }
 
 
 def clientCase(d, n):
-	'''A TSVZClient with no handler (its engine in this process) or a one-shot call: no lock left held, and another
-	thread's write through the same client or to the same path returns.'''
+	'''A TSVZClient with no handler (its engine in this process), a TSVZedLite or a one-shot call: no lock left held, and
+	another thread's write through the same client (a Lite: to the same path, through a descriptor of its own, which a
+	lock left on the Lite's open file holds off) or to the same path returns.'''
 	p = os.path.join(d, 'f.' + KIND)
 	for k in 'abc':
 		T.appendTabularFile(p, [k, '1'], verbose=False, createIfNotExist=True)
 	if OP == 'oneshot-create':
 		p = os.path.join(d, 'new.' + KIND)  # (made by the append)
-	client = T.TSVZClient(p) if OP.startswith('client') else None
+	lite = OP.startswith('lite')
+	client = T.TSVZClient(p) if OP.startswith('client') else T.TSVZedLite(p, verbose=False) if lite else None
 	reached, error = stepped(n, interrupt, lambda: CLIENT_OPS[OP](client, p, d))
 	if not reached:
 		if client is not None:
@@ -17211,14 +17215,14 @@ def clientCase(d, n):
 	notes = []
 	interrupted(error, notes)
 	locks = [('path', T._PATH_LOCKS.get(os.path.realpath(p)))]
-	if client is not None:
+	if client is not None and not lite:
 		locks.append(('client', client._lock))
 		if hasattr(client._backend, 'store'):
 			locks.append(('store', client._backend.store.lock))
 	held = [name for name, lock in locks if lock is not None and lock._is_owned()]
 	if held:
 		notes.append('fail:held:' + '+'.join(held))
-	if client is not None:
+	if client is not None and not lite:
 		write = lambda: client.__setitem__('other', ['other', '1'])
 	else:
 		write = lambda: T.appendTabularFile(p, ['other', '1'], verbose=False, createIfNotExist=True)
@@ -17549,7 +17553,8 @@ _INTERRUPT_SWEPT = ([(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (
 	+ [('tsv', 'closed-commit', 1, 0), ('tsvz', 'closed-commit', 1, 0), ('tsvz', 'closed-rewrite', 1, 0)]
 	+ [(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in ('clear', 'exit')]  # (exit: _stopLiveStores, a row queued)
 	+ [(kind, op, 1, 0) for kind in ('tsv', 'tsvz') for op in (  # (a TSVZClient with no handler; one-shot calls)
-		'client-set', 'client-del', 'client-get', 'client-pop', 'oneshot-append', 'oneshot-create', 'oneshot-scrub', 'oneshot-clear')]
+		'client-set', 'client-del', 'client-get', 'client-pop', 'oneshot-append', 'oneshot-create', 'oneshot-scrub', 'oneshot-clear',
+		'lite-set', 'lite-del')]
 	+ [('tsv', 'closed-rewrite', start, start + 1299 if start < 7801 else 0) for start in range(1, 9100, 1300)])
 
 
@@ -21153,3 +21158,106 @@ def test_a_second_release_file_obj_of_a_file_let_go_of_leaves_another_threads_wr
 		B.join()
 	t.close()
 
+
+#: ARGV: TSVZ's directory, the file (.tsvz), NAME, HOW, NTH. A TSVZedLite holding a sets b; a KeyboardInterrupt is raised
+#: at the NTH call of TSVZ.NAME in that set's append clean-up (_seekRawStart, _unlockFile), once: HOW in, as the call
+#: begins; after, just after it returned; popped, for _unlockFile, with its _HELD entry gone and the lock not let go of
+#: yet. The program catches it and goes on. Printed, as JSON: whether the cut was made, another process's
+#: appendTabularFile of o ('returned' or 'hung', 10 s), the Lite's own clear_file() ('returned' or 'hung', 10 s; before
+#: any later set, whose own unlock through the same open file hid a lock left there in 5.17), and after a set of c, the
+#: Lite's c and len, and the file's keys.
+_A_CTRL_C_IN_A_LITES_TSVZ_APPEND = r"""
+import json, os, signal, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, name, how, nth = sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
+class Hung(BaseException):
+	pass
+def alarm(sig, frame):
+	raise Hung()
+signal.signal(signal.SIGALRM, alarm)
+t = TSVZ.TSVZedLite(p, header='id\tv', verbose=False)
+t['a'] = ['a', '1']
+real = getattr(TSVZ, name)
+calls, cut = [0], [False]
+def cutting(*args, **kwargs):
+	calls[0] += 1
+	if calls[0] != nth or cut[0]:
+		return real(*args, **kwargs)
+	cut[0] = True
+	if how == 'popped':
+		TSVZ._HELD.pop(args[0].fileno(), None)
+	elif how == 'after':
+		real(*args, **kwargs)
+	raise KeyboardInterrupt
+setattr(TSVZ, name, cutting)
+try:
+	t['b'] = ['b', '2']
+except KeyboardInterrupt:
+	pass
+setattr(TSVZ, name, real)
+code = 'import sys\nsys.path.insert(0, %r)\nimport TSVZ\nTSVZ.appendTabularFile(%r, ["o", "1"], verbose=False)\n' % (sys.argv[1], p)
+try:
+	subprocess.run([sys.executable, '-c', code], timeout=10, check=True)
+	other = 'returned'
+except subprocess.TimeoutExpired:
+	other = 'hung'
+signal.alarm(10)
+try:
+	t.clear_file()
+	cleared = 'returned'
+except Hung:
+	cleared = 'hung'
+signal.alarm(0)
+c = None
+if cleared == 'returned':
+	t['c'] = ['c', '3']
+	c = [t.get('c'), len(t), sorted(TSVZ.readTabularFile(p, verbose=False))]
+print(json.dumps([cut[0], other, cleared, c]), flush=True)
+os._exit(0)  # (a file left locked would hold the exit's close)
+"""
+
+_LITE_APPEND_CUTS = [('_seekRawStart', how, nth) for how in ('in', 'after') for nth in (1, 2)] + [
+	('_unlockFile', how, 1) for how in ('in', 'after', 'popped')]
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='SIGALRM')
+@pytest.mark.parametrize('name, how, nth', _LITE_APPEND_CUTS, ids=['%s-%s-%d' % cut for cut in _LITE_APPEND_CUTS])
+def test_a_ctrl_c_a_tsvzedlite_catches_in_a_tsvz_write_leaves_its_file_unlocked(tmp_path, name, how, nth):
+	# A TSVZedLite keeps its .tsvz part open for its lifetime. Its appends went through that open file, so a Ctrl-C that cut
+	# the append's clean-up (a seek, or the unlock) left the part append-locked until the Lite closed: its own clear_file()
+	# and other processes' appends waited (5.17: 104 of 1,920 caught real Ctrl-Cs). An append now opens the part for itself,
+	# and the lock goes with that descriptor's close, whatever step the Ctrl-C cut.
+	p = str(tmp_path / 'l.tsvz')
+	script = tmp_path / 'cut.py'
+	script.write_text(_A_CTRL_C_IN_A_LITES_TSVZ_APPEND)
+	# 60 s: the run takes about a second; only a wait for ever takes this long (the script's own limits end it sooner).
+	done = subprocess.run([sys.executable, str(script), HERE, p, name, how, str(nth)], stdout=subprocess.PIPE,
+						  stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	lines = [line for line in done.stdout.split('\n') if line.startswith('[')]
+	assert done.returncode == 0 and lines, done.stdout + done.stderr
+	cut, other, cleared, c = json.loads(lines[0])
+	assert cut and (other, cleared) == ('returned', 'returned'), done.stdout + done.stderr
+	assert c == [['c', '3'], 1, ['c']], done.stdout + done.stderr
+
+
+def test_a_tsvzedlite_reads_its_rows_right_after_appending_over_an_uncommitted_tail(tmp_path):
+	# A Lite reads rows at their offsets through the part it keeps open, and appends through a descriptor of its own: the
+	# kept file drops what it read ahead after each append. Here its buffer held the uncommitted tail (bytes after the last
+	# newline) that the append cut off and wrote over.
+	p = str(tmp_path / 'tail.tsvz')
+	t = TSVZ.TSVZedLite(p, header='id\tv', verbose=False)
+	for i in range(50):
+		t['k%d' % i] = ['k%d' % i, 'v' * 40]
+	t.close()
+	with open(p, 'ab') as f:
+		f.write(b'partial\tno newline' * 3)
+	with contextlib.redirect_stderr(io.StringIO()):
+		t = TSVZ.TSVZedLite(p, header='id\tv', verbose=False)
+		assert t['k49'] == ['k49', 'v' * 40]  # (a read near the end: the kept file's buffer holds the tail)
+		t['n'] = ['n', 'new']
+		assert (t['n'], t['k49'], t['k0']) == (['n', 'new'], ['k49', 'v' * 40], ['k0', 'v' * 40])
+		t['m'] = ['m', 'more']
+		assert (t['m'], t['n']) == (['m', 'more'], ['n', 'new'])
+	t.close()
+	assert sorted(TSVZ.readTabularFile(p, verbose=False)) == sorted(['k%d' % i for i in range(50)] + ['n', 'm'])

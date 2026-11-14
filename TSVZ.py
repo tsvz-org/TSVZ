@@ -8980,16 +8980,24 @@ class TSVZedLite(MutableMapping):
 		self._specWrite(_specFormatRecord(value, self.delimiter, marker=True))
 
 	def _specWrite(self, line):
-		"""Append one record (or lines written together) to the active part; return its offset, or None for a compressed part."""
+		"""Append one record (or lines written together) to the active part; return its offset, or None for a compressed part.
+
+		The append opens the part for itself (_specAppendPayload), and its lock goes with that descriptor's close: a Ctrl-C
+		that cuts the append's clean-up still drops it (5.18; through the Lite's kept fileObj, which lives on, 5.17 left the
+		part append-locked until the Lite closed, and its own clear_file() and other processes' appends waited). The kept
+		fileObj is only read from: it drops what it read ahead."""
 		data = _encodeText(line + '\n', 'utf-8', self.errors)
 		reporter = _Reporter(self._activePath)
 		try:
+			size = _specAppendPayload(self._activePath, data, reporter, memberSize=self._specState.memberSize)[0]
 			if self.fileObj is None:
-				_specAppendPayload(self._activePath, data, reporter, memberSize=self._specState.memberSize)
 				return None
-			size = _specAppendTo(self.fileObj, self._activePath, data, reporter)[0]
 		finally:
-			reporter.flush()
+			try:
+				if self.fileObj is not None:
+					self.fileObj.seek(0, os.SEEK_END)  # (drops what it had read ahead: the append was made through another descriptor)
+			finally:
+				reporter.flush()
 		if not self._transStates or self._specState.rowState is not self._transStates[-1]:
 			self._transOffsets.append(size)
 			self._transStates.append(self._specState.rowState)

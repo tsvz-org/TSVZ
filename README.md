@@ -376,6 +376,12 @@ The file formats are unchanged, and an upgrade needs nothing.
   ([planned for 5.19](docs/limitations.md#a-ctrl-c-caught-just-as-get_file_obj-takes-writelock-leaves-it-held-and-the-stores-next-commit-then-waits-for-ever)).
   A second `release_file_obj()` of a file already let go of no longer lets go of the lock the writer thread holds for
   its own write, and a failed `get_file_obj()` of a compressed file also closes the file under its codec's writer.
+- **A Ctrl-C that a `TSVZedLite` catches in a `.tsvz` write no longer leaves the file append-locked until the Lite
+  closes.** Each append opens the part for itself, and the lock goes with that descriptor's close whatever step the
+  Ctrl-C cut; the Lite's open file is only read from. In 5.17 its own `clear_file()` then waited for ever, and other
+  processes' appends until it closed (104 of 1,920 caught real Ctrl-Cs on Python 3.14, 91 on 3.11; none now). A Lite's
+  `.tsvz` set costs one open and close more: 12.6 to 16.3 µs on Python 3.14 and 18.2 to 22.8 µs on 3.6 (tmpfs), 12.9 to
+  15.6 µs and 17.2 to 21.6 µs on an XFS disk.
 - **`tsvzconform` times its waits on the monotonic clock**, so a host that sleeps while a handler starts (a laptop) no
   longer fails the case: a wall clock 15 minutes on at the handler's first poll failed it in 5.17 ("no valid pointer
   file and answer within 300 s").
@@ -465,7 +471,7 @@ handler makes inside a store's own write returns where the store has no writer t
   in 5.16; [known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and Python 3.6 to 3.9 (measured on 3.6 and 3.9), where a signal at the end of a `try` or `with`
   block still leaves the file locked, or `writeLock` held ([known](docs/limitations.md#on-python-36-to-39-a-signal-handler-that-ends-the-process-inside-a-stores-own-write-can-still-hang-in-a-few-of-8000-signals)). A `TSVZedLite`'s write of a
   `.tsvz` file is not covered: a Ctrl-C it catches can leave the file append-locked until the Lite closes, as in 5.16
-  ([deferred to 5.18](docs/limitations.md#a-ctrl-c-that-a-tsvzedlite-catches-in-a-tsvz-write-can-leave-its-file-append-locked-until-it-closes)).
+  ([fixed in 5.18](#upgrading-to-518-from-517)).
 - The planned "write lock that knows its holder", which was to tell a call made inside the store's own write from a new
   one, became a look at the call stack for the store's own job (above): a reentrant write lock still hung at 619 of
   1,060 steps of 5.16's commit's sweep, since the nested commit opens the file again and waits for the file lock its own
@@ -500,7 +506,7 @@ handler makes inside a store's own write returns where the store has no writer t
   to the store after a put-off call, and the process it forks inside a closed store's write (the handler bullet above),
   a handler's `move_to_end()` or set inside the last commit of a close or an exit, and the remake that a forked child
   keeps from its parent's failed rewrite; a `TSVZedLite` on a `.tsvz` file whose caught Ctrl-C leaves its file
-  append-locked until it closes ([deferred](docs/limitations.md#a-ctrl-c-that-a-tsvzedlite-catches-in-a-tsvz-write-can-leave-its-file-append-locked-until-it-closes); 5.16 the same); a program that holds the file with
+  append-locked until it closes (5.16 the same; [fixed in 5.18](#upgrading-to-518-from-517)); a program that holds the file with
   `get_file_obj()`, lets go of it in a `finally` and catches a Ctrl-C there, which can leave `writeLock` held, so that
   the store's next commit waits for ever (5.16 the same; from 5.18 only a Ctrl-C just as `get_file_obj()` takes the lock,
   [planned for 5.19](docs/limitations.md#a-ctrl-c-caught-just-as-get_file_obj-takes-writelock-leaves-it-held-and-the-stores-next-commit-then-waits-for-ever),

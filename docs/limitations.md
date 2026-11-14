@@ -766,32 +766,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Noted: 2026-11-11, found by the 5.17 build; the 5.17 final review's findings added the same day; the design check's
   condition added 2026-11-12; a deferral, not asked.
 
-### A Ctrl-C that a TSVZedLite catches in a .tsvz write can leave its file append-locked until it closes
-- Kind: deferred
-- What the operator sees: a program keeps a `TSVZedLite` on a plain `.tsvz` file open (it holds the file open for its
-  lifetime), sets rows, and catches `KeyboardInterrupt` and goes on. A Ctrl-C that lands in `_specAppendTo`'s `finally`,
-  in `_seekRawStart` before the unlock or in `_unlockFile` before its unlock call, leaves the Lite's file append-locked
-  until the Lite closes or the process ends. Then the Lite's own `clear_file()` waits for ever (it opens the part again,
-  and its rewrite lock waits for the append lock); another process's append (`appendTabularFile`, `tsvz set`, a
-  `TSVZed`'s commit) waits until the Lite closes, and so does a scrub or a rewrite by anyone. The Lite's own later sets
-  go on (a lock taken again through the same open file description does not conflict; by reading). Real SIGINTs from
-  another process 2 to 30 ms into a set loop, caught, 1,920 each: the append lock was still held after 104 on 3.14 (72 in
-  `_seekRawStart`, 32 in `_unlockFile`), 91 on 3.11, and 120 on 5.16 (3.14). The Lite's `clear_file()` hung in all 54
-  held cases of the 3.14 run (55 of 55 on 5.16) and another process's `appendTabularFile` in all 44 it was tried on (it
-  returned once the Lite closed). On macOS and other flock systems, by reading: the held lock is a whole-file exclusive
-  `flock`, so other processes' reads wait too.
-- Why: not worse than 5.16 (`_specAppendTo`, `_unlockFile`, `_specWrite` and `_specAppendPayload` are the same text in
-  5.16 and 5.17); found by the review of the third fix round, after that round put every write of a `TSVZed` under its
-  clean-up from the step that takes its file. The Lite's `.tsvz` append is the one site whose file outlives the call
-  (`_specAppendTo(f, ...)` with its long-lived `self.fileObj`), so a close cannot drop its lock.
-- Plan (5.18): fix at source. The Lite appends through `_specAppendPayload`, which returns the same `(offset, before,
-  after)`, so the lock sits on a descriptor of its own that a `with` closes, and a cut clean-up drops the lock with the
-  close. A nested `try` in `_specAppendTo` alone would close the 72 landings in `_seekRawStart` and not the 32 in
-  `_unlockFile`. Check the Lite's reads at offsets through its kept `fileObj` after appends made through another
-  descriptor, and add a test like the third round's.
-- Revisit when: 5.18.
-- Noted: 2026-11-12, found by the review of the third fix round; a deferral, not asked.
-
 ### A Ctrl-C caught just as get_file_obj() takes writeLock leaves it held, and the store's next commit then waits for ever
 - Kind: deferred
 - What the operator sees: a program holds the store's file with `get_file_obj('ab')`, writes, lets go of it with
