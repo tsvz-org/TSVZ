@@ -8608,7 +8608,7 @@ memoryOnly:{self.memoryOnly}
 			return file
 		except BaseException as e:
 			# Each step in the finally of the one before, writeLock let go of last: a Ctrl-C that cuts one still lets go of
-			# the rest (5.18). (Two if blocks, not a loop: a loop's back jump in a try body is outside its handler on 3.12+.)
+			# the rest (5.18). (Two if blocks, not a loop: a loop adds a back jump, one more step a signal lands at.)
 			try:
 				if locked is not None:
 					_unlockFile(locked)  # (else _HELD keeps its descriptor, and a later file with the same number looks locked)
@@ -11022,8 +11022,8 @@ class TSVZClient(MutableMapping):
 		on the parent's connection could read the answer to the parent's (5.17: the parent's next read got the child's row),
 		and the local engine's writer thread is not here (5.17: the child's first write waited for ever). The next request
 		connects anew, as after a cut one (_request): a connection of its own, or an engine of its own that reads the file
-		afresh. The parent's are dropped, never closed here: closing the engine would run its writer's close on the
-		parent's queue. The lock is new too: a thread of the parent's may have held it at the fork."""
+		afresh. The parent's are dropped, and nothing of theirs is written here (the exit's close of the writer copy joins a
+		thread that is not in the child). The lock is new too: a thread of the parent's may have held it at the fork."""
 		self._lock = _SectionLock()
 		if self._backend is not None:  # (a closed client stays closed)
 			self._backend, self._cut = _UNCONNECTED, True
