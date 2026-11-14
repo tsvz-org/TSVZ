@@ -798,11 +798,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   (tmpfs), none on an XFS disk (5.17); 1 to 5, 4 to 5 and 0 to 1 on 5.18 (three runs each, two on the disk); 5.16: 3.
   From 5.18, on Python 3.11 and later, the rest of `release_file_obj()` lets go of everything wherever one Ctrl-C
   lands (run on 3.11, 3.12 and 3.14).
-  - On Python 3.6 to 3.10 the same program hangs after 14 to 22 of 960 caught Ctrl-Cs (6 to 13 on 3.11 and 3.14; 5.17:
-    330 on 3.9 and 330 on 3.6). Besides the entry and the acquire gap, a Ctrl-C there can land between two steps of
-    `get_file_obj()` or `release_file_obj()`, its read of the locked file among them (1 to 4 of 960 on 3.6 and 3.9), or
-    in the program's own code between `get_file_obj()`'s return and its `try` (1 to 9 of 960), which no code of TSVZ's
-    can close.
+  - On Python 3.6 to 3.10 the same program hangs after 8 to 25 of 960 caught Ctrl-Cs (6 to 13 on 3.11 and 3.14; 5.17:
+    about 330). Besides the entry and the acquire gap, a Ctrl-C there can land between two steps of `get_file_obj()` or
+    `release_file_obj()`, its read of the locked file among them (1 to 6 of 960 on 3.6 and 3.9), or in the program's own
+    code between `get_file_obj()`'s return and its `try` (1 to 9 of 960), which no code of TSVZ's can close.
 - Why: `_fileObjHeld` is still True there, so no test can tell the leftover from a program that still holds the file (the
   lock-held entry's Why). `get_file_obj()` is the 3.39 compatibility API, which the store's own writes do not use, and
   this is a few in a thousand Ctrl-Cs caught in a tight loop of it.
@@ -811,7 +810,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `release_file_obj()`'s entry can leave `writeLock` held, and the store's next commit then waits for ever. Widened
   2026-11-13: the user chose "Known limitation (Recommended)" on the 5.18 final review's question: on Python 3.6 to 3.10 a
   caught Ctrl-C around `get_file_obj()` can leave the write lock held a little more often than on 3.11 and later (17 to 22
-  of 960 against 9 to 12; 5.17: about 330).
+  of 960 against 9 to 12; 5.17: about 330). Figures from more runs 2026-11-14: the user chose "Update the figures to the
+  runs (Recommended)" on the 5.18 review's question: on Python 3.6 to 3.10, 8 to 25 of 960 against 6 to 13 on 3.11 and
+  3.14, the same for the build approved on 2026-11-13 and for 5.18 as released.
 
 ### A Ctrl-C caught inside release_file_obj() before its flush loses what was written through the file
 - Kind: deferred

@@ -399,7 +399,7 @@ that `fork()` made connects anew there (below).
   (two tests failed on macOS, whose socket paths are limited to 104 bytes), and has its sweep limit and its real-signal
   test sized under load.
 - **Known** ([docs/limitations.md](docs/limitations.md)): the list under 5.17, a Ctrl-C at `release_file_obj()`'s
-  entry (above), and, on Python 3.6 to 3.10, a few more landings of the same hang (14 to 22 of 960 caught Ctrl-Cs in the
+  entry (above), and, on Python 3.6 to 3.10, a few more landings of the same hang (8 to 25 of 960 caught Ctrl-Cs in the
   loop above; 5.17: about 330).
 - **Planned for 5.19** ([docs/limitations.md](docs/limitations.md)): first a design check of stores with no writer thread
   (after `close()`, in a forked child), covering a signal handler's set inside such a store's own write and what a
