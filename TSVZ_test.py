@@ -21166,6 +21166,103 @@ def test_a_ctrl_c_at_release_file_objs_entry_or_get_file_objs_acquire_still_leav
 	assert (writeLock, held, commit) == (True, name == 'entry', 'hung'), log
 
 
+#: ARGV: TSVZ's directory, the file (.tsv or .tsv.gz), MODE ('ab', or 'a' for a text writer over the compressed file), HOW.
+#: A running store holding a; the program holds the file (get_file_obj), writes k, and a KeyboardInterrupt is raised at
+#: release_file_obj()'s read of the file's _tsvzRaw (TSVZ.getattr, patched; HOW in, as the call begins; after, just after it
+#: returned: where a real signal lands from Python 3.11), once. The program catches it. Printed, as JSON: whether the cut was
+#: made, writeLock and _fileObjHeld after it, whether the file that holds the lock is closed, another process's
+#: appendTabularFile of o ('returned' or 'hung', 10 s), whether the file's bytes were the same before and after the held
+#: file object was dropped and collected, the store's next commit of z ('returned' or 'hung', 10 s), and what the process
+#: wrote to stderr (a finalizer's "Exception ignored" among it) other than TSVZ's own warnings of a damaged member.
+_A_CTRL_C_AT_RELEASE_FILE_OBJS_LOOK_AT_THE_RAW_FILE = r"""
+import builtins, gc, io, json, os, signal, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, mode, how = sys.argv[2:5]
+err = sys.stderr = io.StringIO()
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)  # (no tick writes)
+t['a'] = ['a', '1']
+t.commitAppendToFile()
+class Hung(BaseException):
+	pass
+def alarm(sig, frame):
+	raise Hung()
+signal.signal(signal.SIGALRM, alarm)
+state = {'armed': False, 'cut': False}
+def cutting(obj, name, *default):
+	if state['armed'] and not state['cut'] and name == '_tsvzRaw':
+		state['cut'] = True
+		if how == 'in':
+			raise KeyboardInterrupt
+		builtins.getattr(obj, name, *default)
+		raise KeyboardInterrupt
+	return builtins.getattr(obj, name, *default)
+f = t.get_file_obj(mode)
+f.write('k\t1\n' if 'b' not in mode else b'k\t1\n')
+TSVZ.getattr = cutting
+state['armed'] = True
+try:
+	t.release_file_obj(f)
+except KeyboardInterrupt:
+	pass
+del TSVZ.getattr
+writeLock, held = t.writeLock.locked(), t._fileObjHeld
+closed = builtins.getattr(f, '_tsvzRaw', f).closed
+code = 'import sys\nsys.path.insert(0, %r)\nimport TSVZ\nTSVZ.appendTabularFile(%r, ["o", "1"], header="id\\tv", verbose=False)\n' % (
+	sys.argv[1], p)
+try:
+	subprocess.run([sys.executable, '-c', code], timeout=10, check=True, stderr=subprocess.DEVNULL)
+	other = 'returned'
+except subprocess.TimeoutExpired:
+	other = 'hung'
+with open(p, 'rb') as g:
+	before = g.read()
+del f
+gc.collect()
+with open(p, 'rb') as g:
+	after = g.read()
+t['z'] = ['z', '1']
+signal.alarm(10)
+try:
+	t.commitAppendToFile()
+	commit = 'returned'
+except Hung:
+	commit = 'hung'
+signal.alarm(0)
+noise = [line for line in err.getvalue().split('\n') if line and not line.startswith('TSVZ warning')]
+sys.__stdout__.write(json.dumps([state['cut'], writeLock, held, closed, other, before == after, commit, noise]) + '\n')
+sys.__stdout__.flush()
+os._exit(0)  # (a store whose writeLock is left held would wait for it at exit)
+"""
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='SIGALRM')
+@pytest.mark.parametrize('how', ['in', 'after'])
+@pytest.mark.parametrize('suffix, mode', [('', 'ab'), ('.gz', 'ab'), ('.gz', 'a')], ids=['tsv-ab', 'gz-ab', 'gz-text'])
+def test_a_ctrl_c_at_release_file_objs_look_at_the_raw_file_still_closes_the_file_that_holds_the_lock(tmp_path, suffix, mode, how):
+	# For a compressed file held in text mode, the file handed out is a text writer over the codec's writer over the locked
+	# file (_tsvzRaw). A Ctrl-C just as release_file_obj() looked for _tsvzRaw left the clean-up the writer to unlock and
+	# close, not the locked file: the lock was let go of, but the file stayed open with the member's last bytes in its buffer,
+	# written when the writer was collected: after another process's append, which they then cut short (5.18 build, found
+	# by its final review). The clean-up closes the locked file whatever that look returned: nothing is written late.
+	p = str(tmp_path / ('s.tsv' + suffix))
+	script = tmp_path / 'look.py'
+	script.write_text(_A_CTRL_C_AT_RELEASE_FILE_OBJS_LOOK_AT_THE_RAW_FILE)
+	# 60 s: the run takes about a second; only a wait for ever takes this long (the script's own limits end it sooner).
+	done = subprocess.run([sys.executable, str(script), HERE, p, mode, how], stdout=subprocess.PIPE,
+						  stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	lines = [line for line in done.stdout.split('\n') if line.startswith('[')]
+	assert done.returncode == 0 and lines, done.stdout + done.stderr
+	cut, writeLock, held, closed, other, unchanged, commit, noise = json.loads(lines[0])
+	log = done.stdout + done.stderr
+	assert cut, log
+	assert (writeLock, held, closed, other, unchanged, commit, noise) == (False, False, True, 'returned', True, 'returned', []), log
+	# (what a cut look costs is what was written through the file: a compressed member it left cut short is skipped, and warned of)
+	with contextlib.redirect_stderr(io.StringIO()):
+		keys = sorted(TSVZ.readTabularFile(p, header='id\tv', verbose=False))
+	assert [key for key in keys if key != 'k'] == ['a', 'o', 'z'], keys
+
+
 def test_a_second_release_file_obj_of_a_file_let_go_of_leaves_another_threads_writelock(tmp_path):
 	# release_file_obj() asks whether get_file_obj() holds the file (_fileObjHeld), not whether writeLock is held: the
 	# writer thread holds it for its own writes, and a second release of a file already let go of then let go of that hold.
