@@ -368,8 +368,8 @@ damaged file, as asked, and warns.
 The file formats are unchanged, and an upgrade needs nothing. The one change to the API: a `TSVZClient` used in a child
 that `fork()` made connects anew there (below).
 
-- **A Ctrl-C caught in `release_file_obj()`, or in `get_file_obj()`'s clean-up after a failed open, no longer leaves the
-  store's write lock held.** Each step of the clean-up runs in the `finally` of the one before, the lock let go of last.
+- **A Ctrl-C caught in `release_file_obj()`'s clean-up, or in `get_file_obj()`'s after a failed open, no longer leaves
+  the store's write lock held.** Each step of the clean-up runs in the `finally` of the one before, the lock let go of last.
   A program that holds the file in a tight loop and catches real Ctrl-Cs, 960 a run: the store's next commit waited for
   ever after 329 on Python 3.14 and 312 on 3.11 (tmpfs), and 43 on an XFS disk (3.14); now after 9, 12 and 1, each a
   Ctrl-C at `release_file_obj()`'s entry
@@ -392,16 +392,14 @@ that `fork()` made connects anew there (below).
   (the engine's writer thread is not in the child), as did its first request where a thread of the parent held the
   client's lock at the fork. The child's exit writes none of the parent's rows.
 - **`tsvzconform` times its waits on the monotonic clock**, so a host that sleeps while a handler starts (a laptop) no
-  longer fails the case: a wall clock 15 minutes on at the handler's first poll failed it in 5.17 ("no valid pointer
-  file and answer within 300 s").
-- The suite times its deadlines on the monotonic clock too, and binds its test sockets in short directories that it
-  removes when each test ends (two tests failed on macOS, whose limit for a socket path is 104 bytes, and the
-  conformance and benchmark tests left a directory in `/tmp` or `$TMPDIR` for each fake handler). Its step sweeps' limit
-  (480 s, twice the slowest at four times the cores' load on Python 3.9) and the real-signal test's run (30 s and 50
-  handler calls, or 100 s) are sized under load, and the test of a write cut after it took the file lock covers a rewrite
-  and a `clear()` too.
-- **Known** ([docs/limitations.md](docs/limitations.md)): the list under 5.17, and a Ctrl-C at `release_file_obj()`'s
-  entry (above).
+  longer fails the case: a wall clock 15 minutes on at the handler's first poll failed it in 5.17 (as "the handler
+  did not start").
+- The suite times its deadlines on the monotonic clock too, binds its test sockets in short directories that it removes
+  (two tests failed on macOS, whose socket paths end at 104 bytes), and has its sweep limit and its real-signal test
+  sized under load.
+- **Known** ([docs/limitations.md](docs/limitations.md)): the list under 5.17, a Ctrl-C at `release_file_obj()`'s
+  entry (above), and, on Python 3.6 to 3.10, a few more landings of the same hang (17 to 22 of 960 caught Ctrl-Cs in the
+  loop above; 5.17: about 330).
 - **Planned for 5.19** ([docs/limitations.md](docs/limitations.md)): first a design check of stores with no writer thread
   (after `close()`, in a forked child), covering a signal handler's set inside such a store's own write and what a
   handler does after a put-off call, a `.tsvz` `clear()` cut there, a `writeLock` that knows its holder (with the Ctrl-C
@@ -409,7 +407,7 @@ that `fork()` made connects anew there (below).
   keeps from its parent's failed rewrite. Then the sections' group: a caught Ctrl-C inside a set, delete, pop or move, a
   handler's change inside `popitem()` or `move_to_end()`, a new key's place, the lone key after a handler's `clear()`, a
   `#` key, the 5.15 final review's test gaps, the loops' back jumps, and a Ctrl-C during the writer thread's own reload.
-  Then the compaction.
+  Then a store opened by a relative path, which follows the path after `os.chdir()`, and the compaction.
 
 ## Upgrading to 5.17 from 5.16
 
@@ -582,7 +580,8 @@ to a 100,000-row file). The one change to the API is what `monitor_external_chan
   No row is lost in any of them.
 - **Known** and **Planned for 5.17**: the lists under 5.15, below. What 5.16 does not fix of 5.15's plan moves to 5.17,
   and one planned fix is a known limitation now: two signal handler calls, the second inside the first one's redo. (5.17
-  took the fork and signal-handler group; the rest is planned for 5.18.)
+  took the fork and signal-handler group, and 5.18 a forked child's `TSVZClient` and the sweep tests' limit; the rest is
+  planned for 5.19.)
 
 ## Upgrading to 5.15 from 5.14
 
@@ -706,8 +705,7 @@ can land in, and checks the locks, memory and the file after each.
   used in a forked child, waits for ever at its first write; a Ctrl-C while the writer thread itself reloads after
   another process's change waits for that reload; the compaction above; and, in the suite, the Ctrl-C sweep tests' 120 s
   limit, sized for parallel runs (one timed out at 120 s with four suites of 32 workers on 32 cores, where it takes
-  13.6 s alone). (5.18 took the `get_file_obj()`/`release_file_obj()` clean-up, the `TSVZedLite` lock, a forked child's
-  `TSVZClient` and two test gaps; the rest is planned for 5.19.)
+  13.6 s alone). (5.18 took a forked child's `TSVZClient` and the sweep tests' limit; the rest is planned for 5.19.)
 
 ## Upgrading to 5.14 from 5.13
 
