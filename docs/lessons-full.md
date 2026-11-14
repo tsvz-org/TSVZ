@@ -591,7 +591,7 @@ entries go last, in the same commit as the change:
   taking a path the object already has for a lost connection, not by restarting the parent's machinery in the child.
   On Python 3.6 the hook is called only in a process that has started a thread, so the module starts one.
 
-## 2026-11-13 TSVZ 5.18: a TSVZedLite's own descriptor is opened on the file it keeps, not on its name
+## 2026-11-13 TSVZ 5.18: a TSVZedLite appends through its own descriptor only while the name still names the file it keeps
 - Changed: a `TSVZedLite`'s `.tsvz` append opens the part for itself (so a Ctrl-C that cuts its clean-up cannot leave the
   file locked: the lock goes with that descriptor's close), and uses that descriptor only if `os.path.sameopenfile` says
   it is the file the Lite keeps open. Otherwise (the path names another file: after an `os.chdir()` away from a relative
@@ -599,8 +599,9 @@ entries go last, in the same commit as the change:
   file, as 5.17 did. A set on a closed Lite raises `ValueError` with nothing written, as in 5.17.
 - Why we had to change: the first 5.18 build appended through the path and read through the kept file. When the two
   parted, a set landed in another file (a new file with no header at the path) and the read of that key raised `KeyError`
-  (strict) or returned `[]` (non-strict); 5.17 worked in every such case. The simplest way to part them needs no other
-  process: a relative path, then `os.chdir()`. A set on a closed Lite also wrote its row before it raised.
+  (strict) or returned `[]` or another key's row (non-strict); 5.17 worked in every such case. The simplest way to part
+  them needs no other process: a relative path, then `os.chdir()`. A set on a closed Lite also wrote its row before it
+  raised.
 - Original design was wrong because: it gave the Lite two ideas of "its file" (a name for writes, a descriptor for
   reads) and assumed they stay one. A row's offset means something only in the file it was written to; an object that
   keeps a file open owns that file's identity, and a name can come to mean another file.

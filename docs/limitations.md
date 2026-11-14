@@ -763,9 +763,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `release_file_obj(f)` in a `finally`, and catches `KeyboardInterrupt` and goes on (real SIGINTs from another process
   into such a loop of a running `.tsv` store, caught, 960 a run: the 5.17 re-review's `gfoki`). A Ctrl-C lands just after
   `writeLock.acquire()` returns and before `_fileObjHeld` is set: 8 of 960 on 3.14 and 9 on 3.11 (tmpfs) and 15 on an
-  XFS disk (the writer thread held `writeLock` for its own fsync) in 5.17, 8 on 5.16, and 6, 8 and none on 5.18. Nothing
-  lets go of the lock, so the writer thread's next commit waits for ever, and so does the commit at exit. (From 5.18 a Ctrl-C anywhere else in `get_file_obj()`'s and
-  `release_file_obj()`'s clean-up lets go of everything: 5.17 hung after 329, 312 and 43 of these 960.)
+  XFS disk (the writer thread held `writeLock` for its own fsync) in 5.17, 8 on 5.16, and 5 to 8, 5 to 8 and none on
+  5.18. Nothing lets go of the lock, so the writer thread's next commit waits for ever, and so does the commit at exit.
+  (From 5.18, on Python 3.11 and later, a Ctrl-C anywhere else in `get_file_obj()`'s and `release_file_obj()`'s
+  clean-up lets go of everything: 5.17 hung after 329, 312 and 43 of these 960. For 3.6 to 3.10, see the next entry.)
 - Why: no `try` can tell this hold from a real one (by reading). On the main thread, a record written after `acquire()`
   returns has the same gap (by reading). A blocking `acquire()` that a signal interrupts raises without taking the lock
   (run on 3.6 to 3.14), so an `except` clause cannot tell a lock it took from one it never got.
@@ -794,9 +795,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: the program of the entry above. A Ctrl-C lands at `release_file_obj()`'s entry, before any
   of its steps. `writeLock` and the file lock stay held, and the next
   commit and the commit at exit wait for ever. Of 960 caught real SIGINTs a run (`gfoki`): 2 on 3.14 and 3 on 3.11
-  (tmpfs), none on an XFS disk (5.17); 3, 4 and 1 on 5.18; 5.16: 3. From 5.18 the rest of `release_file_obj()` lets go of
-  everything wherever one Ctrl-C lands (run on Python 3.11 and 3.14).
-  - On Python 3.6 to 3.10 the same program hangs after 17 to 22 of 960 caught Ctrl-Cs (9 to 12 on 3.11 and 3.14; 5.17:
+  (tmpfs), none on an XFS disk (5.17); 1 to 5, 4 to 5 and 0 to 1 on 5.18 (three runs each, two on the disk); 5.16: 3.
+  From 5.18 the rest of `release_file_obj()` lets go of everything wherever one Ctrl-C lands (run on Python 3.11 and
+  3.14).
+  - On Python 3.6 to 3.10 the same program hangs after 14 to 22 of 960 caught Ctrl-Cs (6 to 13 on 3.11 and 3.14; 5.17:
     330 on 3.9 and 331 on 3.6). Besides the entry and the acquire gap, a Ctrl-C there can land between two steps of
     `get_file_obj()` or `release_file_obj()` (1 to 3 of 960 on 3.6 and 3.9), or in the program's own code between
     `get_file_obj()`'s return and its `try` (1 to 9 of 960), which no code of TSVZ's can close.
@@ -810,6 +812,31 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   caught Ctrl-C around `get_file_obj()` can leave the write lock held a little more often than on 3.11 and later (17 to 22
   of 960 against 9 to 12; 5.17: about 330).
 
+### A Ctrl-C caught inside release_file_obj() before its flush loses what was written through the file
+- Kind: deferred
+- What the operator sees: a program holds the store's file with `get_file_obj()`, writes, and a Ctrl-C lands in
+  `release_file_obj()` before its flush. The clean-up lets go of the lock and closes the file without writing what its
+  buffers hold:
+  - a `'wb'` hold leaves the file empty (the take emptied it);
+  - an `'ab'` hold loses its rows;
+  - a compressed hold leaves a member cut short, which every later read skips with a warning.
+
+  5.17 did the same at those steps, except for the first, the look at `_tsvzRaw`, where it kept `writeLock` for ever
+  instead. There the data landed only if the program then ended with nothing queued.
+
+  Real Ctrl-Cs, not caught, into a `get_file_obj('wb')` rewrite loop, 960 a run: the store was left empty after 122 to
+  138 in 5.17 and 5.18 alike, nearly all just after the take's truncate (`'wb'` empties the file once it is locked, as
+  `open()` does). 3 to 5 of them landed in `release_file_obj()` in 5.18, against 0 to 1 in 5.17 (Python 3.14, 3.11 and
+  3.9).
+- Why: the clean-up closes the file unflushed, so that nothing is written after the unlock. A flush first was not in
+  5.18's plan. Found by the 5.18 re-review's second opinion; not worse than 5.17.
+- Plan (5.19): flush under the lock as the clean-up's first step (the codec's writer first, for a compressed hold),
+  inside an existing `finally` link rather than a new one (a new link added hangs on 3.6 and 3.9 in 5.18's round 1), so
+  that a cut release still writes what was written through the file. Measure it with gfoki and this rewrite loop. A
+  program that retries after the `KeyboardInterrupt` may then append the rows twice; a key's later line wins.
+- Revisit when: 5.19.
+- Noted: 2026-11-14, found by the 5.18 re-review's second opinion; a deferral, not asked.
+
 ### A store opened by a relative path follows the path after os.chdir()
 - Kind: deferred
 - What the operator sees: a program opens `TSVZed('rel.tsv')` or a `TSVZClient` with no handler by a relative path,
@@ -817,6 +844,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   file keeps only the rows written before; a `.tsvz` store and a client put the later rows in a new file there, and
   the client no longer finds the rows set before. The same in 5.17 (run on 5.17 and 5.18, Python 3.14). A
   `TSVZedLite`'s sets and reads go on in the file it keeps open; its `clear_file()` and `reload()` follow the path (run).
+  There a Ctrl-C caught in a set can still leave that file append-locked until the Lite closes, as in 5.17 (it appends
+  through its open file once the path names another).
 - Why: every write opens the path as it was given. Found by the 5.18 final review; not worse than 5.17.
 - Plan (5.19): each class takes `os.path.abspath(fileName)` once, at open, for every later open of the file; decide
   what `_fileName` shows and what a pickle carries.

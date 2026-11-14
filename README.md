@@ -371,34 +371,35 @@ that `fork()` made connects anew there (below).
 - **A Ctrl-C caught in `release_file_obj()`'s clean-up, or in `get_file_obj()`'s after a failed open, no longer leaves
   the store's write lock held.** Each step of the clean-up runs in the `finally` of the one before, the lock let go of last.
   A program that holds the file in a tight loop and catches real Ctrl-Cs, 960 a run: the store's next commit waited for
-  ever after 329 on Python 3.14 and 312 on 3.11 (tmpfs), and 43 on an XFS disk (3.14); now after 9, 12 and 1, each a
-  Ctrl-C at `release_file_obj()`'s entry
+  ever after 329 on Python 3.14 and 312 on 3.11 (tmpfs), and 43 on an XFS disk (3.14); now after 6 to 13, 10 to 12 and
+  0 to 1 (three runs each, two on the disk), each a Ctrl-C at `release_file_obj()`'s entry
   ([known](docs/limitations.md#a-ctrl-c-caught-as-release_file_obj-begins-can-leave-writelock-held-and-the-stores-next-commit-then-waits-for-ever))
   or just as `get_file_obj()` takes the lock
   ([planned for 5.19](docs/limitations.md#a-ctrl-c-caught-just-as-get_file_obj-takes-writelock-leaves-it-held-and-the-stores-next-commit-then-waits-for-ever)).
   A second `release_file_obj()` of a file already let go of no longer lets go of the lock the writer thread holds for
   its own write, and a failed `get_file_obj()` of a compressed file also closes the file under its codec's writer.
 - **A Ctrl-C that a `TSVZedLite` catches in a `.tsvz` write no longer leaves the file append-locked until the Lite
-  closes.** Each append opens the part for itself (while the path still names the file the Lite holds; after a rename, a
-  removal or an `os.chdir()` away from a relative path it appends through its open file, as 5.17 did), and the lock goes
-  with that descriptor's close whatever step the Ctrl-C cut. In 5.17 its own `clear_file()` then waited for ever, and
-  other processes' appends until it closed (104 of 1,920 caught real Ctrl-Cs on Python 3.14, 91 on 3.11; none of 1,920
-  now). A Lite's `.tsvz` set costs one open and close more: about 4 to 5 µs (12.6 to 16.8 µs on Python 3.14, 17.9 to
-  23.5 µs on 3.6).
+  closes, while the path still names the file the Lite holds.** Each append opens the part for itself, and the lock goes
+  with that descriptor's close whatever step the Ctrl-C cut. Where the path names another file (after a rename, a
+  replace or an `os.chdir()` away from a relative path) it appends through its open file, as 5.17 did, lock and all. In
+  5.17 its own `clear_file()` then waited for ever, and other processes' appends until it closed (104 of 1,920 caught
+  real Ctrl-Cs on Python 3.14, 91 on 3.11; none of 1,920 now). A Lite's `.tsvz` set costs one open and close more: about
+  4 to 6 µs (from 12.6 to 16.8 µs a set on Python 3.14, from 17.9 to 23.5 µs on 3.6).
 - **A `TSVZClient` made before a `fork()` works in the child.** At its first request there it connects to the handler
   anew, or, with no handler, opens an engine of its own that reads the file afresh; the parent's connection and engine
   stay the parent's. In 5.17 the child shared its parent's connection, so an answer could reach the other process (the
   parent's read of one key got the child's row of another), and with no handler the child's first write waited for ever
   (the engine's writer thread is not in the child), as did its first request where a thread of the parent held the
-  client's lock at the fork. The child's exit writes none of the parent's rows.
+  client's lock at the fork. The child's exit writes none of the parent's rows. On Python 3.6 the module starts one
+  thread at import, where it can, so that 3.6 runs the fork hook in a program that has started none.
 - **`tsvzconform` times its waits on the monotonic clock**, so a host that sleeps while a handler starts (a laptop) no
   longer fails the case: a wall clock 15 minutes on at the handler's first poll failed it in 5.17 (as "the handler
   did not start").
 - The suite times its deadlines on the monotonic clock too, binds its test sockets in short directories that it removes
-  (two tests failed on macOS, whose socket paths end at 104 bytes), and has its sweep limit and its real-signal test
-  sized under load.
+  (two tests failed on macOS, whose socket paths are limited to 104 bytes), and has its sweep limit and its real-signal
+  test sized under load.
 - **Known** ([docs/limitations.md](docs/limitations.md)): the list under 5.17, a Ctrl-C at `release_file_obj()`'s
-  entry (above), and, on Python 3.6 to 3.10, a few more landings of the same hang (17 to 22 of 960 caught Ctrl-Cs in the
+  entry (above), and, on Python 3.6 to 3.10, a few more landings of the same hang (14 to 22 of 960 caught Ctrl-Cs in the
   loop above; 5.17: about 330).
 - **Planned for 5.19** ([docs/limitations.md](docs/limitations.md)): first a design check of stores with no writer thread
   (after `close()`, in a forked child), covering a signal handler's set inside such a store's own write and what a
@@ -407,7 +408,8 @@ that `fork()` made connects anew there (below).
   keeps from its parent's failed rewrite. Then the sections' group: a caught Ctrl-C inside a set, delete, pop or move, a
   handler's change inside `popitem()` or `move_to_end()`, a new key's place, the lone key after a handler's `clear()`, a
   `#` key, the 5.15 final review's test gaps, the loops' back jumps, and a Ctrl-C during the writer thread's own reload.
-  Then a store opened by a relative path, which follows the path after `os.chdir()`, and the compaction.
+  Then a store opened by a relative path, which follows the path after `os.chdir()`; a Ctrl-C inside
+  `release_file_obj()` before its flush, which loses what was written through the file; and the compaction.
 
 ## Upgrading to 5.17 from 5.16
 
