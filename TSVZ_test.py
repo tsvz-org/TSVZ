@@ -285,6 +285,7 @@ import io
 import random
 import errno
 import json
+import shutil
 import signal
 import stat
 import subprocess
@@ -21294,6 +21295,100 @@ def test_a_tsvzedlite_reads_its_rows_right_after_appending_over_an_uncommitted_t
 		assert (t['m'], t['n']) == (['m', 'more'], ['n', 'new'])
 	t.close()
 	assert sorted(TSVZ.readTabularFile(p, verbose=False)) == sorted(['k%d' % i for i in range(50)] + ['n', 'm'])
+
+
+def _lite_after(tmp_path, how):
+	"""A TSVZedLite of a .tsvz part that holds a, then HOW happens to the part's path (chdir: the part was opened by a
+	relative path and the program changes directory; rename, remove, replace: another process's doing; readonly: made 0444;
+	closed: the Lite is closed). Returns (the Lite, the part's path, the directory the part lives in, a place to look for new files)."""
+	home = tmp_path / 'home'
+	home.mkdir()
+	away = tmp_path / 'away'
+	away.mkdir()
+	p = str(home / 'rel.tsvz')
+	if how == 'chdir':
+		cwd = os.getcwd()
+		os.chdir(str(home))
+		try:
+			t = TSVZ.TSVZedLite('rel.tsvz', header='id\tv', verbose=False)
+			t['a'] = ['a', 'A']
+		finally:
+			os.chdir(cwd)
+		return t, p, home, away
+	t = TSVZ.TSVZedLite(p, header='id\tv', verbose=False)
+	t['a'] = ['a', 'A']
+	if how == 'rename':
+		os.rename(p, p + '.old')
+	elif how == 'remove':
+		os.remove(p)
+	elif how == 'replace':  # write-beside-and-rename, as an editor, rsync or hpcp does it
+		shutil.copy(p, p + '.new')
+		os.replace(p + '.new', p)
+	elif how == 'readonly':
+		os.chmod(p, 0o444)
+	elif how == 'closed':
+		t.close()
+	return t, p, home, away
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='an open file is renamed or removed on POSIX')
+@pytest.mark.parametrize('how', ['rename', 'remove', 'replace'])
+def test_a_tsvzedlite_whose_part_was_moved_away_sets_and_reads_through_the_part_it_holds(tmp_path, how):
+	# A TSVZedLite appends through a descriptor of its own (5.18: so that a Ctrl-C cannot leave the part locked), and reads
+	# its rows through the part it keeps open. When the path no longer names that part (another process renamed, removed or
+	# replaced it), the set must still land where the reads look: the 5.18 build appended to a new header-less file at the
+	# path, and the read of the new key raised KeyError. 5.17 appended through the kept part, and so does this.
+	t, p, home, away = _lite_after(tmp_path, how)
+	try:
+		t['b'] = ['b', 'B']
+		assert (t['b'], t['a']) == (['b', 'B'], ['a', 'A'])
+	finally:
+		t.close()
+	if how == 'rename':
+		assert not os.path.exists(p)
+		assert _bytes(p + '.old') == b'#id\tv\na\tA\nb\tB\n'  # (the renamed part holds b)
+	elif how == 'remove':
+		assert not os.path.exists(p)  # (no new file at the path)
+	else:
+		assert _bytes(p) == b'#id\tv\na\tA\n'  # (the copy is unchanged: the row went to the old part)
+
+
+def test_a_tsvzedlite_whose_relative_path_changed_meaning_sets_and_reads_through_the_part_it_holds(tmp_path):
+	# The same without another process: the program opened the part by a relative path and changed directory. 5.17 kept
+	# working; the 5.18 build wrote b to a new header-less file in the new directory and then raised KeyError on t['b'].
+	t, p, home, away = _lite_after(tmp_path, 'chdir')
+	cwd = os.getcwd()
+	os.chdir(str(away))
+	try:
+		t['b'] = ['b', 'B']
+		assert (t['b'], t['a']) == (['b', 'B'], ['a', 'A'])
+		t.close()
+		assert os.listdir(str(away)) == []  # (nothing appeared where the program is now)
+	finally:
+		os.chdir(cwd)
+	assert _bytes(p) == b'#id\tv\na\tA\nb\tB\n'  # (the part the Lite holds)
+
+
+@pytest.mark.skipif(os.name != 'posix' or os.geteuid() == 0, reason='root writes a read-only file')
+def test_a_tsvzedlite_whose_part_was_made_read_only_still_sets_through_the_part_it_holds(tmp_path):
+	# The part was opened for writing before it was made read-only (a rotation, a chmod -w): opening it again for an append
+	# fails with PermissionError, as it did in the 5.18 build; the kept part, opened for writing, still takes the append.
+	t, p, home, away = _lite_after(tmp_path, 'readonly')
+	try:
+		t['b'] = ['b', 'B']
+		assert (t['b'], t['a']) == (['b', 'B'], ['a', 'A'])
+	finally:
+		t.close()
+	assert _bytes(p) == b'#id\tv\na\tA\nb\tB\n'
+
+
+def test_a_set_on_a_closed_tsvzedlite_raises_and_writes_nothing(tmp_path):
+	# 5.17 raised ValueError (its kept part is closed) with nothing written; the 5.18 build raised it after the row was in the file.
+	t, p, home, away = _lite_after(tmp_path, 'closed')
+	before = _bytes(p)
+	with pytest.raises(ValueError):
+		t['b'] = ['b', 'B']
+	assert _bytes(p) == before == b'#id\tv\na\tA\n'
 
 
 #: ARGV: TSVZ's directory, the file, CASE. A TSVZClient c made before a fork(), used in the child. CASE local: no handler

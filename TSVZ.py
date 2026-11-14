@@ -8984,26 +8984,43 @@ class TSVZedLite(MutableMapping):
 	def _specWrite(self, line):
 		"""Append one record (or lines written together) to the active part; return its offset, or None for a compressed part.
 
-		The append opens the part for itself (_specAppendPayload), and its lock goes with that descriptor's close: a Ctrl-C
-		that cuts the append's clean-up still drops it (5.18; through the Lite's kept fileObj, which lives on, 5.17 left the
-		part append-locked until the Lite closed, and its own clear_file() and other processes' appends waited). The kept
-		fileObj is only read from: it drops what it read ahead."""
+		The append opens the part for itself, and its lock goes with that descriptor's close: a Ctrl-C that cuts the append's
+		clean-up still drops it (5.18; through the kept fileObj, which lives on, 5.17 left the part append-locked until the
+		Lite closed, and its own clear_file() and other processes' appends waited). It does so only while the path still names
+		the file the Lite keeps open, since a row's offset is read through that file (_specAppendOwn): once the path names
+		another (an os.chdir() away from a relative path, a rename, a removal or a replace) the append goes through the kept
+		file, as 5.17's did. The kept fileObj drops what it read ahead."""
 		data = _encodeText(line + '\n', 'utf-8', self.errors)
 		reporter = _Reporter(self._activePath)
 		try:
-			size = _specAppendPayload(self._activePath, data, reporter, memberSize=self._specState.memberSize)[0]
 			if self.fileObj is None:
+				_specAppendPayload(self._activePath, data, reporter, memberSize=self._specState.memberSize)
 				return None
+			size = self._specAppendOwn(data, reporter)
 		finally:
 			try:
 				if self.fileObj is not None:
-					self.fileObj.seek(0, os.SEEK_END)  # (drops what it had read ahead: the append was made through another descriptor)
+					self.fileObj.seek(0, os.SEEK_END)  # (drops what it had read ahead: the append may have been made through another descriptor)
 			finally:
 				reporter.flush()
 		if not self._transStates or self._specState.rowState is not self._transStates[-1]:
 			self._transOffsets.append(size)
 			self._transStates.append(self._specState.rowState)
 		return size
+
+	def _specAppendOwn(self, data, reporter):
+		"""``_specAppendTo`` the kept part: through a descriptor of its own while the path names that file (opened without
+		creating), else through the kept ``fileObj``. A part that cannot be opened (made read-only, or gone) takes the
+		second way too."""
+		try:
+			own = open(self._activePath, 'r+b')
+		except OSError:
+			own = None
+		if own is not None:
+			with own:  # (its close drops the lock whatever step a Ctrl-C cuts)
+				if os.path.sameopenfile(own.fileno(), self.fileObj.fileno()):  # (device and inode; raises for a closed Lite)
+					return _specAppendTo(own, self._activePath, data, reporter, memberSize=self._specState.memberSize)[0]
+		return _specAppendTo(self.fileObj, self._activePath, data, reporter, memberSize=self._specState.memberSize)[0]
 
 	def setDefaults(self,defaults):
 		defaults = _normalizeDefaults(defaults, self.delimiter)
