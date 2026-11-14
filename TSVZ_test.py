@@ -4963,10 +4963,17 @@ def _raw(address, data):
 	sock.connect(address[len('unix:'):])
 	try:
 		sock.sendall(data)
-		sock.shutdown(socket.SHUT_WR)
+		try:
+			sock.shutdown(socket.SHUT_WR)
+		except OSError as e:
+			if e.errno != errno.ENOTCONN:
+				raise  # (ENOTCONN: the handler closed the connection already; macOS says so here, Linux does not)
 		chunks = []
 		while True:
-			chunk = sock.recv(65536)
+			try:
+				chunk = sock.recv(65536)
+			except ConnectionResetError:  # (closed with bytes it did not read: the end, as an empty read is)
+				chunk = b''
 			if not chunk:
 				return b''.join(chunks)
 			chunks.append(chunk)
