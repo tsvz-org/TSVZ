@@ -395,7 +395,9 @@ that `fork()` made connects anew there (below).
   file and answer within 300 s").
 - The suite times its deadlines on the monotonic clock too, and binds its test sockets in short directories that it
   removes when each test ends (two tests failed on macOS, whose limit for a socket path is 104 bytes, and the
-  conformance and benchmark tests left a directory in `/tmp` or `$TMPDIR` for each fake handler).
+  conformance and benchmark tests left a directory in `/tmp` or `$TMPDIR` for each fake handler). The real-signal
+  test's run (30 s and 50 handler calls, or 100 s) is sized under load, and the test of a write cut after it took the
+  file lock covers a rewrite and a `clear()` too.
 
 ## Upgrading to 5.17 from 5.16
 
@@ -520,7 +522,7 @@ handler makes inside a store's own write returns where the store has no writer t
   [planned for 5.19](docs/limitations.md#a-ctrl-c-caught-just-as-get_file_obj-takes-writelock-leaves-it-held-and-the-stores-next-commit-then-waits-for-ever),
   and one as `release_file_obj()` begins, [known](docs/limitations.md#a-ctrl-c-caught-as-release_file_obj-begins-can-leave-writelock-held-and-the-stores-next-commit-then-waits-for-ever)); two test gaps (a
   real-signal test's count of handler calls under load, and the round's test of the rewrite's and `clear()`'s half of the
-  fix; [deferred](docs/limitations.md#test-gaps-the-review-of-517s-third-fix-round-leaves)); and, before the put-off grows to sets, deletes, pops and moves, a design check
+  fix; [fixed in 5.18](#upgrading-to-518-from-517)); and, before the put-off grows to sets, deletes, pops and moves, a design check
   against a store that stops running its writes on the calling thread. A candidate for 5.18, to be measured: a `writeLock`
   that knows its holder, used only to let go of a hold a cut write left (the lock a cut write leaves held on Python
   3.14).

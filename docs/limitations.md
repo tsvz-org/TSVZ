@@ -368,26 +368,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 5.18.
 - Noted: 2026-11-11, from the 5.15 release run; a deferral, not asked.
 
-### Test gaps the review of 5.17's third fix round leaves
-- Kind: deferred
-- What the operator sees: nothing in the library; two gaps in the suite.
-  - The real-signal handler test's `reload` cases
-    (`test_a_real_signal_handler_that_uses_the_store_while_the_program_sets_rows_leaves_memory_and_the_file_as_it_set_them[reload-*]`)
-    ask for at least 50 handler calls in 30 s. On a loaded host the timer's handler runs fewer times: 24 copies beside 24
-    CPU burners, Python 3.11, 27 to 74 calls (every `.tsv` run 27 to 41), memory and the file agreeing in all 48 runs.
-  - The round's own test
-    (`test_a_signal_that_cuts_a_stores_own_write_after_it_took_the_file_lock_leaves_no_locked_file_for_the_calls_after_it`)
-    pins the commit's half of the fix only: a build with the previous `_writeFileStarted`, `_readLocked` and
-    `_openLocked` and this round's commit passed the 1,150 related tests. The rewrite's and `clear()`'s half (the design
-    check's sweeps: 91 to 9 and 87 to 5 hung steps) has no test.
-- Why: the first is a limit sized without load, as in the entry above; the second was found by mutating the fix, after
-  the round.
-- Plan (5.18): size the count from a release run's load, or count handler landings inside sets instead of calls;
-  parametrize the round's test over `rewrite(force=True)` and `clear()` (`_writeFileStarted` calls `_unattended()` after its
-  open and `_unlockFile` in its clean-up, so the test's two landing points apply as they are).
-- Revisit when: 5.18.
-- Noted: 2026-11-12, from the review of the third fix round; a deferral, not asked.
-
 ### A write after close(), or in a forked child, can be cut by a Ctrl-C
 - Kind: known limitation
 - What the operator sees: a `TSVZed` has no writer thread once it is closed, nor in a child that `fork()` made, so
