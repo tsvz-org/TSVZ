@@ -181,10 +181,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   0.97 s, where one with no read under way ends in 0.41 to 0.57 s; on 3.6, 0.46 to 0.97 s against 0.46 to 0.52 s.
 - Why: the tick's reads run inside its sync, which also serves its commits and rewrites; a stop there needs its own
   flag set at exit and its own sweep of the write path, more than this release's load stop.
-- Plan (5.18): the tick's reload, both kinds, runs with a stop of its own that `_atExit` sets when it lets go of the
+- Plan (5.19): the tick's reload, both kinds, runs with a stop of its own that `_atExit` sets when it lets go of the
   store (for a loose store, the same swap of its reader's file), and `_appendWork` ends on `_LoadStopped`; with a
   sweep of the tick's write path.
-- Revisit when: 5.18.
+- Revisit when: 5.19.
+- Moved to 5.19 on 2026-11-13: its stop runs through the exit path and the tick's write path, with a sweep of their own,
+  which go with the 5.19 Ctrl-C group; the operator sees an exit up to a second or two later; the main session's call (a
+  deferral, not asked).
 - Noted: 2026-11-10, found by the 5.15 plan's measurement; a deferral, not asked.
 
 ### A Ctrl-C caught inside a set, delete, pop or move can leave that one key apart
@@ -206,11 +209,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     Checked on Python 3.14 for a set, both kinds (the 5.15 review's probe, with the handler alone as the control).
 - Why: a fix finishes the operation in the section's `except BaseException` clause, which changes what a cut set
   means (it completes) and needs its own sweep; 5.15's work on these sections was the signal handler's case.
-- Plan (5.18): the clause the sections already have calls the section's redo (`_setAgain`, `_delAgain` and the others
+- Plan (5.19): the clause the sections already have calls the section's redo (`_setAgain`, `_delAgain` and the others
   5.15 added for signal handlers) with its own arguments, under the lock, when the section had begun changing memory
   or found its hold let go of (the two-signal case): a set cut by a Ctrl-C completes, and the KeyboardInterrupt still
   goes up. With its own sweep.
-- Revisit when: 5.18.
+- Revisit when: 5.19.
+- Moved to 5.19 on 2026-11-13: it changes what a cut set means in every section's clause and needs its own sweep; it
+  goes with the sections' redo group, whose code 5.15's two fix rounds changed; the main session's call (a deferral, not
+  asked).
 - Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked. The two-signal case and the move to the
   beginning's several keys were added 2026-11-11, from the 5.15 review.
 
@@ -234,9 +240,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   why 5.15's sweep missed `_call`'s.
 - Why: each loop has its own clean-up, and its own test, so moving them all is a release's work; a check that finds the
   new ones as they are written has to come first.
-- Plan (5.18): a static exception-table check in the suite (Python 3.12+), listing the uncovered back jumps in
+- Plan (5.19): a static exception-table check in the suite (Python 3.12+), listing the uncovered back jumps in
   functions the main thread of an open store runs; move each loop of those into a method, and write down the rest.
-- Revisit when: 5.18.
+- Revisit when: 5.19.
+- Moved to 5.19 on 2026-11-13: a release's work by its own Why (the static check first, then each loop with its own
+  test); with the 5.19 Ctrl-C group; none is worse than 5.14; the main session's call (a deferral, not asked).
 - Noted: 2026-11-11, found by the 5.15 review; a deferral, not asked.
 
 ### A signal handler's change of the store inside popitem or move_to_end can make it raise the wrong exception
@@ -253,10 +261,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   Two handler calls, the second inside the redo the first one caused, are the known limitation after this entry.
 - Why: found by the 5.15 plan's sweep (the move to the beginning's, by the fix round's); the change is small but in two
   hot methods, and wants its own tests.
-- Plan (5.18): `popitem` looks for its key again when the store changed between its look and its take, and raises
+- Plan (5.19): `popitem` looks for its key again when the store changed between its look and its take, and raises
   `KeyError('dictionary is empty')` when the store went empty; `move_to_end` raises `KeyError(key)` when its key went
   inside it, and a move to the beginning lists the other keys again when the store changed while it listed them.
-- Revisit when: 5.18.
+- Revisit when: 5.19.
+- Moved to 5.19 on 2026-11-13: two hot methods and handler-only; with the sections' redo group and the handler sweeps
+  that count it; the main session's call (a deferral, not asked).
 - Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked. The two-handler cases, added 2026-11-11 from the
   5.15 re-review, became the known limitation after this entry the same day.
 
@@ -304,9 +314,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   review's fixes: 20 of 325 landings on Python 3.14 for each such handler, with or without a header (4 of 59 line
   steps on 3.6), and a `.tsvz` store's 10 of 399 for a set of another key (2 of 72); 5.14 the same 20.
 - Why: found by the 5.15 final review's wider sweep; not worse than 5.14, and the fix is in the redo of every set.
-- Plan (5.18): `_setAgain` and `_specAgain` move a key that was new to the end when its line is still the last one
+- Plan (5.19): `_setAgain` and `_specAgain` move a key that was new to the end when its line is still the last one
   queued; the sweep's allowance goes.
-- Revisit when: 5.18.
+- Revisit when: 5.19.
+- Moved to 5.19 on 2026-11-13: the fix is in the redo of every set (`_setAgain`, `_specAgain`); with the sections' redo
+  group; the main session's call (a deferral, not asked).
 - Noted: 2026-11-11, found by the 5.15 final review; a deferral, not asked.
 
 ### A signal handler's clear() in a store with no header can leave a deleted key as a row of the key alone
@@ -320,9 +332,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   of 81, 17 of 120). 5.14: 63, 67 and 67 for the first three, and for a move the whole row back at 182 of 532. With a
   header every reader takes the line as a deletion (none in the sweeps with one).
 - Why: found by the 5.15 final review's wider sweep; 5.14 the same or worse.
-- Plan (5.18): the branch of `__appendEmptyLine` for a store with no column count writes what reads as a deletion
+- Plan (5.19): the branch of `__appendEmptyLine` for a store with no column count writes what reads as a deletion
   there (a drop item, as a one-column store's); the sweep's allowance goes.
-- Revisit when: 5.18.
+- Revisit when: 5.19.
+- Moved to 5.19 on 2026-11-13: with the sections' redo group, whose sweeps carry its allowance; the main session's call
+  (a deferral, not asked).
 - Noted: 2026-11-11, found by the 5.15 final review; a deferral, not asked.
 
 ### A '#' key can leave memory when the store follows another process's change while rows are queued
@@ -334,9 +348,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   3.14 (a move queued, another process's line, then the follow; 5.14: 6 of 10). `reload()` drops it always.
 - Why: found by the 5.15 final review fixes' sweep of a store with a `#` key; 5.14 the same. Whether a whole read
   keeps `#` keys is a choice of what `reload()` means, as `_readWidened` keeps them and `reload()` does not.
-- Plan (5.18): decide whether a whole read keeps the `#` keys memory holds (in their place, as `_readWidened` does), and
+- Plan (5.19): decide whether a whole read keeps the `#` keys memory holds (in their place, as `_readWidened` does), and
   make the follow and `reload()` agree; the sweep's check of a `#` key's place then covers memory without it too.
-- Revisit when: 5.18.
+- Revisit when: 5.19.
+- Moved to 5.19 on 2026-11-13: its plan begins with a decision of what a whole read keeps (a question for the user, sent
+  2026-11-13); with the sections' group; the main session's call (a deferral, not asked).
 - Noted: 2026-11-11, found by the 5.15 final review's fixes; a deferral, not asked.
 
 ### Test gaps the 5.15 final review's fixes leave
@@ -352,8 +368,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: each handler and store adds sweeps to CI's serial run (each under 3.5 s on 3.14; the whole serial 3.14 run took
   13 min 7 s here with the 160 sweeps the fixes added, of the job's 40 minutes); the fixes added the ones that guard
   what they changed.
-- Plan (5.18): add them to the suite, measured against CI's time.
-- Revisit when: 5.18.
+- Plan (5.19): add them to the suite, measured against CI's time.
+- Revisit when: 5.19.
+- Moved to 5.19 on 2026-11-13: the sweeps' allowances are the sections' group's deferrals; added with those fixes, each
+  allowance going as its fix lands; the main session's call (a deferral, not asked).
 - Noted: 2026-11-11, from the 5.15 final review's test gaps; a deferral, not asked. The fork bullet was done in 5.17.
 
 ### The Ctrl-C sweep tests' 120 s limit is too short for suites run side by side
@@ -382,7 +400,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: calls after `close()` and writes from forked children are rare, and covering them means starting a writer
   thread again in both cases, with its lifetime to get right.
 - Revisit when: someone writes through a closed store or from a forked child and hits it. For the `.tsvz` `clear()`:
-  5.18, which sets `deSynced` before memory is emptied; a closed store would still need a reload.
+  5.19, which sets `deSynced` before memory is emptied; a closed store would still need a reload.
+- Moved to 5.19 on 2026-11-13 (the `.tsvz` `clear()` part): the planned `deSynced` would bring the rows back only at a
+  forked child's next rewrite, move or close, and never for a closed store; it goes with the 5.19 design check of stores
+  with no writer thread, whose other option (writes off the calling thread) removes the case; the main session's call (a
+  deferral, not asked).
 - Approved: 2026-10-29, the user chose "Known limitation (Recommended)". (The `.tsvz` `clear()` is deferred, not
   approved.)
 
@@ -435,6 +457,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   its own sweep: with a reentrant lock, a nested taker that is not put off would run inside the write where it waits today
   (a plain reentrant `writeLock` hung at 619 of 1,060 steps of 5.16's commit: the nested commit opens the file again, and
   waits for the file lock its own write holds; the 5.17 design check).
+- Moved to 5.19 on 2026-11-13 (the Revisit's candidate): the holder-aware `writeLock` is the 5.19 candidate, with G1's
+  acquire gap and the design check of stores with no writer thread; the main session's call (a deferral, not asked).
 - Approved: 2026-11-10, the user chose "Approve as KL (Recommended)" on the question: "One rare case is left, for a
   program that catches Ctrl-C and keeps running: a second Ctrl-C landing inside the cleanup that lets go of the lock,
   or a write after close() or in a forked child, can still leave a store's lock held, and another thread then waits
@@ -601,7 +625,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   (Recommended)"): the parent writes the file too, and a child that took the failed rewrite to try again made the parent
   overwrite the child's rows. The child cannot tell a parent that will mend the file from one that will not.
 - Revisit when: someone needs it. One idea for a design check: a child whose parent is gone (`os.getppid()` changed since
-  the fork) is the only heir and takes the duty back. Not built or tested. The next entry, a deferral for 5.18, is the same
+  the fork) is the only heir and takes the duty back. Not built or tested. The next entry, a deferral for 5.19, is the same
   design question for the remake a failed rewrite leaves, and the two are designed together.
 - Approved: 2026-11-11, the user chose "Known limitation (Recommended)" on the 5.17 final review's question: after a
   parent's failed rewrite, a forked child no longer mends the file; the README and its upgrade note say so, with the
@@ -625,10 +649,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   prototype: a live parent keeps `c2`, `p2` and every row, close and exit alike). It would also move the dead-parent case,
   which 5.16 and 5.17 mend, into the approved limitation above ("a forked child no longer mends the file"), and that
   needs the user's OK: it is the same design question as that entry's, so it is decided there.
-- Plan (5.18): design it with the entry above. A child whose parent is gone (`os.getppid()` changed since the fork) is the
+- Plan (5.19): design it with the entry above. A child whose parent is gone (`os.getppid()` changed since the fork) is the
   only heir and takes the duty back, the remake too; a child whose parent lives leaves the remake, and the repair, to it.
   A test from `g1.py` for the live parent (the child's row kept) and the dead parent (the file mended).
-- Revisit when: 5.18.
+- Revisit when: 5.19.
+- Moved to 5.19 on 2026-11-13: its plan is 'design it with' the approved W1 entry: the heir rule (`os.getppid()`) is an
+  idea for a design check, not built or tested, and the one-line fix moves a case into an approved known limitation; the
+  5.19 design check; the main session's call (a deferral, not asked).
 - Noted: 2026-11-12, found by the 5.17 re-review's second opinion (Grok); a deferral, not asked.
 
 ### A call a signal handler puts off inside a store's own write is lost when the handler ends the process by os._exit
@@ -720,7 +747,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
       held-file limitation above) must stay as they are.
 - Why: found by the 5.17 build, by reading, while putting off a handler's commit or reload inside such a write; not worse
   than 5.16, and a fix touches every section of the write path, which wants its own sweep.
-- Plan (5.18): a set, delete, pop or move that finds the section lock held by its own thread, in a store with no writer
+- Plan (5.19): a set, delete, pop or move that finds the section lock held by its own thread, in a store with no writer
   thread, is put off until the write below it ends, as a commit is (`_jobHere`, looked up only then: only a handler or a
   Ctrl-C's leftover finds the lock held); with a handler sweep over a forked child's and a closed store's writes. It also
   puts off a set (and a delete or move) made while calls are waiting, so that what a handler does to the store after
@@ -742,7 +769,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     (checked on 3.11, 3.12 and 3.14; TSVZ's hook is `atexit.register(_stopLiveStores)`); later in the interpreter's shutdown it may not). Nothing of it was built or run.
   - **A `writeLock` that knows its holder**, used only to let go of a hold a cut write left (the approved limitation of
     a lock left held, Python 3.14), is the other candidate, to be measured: see that entry.
-- Revisit when: 5.18.
+- Revisit when: 5.19.
+- Moved to 5.19 on 2026-11-13: its plan says a design check comes first; it opens 5.19; the main session's call (a
+  deferral, not asked).
 - Noted: 2026-11-11, found by the 5.17 build; the 5.17 final review's findings added the same day; the design check's
   condition added 2026-11-12; a deferral, not asked.
 
@@ -1207,11 +1236,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   (`a\t1\na\t\t1\nd\t1\n\na\t1\t2\n`, defaults `[#_defaults_#, '', '']`), a strict reader given a count of 3 that the
   writer was not given lost a cell (`c` from `[c, 2, X]` to `[c, 2, '']`), and tsvz-rs read `c, b` as `b, c`. So 5.15
   keeps 5.14's compaction; the suite holds the first two files as a test.
-- Plan (5.18): drop that line only where no reader that can read the file otherwise takes a line between: a reader
+- Plan (5.19): drop that line only where no reader that can read the file otherwise takes a line between: a reader
   given line 1 for its header (also where the writer has no header) and a reader given a count the writer was not
   given, as the random differential lists them; then the exhaustive differential with an empty header and count readers
   for a rewrite, and the random one.
-- Revisit when: 5.18.
+- Revisit when: 5.19.
+- Moved to 5.19 on 2026-11-13: one extra line, kept once, which never grows; its rule was built and taken back in 5.15
+  after the random differential; it needs the full differentials, which are a build of their own; the main session's
+  call (a deferral, not asked).
 - Noted: 2026-11-09, found in the 5.12 review (the second half of 5.12's deferral "A compaction keeps a moved-up line only
   from the deletion that ends the other reader's life of the key", whose first half 5.14 builds); a deferral, not asked.
   2026-11-10: the 5.15 plan's rule was built and taken back, as above.

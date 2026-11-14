@@ -267,7 +267,7 @@ the write ends, unless a Ctrl-C ended it (which
 drops it, and a commit's rows stay queued for the next commit), and returns at once
 (5.17; it waited for ever before). What the handler does to the store after such a call
 happens before it: a set after its own `clear()` is lost when the clear is made, and a
-read after its `reload()` sees the old row ([deferred to 5.18](docs/limitations.md#a-signal-handlers-set-inside-a-forked-childs-or-a-closed-stores-own-write-can-leave-memory-apart-from-the-file)).
+read after its `reload()` sees the old row ([deferred to 5.19](docs/limitations.md#a-signal-handlers-set-inside-a-forked-childs-or-a-closed-stores-own-write-can-leave-memory-apart-from-the-file)).
 A handler that ends the process by `os._exit()` after such a call loses the call: end by
 `sys.exit()`, which makes it first
 ([known](docs/limitations.md#a-call-a-signal-handler-puts-off-inside-a-stores-own-write-is-lost-when-the-handler-ends-the-process-by-os_exit)),
@@ -368,12 +368,6 @@ damaged file, as asked, and warns.
 The file formats are unchanged, and an upgrade needs nothing. The one change to the API: a `TSVZClient` used in a child
 that `fork()` made connects anew there (below).
 
-- **A `TSVZClient` made before a `fork()` works in the child.** At its first request there it connects to the handler
-  anew, or, with no handler, opens an engine of its own that reads the file afresh; the parent's connection and engine
-  stay the parent's. In 5.17 the child shared its parent's connection, so an answer could reach the other process (the
-  parent's read of one key got the child's row of another), and with no handler the child's first write waited for ever
-  (the engine's writer thread is not in the child), as did its first request where a thread of the parent held the
-  client's lock at the fork. The child's exit writes none of the parent's rows.
 - **A Ctrl-C caught in `release_file_obj()`, or in `get_file_obj()`'s clean-up after a failed open, no longer leaves the
   store's write lock held.** Each step of the clean-up runs in the `finally` of the one before, the lock let go of last.
   A program that holds the file in a tight loop and catches real Ctrl-Cs, 960 a run: the store's next commit waited for
@@ -390,6 +384,12 @@ that `fork()` made connects anew there (below).
   processes' appends until it closed (104 of 1,920 caught real Ctrl-Cs on Python 3.14, 91 on 3.11; none now). A Lite's
   `.tsvz` set costs one open and close more: 12.6 to 16.3 µs on Python 3.14 and 18.2 to 22.8 µs on 3.6 (tmpfs), 12.9 to
   15.6 µs and 17.2 to 21.6 µs on an XFS disk.
+- **A `TSVZClient` made before a `fork()` works in the child.** At its first request there it connects to the handler
+  anew, or, with no handler, opens an engine of its own that reads the file afresh; the parent's connection and engine
+  stay the parent's. In 5.17 the child shared its parent's connection, so an answer could reach the other process (the
+  parent's read of one key got the child's row of another), and with no handler the child's first write waited for ever
+  (the engine's writer thread is not in the child), as did its first request where a thread of the parent held the
+  client's lock at the fork. The child's exit writes none of the parent's rows.
 - **`tsvzconform` times its waits on the monotonic clock**, so a host that sleeps while a handler starts (a laptop) no
   longer fails the case: a wall clock 15 minutes on at the handler's first poll failed it in 5.17 ("no valid pointer
   file and answer within 300 s").
@@ -398,6 +398,16 @@ that `fork()` made connects anew there (below).
   conformance and benchmark tests left a directory in `/tmp` or `$TMPDIR` for each fake handler). The real-signal
   test's run (30 s and 50 handler calls, or 100 s) is sized under load, and the test of a write cut after it took the
   file lock covers a rewrite and a `clear()` too.
+- **Known** ([docs/limitations.md](docs/limitations.md)): the list under 5.17, and a Ctrl-C at `release_file_obj()`'s
+  entry (above).
+- **Planned for 5.19** ([docs/limitations.md](docs/limitations.md)): first a design check of stores with no writer thread
+  (after `close()`, in a forked child), covering a signal handler's set inside such a store's own write and what a
+  handler does after a put-off call, a `.tsvz` `clear()` cut there, a `writeLock` that knows its holder (with the Ctrl-C
+  just as `get_file_obj()` takes it, and the Python 3.14 gap at `with self.writeLock:`), and the remake a forked child
+  keeps from its parent's failed rewrite. Then the sections' group: a caught Ctrl-C inside a set, delete, pop or move, a
+  handler's change inside `popitem()` or `move_to_end()`, a new key's place, the lone key after a handler's `clear()`, a
+  `#` key, the 5.15 final review's test gaps, the loops' back jumps, and a Ctrl-C during the writer thread's own reload.
+  Then the compaction.
 
 ## Upgrading to 5.17 from 5.16
 
@@ -449,10 +459,10 @@ handler makes inside a store's own write returns where the store has no writer t
   as always). A move that has to follow the file first waits with its follow, so another
   writer's change of the row is kept. A handler's set returns at once, as before; one that lands inside such a write's own
   change of memory (a reload's swap) can leave its row in the file and not in memory until the next reload
-  ([deferred to 5.18](docs/limitations.md#a-signal-handlers-set-inside-a-forked-childs-or-a-closed-stores-own-write-can-leave-memory-apart-from-the-file);
+  ([deferred to 5.19](docs/limitations.md#a-signal-handlers-set-inside-a-forked-childs-or-a-closed-stores-own-write-can-leave-memory-apart-from-the-file);
   5.16 the same). What the handler does to the store after such a call happens before it: a set after its own `clear()` is
   lost when the clear is made, a read after its `reload()` sees the old row, and a `move_to_end()` of a key the handler
-  deletes next reports its failure later instead of raising (also deferred to 5.18; 5.16 waited for ever at the first
+  deletes next reports its failure later instead of raising (also deferred to 5.19; 5.16 waited for ever at the first
   call). A handler that ends the process by `os._exit()` after such a call loses the call, where `sys.exit()` makes it
   first: end by `sys.exit()`
   ([known](docs/limitations.md#a-call-a-signal-handler-puts-off-inside-a-stores-own-write-is-lost-when-the-handler-ends-the-process-by-os_exit)), except for a write cut just as it takes its lock: on Python 3.14 a signal landing just after
@@ -460,7 +470,7 @@ handler makes inside a store's own write returns where the store has no writer t
   README's handler in a commit loop; [known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and on Python 3.6 to 3.9 (measured on 3.6 and 3.9) one landing at the end of a `try` or `with` block can
   leave the file locked, or `writeLock` held (2 of 8,000 on 3.6; [known](docs/limitations.md#on-python-36-to-39-a-signal-handler-that-ends-the-process-inside-a-stores-own-write-can-still-hang-in-a-few-of-8000-signals)).
   A process a handler forks inside a closed store's own write, and that sets a row and commits, loses that commit, where
-  a forked child's store keeps it (the closed store has no fork hook; deferred to 5.18; 5.16 waited for ever at the
+  a forked child's store keeps it (the closed store has no fork hook; deferred to 5.19; 5.16 waited for ever at the
   handler's first call). A running store is unchanged: its writes run on its writer thread, and a handler's call waits
   for the one under way.
 - **In a closed `TSVZed`'s or a forked child's own write, a `sys.exit()` or a Ctrl-C that cuts the write no longer
@@ -525,7 +535,8 @@ handler makes inside a store's own write returns where the store has no writer t
   fix; [fixed in 5.18](#upgrading-to-518-from-517)); and, before the put-off grows to sets, deletes, pops and moves, a design check
   against a store that stops running its writes on the calling thread. A candidate for 5.18, to be measured: a `writeLock`
   that knows its holder, used only to let go of a hold a cut write left (the lock a cut write leaves held on Python
-  3.14).
+  3.14). (5.18 took the `get_file_obj()`/`release_file_obj()` clean-up, the `TSVZedLite` lock, a forked child's
+  `TSVZClient` and two test gaps; the rest is planned for 5.19.)
 
 ## Upgrading to 5.16 from 5.15
 
@@ -639,7 +650,7 @@ can land in, and checks the locks, memory and the file after each.
 - **A Ctrl-C at a loop in `move_to_end` no longer leaves the store's lock held, and one in the wait for the writer
   thread no longer skips taking its job back** (Python 3.12 to 3.14, which leave a loop's back jump inside a `try` or
   `with` block out of the exception table, so a signal landing there skipped the block's exit and its clean-up). Other
-  loops of that shape are left (planned for 5.18, below).
+  loops of that shape are left (planned for 5.19, below).
 - Compactions are unchanged: the plan to drop a strict reader's first line of a key where it takes no row between it
   and its last moved the view of readers given other arguments than the writer's in the random differential (4 of
   20,000 `.tsv` argument sets), so it is deferred again
@@ -693,7 +704,8 @@ can land in, and checks the locks, memory and the file after each.
   used in a forked child, waits for ever at its first write; a Ctrl-C while the writer thread itself reloads after
   another process's change waits for that reload; the compaction above; and, in the suite, the Ctrl-C sweep tests' 120 s
   limit, sized for parallel runs (one timed out at 120 s with four suites of 32 workers on 32 cores, where it takes
-  13.6 s alone).
+  13.6 s alone). (5.18 took the `get_file_obj()`/`release_file_obj()` clean-up, the `TSVZedLite` lock, a forked child's
+  `TSVZClient` and two test gaps; the rest is planned for 5.19.)
 
 ## Upgrading to 5.14 from 5.13
 
@@ -784,7 +796,7 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
 
 - Deferred to 5.15: a compaction can keep a strict reader's first line of a key where no other key competes for its
   place, once (`a\na\tX\na\t2\t\na\t\t2\n` scrubbed with header `id\tv`, defaults `[#_defaults_#, '', '']` and count 2
-  keeps all four lines). Every reader reads it alike (deferred again to 5.18: see Upgrading to 5.15). See
+  keeps all four lines). Every reader reads it alike (deferred again to 5.19: see Upgrading to 5.15). See
   [docs/limitations.md](docs/limitations.md#a-compaction-can-keep-a-strict-readers-first-line-of-a-key-where-no-other-key-competes-for-its-place).
 
 - **Known: a program still running 3.39 to 5.2 can cut a wide row when another writer changes its file.** A `TSVZed` of
