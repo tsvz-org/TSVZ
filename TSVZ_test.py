@@ -2745,8 +2745,8 @@ def test_spec_scrub_empty_stores(tmp_path):
 # TSVZed on spec stores: loading and reading (design §5.6, §6)
 # ==========================================================================
 def _wait_for(predicate, timeout=3.0):
-	deadline = time.time() + timeout
-	while not predicate() and time.time() < deadline:
+	deadline = time.monotonic() + timeout
+	while not predicate() and time.monotonic() < deadline:
 		time.sleep(0.01)
 	return predicate()
 
@@ -3826,8 +3826,8 @@ def test_lite_spec_and_another_process_append_without_losing_records(tmp_path):
 	go = str(tmp_path / 'go')
 	n = 200
 	code = ('import os, sys, time\nsys.path.insert(0, {!r})\nimport TSVZ\n'
-			'deadline = time.time() + 20\n'
-			'while not os.path.exists({!r}) and time.time() < deadline:\n\tpass\n'
+			'deadline = time.monotonic() + 20\n'
+			'while not os.path.exists({!r}) and time.monotonic() < deadline:\n\tpass\n'
 			'for i in range({}):\n\tTSVZ.appendLinesTabularFile({!r}, [["H%d" % i, "v" * 50]])\n').format(HERE, go, n, p)
 	helper = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 	written = 0
@@ -5024,9 +5024,9 @@ def _serve_process(store, *options):
 	"""Start ``tsvz serve STORE`` in the background; return the Popen once its pointer file is written."""
 	proc = subprocess.Popen([sys.executable, os.path.join(HERE, 'TSVZ.py'), 'serve', store] + list(options),
 							stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-	deadline = time.time() + 10
+	deadline = time.monotonic() + 10
 	while TSVZ._serveFind(store) is None:
-		if proc.poll() is not None or time.time() > deadline:
+		if proc.poll() is not None or time.monotonic() > deadline:
 			proc.kill()
 			raise AssertionError(proc.communicate()[1])
 		time.sleep(0.02)
@@ -5241,11 +5241,21 @@ def test_cli_falls_back_to_the_files_when_the_handler_is_gone(tmp_path):
 	assert _run('stop', p)[0] == 1
 
 
+@pytest.fixture
+def short_dir():
+	"""A directory for a Unix socket, removed when the test ends: a socket path under macOS's pytest basetemp is over
+	macOS's 104-byte limit for one (Linux's is 108). /tmp is short there (/private/tmp)."""
+	import shutil
+	path = tempfile.mkdtemp(prefix='tsvzt-', dir='/tmp')
+	yield path
+	shutil.rmtree(path, ignore_errors=True)
+
+
 @pytest.mark.skipif(not hasattr(__import__('socket'), 'AF_UNIX'), reason='Unix sockets')
-def test_cli_when_the_handler_drops_the_connection(tmp_path):
+def test_cli_when_the_handler_drops_the_connection(tmp_path, short_dir):
 	"""A read falls back to the files; a write reports that its outcome is unknown."""
 	import socket
-	path = str(tmp_path / 'drop.sock')
+	path = os.path.join(short_dir, 'drop.sock')
 	listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	listener.bind(path)
 	listener.listen(8)
@@ -5586,9 +5596,10 @@ def test_tsvz_client_is_safe_to_share_between_threads(tmp_path, served):
 
 
 @pytest.mark.skipif(not _UNIX, reason='Unix sockets')
-def test_serve_group_socket_is_not_put_in_a_private_runtime_dir(tmp_path, served, monkeypatch):
+def test_serve_group_socket_is_not_put_in_a_private_runtime_dir(tmp_path, served, monkeypatch, short_dir):
 	"""I6: a socket meant for a group does not go under a 0700 XDG_RUNTIME_DIR."""
-	xdg = tmp_path / 'xdg'
+	import pathlib
+	xdg = pathlib.Path(short_dir) / 'xdg'  # (the handler binds <xdg>/tsvz-XXXXXXXX/s: short_dir's reason)
 	xdg.mkdir()
 	os.chmod(str(xdg), 0o700)
 	monkeypatch.setenv('XDG_RUNTIME_DIR', str(xdg))
@@ -6973,8 +6984,8 @@ def test_tsvzed_legacy_reload_that_keeps_failing_is_reported_once_and_retried_le
 	assert len(failures) == 1, log.errors
 	with open(p, 'wb') as f:
 		f.write(b'key\tval\nx\t1\n')  # put right
-	deadline = time.time() + 5
-	while 'x' not in t and time.time() < deadline:
+	deadline = time.monotonic() + 5
+	while 'x' not in t and time.monotonic() < deadline:
 		time.sleep(0.01)
 	assert t['x'] == ['x', '1']
 	t.close()
@@ -7879,8 +7890,8 @@ def test_tsvzed_legacy_background_writer_never_reloads_a_file_its_failed_rewrite
 		t._failed('rewrite', 'No space left on device', False)  # it keeps failing: the next try is a minute away
 	assert b'k1' not in _bytes(p), 'the rewrite did not damage the file'  # the queued k0 may be appended to it
 	_append_external(p)
-	deadline = time.time() + 0.5
-	while time.time() < deadline:  # many ticks
+	deadline = time.monotonic() + 0.5
+	while time.monotonic() < deadline:  # many ticks
 		assert dict(t) == rows, 'a tick reloaded the damaged file over memory'
 		time.sleep(0.01)
 	monkeypatch.undo()
@@ -9014,12 +9025,12 @@ def test_tsvzed_legacy_ctrl_c_during_a_rewrite_never_cuts_it(tmp_path, mode):
 		f.write('key\tval\n' + ''.join('k{0}\tv{0}\nk{0}\tnew{0}\n'.format(i) for i in range(5000)))
 	script = tmp_path / 'ctrl_c.py'
 	script.write_text(_CTRL_C_SCRIPT)
-	started = time.time()
+	started = time.monotonic()
 	proc = subprocess.run([sys.executable, str(script), os.path.dirname(os.path.abspath(TSVZ.__file__)), mode, p],
 						  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
 	finishing = proc.stderr.count('is being finished; Ctrl-C again to abandon it')
 	if mode == 'twice':
-		assert finishing == 1 and time.time() - started < 60, proc.stderr
+		assert finishing == 1 and time.monotonic() - started < 60, proc.stderr
 		try:  # abandoned: not written whole (left as it was, or new bytes over the old ones)
 			with gzip.open(p) as f:
 				assert f.read().count(b'\n') != 5001
@@ -15654,11 +15665,11 @@ def test_a_one_column_delete_beside_a_busy_writer_succeeds_and_loses_no_row(tmp_
 	child = subprocess.Popen([sys.executable, '-c', _DROP_APPENDER, p, stop], stdout=subprocess.PIPE)
 	deleted = 0
 	try:
-		deadline = time.time() + 120
-		while b'\nz0\n' not in _bytes(p) and time.time() < deadline:  # (the appender is running)
+		deadline = time.monotonic() + 120
+		while b'\nz0\n' not in _bytes(p) and time.monotonic() < deadline:  # (the appender is running)
 			time.sleep(0.01)
-		started = time.time()
-		while deleted < 400 and (time.time() - started < 1.5 or deleted < 40):
+		started = time.monotonic()
+		while deleted < 400 and (time.monotonic() - started < 1.5 or deleted < 40):
 			assert _run('delete', p, 'k%d' % deleted)[0] == 0
 			deleted += 1
 	finally:
@@ -16798,8 +16809,8 @@ def test_a_flag_does_what_a_threading_event_does():
 	waiters = [threading.Thread(target=lambda: woken.append(flag.wait())) for _ in range(4)]
 	for waiter in waiters:
 		waiter.start()
-	deadline = time.time() + 10
-	while len(flag._waiters) < 4 and time.time() < deadline:
+	deadline = time.monotonic() + 10
+	while len(flag._waiters) < 4 and time.monotonic() < deadline:
 		time.sleep(0.01)
 	flag.set()  # every waiter, with no timeout, is woken
 	for waiter in waiters:
@@ -16819,8 +16830,8 @@ def test_a_ctrl_c_in_a_wait_for_the_writer_thread_leaves_nothing_another_thread_
 	woken = []
 	waiter = threading.Thread(target=lambda: woken.append(flag.wait(10)))
 	waiter.start()
-	deadline = time.time() + 10
-	while len(flag._waiters) < 3 and time.time() < deadline:
+	deadline = time.monotonic() + 10
+	while len(flag._waiters) < 3 and time.monotonic() < deadline:
 		time.sleep(0.01)
 	setter = threading.Thread(target=flag.set)
 	setter.start()
@@ -17328,8 +17339,8 @@ def idle(t):
 	history's step starts there, so no commit of the writer thread's own lands in it: such a commit is a history of its own
 	('c'), and a history without it then has one outcome. (After the set-up's commit, its tick wrote the operation's lines
 	before another process's line in about 1 run in 5, and the sweep's one run of that history missed the other outcome.)'''
-	end = time.time() + 10
-	while not t._wake._waiters and time.time() < end:
+	end = time.monotonic() + 10
+	while not t._wake._waiters and time.monotonic() < end:
 		time.sleep(0.001)
 
 
@@ -17754,8 +17765,8 @@ model = {}
 i = 0
 # (reload: in 30 s, 5.14 left 2 to 11 keys apart in each of 8 runs, 3.14 and 3.6, both kinds; the file grows with every
 # set, and each reload reads it whole, so a longer run adds few reloads)
-want, end = (float('inf'), time.time() + 30) if how == 'reload' else (50, float('inf'))
-while calls[0] < want and time.time() < end:
+want, end = (float('inf'), time.monotonic() + 30) if how == 'reload' else (50, float('inf'))
+while calls[0] < want and time.monotonic() < end:
 	k = 'k%d' % i
 	t[k] = [k, str(i)]
 	model[k] = [k, str(i)]
@@ -18044,9 +18055,9 @@ def test_tsvz_serve_stops_on_a_sigterm_that_lands_as_a_connection_starts(tmp_pat
 	script.write_text(_SIGTERM_AS_A_CONNECTION_STARTS)
 	proc = subprocess.Popen([sys.executable, str(script), HERE, p], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 	try:
-		deadline = time.time() + 10
+		deadline = time.monotonic() + 10
 		while TSVZ._serveFind(p) is None:
-			assert proc.poll() is None and time.time() < deadline, proc.communicate()[1]
+			assert proc.poll() is None and time.monotonic() < deadline, proc.communicate()[1]
 			time.sleep(0.02)
 		TSVZ._ServeConnection(TSVZ._serveFind(p)).close()  # (the handler starts its thread: the SIGTERM lands there)
 		assert proc.wait(10) == 0  # (a handler stops in milliseconds; 5.14 served on for ever)
@@ -18198,8 +18209,8 @@ def _the_writer_thread_held_off(t):
 			pass
 	committer = threading.Thread(target=t._call, args=(write,), daemon=True)
 	committer.start()
-	deadline = time.time() + 10
-	while not t._writing and time.time() < deadline:  # (the writer thread took the write, and waits for the lock)
+	deadline = time.monotonic() + 10
+	while not t._writing and time.monotonic() < deadline:  # (the writer thread took the write, and waits for the lock)
 		time.sleep(0.001)
 
 	def letGo():

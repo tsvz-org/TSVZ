@@ -7,6 +7,7 @@ import lzma
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -36,8 +37,8 @@ def handler_limit(monkeypatch):
 
 def wait_gone(pid):
 	"""Return once `pid` no longer exists: a killed process is reaped when the machine gets to it, not at a set time."""
-	deadline = time.time() + 60
-	while time.time() < deadline:
+	deadline = time.monotonic() + 60
+	while time.monotonic() < deadline:
 		try:
 			os.kill(pid, 0)
 		except ProcessLookupError:
@@ -369,9 +370,9 @@ def test_check_after_fidelity_and_paths(tmp_path):
 def test_run_command_exit_output_and_timeout(tmp_path):
 	ran = tc.run_command([sys.executable, '-c', 'import sys; print(sys.stdin.read().upper()); sys.exit(3)'], str(tmp_path), 10, b'hi', str(tmp_path))
 	assert ran.exit == 3 and ran.stdout == b'HI\n' and not ran.timed_out
-	started = time.time()
+	started = time.monotonic()
 	ran = tc.run_command([sys.executable, '-c', 'import time; time.sleep(300)'], str(tmp_path), 0.5, b'', str(tmp_path), 'slow')
-	assert ran.timed_out and time.time() - started < 300, 'it waited for the child'
+	assert ran.timed_out and time.monotonic() - started < 300, 'it waited for the child'
 	assert 'cannot run' in tc.run_command(['/nonexistent/tool'], str(tmp_path), 5, b'', str(tmp_path), 'none').error
 
 
@@ -404,8 +405,13 @@ def test_two_threads_can_reap_the_same_process(tmp_path):
 	assert got == [(0, False), (0, False)]
 
 
-def _short_socket_dir():
-	return tempfile.mkdtemp(prefix='tc-', dir='/tmp')
+@pytest.fixture
+def short_dir():
+	"""A directory for a Unix socket, removed when the test ends with what a fake handler bound in it: a socket path under
+	macOS's pytest basetemp is over macOS's 104-byte limit for one (Linux's is 108). /tmp is short there (/private/tmp)."""
+	path = tempfile.mkdtemp(prefix='tc-', dir='/tmp')
+	yield path
+	shutil.rmtree(path, ignore_errors=True)
 
 
 def test_read_pointer(tmp_path):
@@ -425,8 +431,8 @@ def test_encode_arg():
 	assert tc.encode_arg('a\tb') == 'a<sep>b'
 
 
-def test_client_reads_diagnostics_status_and_bulk_requests():
-	path = os.path.join(_short_socket_dir(), 's')
+def test_client_reads_diagnostics_status_and_bulk_requests(short_dir):
+	path = os.path.join(short_dir, 's')
 	server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	server.bind(path)
 	server.listen(1)
@@ -461,8 +467,8 @@ def test_client_reads_diagnostics_status_and_bulk_requests():
 	assert got == [b'get\tk\n', b'--sync\tset\t-\n', b'a\tx\n', b'b\ty\n', b'#\n']
 
 
-def test_a_status_line_with_non_ascii_digits_is_malformed():
-	path = os.path.join(_short_socket_dir(), 's')
+def test_a_status_line_with_non_ascii_digits_is_malformed(short_dir):
+	path = os.path.join(short_dir, 's')
 	server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	server.bind(path)
 	server.listen(1)
@@ -526,15 +532,15 @@ def test_a_serve_that_forks_and_exits_leaves_nothing_running(tmp_path):
 
 
 FAKE_SERVE = r'''
-import os, socket, sys, tempfile
-args = sys.argv[1:]
+import os, socket, sys
+args = sys.argv[2:]  # (argv[1]: the test's directory for the socket, which the test removes)
 if '-V' in args:
 	print('stubborn 1.0')
 	sys.exit(0)
 if 'serve' not in args:
 	sys.exit(1)
 store = args[-1]
-path = os.path.join(tempfile.mkdtemp(prefix='tc-', dir='/tmp'), 's')
+path = os.path.join(sys.argv[1], 's%d' % os.getpid())  # (one a process: a harness may start it again)
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(path)
 server.listen(4)
@@ -552,12 +558,12 @@ while True:
 '''
 
 
-def test_a_handler_that_ignores_stop_is_killed(tmp_path):
+def test_a_handler_that_ignores_stop_is_killed(tmp_path, short_dir):
 	script = tmp_path / 'stubborn.py'
 	script.write_text(FAKE_SERVE)
 	store = tmp_path / 's.tsvz'
 	store.write_text('')
-	impl = tc.Impl('%s %s' % (shlex.quote(sys.executable), shlex.quote(str(script))))
+	impl = tc.Impl('%s %s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)), shlex.quote(short_dir)))
 	handler = tc.Handler(impl, str(store), str(tmp_path), wait=60).start()  # (only the wait after stop is under test)
 	pid = handler.proc.pid
 	handler.wait = 1
@@ -656,13 +662,13 @@ WRITES = {'id': '13.3-set-and-check', 'spec': ['13.3'], 'level': 'MUST', 'note':
 
 
 FAKE_SLOW_SERVE = r'''
-import os, socket, sys, tempfile, threading, time
-args = sys.argv[1:]
+import os, socket, sys, threading, time
+args = sys.argv[2:]  # (argv[1]: the test's directory for the socket, which the test removes)
 if '-V' in args:
 	print('slow 1.0')
 	sys.exit(0)
 store = args[-1]
-path = os.path.join(tempfile.mkdtemp(prefix='tc-', dir='/tmp'), 's')
+path = os.path.join(sys.argv[1], 's%d' % os.getpid())  # (one a process: a harness may start it again)
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(path)
 server.listen(8)
@@ -704,16 +710,50 @@ def test_a_handler_gets_the_limit_of_a_step_to_start(tmp_path, monkeypatch):
 		assert waits.pop() == want
 
 
-def test_socket_steps_obey_the_timeout(tmp_path):
+def test_a_wall_clock_jump_as_a_handler_starts_does_not_fail_the_case(tmp_path, monkeypatch):
+	# A laptop that sleeps just after the harness spawned the handler wakes with its wall clock 15 minutes on and its
+	# monotonic clock where it was (it stops in sleep, on macOS and Linux): the harness times its waits on the monotonic
+	# clock, so the start's 300 s are not taken as gone. 5.17 timed them on the wall clock, and failed the case.
+	real_time = time
+
+	class Clock(object):
+		def __init__(self):
+			self.offset = 0.0
+
+		def __getattr__(self, name):
+			return getattr(real_time, name)
+
+		def time(self):
+			return real_time.time() + self.offset
+	clock = Clock()
+	monkeypatch.setattr(tc, 'time', clock)
+	real_exited = tc._exited
+	polled = set()
+
+	def exited(proc):
+		if proc.pid not in polled:  # the first poll of a process just spawned: the host sleeps here
+			polled.add(proc.pid)
+			clock.offset += 900.0
+		return real_exited(proc)
+	monkeypatch.setattr(tc, '_exited', exited)
+	code, results = run_main(tmp_path, REF_COMMAND, '--feature', 'handler', '--mode', 'socket', '--only',
+		'10.3-strip-toggles-forward', '-j', '1')
+	result = results[('10.3-strip-toggles-forward', 'socket')]
+	assert (code, result['result']) == (0, 'pass'), result['detail']
+	assert polled and clock.offset >= 900.0  # (the jump was made)
+
+
+def test_socket_steps_obey_the_timeout(tmp_path, short_dir):
 	script = tmp_path / 'slow.py'
 	script.write_text(FAKE_SLOW_SERVE)
 	case = tc.validate_case({'id': '21.6.1-x', 'spec': ['21.6.1'], 'level': 'MUST', 'note': 'n', 'files': {'s.tsvz': 'k\tv\n'},
 		'steps': [{'request': ['get', 'k'], 'stdout': {'rows': [['k', 'v']]}}]}, 'handler', 'x')
-	ctx = tc.Context(tc.Impl('%s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)))), str(tmp_path), 1.0, frozenset(['handler']))
-	started = time.time()
+	command = '%s %s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)), shlex.quote(short_dir))
+	ctx = tc.Context(tc.Impl(command), str(tmp_path), 1.0, frozenset(['handler']))
+	started = time.monotonic()
 	result = tc.run_case(case, 'socket', ctx)
 	assert result.result == tc.FAIL and 'no response' in ' '.join(result.detail)
-	assert time.time() - started < 300, 'it waited for the answer'
+	assert time.monotonic() - started < 300, 'it waited for the answer'
 
 
 def test_expand_expect_and_step_op():
@@ -795,12 +835,12 @@ def test_the_terminal_check_obeys_the_timeout(tmp_path, monkeypatch):
 		try:
 			return real(argv, cwd, 120, *args, **kwargs)
 		finally:
-			ended.append(time.time())
+			ended.append(time.monotonic())
 	monkeypatch.setattr(tc, 'run_command', run)
 	result = tc.run_case(check, 'files', ctx)
 	# The terminal step alone, from the end of the last run_command: it ends at its 2 s deadline, not at the fake's
 	# 40 s sleep, and not at a hard-coded 30 s.
-	assert ended and time.time() - ended[-1] < 30
+	assert ended and time.monotonic() - ended[-1] < 30
 
 	assert result.result == tc.WARN and 'timed out' in ' '.join(result.detail)
 
@@ -995,8 +1035,8 @@ def test_an_interrupt_prints_the_results_so_far(tmp_path):
 	proc = subprocess.Popen([sys.executable, os.path.join(HERE, 'tsvzconform.py'), '--impl', fake(tmp_path, 'hang'),
 		'--only', '20.2-len,20.4.3-terminal-output-is-a-table', '-j', '1', '--timeout', '300', '--work-dir', str(tmp_path / 'work')],
 		cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-	deadline = time.time() + 300
-	while not (tmp_path / 'pid').exists() and time.time() < deadline:
+	deadline = time.monotonic() + 300
+	while not (tmp_path / 'pid').exists() and time.monotonic() < deadline:
 		time.sleep(0.1)
 	proc.send_signal(signal.SIGINT)
 	out, _ = proc.communicate(timeout=300)

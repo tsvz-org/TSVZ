@@ -1174,8 +1174,8 @@ def reap(proc, timeout, first_signal=signal.SIGKILL):
 	finally:
 		for timer in timers:
 			timer.cancel()
-	deadline = time.time() + 5.0
-	while proc.returncode is None and time.time() < deadline:
+	deadline = time.monotonic() + 5.0
+	while proc.returncode is None and time.monotonic() < deadline:
 		time.sleep(0.01)
 	LIVE_GROUPS.discard(pid)
 	return proc.returncode, fired.is_set()
@@ -1348,7 +1348,7 @@ class Handler(object):
 				stdout=out, stderr=err, start_new_session=True)
 		LIVE_GROUPS.add(self.proc.pid)
 		LIVE_HANDLERS.add(self)
-		deadline = time.time() + self.wait
+		deadline = time.monotonic() + self.wait
 		while True:
 			if _exited(self.proc):
 				kill_group(self.proc.pid)
@@ -1367,7 +1367,7 @@ class Handler(object):
 					return self
 				except (OSError, ConnectionError):
 					pass
-			if time.time() > deadline:
+			if time.monotonic() > deadline:
 				self.kill()
 				raise HandlerError('no valid pointer file and answer within %.0f s%s' % (self.wait, self.stderr_tail()))
 			time.sleep(0.01)
@@ -1698,13 +1698,13 @@ def run_name(case, mode):
 
 def run_case(case, mode, ctx):
 	"""Run one case in one mode and return its Result; a passing or skipped case's directory is removed."""
-	started = time.time()
+	started = time.monotonic()
 	case_dir = os.path.join(ctx.work, run_name(case, mode))
 	shutil.rmtree(case_dir, ignore_errors=True)
 	try:
 		os.makedirs(case_dir)
 	except OSError as e:
-		return Result(case, mode, ERROR, ['cannot prepare the case directory %s: %s' % (case_dir, e.strerror or e)], time.time() - started)
+		return Result(case, mode, ERROR, ['cannot prepare the case directory %s: %s' % (case_dir, e.strerror or e)], time.monotonic() - started)
 	detail = []
 	try:
 		if case.func:
@@ -1732,7 +1732,7 @@ def run_case(case, mode, ctx):
 		shutil.rmtree(case_dir, ignore_errors=True)
 	else:
 		kept = case_dir
-	return Result(case, mode, result, detail, time.time() - started, kept)
+	return Result(case, mode, result, detail, time.monotonic() - started, kept)
 
 
 # ---------------------------------------------------------------------------
@@ -1756,10 +1756,10 @@ def check_terminal_default(cx):
 		os.close(slave)
 		slave = None
 		chunks = []
-		deadline = time.time() + cx.timeout
+		deadline = time.monotonic() + cx.timeout
 		timed_out = False
 		while True:
-			left = deadline - time.time()
+			left = deadline - time.monotonic()
 			if left <= 0 or not wait_readable([master], [], [], left)[0]:
 				timed_out = True
 				kill_group(proc.pid)
@@ -1771,7 +1771,7 @@ def check_terminal_default(cx):
 			if not chunk:
 				break
 			chunks.append(chunk)
-		code, _ = reap(proc, max(0.1, deadline - time.time()))
+		code, _ = reap(proc, max(0.1, deadline - time.monotonic()))
 	finally:
 		os.close(master)
 		if slave is not None:

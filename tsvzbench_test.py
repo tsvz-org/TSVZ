@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -23,8 +24,8 @@ REF_COMMAND = '%s %s' % (shlex.quote(sys.executable), shlex.quote(REFERENCE))
 
 def wait_gone(pid):
 	"""Return once `pid` no longer exists: a killed process is reaped when the machine gets to it, not at a set time."""
-	deadline = time.time() + 60
-	while time.time() < deadline:
+	deadline = time.monotonic() + 60
+	while time.monotonic() < deadline:
 		try:
 			os.kill(pid, 0)
 		except ProcessLookupError:
@@ -269,8 +270,14 @@ def test_processes_left_in_the_group_are_killed(tmp_path):
 
 # --- the handler protocol --------------------------------------------------------------------
 
-def _short_socket_dir():
-	return tempfile.mkdtemp(prefix='tsvzb-')
+@pytest.fixture
+def short_dir():
+	"""A directory for a Unix socket, removed when the test ends with what a fake handler bound in it: one under the
+	temporary directory, whose path is short enough for a socket's (104 bytes on macOS, 108 on Linux), where one under
+	pytest's basetemp may not be."""
+	path = tempfile.mkdtemp(prefix='tsvzb-')
+	yield path
+	shutil.rmtree(path, ignore_errors=True)
 
 
 def test_request_encoding_and_response_parsing():
@@ -292,8 +299,8 @@ def test_read_pointer(tmp_path):
 	assert tb.read_pointer(store) is None
 
 
-def test_client_reads_diagnostics_and_bulk_requests():
-	path = os.path.join(_short_socket_dir(), 's')
+def test_client_reads_diagnostics_and_bulk_requests(short_dir):
+	path = os.path.join(short_dir, 's')
 	server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	server.bind(path)
 	server.listen(1)
@@ -329,8 +336,8 @@ def test_check_responses():
 	assert tb.check_responses([[b'k\tw\n', b'#0\n']], [['k', 'v']]).startswith('request 1: row 1')
 
 
-def test_concurrent_clients_against_the_dummy_server():
-	path = os.path.join(_short_socket_dir(), 's')
+def test_concurrent_clients_against_the_dummy_server(short_dir):
+	path = os.path.join(short_dir, 's')
 	pid = tb.start_dummy(path)
 	try:
 		plans = [[(b'get\tk\n', None)] * 20 for _ in range(3)]
@@ -374,10 +381,10 @@ def test_handler_that_never_starts(tmp_path):
 
 
 STUCK = r'''
-import os, socket, sys, tempfile
-args = sys.argv[1:]
+import os, socket, sys
+args = sys.argv[2:]  # (argv[1]: the test's directory for the socket, which the test removes)
 store = args[-1]
-path = os.path.join(tempfile.mkdtemp(prefix='tsvzb-'), 's')
+path = os.path.join(sys.argv[1], 's%d' % os.getpid())  # (one a process: a harness may start it again)
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(path)
 server.listen(4)
@@ -391,10 +398,10 @@ while True:
 '''
 
 
-def test_a_handler_that_ignores_stop_is_killed(tmp_path):
+def test_a_handler_that_ignores_stop_is_killed(tmp_path, short_dir):
 	script = tmp_path / 'stuck.py'
 	script.write_text(STUCK)
-	impl = tb.Impl('stuck', '%s %s' % (shlex.quote(sys.executable), shlex.quote(str(script))))
+	impl = tb.Impl('stuck', '%s %s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)), shlex.quote(short_dir)))
 	handler = tb.Handler(impl, str(tmp_path / 'h.tsvz'), str(tmp_path), 300.0)
 	handler.start()
 	sample = handler.stop(wait=0.5)
@@ -403,10 +410,10 @@ def test_a_handler_that_ignores_stop_is_killed(tmp_path):
 	wait_gone(handler.pid)
 
 
-def test_a_handler_that_ignores_sigterm_is_killed(tmp_path):
+def test_a_handler_that_ignores_sigterm_is_killed(tmp_path, short_dir):
 	script = tmp_path / 'stubborn.py'
 	script.write_text('import signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n' + STUCK)
-	impl = tb.Impl('stubborn', '%s %s' % (shlex.quote(sys.executable), shlex.quote(str(script))))
+	impl = tb.Impl('stubborn', '%s %s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)), shlex.quote(short_dir)))
 	handler = tb.Handler(impl, str(tmp_path / 'h.tsvz'), str(tmp_path), 300.0)
 	handler.start()
 	sample = handler.stop(wait=0.5)
@@ -656,13 +663,13 @@ def test_a_verify_that_checks_nothing_is_wrong(tmp_path):
 
 
 MUTE = r'''
-import os, socket, sys, tempfile
-args = sys.argv[1:]
+import os, socket, sys
+args = sys.argv[2:]  # (argv[1]: the test's directory for the socket, which the test removes)
 if '-V' in args:
 	print('mute 0')
 	sys.exit(0)
 store = args[-1]
-path = os.path.join(tempfile.mkdtemp(prefix='tsvzb-'), 's')
+path = os.path.join(sys.argv[1], 's%d' % os.getpid())  # (one a process: a harness may start it again)
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(path)
 server.listen(4)
@@ -681,7 +688,7 @@ while True:
 '''
 
 
-def test_a_handler_that_stops_answering_times_out(tmp_path, monkeypatch):
+def test_a_handler_that_stops_answering_times_out(tmp_path, monkeypatch, short_dir):
 	# (the `-V` probe and the handler's start share the 2 s timeout; on a loaded host the probe timed out and the
 	# implementation was skipped, or the handler was not up in time. The loads' own 2 s socket timeout is the
 	# harness's timeout and is unchanged.)
@@ -689,7 +696,7 @@ def test_a_handler_that_stops_answering_times_out(tmp_path, monkeypatch):
 	monkeypatch.setattr(tb, 'Handler', lambda impl, store, directory, wait=None: real_handler(impl, store, directory, 60.0))
 	script = tmp_path / 'mute.py'
 	script.write_text(MUTE)
-	command = '%s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)))
+	command = '%s %s %s' % (shlex.quote(sys.executable), shlex.quote(str(script)), shlex.quote(short_dir))
 	bench = tb.Bench(tb.parse_args(bench_argv(tmp_path, [('mute', command)], ['--only', 'perop', '--timeout', '2'])),
 		out=io.StringIO())
 	try:

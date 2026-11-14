@@ -362,6 +362,17 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
+## Upgrading to 5.18 from 5.17
+
+The file formats are unchanged, and an upgrade needs nothing.
+
+- **`tsvzconform` times its waits on the monotonic clock**, so a host that sleeps while a handler starts (a laptop) no
+  longer fails the case: a wall clock 15 minutes on at the handler's first poll failed it in 5.17 ("no valid pointer
+  file and answer within 300 s").
+- The suite times its deadlines on the monotonic clock too, and binds its test sockets in short directories that it
+  removes when each test ends (two tests failed on macOS, whose limit for a socket path is 104 bytes, and the
+  conformance and benchmark tests left a directory in `/tmp` or `$TMPDIR` for each fake handler).
+
 ## Upgrading to 5.17 from 5.16
 
 The file formats are unchanged, and an upgrade needs nothing, except in a program whose forked children should compact the
