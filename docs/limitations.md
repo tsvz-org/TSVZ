@@ -796,12 +796,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   of its steps. `writeLock` and the file lock stay held, and the next
   commit and the commit at exit wait for ever. Of 960 caught real SIGINTs a run (`gfoki`): 2 on 3.14 and 3 on 3.11
   (tmpfs), none on an XFS disk (5.17); 1 to 5, 4 to 5 and 0 to 1 on 5.18 (three runs each, two on the disk); 5.16: 3.
-  From 5.18 the rest of `release_file_obj()` lets go of everything wherever one Ctrl-C lands (run on Python 3.11 and
-  3.14).
+  From 5.18, on Python 3.11 and later, the rest of `release_file_obj()` lets go of everything wherever one Ctrl-C
+  lands (run on 3.11, 3.12 and 3.14).
   - On Python 3.6 to 3.10 the same program hangs after 14 to 22 of 960 caught Ctrl-Cs (6 to 13 on 3.11 and 3.14; 5.17:
-    330 on 3.9 and 331 on 3.6). Besides the entry and the acquire gap, a Ctrl-C there can land between two steps of
-    `get_file_obj()` or `release_file_obj()` (1 to 3 of 960 on 3.6 and 3.9), or in the program's own code between
-    `get_file_obj()`'s return and its `try` (1 to 9 of 960), which no code of TSVZ's can close.
+    330 on 3.9 and 330 on 3.6). Besides the entry and the acquire gap, a Ctrl-C there can land between two steps of
+    `get_file_obj()` or `release_file_obj()`, its read of the locked file among them (1 to 4 of 960 on 3.6 and 3.9), or
+    in the program's own code between `get_file_obj()`'s return and its `try` (1 to 9 of 960), which no code of TSVZ's
+    can close.
 - Why: `_fileObjHeld` is still True there, so no test can tell the leftover from a program that still holds the file (the
   lock-held entry's Why). `get_file_obj()` is the 3.39 compatibility API, which the store's own writes do not use, and
   this is a few in a thousand Ctrl-Cs caught in a tight loop of it.
@@ -815,25 +816,32 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### A Ctrl-C caught inside release_file_obj() before its flush loses what was written through the file
 - Kind: deferred
 - What the operator sees: a program holds the store's file with `get_file_obj()`, writes, and a Ctrl-C lands in
-  `release_file_obj()` before its flush. The clean-up lets go of the lock and closes the file without writing what its
-  buffers hold:
-  - a `'wb'` hold leaves the file empty (the take emptied it);
-  - an `'ab'` hold loses its rows;
-  - a compressed hold leaves a member cut short, which every later read skips with a warning.
+  `release_file_obj()` before its flush is done. The clean-up lets go of the lock and closes the locked file
+  without writing what its buffer holds:
+  - a `'wb'` hold leaves the file empty (the take emptied it), or, past its buffer, without the last buffer's
+    worth;
+  - an `'ab'` hold loses its rows (past its buffer, the last buffer's worth);
+  - a compressed hold cut inside its codec writer's close leaves a member cut short, which every later read skips
+    with a warning; one that still fitted its buffers leaves nothing, and no warning.
 
-  5.17 did the same at those steps, except for the first, the look at `_tsvzRaw`, where it kept `writeLock` for ever
-  instead. There the data landed only if the program then ended with nothing queued.
+  5.17 did the same. From Python 3.11 a signal lands there only inside a compressed hold's codec writer's close: a
+  plain file's hold has no step before its flush ends. On Python 3.6 to 3.10 a signal also lands between two steps
+  before the flush. There a plain file held in text mode still writes its rows after the unlock (its close
+  flushes), and in `'r+'` mode they can land on a row another process appended meanwhile, as in 5.17.
 
-  Real Ctrl-Cs, not caught, into a `get_file_obj('wb')` rewrite loop, 960 a run: the store was left empty after 122 to
-  138 in 5.17 and 5.18 alike, nearly all just after the take's truncate (`'wb'` empties the file once it is locked, as
-  `open()` does). 3 to 5 of them landed in `release_file_obj()` in 5.18, against 0 to 1 in 5.17 (Python 3.14, 3.11 and
-  3.9).
-- Why: the clean-up closes the file unflushed, so that nothing is written after the unlock. A flush first was not in
-  5.18's plan. Found by the 5.18 re-review's second opinion; not worse than 5.17.
-- Plan (5.19): flush under the lock as the clean-up's first step (the codec's writer first, for a compressed hold),
-  inside an existing `finally` link rather than a new one (a new link added hangs on 3.6 and 3.9 in 5.18's round 1), so
-  that a cut release still writes what was written through the file. Measure it with gfoki and this rewrite loop. A
-  program that retries after the `KeyboardInterrupt` may then append the rows twice; a key's later line wins.
+  Real Ctrl-Cs, not caught, into a `get_file_obj('wb')` rewrite loop of a plain `.tsv`, 960 a run: the store was
+  left empty after 103 to 158 in 5.17 and 105 to 144 in 5.18, nearly all just after the take's truncate (`'wb'`
+  empties the file once it is locked, as `open()` does). Of those, in `release_file_obj()`: none on Python 3.11 and
+  3.14 in either, and 0 to 4 on 3.6 to 3.10 in either.
+- Why: the clean-up closes the file that holds the lock unflushed, so that nothing is written through it after
+  the unlock. A flush first was not in 5.18's plan. Found by the 5.18 re-review's second opinion; the same as 5.17.
+- Plan (5.19): flush under the lock as the clean-up's first step (the codec's writer first, for a compressed
+  hold), inside an existing `finally` link rather than a new one (a new link added hangs on 3.6 and 3.9 in 5.18's
+  round 1), so that a cut release still writes what was written through the file. A codec writer's close that a
+  Ctrl-C cut cannot be run again, so that member stays cut short. Close a text file through the buffered file
+  under it, so that its close writes nothing after the unlock, and keep the error a failed flush raises there
+  today. Measure it with gfoki and this rewrite loop. A program that retries after the `KeyboardInterrupt` may
+  then append the rows twice; a key's later line wins.
 - Revisit when: 5.19.
 - Noted: 2026-11-14, found by the 5.18 re-review's second opinion; a deferral, not asked.
 
