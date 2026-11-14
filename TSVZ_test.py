@@ -21642,3 +21642,32 @@ def test_a_tsvzclient_made_before_a_fork_connects_anew_in_the_child(tmp_path, ex
 	else:
 		assert out['child'] == [['a', 'A'], ['x', 'X']], log
 		assert sorted(out['file']) == sorted(['a', 'b', 'x', 'y'] + (['q'] if case == 'queued' else [])), log
+
+
+_AN_IMPORT_WHERE_NO_THREAD_CAN_START = r"""
+import json, sys, threading
+def refuse(*args, **kwargs):
+	raise RuntimeError("can't start new thread")
+threading._start_new_thread = refuse
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+t = TSVZ.TSVZedLite(sys.argv[2], header='id\tv', verbose=False)
+t['a'] = ['a', 'A']
+print(json.dumps([t['a'], TSVZ.version]))
+t.close()
+"""
+
+
+def test_an_import_goes_on_where_no_thread_can_start(tmp_path):
+	# On Python 3.6, TSVZ starts one thread at import (so that 3.6 runs the fork hook in a program that has started none).
+	# Where no thread can start (a thread or memory limit), the import goes on without it, as before 5.18: a TSVZedLite, the
+	# one-shot calls and the command line need no thread. This means something only on 3.6, which uses that branch; on 3.7 and
+	# later it passes either way.
+	script = tmp_path / 'nothread.py'
+	script.write_text(_AN_IMPORT_WHERE_NO_THREAD_CAN_START)
+	# 60 s: the run takes about 0.1 s (3.6 to 3.14, in Docker); only a hang takes this long.
+	done = subprocess.run([sys.executable, str(script), HERE, str(tmp_path / 'n.tsvz')], stdout=subprocess.PIPE,
+						  stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	lines = [line for line in done.stdout.split('\n') if line.startswith('[')]
+	assert done.returncode == 0 and [json.loads(line) for line in lines] == [[['a', 'A'], TSVZ.version]], \
+		done.stdout + done.stderr

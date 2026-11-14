@@ -743,7 +743,8 @@ def _writeLines(file, header, lines, chunk=1 << 20, codec=None):
 
 
 def _closeUnflushed(f):
-	"""Close the open file ``f`` without writing what its buffer still holds (after a write that failed)."""
+	"""Close the open file ``f`` without writing what its buffer still holds (after a write that failed). A wrapper with no
+	``raw`` (a text or codec writer) is closed as it is: its close writes what it holds."""
 	inner = getattr(f, 'raw', None)  # the descriptor under a buffered file: closing it closes both
 	(inner if inner is not None else f).close()
 
@@ -5758,8 +5759,13 @@ elif hasattr(threading, '_after_fork'):
 	# parent's connection in the child; a TSVZed starts its writer thread, a client with no handler its engine's): start
 	# one that does nothing, and wait for it.
 	_firstThread36 = threading.Thread(target=lambda: None)
-	_firstThread36.start()
-	_firstThread36.join()
+	try:
+		_firstThread36.start()
+		_firstThread36.join()
+	except RuntimeError:
+		# (no thread can start here, at a thread or memory limit: the import goes on, and the hook runs once the program
+		# starts a thread, as before 5.18)
+		pass
 
 
 _exitArmed = False  # _stopLiveStores reached its inner try: from there on it takes a first Ctrl-C as the first
@@ -8640,9 +8646,9 @@ memoryOnly:{self.memoryOnly}
 		one still lets go of the rest (5.18); a cut unlock leaves the lock only until the close drops it. The guard reads
 		an attribute, where writeLock.locked() was a call a signal could land at, and which the writer thread's own hold
 		also answered: a second release of a file already let go of then let go of that hold. A Ctrl-C at the look at
-		``_tsvzRaw`` costs what was written through ``file`` (the file that holds the lock is closed unflushed: nothing is
-		written late). Left: a Ctrl-C at this function's entry, and just after get_file_obj() takes writeLock
-		(docs/limitations.md)."""
+		``_tsvzRaw`` costs what was written through ``file``: a codec's writer is closed after the unlock, and the file that
+		holds the lock unflushed (a member cut short at most; nothing is written after this returns). Left: a Ctrl-C at this
+		function's entry, and just after get_file_obj() takes writeLock (docs/limitations.md)."""
 		if file is None or not self._fileObjHeld:  # (outside the try: a guard cut inside it would let go of a lock it refused)
 			return
 		raw = file  # (a cut getattr leaves the file itself, whose fileno() serves the unlock)
