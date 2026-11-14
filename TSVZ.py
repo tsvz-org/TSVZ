@@ -8598,15 +8598,26 @@ memoryOnly:{self.memoryOnly}
 				self.__teePrintOrNot(f"File {self._fileName} locked with mode {modes}")
 			return file
 		except BaseException as e:
-			if locked is not None:
-				_unlockFile(locked)  # (else _HELD keeps its descriptor, and a later file with the same number looks locked)
-			if file is not None:
+			# Each step in the finally of the one before, writeLock let go of last: a Ctrl-C that cuts one still lets go of
+			# the rest (5.18). (Two if blocks, not a loop: a loop's back jump in a try body is outside its handler on 3.12+.)
+			try:
+				if locked is not None:
+					_unlockFile(locked)  # (else _HELD keeps its descriptor, and a later file with the same number looks locked)
+			finally:
 				try:
-					file.close()  # an unlocked file is never handed out
-				except Exception:
-					pass
-			self._fileObjHeld = False
-			self.writeLock.release()
+					if file is not None:
+						try:
+							file.close()  # an unlocked file is never handed out
+						except Exception:
+							pass
+					if locked is not None and locked is not file:
+						try:
+							locked.close()  # (a codec's writer leaves the file it writes into open)
+						except Exception:
+							pass
+				finally:
+					self._fileObjHeld = False
+					self.writeLock.release()
 			if not isinstance(e, Exception):
 				raise
 			self._failed('append' if 'a' in modes else 'rewrite', f"Failed to open file {self._fileName}: {e}", trace=False)
@@ -8614,11 +8625,18 @@ memoryOnly:{self.memoryOnly}
 
 	def release_file_obj(self,file):
 		"""Flush, sync, unlock and close ``file`` from get_file_obj(), note the file's time as this object's own (what was
-		written through it is not known: _known), and let go of writeLock."""
-		if file is None or not self.writeLock.locked():
+		written through it is not known: _known), and let go of writeLock.
+
+		Each step of the clean-up runs in the finally of the one before, writeLock let go of last, so a Ctrl-C that cuts
+		one still lets go of the rest (5.18); a cut unlock leaves the lock only until the close drops it. The guard reads
+		an attribute, where writeLock.locked() was a call a signal could land at, and which the writer thread's own hold
+		also answered: a second release of a file already let go of then let go of that hold. Left: a Ctrl-C at this
+		function's entry, and just after get_file_obj() takes writeLock (docs/limitations.md)."""
+		if file is None or not self._fileObjHeld:  # (outside the try: a guard cut inside it would let go of a lock it refused)
 			return
-		raw = getattr(file, '_tsvzRaw', file)
+		raw = file  # (a cut getattr leaves the file itself, whose fileno() and close() serve the clean-up)
 		try:
+			raw = getattr(file, '_tsvzRaw', file)
 			if raw is not file:
 				file.close()  # the codec's writer writes all it holds, and its trailer, into the file
 			raw.flush()
@@ -8626,14 +8644,18 @@ memoryOnly:{self.memoryOnly}
 		except Exception as e:
 			self.__teePrintOrNot(f"Failed to release file {self._fileName}: {e}",'error')
 		finally:
-			self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # noted before the unlock
-			self._known = None
-			_unlockFile(raw)
 			try:
-				_closeUnflushed(raw)
+				self._known = None  # (first: a cut look at the time then leaves a change to read whole, as another's)
+				self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # noted before the unlock
 			finally:
-				self._fileObjHeld = False
-				self.writeLock.release()
+				try:
+					_unlockFile(raw)
+				finally:
+					try:
+						_closeUnflushed(raw)  # (closing drops the lock too, where a Ctrl-C cut the unlock)
+					finally:
+						self._fileObjHeld = False
+						self.writeLock.release()
 		if self.verbose:
 			self.__teePrintOrNot(f"File {self._fileName} unlocked / released")
 

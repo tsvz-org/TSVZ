@@ -20952,3 +20952,204 @@ def test_a_rewrite_leaves_nothing_for_a_second_rewrite_where_it_weighed_a_later_
 		finally:
 			t.close()
 	assert first == second == b'id\tv\na\n'
+
+
+# --------------------------------------------------------------------------
+# 5.18: get_file_obj() and release_file_obj()'s clean-up, a TSVZedLite's .tsvz append, a TSVZClient in a forked child
+# --------------------------------------------------------------------------
+#: ARGV: TSVZ's directory, the file (.tsv, or .tsv.gz), KIND, NAME, HOW. A running store holding a. KIND release: the
+#: program holds the file (get_file_obj: 'ab', or 'a' for .tsv.gz, where the file handed out is a text writer over the
+#: locked one), writes k and lets go of it (release_file_obj); KIND except: get_file_obj('ab') of the .tsv.gz, whose codec
+#: writer fails (OSError), so its except clause lets go of the lock. A KeyboardInterrupt is raised at the clean-up's call
+#: of TSVZ.NAME, once, on the main thread: HOW in as the call begins; after, just after it returned (where a real signal
+#: lands from Python 3.11, at the end of the CALL); popped, for _unlockFile, with its _HELD entry gone and the lock not let
+#: go of yet. NAME entry, or gap: a KeyboardInterrupt at release_file_obj()'s entry, or just after get_file_obj()'s
+#: writeLock.acquire() returned (a settrace call or line event), the known limitation and the 5.19 deferral. The program
+#: catches it and goes on. Printed, as JSON: how the call ended, whether the cut was made, writeLock and _fileObjHeld after
+#: it, another process's appendTabularFile of o ('returned' or 'hung', 10 s), the store's next commit of z ('returned' or
+#: 'hung': 10 s, 3 s where a hang is what the case pins), and the file's keys.
+_A_CTRL_C_IN_THE_FILE_OBJ_CLEAN_UP = r"""
+import errno, json, os, signal, subprocess, sys, threading
+sys.path.insert(0, sys.argv[1])
+import TSVZ
+p, kind, name, how = sys.argv[2:6]
+t = TSVZ.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=60)  # (no tick writes)
+t['a'] = ['a', '1']
+t.commitAppendToFile()
+class Hung(BaseException):
+	pass
+def alarm(sig, frame):
+	raise Hung()
+signal.signal(signal.SIGALRM, alarm)
+main = threading.get_ident()
+state = {'armed': False, 'cut': False}
+def cutHere():
+	if state['armed'] and not state['cut'] and threading.get_ident() == main:
+		state['cut'] = True
+		return True
+	return False
+if name in ('entry', 'gap'):
+	import inspect
+	target = 'release_file_obj' if name == 'entry' else 'get_file_obj'
+	source, start = inspect.getsourcelines(TSVZ.TSVZed.get_file_obj)
+	acquired = start + [line.strip() for line in source].index('self.writeLock.acquire()')
+	def local(frame, event, arg):
+		if event == 'line' and frame.f_lineno == acquired + 1 and cutHere():
+			raise KeyboardInterrupt  # (the line after the acquire: the lock is taken, _fileObjHeld not set yet)
+		return local
+	def trace(frame, event, arg):
+		if event == 'call' and frame.f_code.co_name == target and frame.f_code.co_filename == TSVZ.__file__:
+			if name == 'entry':
+				if cutHere():
+					raise KeyboardInterrupt  # (the function's entry: none of its steps made)
+				return None
+			return local
+		return None
+else:
+	real = getattr(TSVZ, name)
+	def cut(*args, **kwargs):
+		if not cutHere():
+			return real(*args, **kwargs)
+		if how == 'popped':
+			TSVZ._HELD.pop(args[0].fileno(), None)
+		elif how == 'after':
+			real(*args, **kwargs)
+		raise KeyboardInterrupt
+	setattr(TSVZ, name, cut)
+out = 'returned'
+try:
+	if kind == 'except':
+		realWriter = TSVZ._compressedWriter
+		def failing(*args, **kwargs):
+			state['armed'] = True
+			raise OSError(errno.EIO, 'Input/output error')
+		TSVZ._compressedWriter = failing
+		try:
+			t.get_file_obj('ab')
+		finally:
+			TSVZ._compressedWriter = realWriter
+	else:
+		text = p.endswith('.gz')
+		if name == 'gap':
+			state['armed'] = True
+			sys.settrace(trace)
+		try:
+			f = t.get_file_obj('a' if text else 'ab')
+		finally:
+			sys.settrace(None)
+		f.write('k\t1\n' if text else b'k\t1\n')
+		state['armed'] = True
+		if name == 'entry':
+			sys.settrace(trace)
+		try:
+			t.release_file_obj(f)
+		finally:
+			sys.settrace(None)
+except KeyboardInterrupt:
+	out = 'KeyboardInterrupt'
+if name not in ('entry', 'gap'):
+	setattr(TSVZ, name, real)
+writeLock, held = t.writeLock.locked(), t._fileObjHeld
+code = 'import sys\nsys.path.insert(0, %r)\nimport TSVZ\nTSVZ.appendTabularFile(%r, ["o", "1"], header="id\\tv", verbose=False)\n' % (
+	sys.argv[1], p)
+other = 'not tried'
+if name != 'entry':  # (the entry leaves the file locked: the pin is the commit's wait)
+	try:
+		subprocess.run([sys.executable, '-c', code], timeout=10, check=True)
+		other = 'returned'
+	except subprocess.TimeoutExpired:
+		other = 'hung'
+t['z'] = ['z', '1']
+signal.alarm(3 if name in ('entry', 'gap') else 10)
+try:
+	t.commitAppendToFile()
+	commit = 'returned'
+except Hung:
+	commit = 'hung'
+signal.alarm(0)
+keys = sorted(TSVZ.readTabularFile(p, header='id\tv', verbose=False)) if commit == 'returned' else None
+print(json.dumps([out, state['cut'], writeLock, held, other, commit, keys]), flush=True)
+os._exit(0)  # (a store whose writeLock is left held would wait for it at exit)
+"""
+
+
+def _cut_file_obj_clean_up(tmp_path, suffix, kind, name, how):
+	p = str(tmp_path / ('s.tsv' + suffix))
+	script = tmp_path / 'cut.py'
+	script.write_text(_A_CTRL_C_IN_THE_FILE_OBJ_CLEAN_UP)
+	# 60 s: the run takes about a second; only a wait for ever takes this long (the script's alarms end it sooner), on a
+	# machine the suite keeps busy.
+	done = subprocess.run([sys.executable, str(script), HERE, p, kind, name, how], stdout=subprocess.PIPE,
+						  stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	lines = [line for line in done.stdout.split('\n') if line.startswith('[')]
+	assert done.returncode == 0 and lines, done.stdout + done.stderr
+	return json.loads(lines[0]), done.stdout + done.stderr
+
+
+_CLEAN_UP_CUTS = [(name, how) for name in ('_fsync', 'getFileUpdateTimeNs', '_unlockFile', '_closeUnflushed')
+				  for how in ('in', 'after') + (('popped',) if name == '_unlockFile' else ())]
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='SIGALRM')
+@pytest.mark.parametrize('name, how', _CLEAN_UP_CUTS, ids=['-'.join(cut) for cut in _CLEAN_UP_CUTS])
+@pytest.mark.parametrize('suffix', ['', '.gz'])
+def test_a_ctrl_c_caught_in_release_file_obj_lets_go_of_the_lock_and_the_file(tmp_path, suffix, name, how):
+	# A program holds the file (get_file_obj), writes, lets go of it (release_file_obj) and catches a Ctrl-C there. Each
+	# step of the clean-up now runs in the finally of the one before, writeLock let go of last: 5.17 left writeLock held at
+	# a cut look at the file's time or a cut unlock (329 of 960 real Ctrl-Cs in a tight loop), and the store's next commit,
+	# and the one at exit, waited for ever. A cut unlock leaves the lock until the close, which drops it.
+	(out, cut, writeLock, held, other, commit, keys), log = _cut_file_obj_clean_up(tmp_path, suffix, 'release', name, how)
+	assert cut and out == 'KeyboardInterrupt', log
+	assert (writeLock, held, other, commit) == (False, False, 'returned', 'returned'), log
+	assert keys == ['a', 'k', 'o', 'z'], log
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='SIGALRM')
+@pytest.mark.parametrize('how', ['in', 'after', 'popped'])
+def test_a_ctrl_c_in_get_file_objs_clean_up_after_a_failed_open_lets_go_of_the_lock(tmp_path, how):
+	# get_file_obj('ab') of a compressed file whose codec writer fails lets go of the file lock, the files and writeLock in
+	# its except clause, each step in the finally of the one before: 5.17's unlock there was unprotected, and a Ctrl-C in it
+	# left writeLock held.
+	(out, cut, writeLock, held, other, commit, keys), log = _cut_file_obj_clean_up(tmp_path, '.gz', 'except', '_unlockFile', how)
+	assert cut and out == 'KeyboardInterrupt', log
+	assert (writeLock, held, other, commit) == (False, False, 'returned', 'returned'), log
+	assert keys == ['a', 'o', 'z'], log
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='SIGALRM')
+@pytest.mark.parametrize('name', ['entry', 'gap'])
+def test_a_ctrl_c_at_release_file_objs_entry_or_get_file_objs_acquire_still_leaves_writelock_held(tmp_path, name):
+	# Pins: the known limitation "A Ctrl-C caught as release_file_obj() begins can leave writeLock held" (entry) and the 5.19
+	# deferral "A Ctrl-C caught just as get_file_obj() takes writeLock leaves it held" (gap): the store's next commit waits
+	# for ever (3 s here). A change that ends one fails here, and its entry changes with it.
+	(out, cut, writeLock, held, other, commit, keys), log = _cut_file_obj_clean_up(tmp_path, '', 'release', name, '-')
+	assert cut and out == 'KeyboardInterrupt', log
+	assert (writeLock, held, commit) == (True, name == 'entry', 'hung'), log
+
+
+def test_a_second_release_file_obj_of_a_file_let_go_of_leaves_another_threads_writelock(tmp_path):
+	# release_file_obj() asks whether get_file_obj() holds the file (_fileObjHeld), not whether writeLock is held: the
+	# writer thread holds it for its own writes, and a second release of a file already let go of then let go of that hold.
+	p = str(tmp_path / 'twice.tsv')
+	t = _stopped(p)
+	f = t.get_file_obj('ab')
+	f.write(b'a\t1\n')
+	t.release_file_obj(f)
+	held, done = threading.Event(), threading.Event()
+
+	def other():
+		with t.writeLock:  # (the writer thread's write)
+			held.set()
+			done.wait(10)
+	B = threading.Thread(target=other)
+	B.start()
+	try:
+		assert held.wait(10)
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			t.release_file_obj(f)
+		assert t.writeLock.locked(), 'the second release let go of the writeLock another thread holds'
+	finally:
+		done.set()
+		B.join()
+	t.close()
+

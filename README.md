@@ -366,6 +366,16 @@ damaged file, as asked, and warns.
 
 The file formats are unchanged, and an upgrade needs nothing.
 
+- **A Ctrl-C caught in `release_file_obj()`, or in `get_file_obj()`'s clean-up after a failed open, no longer leaves the
+  store's write lock held.** Each step of the clean-up runs in the `finally` of the one before, the lock let go of last.
+  A program that holds the file in a tight loop and catches real Ctrl-Cs, 960 a run: the store's next commit waited for
+  ever after 329 on Python 3.14 and 312 on 3.11 (tmpfs), and 43 on an XFS disk (3.14); now after 9, 12 and 1, each a
+  Ctrl-C at `release_file_obj()`'s entry
+  ([known](docs/limitations.md#a-ctrl-c-caught-as-release_file_obj-begins-can-leave-writelock-held-and-the-stores-next-commit-then-waits-for-ever))
+  or just as `get_file_obj()` takes the lock
+  ([planned for 5.19](docs/limitations.md#a-ctrl-c-caught-just-as-get_file_obj-takes-writelock-leaves-it-held-and-the-stores-next-commit-then-waits-for-ever)).
+  A second `release_file_obj()` of a file already let go of no longer lets go of the lock the writer thread holds for
+  its own write, and a failed `get_file_obj()` of a compressed file also closes the file under its codec's writer.
 - **`tsvzconform` times its waits on the monotonic clock**, so a host that sleeps while a handler starts (a laptop) no
   longer fails the case: a wall clock 15 minutes on at the handler's first poll failed it in 5.17 ("no valid pointer
   file and answer within 300 s").
@@ -492,7 +502,9 @@ handler makes inside a store's own write returns where the store has no writer t
   keeps from its parent's failed rewrite; a `TSVZedLite` on a `.tsvz` file whose caught Ctrl-C leaves its file
   append-locked until it closes ([deferred](docs/limitations.md#a-ctrl-c-that-a-tsvzedlite-catches-in-a-tsvz-write-can-leave-its-file-append-locked-until-it-closes); 5.16 the same); a program that holds the file with
   `get_file_obj()`, lets go of it in a `finally` and catches a Ctrl-C there, which can leave `writeLock` held, so that
-  the store's next commit waits for ever ([deferred](docs/limitations.md#a-ctrl-c-caught-just-as-get_file_obj-takes-writelock-leaves-it-held-and-the-stores-next-commit-then-waits-for-ever); 5.16 the same); two test gaps (a
+  the store's next commit waits for ever (5.16 the same; from 5.18 only a Ctrl-C just as `get_file_obj()` takes the lock,
+  [planned for 5.19](docs/limitations.md#a-ctrl-c-caught-just-as-get_file_obj-takes-writelock-leaves-it-held-and-the-stores-next-commit-then-waits-for-ever),
+  and one as `release_file_obj()` begins, [known](docs/limitations.md#a-ctrl-c-caught-as-release_file_obj-begins-can-leave-writelock-held-and-the-stores-next-commit-then-waits-for-ever)); two test gaps (a
   real-signal test's count of handler calls under load, and the round's test of the rewrite's and `clear()`'s half of the
   fix; [deferred](docs/limitations.md#test-gaps-the-review-of-517s-third-fix-round-leaves)); and, before the put-off grows to sets, deletes, pops and moves, a design check
   against a store that stops running its writes on the calling thread. A candidate for 5.18, to be measured: a `writeLock`

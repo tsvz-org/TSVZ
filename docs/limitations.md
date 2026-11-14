@@ -792,37 +792,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 5.18.
 - Noted: 2026-11-12, found by the review of the third fix round; a deferral, not asked.
 
-### A Ctrl-C caught in release_file_obj()'s or get_file_obj()'s clean-up can leave writeLock held, and the store's next commit then waits for ever
-- Kind: deferred
-- What the operator sees: a program holds the store's file with `get_file_obj('ab')`, writes, lets go of it with
-  `release_file_obj(f)` in a `finally`, and catches `KeyboardInterrupt` and goes on. A Ctrl-C that lands in
-  `release_file_obj`'s guard (its `writeLock.locked()` call) or `finally` before its nested `try` (in
-  `getFileUpdateTimeNs()`, or in `_unlockFile`) leaves `writeLock` held, and usually the file locked. The store's next
-  commit, on its writer thread, then waits for ever, and so does the commit at exit. Real SIGINTs from another process
-  into a `get_file_obj()`/`release_file_obj()` loop of a running `.tsv` store, caught, 960 each (the 5.17 re-review's
-  `gfoki`): the next commit hung after 329 on 3.14 and 312 on 3.11 (files on tmpfs), 43 (4.5%) on 3.14 with the files on
-  an XFS disk, where an fsync takes real time (16 in `getFileUpdateTimeNs`, 12 in `_unlockFile`, 15 at `get_file_obj`'s
-  acquire gap), and 311 on 5.16 (3.14, tmpfs). Those counts include the landings of the two entries after this one (the
-  acquire gap and the function's entry). `get_file_obj`, `release_file_obj` and `_startWrite` are the same text in 5.16
-  and 5.17. (A second Ctrl-C, or an error and a Ctrl-C, inside `get_file_obj`'s `except` clause leaves the same:
-  `_unlockFile(locked)` there is unprotected.)
-- Why: not worse than 5.16, and a Ctrl-C landing in the code that takes or lets go of a lock is the family of the
-  approved lock-held limitation; found by the review of the third fix round.
-- Plan (5.18): fix at source. Nest `release_file_obj`'s `finally` (the time noted, then the unlock, then the close, then
-  `_fileObjHeld = False` and `writeLock.release()` last, innermost), and `get_file_obj`'s `except` path the same: one
-  Ctrl-C anywhere in them then still lets go of everything. That closes about 319 of the 329 hangs on tmpfs and 28 of
-  the 43 on disk, estimated from where the Ctrl-Cs landed (not built when this was written); the rest are the two entries
-  after this one.
-- Revisit when: 5.18.
-- Noted: 2026-11-12, found by the review of the third fix round (a second opinion's lead, run); a deferral, not asked.
-  Split 2026-11-13 into this entry and the two after it, and its counts corrected from the run's output.
-
 ### A Ctrl-C caught just as get_file_obj() takes writeLock leaves it held, and the store's next commit then waits for ever
 - Kind: deferred
-- What the operator sees: the program of the entry above. A Ctrl-C lands just after `writeLock.acquire()` returns and
-  before `_fileObjHeld` is set: 8 of 960 on 3.14 and 9 on 3.11 (tmpfs), 15 on disk (the writer thread held `writeLock`
-  for its own fsync), and 8 on 5.16 (the 5.17 re-review's `gfoki`). Nothing lets go of the lock, so the writer thread's
-  next commit waits for ever, and so does the commit at exit.
+- What the operator sees: a program holds the store's file with `get_file_obj('ab')`, writes, lets go of it with
+  `release_file_obj(f)` in a `finally`, and catches `KeyboardInterrupt` and goes on (real SIGINTs from another process
+  into such a loop of a running `.tsv` store, caught, 960 a run: the 5.17 re-review's `gfoki`). A Ctrl-C lands just after
+  `writeLock.acquire()` returns and before `_fileObjHeld` is set: 8 of 960 on 3.14 and 9 on 3.11 (tmpfs), 15 on disk (the writer thread held `writeLock`
+  for its own fsync), and 8 on 5.16; 6, 8 and none on 5.18. Nothing lets go of the lock, so the writer thread's next
+  commit waits for ever, and so does the commit at exit. (From 5.18 a Ctrl-C anywhere else in `get_file_obj()`'s and
+  `release_file_obj()`'s clean-up lets go of everything: 5.17 hung after 329, 312 and 43 of these 960.)
 - Why: no `try` can tell this hold from a real one (by reading). On the main thread, a record written after `acquire()`
   returns has the same gap (by reading). A blocking `acquire()` that a signal interrupts raises without taking the lock
   (run on 3.6 to 3.14), so an `except` clause cannot tell a lock it took from one it never got.
@@ -848,10 +826,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A Ctrl-C caught as release_file_obj() begins can leave writeLock held, and the store's next commit then waits for ever
 - Kind: known limitation
-- What the operator sees: the program of the entries above. A Ctrl-C lands at `release_file_obj()`'s entry (a function's
+- What the operator sees: the program of the entry above. A Ctrl-C lands at `release_file_obj()`'s entry (a function's
   entry takes a signal from Python 3.11), before any of its steps. `writeLock` and the file lock stay held, and the next
-  commit and the commit at exit wait for ever. Of 960 caught real SIGINTs a run (the 5.17 re-review's `gfoki`): 2 on
-  3.14 and 3 on 3.11 (tmpfs), none on an XFS disk; 5.16: 3.
+  commit and the commit at exit wait for ever. Of 960 caught real SIGINTs a run (`gfoki`): 2 on 3.14 and 3 on 3.11
+  (tmpfs), none on an XFS disk (5.17); 3, 4 and 1 on 5.18; 5.16: 3. From 5.18 the rest of `release_file_obj()` lets go of
+  everything wherever one Ctrl-C lands.
 - Why: `_fileObjHeld` is still True there, so no test can tell the leftover from a program that still holds the file (the
   lock-held entry's Why). `get_file_obj()` is the 3.39 compatibility API, which the store's own writes do not use, and
   this is a few in a thousand Ctrl-Cs caught in a tight loop of it.
