@@ -50,9 +50,9 @@ def say(word):
 	sys.stdout.flush()
 
 def released(path):
-	end = time.time() + 30
+	end = time.monotonic() + 30
 	while not os.path.exists(path):
-		if time.time() > end:
+		if time.monotonic() > end:
 			sys.exit(2)
 		time.sleep(0.01)
 '''.format(here=HERE)
@@ -293,14 +293,14 @@ SAME_THREAD = r'''
 p = ARGS[0]
 f = open(p, 'r+b')
 T._lockFile(f, T._REWRITE)
-start = time.time()
+start = time.monotonic()
 with T._readLock(p):
 	inside = len(T._HELD)
-say('own %s %d' % ('fast' if time.time() - start < 2 else 'slow', inside))
+say('own %s %d' % ('fast' if time.monotonic() - start < 2 else 'slow', inside))
 done = []
 def other():
 	with T._readLock(p):
-		done.append(time.time())
+		done.append(time.monotonic())
 t = threading.Thread(target=other)
 t.start()
 t.join(0.5)
@@ -394,8 +394,8 @@ def test_a_forked_child_does_not_keep_a_lock_its_parent_held(tmp_path, mode, kin
 		finally:
 			os._exit(0)
 	try:
-		end = time.time() + 10
-		while not os.path.exists(p + '.unlocked') and time.time() < end:
+		end = time.monotonic() + 10
+		while not os.path.exists(p + '.unlocked') and time.monotonic() < end:
 			time.sleep(0.01)
 		assert _other(p, how) == 'busy', "the forked child's unlock dropped the parent's lock"
 		release.set()
@@ -871,8 +871,8 @@ def test_ctrl_c_at_close_of_a_store_with_a_queued_row_ends_after_three(tmp_path,
 		time.sleep(0.5)
 		assert store.poll() is None, b''.join(seen)
 		store.send_signal(signal.SIGINT)
-		deadline = time.time() + 120
-		while time.time() < deadline and not any(b'being finished' in line for line in seen):
+		deadline = time.monotonic() + 120
+		while time.monotonic() < deadline and not any(b'being finished' in line for line in seen):
 			time.sleep(0.02)
 		assert any(b'being finished' in line for line in seen), b''.join(seen)
 		time.sleep(0.5)
@@ -1020,8 +1020,8 @@ sys.path.insert(0, here)
 import TSVZ as T
 t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=True, append_check_delay=0.001)
 os.write(2, b'open\n')
-end = time.time() + 60
-while not os.path.exists(p + '.go') and time.time() < end:
+end = time.monotonic() + 60
+while not os.path.exists(p + '.go') and time.monotonic() < end:
 	time.sleep(0.01)
 os.write(2, b'exiting\n')
 """
@@ -1040,8 +1040,8 @@ def test_a_writer_thread_inside_a_print_at_exit_does_not_abort_the_program(tmp_p
 
 		def held():
 			return struct.unpack('i', fcntl.ioctl(proc.stdout.fileno(), termios.FIONREAD, b'\0' * 4))[0]
-		end, n = time.time() + 60, 0
-		while held() < 3500 and time.time() < end:  # (each change seen is a print: the pipe fills, and the next one stops in it)
+		end, n = time.monotonic() + 60, 0
+		while held() < 3500 and time.monotonic() < end:  # (each change seen is a print: the pipe fills, and the next one stops in it)
 			n += 1
 			with open(p, 'ab') as f:
 				f.write(b'n%d\t%d\n' % (n, n))
@@ -1195,9 +1195,9 @@ SETTER = r'''
 p, seconds = ARGS[0], float(ARGS[1])
 t = T.TSVZed(p, header='id\tv', rewrite_on_load=False, verbose=False, append_check_delay=0.001)
 say('started')
-end = time.time() + seconds
+end = time.monotonic() + seconds
 i = 0
-while time.time() < end:
+while time.monotonic() < end:
 	t['s%d-%d' % (os.getpid(), i % 50)] = ['x', str(i)]
 	i += 1
 	time.sleep(0.001)
@@ -1353,15 +1353,15 @@ def test_a_header_check_waits_out_another_process_compressed_rewrite(tmp_path, k
 LOOP_READER = r'''
 p, seconds = ARGS[0], float(ARGS[1])
 say('reading')
-end = time.time() + seconds
-while time.time() < end:
+end = time.monotonic() + seconds
+while time.monotonic() < end:
 	T.readTabularFile(p, header='id\tv', strict=False)
 '''
 
 APPEND_TIMED = r'''
-start = time.time()
+start = time.monotonic()
 T.appendTabularFile(ARGS[0], ['zz', 'appended'], header='id\tv')
-say('%.2f' % (time.time() - start))
+say('%.2f' % (time.monotonic() - start))
 '''
 
 

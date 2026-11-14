@@ -44,10 +44,10 @@ if os.name == 'nt':
 elif os.name == 'posix':
 	import fcntl
 
-version = '5.17'
+version = '5.18'
 __version__ = version
 author = 'pan@zopyr.us'
-COMMIT_DATE = '2026-11-12'
+COMMIT_DATE = '2026-11-14'
 
 DEFAULT_DELIMITER = '\t'
 DEFAULTS_INDICATOR_KEY = '#_defaults_#'
@@ -743,7 +743,8 @@ def _writeLines(file, header, lines, chunk=1 << 20, codec=None):
 
 
 def _closeUnflushed(f):
-	"""Close the open file ``f`` without writing what its buffer still holds (after a write that failed)."""
+	"""Close the open file ``f`` without writing what its buffer still holds (after a write that failed). A wrapper with no
+	``raw`` (a text or codec writer) is closed as it is: its close writes what it holds."""
 	inner = getattr(f, 'raw', None)  # the descriptor under a buffered file: closing it closes both
 	(inner if inner is not None else f).close()
 
@@ -5730,19 +5731,22 @@ _LIVE_STORES = weakref.WeakValueDictionary()
 
 def _storesAfterFork():
 	"""In a child that fork() made, before any of its code runs: the in-process and file locks it inherits
-	(_locksAfterFork), and each live store (_afterFork)."""
+	(_locksAfterFork), each live store (_afterFork), and each TSVZClient (TSVZClient._afterFork, 5.18)."""
 	_locksAfterFork()
 	for store in list(_LIVE_STORES.values()):
 		store._afterFork()
+	for client in list(_CLIENTS.values()):
+		client._afterFork()
 
 
 if hasattr(os, 'register_at_fork'):  # Python 3.7+
 	os.register_at_fork(after_in_child=_storesAfterFork)
 elif hasattr(threading, '_after_fork'):
-	# Python 3.6 has no os.register_at_fork, but os.fork() runs threading._after_fork() in every child (PyOS_AfterFork):
-	# the hook goes there (the user's pick, 2026-11-10). 3.6 is frozen, so this private name cannot change under it. A
-	# library that later replaces it without calling it turns this off: such a child writes nothing at its close and
-	# exit, and says so (TSVZed._commitsAtClose).
+	# Python 3.6 has no os.register_at_fork, but os.fork() runs threading._after_fork() in the child (PyOS_AfterFork), once
+	# the process has started a thread (3.6 sets its threads up at the first thread start: before that, os.fork() does
+	# not call it): the hook goes there (the user's pick, 2026-11-10). 3.6 is frozen, so this private name cannot change
+	# under it. A library that later replaces it without calling it turns this off: such a child writes nothing at its
+	# close and exit, and says so (TSVZed._commitsAtClose).
 	_threadingAfterFork = threading._after_fork
 
 	def _afterFork36():
@@ -5751,6 +5755,17 @@ elif hasattr(threading, '_after_fork'):
 		finally:
 			_storesAfterFork()
 	threading._after_fork = _afterFork36
+	# A program that has started no thread yet is reached too (5.18: a served TSVZClient in such a program shared its
+	# parent's connection in the child; a TSVZed starts its writer thread, a client with no handler its engine's): start
+	# one that does nothing, and wait for it.
+	_firstThread36 = threading.Thread(target=lambda: None)
+	try:
+		_firstThread36.start()
+		_firstThread36.join()
+	except RuntimeError:
+		# (no thread can start here, at a thread or memory limit: the import goes on, and the hook runs once the program
+		# starts a thread, as before 5.18)
+		pass
 
 
 _exitArmed = False  # _stopLiveStores reached its inner try: from there on it takes a first Ctrl-C as the first
@@ -8585,6 +8600,7 @@ memoryOnly:{self.memoryOnly}
 				file = openFileAsCompressed(self._fileName, mode=modes, encoding=self.encoding, teeLogger=self.teeLogger)
 			_lockFile(file, mode=_APPEND if 'a' in modes else _REWRITE)
 			locked = file
+			file._tsvzRaw = None  # (None: this file itself holds the lock; release_file_obj() reads it with no call)
 			if 'w' in modes:
 				file.truncate(0)
 				file = _compressedWriter(self._fileName, file) or file
@@ -8598,15 +8614,26 @@ memoryOnly:{self.memoryOnly}
 				self.__teePrintOrNot(f"File {self._fileName} locked with mode {modes}")
 			return file
 		except BaseException as e:
-			if locked is not None:
-				_unlockFile(locked)  # (else _HELD keeps its descriptor, and a later file with the same number looks locked)
-			if file is not None:
+			# Each step in the finally of the one before, writeLock let go of last: a Ctrl-C that cuts one still lets go of
+			# the rest (5.18). (Two if blocks, not a loop: a loop adds a back jump, one more step a signal lands at.)
+			try:
+				if locked is not None:
+					_unlockFile(locked)  # (else _HELD keeps its descriptor, and a later file with the same number looks locked)
+			finally:
 				try:
-					file.close()  # an unlocked file is never handed out
-				except Exception:
-					pass
-			self._fileObjHeld = False
-			self.writeLock.release()
+					if file is not None:
+						try:
+							file.close()  # an unlocked file is never handed out
+						except Exception:
+							pass
+					if locked is not None and locked is not file:
+						try:
+							locked.close()  # (a codec's writer leaves the file it writes into open)
+						except Exception:
+							pass
+				finally:
+					self._fileObjHeld = False
+					self.writeLock.release()
 			if not isinstance(e, Exception):
 				raise
 			self._failed('append' if 'a' in modes else 'rewrite', f"Failed to open file {self._fileName}: {e}", trace=False)
@@ -8614,26 +8641,45 @@ memoryOnly:{self.memoryOnly}
 
 	def release_file_obj(self,file):
 		"""Flush, sync, unlock and close ``file`` from get_file_obj(), note the file's time as this object's own (what was
-		written through it is not known: _known), and let go of writeLock."""
-		if file is None or not self.writeLock.locked():
+		written through it is not known: _known), and let go of writeLock.
+
+		Each step of the clean-up runs in the finally of the one before, writeLock let go of last, so a Ctrl-C that cuts
+		one still lets go of the rest (5.18); a cut unlock leaves the lock only until the close drops it. The guard reads
+		an attribute, where writeLock.locked() was a call a signal could land at, and which the writer thread's own hold
+		also answered: a second release of a file already let go of then let go of that hold. The file that holds the lock
+		(``file``, or its ``_tsvzRaw`` under a codec's writer) is read before the clean-up with no call, so from Python 3.11
+		no Ctrl-C lands between this function's entry and its first step, and the clean-up always unlocks and closes that
+		file. Left: a Ctrl-C at this function's entry, and just after get_file_obj() takes writeLock (docs/limitations.md)."""
+		if file is None or not self._fileObjHeld:  # (outside the try: a guard cut inside it would let go of a lock it refused)
 			return
-		raw = getattr(file, '_tsvzRaw', file)
+		try:  # (attribute reads, no call: from Python 3.11 no signal lands between the entry and the first step below)
+			raw = file._tsvzRaw  # the locked file under a codec's writer; None: ``file`` holds the lock itself
+		except AttributeError:
+			raw = None  # (a file get_file_obj() did not hand out: taken as the locked file)
+		if raw is None:
+			raw = file
 		try:
-			if raw is not file:
+			if raw is file:
+				raw.flush()  # (the first step, with no jump taken before it: on Python 3.10 a taken jump is a step a signal lands at)
+			else:
 				file.close()  # the codec's writer writes all it holds, and its trailer, into the file
-			raw.flush()
+				raw.flush()
 			_fsync(raw.fileno())
 		except Exception as e:
 			self.__teePrintOrNot(f"Failed to release file {self._fileName}: {e}",'error')
 		finally:
-			self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # noted before the unlock
-			self._known = None
-			_unlockFile(raw)
 			try:
-				_closeUnflushed(raw)
+				self._known = None  # (first: a cut look at the time then leaves a change to read whole, as another's)
+				self.externalFileUpdateTime = getFileUpdateTimeNs(self._fileName)  # noted before the unlock
 			finally:
-				self._fileObjHeld = False
-				self.writeLock.release()
+				try:
+					_unlockFile(raw)
+				finally:
+					try:
+						_closeUnflushed(raw)  # (closing drops the lock too, where a Ctrl-C cut the unlock)
+					finally:
+						self._fileObjHeld = False
+						self.writeLock.release()
 		if self.verbose:
 			self.__teePrintOrNot(f"File {self._fileName} unlocked / released")
 
@@ -8958,20 +9004,45 @@ class TSVZedLite(MutableMapping):
 		self._specWrite(_specFormatRecord(value, self.delimiter, marker=True))
 
 	def _specWrite(self, line):
-		"""Append one record (or lines written together) to the active part; return its offset, or None for a compressed part."""
+		"""Append one record (or lines written together) to the active part; return its offset, or None for a compressed part.
+
+		The append opens the part for itself, and its lock goes with that descriptor's close: a Ctrl-C that cuts the append's
+		clean-up still drops it (5.18; through the kept fileObj, which lives on, 5.17 left the part append-locked until the
+		Lite closed, and its own clear_file() and other processes' appends waited). It does so only while the path still names
+		the file the Lite keeps open, since a row's offset is read through that file (_specAppendOwn): once the path names
+		another (an os.chdir() away from a relative path, a rename, a removal or a replace) the append goes through the kept
+		file, as 5.17's did. The kept fileObj drops what it read ahead."""
 		data = _encodeText(line + '\n', 'utf-8', self.errors)
 		reporter = _Reporter(self._activePath)
 		try:
 			if self.fileObj is None:
 				_specAppendPayload(self._activePath, data, reporter, memberSize=self._specState.memberSize)
 				return None
-			size = _specAppendTo(self.fileObj, self._activePath, data, reporter)[0]
+			size = self._specAppendOwn(data, reporter)
 		finally:
-			reporter.flush()
+			try:
+				if self.fileObj is not None:
+					self.fileObj.seek(0, os.SEEK_END)  # (drops what it had read ahead: the append may have been made through another descriptor)
+			finally:
+				reporter.flush()
 		if not self._transStates or self._specState.rowState is not self._transStates[-1]:
 			self._transOffsets.append(size)
 			self._transStates.append(self._specState.rowState)
 		return size
+
+	def _specAppendOwn(self, data, reporter):
+		"""``_specAppendTo`` the kept part: through a descriptor of its own while the path names that file (opened without
+		creating), else through the kept ``fileObj``. A part that cannot be opened (made read-only, or gone) takes the
+		second way too."""
+		try:
+			own = open(self._activePath, 'r+b')
+		except OSError:
+			own = None
+		if own is not None:
+			with own:  # (its close drops the lock whatever step a Ctrl-C cuts)
+				if os.path.sameopenfile(own.fileno(), self.fileObj.fileno()):  # (device and inode; raises for a closed Lite)
+					return _specAppendTo(own, self._activePath, data, reporter, memberSize=self._specState.memberSize)[0]
+		return _specAppendTo(self.fileObj, self._activePath, data, reporter, memberSize=self._specState.memberSize)[0]
 
 	def setDefaults(self,defaults):
 		defaults = _normalizeDefaults(defaults, self.delimiter)
@@ -9492,6 +9563,8 @@ def _partRows(store, reporter):
 
 #: Writers not closed yet; ``_serveCloseWriters`` closes them when the interpreter exits.
 _SERVE_OPEN_WRITERS = weakref.WeakSet()
+#: Every TSVZClient, by id() (a mapping is not hashable): the fork hook gives each a connection of its own in the child.
+_CLIENTS = weakref.WeakValueDictionary()
 
 
 def _serveCloseWriters():
@@ -10897,6 +10970,17 @@ def _serveHoldSignals():
 	return lambda: [signal.signal(number, old) for number, old in saved]
 
 
+class _Unconnected(object):
+	"""A forked child's TSVZClient before its first request there: nothing to close (the parent's connection and engine
+	stay the parent's)."""
+
+	def close(self):
+		pass
+
+
+_UNCONNECTED = _Unconnected()
+
+
 class TSVZClient(MutableMapping):
 	"""A store kept by ``tsvz serve`` (spec §21), as a mapping with ``TSVZed``'s semantics.
 
@@ -10938,6 +11022,18 @@ class TSVZClient(MutableMapping):
 		self._lock = _SectionLock()  # (never nested: a hold found at a request's start is a Ctrl-C's, see _SectionLock)
 		self._cut = False  # a Ctrl-C cut the last request on the connection: its reply may still come (_request)
 		self._connect()
+		_CLIENTS[id(self)] = self
+
+	def _afterFork(self):
+		"""In a child that fork() made (_storesAfterFork): the connection, or the local engine, is the parent's. A request
+		on the parent's connection could read the answer to the parent's (5.17: the parent's next read got the child's row),
+		and the local engine's writer thread is not here (5.17: the child's first write waited for ever). The next request
+		connects anew, as after a cut one (_request): a connection of its own, or an engine of its own that reads the file
+		afresh. The parent's are dropped, and nothing of theirs is written here (the exit's close of the writer copy joins a
+		thread that is not in the child). The lock is new too: a thread of the parent's may have held it at the fork."""
+		self._lock = _SectionLock()
+		if self._backend is not None:  # (a closed client stays closed)
+			self._backend, self._cut = _UNCONNECTED, True
 
 	def _connect(self):
 		info, problem = _serveLookup(self._fileName)

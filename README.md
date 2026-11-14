@@ -7,7 +7,7 @@ key-value store in a delimiter-separated text file**. The first column of each
 row is the key; the file behaves like an ordered dictionary that is persisted to
 disk as you change it.
 
-**Version 5.17**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
+**Version 5.18**, Python **3.6+**, one self-contained module (`TSVZ.py`): drop it
 next to your code and `import TSVZ`, or install it.
 
 ```bash
@@ -202,7 +202,8 @@ with TSVZ.TSVZClient('people.tsvz') as people:  # served, or in this process whe
 `setDefaults`. Its writes return once they are written (raising `OSError` if they
 cannot be), one client may be shared between threads, and without a server it
 warns once and works on the files in-process, finishing its writes when the
-program exits. A server of a `.tsv`-family file names its delimiter in
+program exits. A client used in a child that `fork()` made connects anew (or opens its
+own engine) at its first request there (5.18). A server of a `.tsv`-family file names its delimiter in
 `STORE.serve`, and `TSVZClient` splits string values on it.
 
 ## Fault tolerance
@@ -251,20 +252,29 @@ raises `KeyboardInterrupt`). At exit a write in progress is
 finished: a Ctrl-C then says so and keeps waiting, and a second one abandons it. A
 closed store is freed. (`get_file_obj()` and `release_file_obj()`, kept from 3.39,
 hand the locked file to the calling thread; while it holds it, that thread must not wait
-on another store of the same file, whose thread waits for this lock.) A store with no
-background thread (after `close()`, or in a child that `fork()` made) writes in the
-thread that asks, one call at a time; a call that a signal handler makes to that store
-inside such a write is made as soon as the write ends, unless a Ctrl-C ended it (which
+on another store of the same file, whose thread waits for this lock. A Ctrl-C caught as
+`release_file_obj()` begins, or just as `get_file_obj()` takes the lock, can leave the
+lock held, and the store's next commit then waits for ever
+([known](docs/limitations.md#a-ctrl-c-caught-as-release_file_obj-begins-can-leave-writelock-held-and-the-stores-next-commit-then-waits-for-ever),
+[planned for 5.19](docs/limitations.md#a-ctrl-c-caught-just-as-get_file_obj-takes-writelock-leaves-it-held-and-the-stores-next-commit-then-waits-for-ever)).)
+A store with no background thread (after `close()`, or in a child that `fork()` made)
+writes in the thread that asks, one call at a time, so a Ctrl-C in its `rewrite()`,
+`mapToFile()` or `hardMapToFile()` can leave a `.tsv`-family file damaged and a
+compressed one unreadable, until the next rewrite makes it again from memory
+([known](docs/limitations.md#a-write-after-close-or-in-a-forked-child-can-be-cut-by-a-ctrl-c)).
+A call that a signal handler makes to that store inside such a write is made as soon as
+the write ends, unless a Ctrl-C ended it (which
 drops it, and a commit's rows stay queued for the next commit), and returns at once
 (5.17; it waited for ever before). What the handler does to the store after such a call
 happens before it: a set after its own `clear()` is lost when the clear is made, and a
-read after its `reload()` sees the old row ([deferred to 5.18](docs/limitations.md#a-signal-handlers-set-inside-a-forked-childs-or-a-closed-stores-own-write-can-leave-memory-apart-from-the-file)).
+read after its `reload()` sees the old row ([deferred to 5.19](docs/limitations.md#a-signal-handlers-set-inside-a-forked-childs-or-a-closed-stores-own-write-can-leave-memory-apart-from-the-file)).
 A handler that ends the process by `os._exit()` after such a call loses the call: end by
 `sys.exit()`, which makes it first
 ([known](docs/limitations.md#a-call-a-signal-handler-puts-off-inside-a-stores-own-write-is-lost-when-the-handler-ends-the-process-by-os_exit)),
 but for a write cut just as it takes its lock: on Python 3.14 a signal that lands just after `with self.writeLock:` has
-taken the lock leaves it held, and the call waits for ever (32 of 8,000 real signals in a commit loop;
-[known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and on Python 3.6 to 3.9 one that lands at the end of a `try` or `with` block can leave the file locked, or
+taken the lock leaves it held, and the call waits for ever (32 to 46 of 8,000 real signals of the README's handler, one
+that sets a row, commits and ends by `sys.exit()`, in a commit loop;
+[known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and on Python 3.6 to 3.9 (measured on 3.6 and 3.9) one that lands at the end of a `try` or `with` block can leave the file locked, or
 `writeLock` held (2 of 8,000 on 3.6; [known](docs/limitations.md#on-python-36-to-39-a-signal-handler-that-ends-the-process-inside-a-stores-own-write-can-still-hang-in-a-few-of-8000-signals)).
 
 A child that `fork()` made (`os.fork()`, or `multiprocessing`'s fork children, which its
@@ -353,6 +363,55 @@ empty; the keys it sets or deletes then take its values, and the keys it left ou
 memory's. An explicit `reload()` while the file is damaged replaces memory with the
 damaged file, as asked, and warns.
 
+## Upgrading to 5.18 from 5.17
+
+The file formats are unchanged, and an upgrade needs nothing. The one change to the API: a `TSVZClient` used in a child
+that `fork()` made connects anew there (below).
+
+- **A Ctrl-C caught in `release_file_obj()`'s clean-up, or in `get_file_obj()`'s after a failed open, no longer leaves
+  the store's write lock held.** Each step of the clean-up runs in the `finally` of the one before, the lock let go of last.
+  A program that holds the file in a tight loop and catches real Ctrl-Cs, 960 a run: the store's next commit waited for
+  ever after 329 on Python 3.14 and 312 on 3.11 (tmpfs), and 43 on an XFS disk (3.14); now after 6 to 13, 10 to 12 and
+  0 to 1 (three runs each, two on the disk), each a Ctrl-C at `release_file_obj()`'s entry
+  ([known](docs/limitations.md#a-ctrl-c-caught-as-release_file_obj-begins-can-leave-writelock-held-and-the-stores-next-commit-then-waits-for-ever))
+  or just as `get_file_obj()` takes the lock
+  ([planned for 5.19](docs/limitations.md#a-ctrl-c-caught-just-as-get_file_obj-takes-writelock-leaves-it-held-and-the-stores-next-commit-then-waits-for-ever)).
+  A second `release_file_obj()` of a file already let go of no longer lets go of the lock the writer thread holds for
+  its own write, and a failed `get_file_obj()` of a compressed file also closes the file under its codec's writer.
+- **A Ctrl-C that a `TSVZedLite` catches in a `.tsvz` write no longer leaves the file append-locked until the Lite
+  closes, while the path still names the file the Lite holds.** Each append opens the part for itself, and the lock goes
+  with that descriptor's close whatever step the Ctrl-C cut. Where the path names another file (after a rename, a
+  replace or an `os.chdir()` away from a relative path) it appends through its open file, as 5.17 did, lock and all. In
+  5.17 its own `clear_file()` then waited for ever, and other processes' appends until it closed (104 of 1,920 caught
+  real Ctrl-Cs on Python 3.14, 91 on 3.11; none of 1,920 now). A Lite's `.tsvz` set costs one open and close more: about
+  4 to 6 µs (from 12.6 to 16.8 µs a set on Python 3.14, from 17.9 to 23.5 µs on 3.6).
+- **A `TSVZClient` made before a `fork()` works in the child.** At its first request there it connects to the handler
+  anew, or, with no handler, opens an engine of its own that reads the file afresh; the parent's connection and engine
+  stay the parent's. In 5.17 the child shared its parent's connection, so an answer could reach the other process (the
+  parent's read of one key got the child's row of another), and with no handler the child's first write waited for ever
+  (the engine's writer thread is not in the child), as did its first request where a thread of the parent held the
+  client's lock at the fork. The child's exit writes none of the parent's rows. On Python 3.6 the module starts one
+  thread at import, where it can, so that 3.6 runs the fork hook in a program that has started none.
+- **`tsvzconform` times its waits on the monotonic clock**, so a host that sleeps while a handler starts (a laptop) no
+  longer fails the case: a wall clock 15 minutes on at the handler's first poll failed it in 5.17 (as "the handler
+  did not start").
+- The suite times its deadlines on the monotonic clock too, binds its test sockets in short directories that it removes
+  (two tests failed on macOS, whose socket paths are limited to 104 bytes), and has its sweep limit and its real-signal
+  test sized under load.
+- **Known** ([docs/limitations.md](docs/limitations.md)): the list under 5.17, a Ctrl-C at `release_file_obj()`'s
+  entry (above), and, on Python 3.6 to 3.10, a few more landings of the same hang (8 to 25 of 960 caught Ctrl-Cs in the
+  loop above; 5.17: about 330).
+- **Planned for 5.19** ([docs/limitations.md](docs/limitations.md)): first a design check of stores with no writer thread
+  (after `close()`, in a forked child), covering a signal handler's set inside such a store's own write and what a
+  handler does after a put-off call, a `.tsvz` `clear()` cut there, a `writeLock` that knows its holder (with the Ctrl-C
+  just as `get_file_obj()` takes it, and the Python 3.14 gap at `with self.writeLock:`), and the remake a forked child
+  keeps from its parent's failed rewrite. Then the sections' group: a caught Ctrl-C inside a set, delete, pop or move, a
+  handler's change inside `popitem()` or `move_to_end()`, a new key's place, the lone key after a handler's `clear()`, a
+  `#` key, the 5.15 final review's test gaps, the loops' back jumps, and a Ctrl-C during the writer thread's own reload.
+  Then a store opened by a relative path, which follows the path after `os.chdir()`; a Ctrl-C inside
+  `release_file_obj()` before its flush, which loses what was written through the file; a Ctrl-C while `get_file_obj()`
+  makes a compressed file's codec writer, which writes after the unlock; and the compaction.
+
 ## Upgrading to 5.17 from 5.16
 
 The file formats are unchanged, and an upgrade needs nothing, except in a program whose forked children should compact the
@@ -394,25 +453,27 @@ handler makes inside a store's own write returns where the store has no writer t
 - **A signal handler that uses a store inside that store's own write no longer waits for ever, in a forked child or
   after `close()`, except where the write is cut as it takes its lock (below).** Such a store has no writer thread, so its
   writes run in the thread that asks, and a handler's `commitAppendToFile()`, `reload()`, `clear()`, `clear_file()`,
-  `rewrite()`, `mapToFile()`, `hardMapToFile()` or `checkExternalChanges()` landing inside one took the lock that
-  write holds again, and waited for ever (5.14 to 5.16; a `move_to_end()` too where it follows the file first, as it does
-  once the write's bytes are in). The call is now made as soon as the write ends, unless a Ctrl-C ended it (which drops
-  it: a put-off commit's rows stay queued for the next commit), after any made before it, and returns
-  at once: `self`, or `True` for `rewrite()`. A move that has to follow the file first waits with its follow, so another
+  `rewrite()`, `mapToFile()` or `hardMapToFile()` landing inside one took the lock that write holds again, and waited
+  for ever (5.14 to 5.16; a `move_to_end()` too where it follows the file first, as it does once the write's bytes are
+  in; in a `.tsvz` store, its commit, `reload()`, `clear()`, `clear_file()`, and a `rewrite()` with another writer's
+  change to follow, while its other calls take no lock and run at once, as before). The call is now made as soon as the
+  write ends, unless a Ctrl-C ended it (which drops it: a put-off commit's rows stay queued for the next commit), after
+  any made before it, and returns at once: `self`, or `True` for a `.tsv`-family `rewrite()` (`False` for a `.tsvz` one,
+  as always). A move that has to follow the file first waits with its follow, so another
   writer's change of the row is kept. A handler's set returns at once, as before; one that lands inside such a write's own
   change of memory (a reload's swap) can leave its row in the file and not in memory until the next reload
-  ([deferred to 5.18](docs/limitations.md#a-signal-handlers-set-inside-a-forked-childs-or-a-closed-stores-own-write-can-leave-memory-apart-from-the-file);
+  ([deferred to 5.19](docs/limitations.md#a-signal-handlers-set-inside-a-forked-childs-or-a-closed-stores-own-write-can-leave-memory-apart-from-the-file);
   5.16 the same). What the handler does to the store after such a call happens before it: a set after its own `clear()` is
   lost when the clear is made, a read after its `reload()` sees the old row, and a `move_to_end()` of a key the handler
-  deletes next reports its failure later instead of raising (also deferred to 5.18; 5.16 waited for ever at the first
+  deletes next reports its failure later instead of raising (also deferred to 5.19; 5.16 waited for ever at the first
   call). A handler that ends the process by `os._exit()` after such a call loses the call, where `sys.exit()` makes it
   first: end by `sys.exit()`
   ([known](docs/limitations.md#a-call-a-signal-handler-puts-off-inside-a-stores-own-write-is-lost-when-the-handler-ends-the-process-by-os_exit)), except for a write cut just as it takes its lock: on Python 3.14 a signal landing just after
-  `with self.writeLock:` has taken the lock leaves it held and the call waits for ever (32 of 8,000 real signals of the
-  README's handler in a commit loop; [known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and on Python 3.6 to 3.9 one landing at the end of a `try` or `with` block can
+  `with self.writeLock:` has taken the lock leaves it held and the call waits for ever (32 to 46 of 8,000 real signals of the
+  README's handler in a commit loop; [known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and on Python 3.6 to 3.9 (measured on 3.6 and 3.9) one landing at the end of a `try` or `with` block can
   leave the file locked, or `writeLock` held (2 of 8,000 on 3.6; [known](docs/limitations.md#on-python-36-to-39-a-signal-handler-that-ends-the-process-inside-a-stores-own-write-can-still-hang-in-a-few-of-8000-signals)).
   A process a handler forks inside a closed store's own write, and that sets a row and commits, loses that commit, where
-  a forked child's store keeps it (the closed store has no fork hook; deferred to 5.18; 5.16 waited for ever at the
+  a forked child's store keeps it (the closed store has no fork hook; deferred to 5.19; 5.16 waited for ever at the
   handler's first call). A running store is unchanged: its writes run on its writer thread, and a handler's call waits
   for the one under way.
 - **In a closed `TSVZed`'s or a forked child's own write, a `sys.exit()` or a Ctrl-C that cuts the write no longer
@@ -426,17 +487,17 @@ handler makes inside a store's own write returns where the store has no writer t
   build before this fix; 5.16 at about 3 of 4), and so did a program's own `except SystemExit:` or
   `except KeyboardInterrupt:` clause that commits again (5.16 and the 5.17 build before this fix both: in every run
   where the signal landed there). The `try` now begins where the file is taken, and the file is closed whatever the
-  unlock did: that handler hangs at 32 of 8,000 on 3.14 (all at the `writeLock` below) and 2 on 3.6, in none on 3.11 or
+  unlock did: that handler hangs at 32 to 46 of 8,000 on 3.14 (all at the `writeLock` below) and 2 on 3.6, in none on 3.11 or
   3.12, and the clause's commit returns, except where the cut leaves a lock held. What is left is two known
   limitations: a lock a cut write leaves held on Python 3.14 (that handler, and two signals inside one commit, where 28
   of 8,000 hang and 5.16 ended, and a program's own `except` clause that commits again, which waits for ever there as
-  in 5.16; [known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and Python 3.6 to 3.9, where a signal at the end of a `try` or `with`
+  in 5.16; [known](docs/limitations.md#a-second-ctrl-c-inside-a-sets-clean-up-or-a-ctrl-c-in-a-write-made-after-close-or-in-a-forked-child-can-leave-a-lock-held)), and Python 3.6 to 3.9 (measured on 3.6 and 3.9), where a signal at the end of a `try` or `with`
   block still leaves the file locked, or `writeLock` held ([known](docs/limitations.md#on-python-36-to-39-a-signal-handler-that-ends-the-process-inside-a-stores-own-write-can-still-hang-in-a-few-of-8000-signals)). A `TSVZedLite`'s write of a
   `.tsvz` file is not covered: a Ctrl-C it catches can leave the file append-locked until the Lite closes, as in 5.16
-  ([deferred to 5.18](docs/limitations.md#a-ctrl-c-that-a-tsvzedlite-catches-in-a-tsvz-write-can-leave-its-file-append-locked-until-it-closes)).
+  ([fixed in 5.18](#upgrading-to-518-from-517)).
 - The planned "write lock that knows its holder", which was to tell a call made inside the store's own write from a new
   one, became a look at the call stack for the store's own job (above): a reentrant write lock still hung at 619 of
-  1,060 steps of a commit's sweep, since the nested commit opens the file again and waits for the file lock its own
+  1,060 steps of 5.16's commit's sweep, since the nested commit opens the file again and waits for the file lock its own
   write holds.
 - **A forked child's commits to a compressed file no longer slow with each commit once its parent has written.** A
   commit looks at what another process appended for damage, which every read stops at; it looked from the bytes the
@@ -468,14 +529,17 @@ handler makes inside a store's own write returns where the store has no writer t
   to the store after a put-off call, and the process it forks inside a closed store's write (the handler bullet above),
   a handler's `move_to_end()` or set inside the last commit of a close or an exit, and the remake that a forked child
   keeps from its parent's failed rewrite; a `TSVZedLite` on a `.tsvz` file whose caught Ctrl-C leaves its file
-  append-locked until it closes ([deferred](docs/limitations.md#a-ctrl-c-that-a-tsvzedlite-catches-in-a-tsvz-write-can-leave-its-file-append-locked-until-it-closes); 5.16 the same); a program that holds the file with
+  append-locked until it closes (5.16 the same; [fixed in 5.18](#upgrading-to-518-from-517)); a program that holds the file with
   `get_file_obj()`, lets go of it in a `finally` and catches a Ctrl-C there, which can leave `writeLock` held, so that
-  the store's next commit waits for ever ([deferred](docs/limitations.md#a-ctrl-c-caught-in-get_file_obj-or-release_file_obj-can-leave-writelock-held-and-the-stores-next-commit-then-waits-for-ever); 5.16 the same); two test gaps (a
+  the store's next commit waits for ever (5.16 the same; from 5.18 only a Ctrl-C just as `get_file_obj()` takes the lock,
+  [planned for 5.19](docs/limitations.md#a-ctrl-c-caught-just-as-get_file_obj-takes-writelock-leaves-it-held-and-the-stores-next-commit-then-waits-for-ever),
+  and one as `release_file_obj()` begins, [known](docs/limitations.md#a-ctrl-c-caught-as-release_file_obj-begins-can-leave-writelock-held-and-the-stores-next-commit-then-waits-for-ever)); two test gaps (a
   real-signal test's count of handler calls under load, and the round's test of the rewrite's and `clear()`'s half of the
-  fix; [deferred](docs/limitations.md#test-gaps-the-review-of-517s-third-fix-round-leaves)); and, before the put-off grows to sets, deletes, pops and moves, a design check
+  fix; [fixed in 5.18](#upgrading-to-518-from-517)); and, before the put-off grows to sets, deletes, pops and moves, a design check
   against a store that stops running its writes on the calling thread. A candidate for 5.18, to be measured: a `writeLock`
   that knows its holder, used only to let go of a hold a cut write left (the lock a cut write leaves held on Python
-  3.14).
+  3.14). (5.18 took the `get_file_obj()`/`release_file_obj()` clean-up, the `TSVZedLite` lock, a forked child's
+  `TSVZClient` and two test gaps; the rest is planned for 5.19.)
 
 ## Upgrading to 5.16 from 5.15
 
@@ -519,7 +583,8 @@ to a 100,000-row file). The one change to the API is what `monitor_external_chan
   No row is lost in any of them.
 - **Known** and **Planned for 5.17**: the lists under 5.15, below. What 5.16 does not fix of 5.15's plan moves to 5.17,
   and one planned fix is a known limitation now: two signal handler calls, the second inside the first one's redo. (5.17
-  took the fork and signal-handler group; the rest is planned for 5.18.)
+  took the fork and signal-handler group, and 5.18 a forked child's `TSVZClient` and the sweep tests' limit; the rest is
+  planned for 5.19.)
 
 ## Upgrading to 5.15 from 5.14
 
@@ -589,7 +654,7 @@ can land in, and checks the locks, memory and the file after each.
 - **A Ctrl-C at a loop in `move_to_end` no longer leaves the store's lock held, and one in the wait for the writer
   thread no longer skips taking its job back** (Python 3.12 to 3.14, which leave a loop's back jump inside a `try` or
   `with` block out of the exception table, so a signal landing there skipped the block's exit and its clean-up). Other
-  loops of that shape are left (planned for 5.18, below).
+  loops of that shape are left (planned for 5.19, below).
 - Compactions are unchanged: the plan to drop a strict reader's first line of a key where it takes no row between it
   and its last moved the view of readers given other arguments than the writer's in the random differential (4 of
   20,000 `.tsv` argument sets), so it is deferred again
@@ -643,7 +708,7 @@ can land in, and checks the locks, memory and the file after each.
   used in a forked child, waits for ever at its first write; a Ctrl-C while the writer thread itself reloads after
   another process's change waits for that reload; the compaction above; and, in the suite, the Ctrl-C sweep tests' 120 s
   limit, sized for parallel runs (one timed out at 120 s with four suites of 32 workers on 32 cores, where it takes
-  13.6 s alone).
+  13.6 s alone). (5.18 took a forked child's `TSVZClient` and the sweep tests' limit; the rest is planned for 5.19.)
 
 ## Upgrading to 5.14 from 5.13
 
@@ -734,7 +799,7 @@ Deletes and compactions of loose files (`.tsv`, `.csv`, `.nsv`, `.psv`): what ch
 
 - Deferred to 5.15: a compaction can keep a strict reader's first line of a key where no other key competes for its
   place, once (`a\na\tX\na\t2\t\na\t\t2\n` scrubbed with header `id\tv`, defaults `[#_defaults_#, '', '']` and count 2
-  keeps all four lines). Every reader reads it alike (deferred again to 5.18: see Upgrading to 5.15). See
+  keeps all four lines). Every reader reads it alike (deferred again to 5.19: see Upgrading to 5.15). See
   [docs/limitations.md](docs/limitations.md#a-compaction-can-keep-a-strict-readers-first-line-of-a-key-where-no-other-key-competes-for-its-place).
 
 - **Known: a program still running 3.39 to 5.2 can cut a wide row when another writer changes its file.** A `TSVZed` of
