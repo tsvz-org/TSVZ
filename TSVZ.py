@@ -8664,15 +8664,13 @@ memoryOnly:{self.memoryOnly}
 				finally:
 					try:
 						_closeUnflushed(raw)  # (closing drops the lock too, where a Ctrl-C cut the unlock)
+						# Then the file that holds the lock, whatever raw names (a Ctrl-C that cut the look at _tsvzRaw above left the
+						# codec's writer there, whose close leaves the file open: its buffer would be written, unlocked, when the file
+						# is collected). Not in a try of its own: one more would be one more step a signal lands at on Python 3.6 to 3.9.
+						_closeUnflushed(getattr(file, '_tsvzRaw', raw))
 					finally:
-						try:
-							# The file that holds the lock, whatever raw names (a Ctrl-C that cut the look at _tsvzRaw above left
-							# the codec's writer there, whose close leaves the file open: its buffer would be written, unlocked, when
-							# the file is collected).
-							_closeUnflushed(getattr(file, '_tsvzRaw', raw))
-						finally:
-							self._fileObjHeld = False
-							self.writeLock.release()
+						self._fileObjHeld = False
+						self.writeLock.release()
 		if self.verbose:
 			self.__teePrintOrNot(f"File {self._fileName} unlocked / released")
 

@@ -383,8 +383,8 @@ that `fork()` made connects anew there (below).
   removal or an `os.chdir()` away from a relative path it appends through its open file, as 5.17 did), and the lock goes
   with that descriptor's close whatever step the Ctrl-C cut. In 5.17 its own `clear_file()` then waited for ever, and
   other processes' appends until it closed (104 of 1,920 caught real Ctrl-Cs on Python 3.14, 91 on 3.11; none of 1,920
-  now). A Lite's `.tsvz` set costs one open and close more: about 4 µs (12.7 to 16.6 µs on Python 3.14, 17.8 to 23.0 µs
-  on 3.6).
+  now). A Lite's `.tsvz` set costs one open and close more: about 4 to 5 µs (12.6 to 16.8 µs on Python 3.14, 17.9 to
+  23.5 µs on 3.6).
 - **A `TSVZClient` made before a `fork()` works in the child.** At its first request there it connects to the handler
   anew, or, with no handler, opens an engine of its own that reads the file afresh; the parent's connection and engine
   stay the parent's. In 5.17 the child shared its parent's connection, so an answer could reach the other process (the
