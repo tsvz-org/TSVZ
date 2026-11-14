@@ -827,20 +827,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-11-10, the user chose "Approve as KL (Recommended)": a parent that forks and ends by `os._exit`
   loses the rows it queued last; the README says to commit before forking.
 
-### A TSVZClient with no server, used in a forked child, waits for ever at its first write
-- Kind: deferred
-- What the operator sees: a program opens a `TSVZClient` on a file no `tsvz serve` handler serves (the client then
-  works on the file in its own process, through a local engine) and forks; in the child, the first write through that
-  client (`c['x'] = ...`) never returns. The engine's writer thread (`_ServeWriter`) is not in the child. Checked on
-  5.14 and 5.15, Python 3.14 and 3.6, `.tsv` and `.tsvz` (the 5.15 plan's `probe/forkclient.py`: no return in 10 s).
-- Why: 5.15's fork hook resets each `TSVZed`; the client's engine is another object with its own thread, and its
-  reset needs its own design and tests.
-- Plan (5.18): built on 5.15's fork hook (`_storesAfterFork`): each live `_ServeWriter` (`_SERVE_OPEN_WRITERS`)
-  drops its inherited queue in the child and starts its thread again, either at its first `submit` there (a pid check
-  once a request) or in the hook; measured to settle which.
-- Revisit when: 5.18.
-- Noted: 2026-11-10, found by the 5.15 plan; a deferral, not asked.
-
 ### A compressed file whose text has no final newline takes an appended member as lines of its own
 - Kind: known limitation
 - What the operator sees: a `.tsv.gz` (or `.bz2`, `.xz`, `.zst`) written by hand or by another tool whose text

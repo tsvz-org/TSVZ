@@ -568,3 +568,24 @@ entries go last, in the same commit as the change:
   still hung (the nested commit opens the file again, and waits for the file lock its own write holds). What is left is
   the approved limitation of a lock a cut write leaves held (Python 3.14: 0.4 to 0.6% of real signals), for which a lock
   that knows its holder, letting go of a hold found where the stack shows no job, is a candidate for 5.18, to be measured.
+
+## 2026-11-13 TSVZ 5.18: a TSVZClient made before a fork connects anew in the child
+- Changed: in a child that `fork()` made, each `TSVZClient` gets a new lock and drops its connection or local engine at
+  the fork (`TSVZClient._afterFork`, from the fork hook `_storesAfterFork`, which walks a weak registry of clients,
+  `_CLIENTS`). Its first request there connects anew, by the path a request cut by a Ctrl-C already takes: a
+  connection of its own to the handler, or, with no handler, an engine of its own that reads the file afresh. The
+  parent's connection and engine are dropped in the child, never closed there.
+- Why we had to change: with no handler, the child's first write never returned: the local engine's writer thread was
+  the parent's, not in the child. With a handler, the child sent its requests on the parent's connection, so the
+  answers crossed: the parent's next read got the child's row (`['a', 'A']` for a get of `b`), a wrong result. A lock a
+  parent thread held at the fork (the client's own, one request at a time) was held for ever in the child, so its first
+  request waited for ever.
+- Original design was wrong because: 5.15's fork hook reset each `TSVZed`, the object a program thinks of as the store,
+  and stopped there. A client is another object that holds something of the process's own: a socket shared with the
+  parent, an engine with its own thread, a lock. The entry's plan was to reset the engine's writer in the child and
+  start its thread again; dropping the copy and connecting at the next use has fewer parts, needs no reset of the
+  engine's insides and no thread start in the hook, and covers the connection and the lock too.
+- Lesson: the fork hook reaches every kind of object that holds something of the process's own (a connection, an
+  engine's thread, a lock), each kind registered in a weak registry the hook walks; one it cannot reach keeps the
+  parent's, and a connection shared across the fork crosses the two processes' answers. Reset by dropping the copy and
+  taking a path the object already has for a lost connection, not by restarting the parent's machinery in the child.

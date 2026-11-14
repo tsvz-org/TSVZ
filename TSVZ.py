@@ -5730,10 +5730,12 @@ _LIVE_STORES = weakref.WeakValueDictionary()
 
 def _storesAfterFork():
 	"""In a child that fork() made, before any of its code runs: the in-process and file locks it inherits
-	(_locksAfterFork), and each live store (_afterFork)."""
+	(_locksAfterFork), each live store (_afterFork), and each TSVZClient (TSVZClient._afterFork, 5.18)."""
 	_locksAfterFork()
 	for store in list(_LIVE_STORES.values()):
 		store._afterFork()
+	for client in list(_CLIENTS.values()):
+		client._afterFork()
 
 
 if hasattr(os, 'register_at_fork'):  # Python 3.7+
@@ -9522,6 +9524,8 @@ def _partRows(store, reporter):
 
 #: Writers not closed yet; ``_serveCloseWriters`` closes them when the interpreter exits.
 _SERVE_OPEN_WRITERS = weakref.WeakSet()
+#: Every TSVZClient, by id() (a mapping is not hashable): the fork hook gives each a connection of its own in the child.
+_CLIENTS = weakref.WeakValueDictionary()
 
 
 def _serveCloseWriters():
@@ -10927,6 +10931,17 @@ def _serveHoldSignals():
 	return lambda: [signal.signal(number, old) for number, old in saved]
 
 
+class _Unconnected(object):
+	"""A forked child's TSVZClient before its first request there: nothing to close (the parent's connection and engine
+	stay the parent's)."""
+
+	def close(self):
+		pass
+
+
+_UNCONNECTED = _Unconnected()
+
+
 class TSVZClient(MutableMapping):
 	"""A store kept by ``tsvz serve`` (spec §21), as a mapping with ``TSVZed``'s semantics.
 
@@ -10968,6 +10983,18 @@ class TSVZClient(MutableMapping):
 		self._lock = _SectionLock()  # (never nested: a hold found at a request's start is a Ctrl-C's, see _SectionLock)
 		self._cut = False  # a Ctrl-C cut the last request on the connection: its reply may still come (_request)
 		self._connect()
+		_CLIENTS[id(self)] = self
+
+	def _afterFork(self):
+		"""In a child that fork() made (_storesAfterFork): the connection, or the local engine, is the parent's. A request
+		on the parent's connection could read the answer to the parent's (5.17: the parent's next read got the child's row),
+		and the local engine's writer thread is not here (5.17: the child's first write waited for ever). The next request
+		connects anew, as after a cut one (_request): a connection of its own, or an engine of its own that reads the file
+		afresh. The parent's are dropped, never closed here: closing the engine would run its writer's close on the
+		parent's queue. The lock is new too: a thread of the parent's may have held it at the fork."""
+		self._lock = _SectionLock()
+		if self._backend is not None:  # (a closed client stays closed)
+			self._backend, self._cut = _UNCONNECTED, True
 
 	def _connect(self):
 		info, problem = _serveLookup(self._fileName)

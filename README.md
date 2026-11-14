@@ -202,7 +202,8 @@ with TSVZ.TSVZClient('people.tsvz') as people:  # served, or in this process whe
 `setDefaults`. Its writes return once they are written (raising `OSError` if they
 cannot be), one client may be shared between threads, and without a server it
 warns once and works on the files in-process, finishing its writes when the
-program exits. A server of a `.tsv`-family file names its delimiter in
+program exits. A client used in a child that `fork()` made connects anew (or opens its
+own engine) at its first request there (5.18). A server of a `.tsv`-family file names its delimiter in
 `STORE.serve`, and `TSVZClient` splits string values on it.
 
 ## Fault tolerance
@@ -364,8 +365,15 @@ damaged file, as asked, and warns.
 
 ## Upgrading to 5.18 from 5.17
 
-The file formats are unchanged, and an upgrade needs nothing.
+The file formats are unchanged, and an upgrade needs nothing. The one change to the API: a `TSVZClient` used in a child
+that `fork()` made connects anew there (below).
 
+- **A `TSVZClient` made before a `fork()` works in the child.** At its first request there it connects to the handler
+  anew, or, with no handler, opens an engine of its own that reads the file afresh; the parent's connection and engine
+  stay the parent's. In 5.17 the child shared its parent's connection, so an answer could reach the other process (the
+  parent's read of one key got the child's row of another), and with no handler the child's first write waited for ever
+  (the engine's writer thread is not in the child), as did its first request where a thread of the parent held the
+  client's lock at the fork. The child's exit writes none of the parent's rows.
 - **A Ctrl-C caught in `release_file_obj()`, or in `get_file_obj()`'s clean-up after a failed open, no longer leaves the
   store's write lock held.** Each step of the clean-up runs in the `finally` of the one before, the lock let go of last.
   A program that holds the file in a tight loop and catches real Ctrl-Cs, 960 a run: the store's next commit waited for
